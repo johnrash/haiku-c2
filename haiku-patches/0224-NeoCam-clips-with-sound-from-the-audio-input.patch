@@ -1,0 +1,610 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 14:19:41 -0500
+Subject: [PATCH 224/342] NeoCam: clips with sound from the audio input
+
+CodyCam's recorder can take a sound track (AAC, else FLAC), written as
+it comes from the first picture on, so both start together. NeoCam
+connects the default audio input (a webcam's microphone) with a
+BMediaRecorder while a clip records; "Record sound" on the Capture tab,
+on by default.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apps/codycam/VideoRecorder.cpp   | 67 ++++++++++++++++++-
+ src/apps/codycam/VideoRecorder.h     | 24 ++++++-
+ src/apps/neocam/AudioCapture.cpp     | 99 ++++++++++++++++++++++++++++
+ src/apps/neocam/AudioCapture.h       | 38 +++++++++++
+ src/apps/neocam/CameraConsumer.cpp   | 17 ++++-
+ src/apps/neocam/CameraConsumer.h     |  6 +-
+ src/apps/neocam/CameraController.cpp | 26 +++++++-
+ src/apps/neocam/CameraController.h   |  7 +-
+ src/apps/neocam/Jamfile              |  1 +
+ src/apps/neocam/MainWindow.cpp       | 19 +++++-
+ src/apps/neocam/MainWindow.h         |  1 +
+ 11 files changed, 289 insertions(+), 16 deletions(-)
+ create mode 100644 src/apps/neocam/AudioCapture.cpp
+ create mode 100644 src/apps/neocam/AudioCapture.h
+
+diff --git a/src/apps/codycam/VideoRecorder.cpp b/src/apps/codycam/VideoRecorder.cpp
+index b7ab3af994..71134f8b37 100644
+--- a/src/apps/codycam/VideoRecorder.cpp
++++ b/src/apps/codycam/VideoRecorder.cpp
+@@ -39,7 +39,10 @@ VideoRecorder::VideoRecorder()
+ 	fWorking(NULL),
+ 	fFirstTime(-1),
+ 	fFramesWritten(0),
+-	fError(B_OK)
++	fError(B_OK),
++	fAudioLock("video recorder sound"),
++	fAudioTrack(NULL),
++	fAudioFrameSize(0)
+ {
+ }
+ 
+@@ -52,7 +55,7 @@ VideoRecorder::~VideoRecorder()
+ 
+ status_t
+ VideoRecorder::Start(const char* path, uint32 width, uint32 height,
+-	uint32 bytesPerRow, float frameRate)
++	uint32 bytesPerRow, float frameRate, const media_multi_audio_format* audio)
+ {
+ 	if (fFile != NULL)
+ 		return EALREADY;
+@@ -126,6 +129,9 @@ VideoRecorder::Start(const char* path, uint32 width, uint32 height,
+ 		delete fFile;
+ 		fFile = NULL;
+ 	}
++	// the sound track, before the header (without one if it can't be had)
++	if (status == B_OK && audio != NULL)
++		_AddAudioTrack(fileFormat, *audio);
+ 	if (status == B_OK)
+ 		status = fFile->CommitHeader();
+ 
+@@ -198,6 +204,14 @@ VideoRecorder::Stop()
+ 	wait_for_thread(fThread, &result);
+ 	fThread = -1;
+ 
++	// no more sound
++	fAudioLock.Lock();
++	BMediaTrack* audioTrack = fAudioTrack;
++	fAudioTrack = NULL;
++	fAudioLock.Unlock();
++	if (audioTrack != NULL)
++		audioTrack->Flush();
++
+ 	fTrack->Flush();
+ 	status_t status = fError;
+ 	_Cleanup();
+@@ -205,6 +219,55 @@ VideoRecorder::Stop()
+ }
+ 
+ 
++/*!	Sound in the format \a audio, as AAC (or, without that encoder, FLAC). */
++void
++VideoRecorder::_AddAudioTrack(const media_file_format& fileFormat,
++	const media_multi_audio_format& audio)
++{
++	media_format inFormat;
++	inFormat.type = B_MEDIA_RAW_AUDIO;
++	inFormat.u.raw_audio = audio;
++	size_t sampleSize = audio.format & media_raw_audio_format::B_AUDIO_SIZE_MASK;
++	if (sampleSize == 0 || audio.channel_count == 0)
++		return;
++
++	static const char* kAudioCodecs[] = { "aac", "flac" };
++	for (size_t i = 0; i < sizeof(kAudioCodecs) / sizeof(kAudioCodecs[0]);
++			i++) {
++		media_format outFormat;
++		media_codec_info codec;
++		int32 cookie = 0;
++		media_file_format format = fileFormat;
++		while (get_next_encoder(&cookie, &format, &inFormat, &outFormat,
++				&codec) == B_OK) {
++			if (strcmp(codec.short_name, kAudioCodecs[i]) != 0)
++				continue;
++			BMediaTrack* track = fFile->CreateTrack(&inFormat, &codec);
++			if (track == NULL)
++				break;
++			if (track->InitCheck() != B_OK) {
++				fFile->ReleaseTrack(track);
++				break;
++			}
++			fAudioFrameSize = sampleSize * audio.channel_count;
++			fAudioTrack = track;
++			return;
++		}
++	}
++}
++
++
++void
++VideoRecorder::AddAudio(const void* data, size_t size)
++{
++	BAutolock _(fAudioLock);
++	// from the first picture on, so that both start together
++	if (fAudioTrack == NULL || fFramesWritten == 0 || fAudioFrameSize == 0)
++		return;
++	fAudioTrack->WriteFrames(data, size / fAudioFrameSize);
++}
++
++
+ bigtime_t
+ VideoRecorder::Duration() const
+ {
+diff --git a/src/apps/codycam/VideoRecorder.h b/src/apps/codycam/VideoRecorder.h
+index ef2a1f76be..d55449a04a 100644
+--- a/src/apps/codycam/VideoRecorder.h
++++ b/src/apps/codycam/VideoRecorder.h
+@@ -7,11 +7,13 @@
+ 
+ 
+ #include <Locker.h>
++#include <MediaDefs.h>
+ #include <OS.h>
+ #include <String.h>
+ 
+ 
+ class BMediaFile;
++struct media_file_format;
+ class BMediaTrack;
+ 
+ 
+@@ -20,8 +22,9 @@ class BMediaTrack;
+ 	for the frames it missed, one that came early is left out, so that the
+ 	video plays at the speed it was taken, also when the camera lowers its
+ 	rate in low light. The video is H.264 where the S905's encoder can take
+-	it (meson_encoder), else MPEG-4. Encoding runs in a thread of its own;
+-	AddFrame() only copies the frame. An encoder that can't keep up leaves time out of the
++	it (meson_encoder), else MPEG-4; sound, when there is any, AAC. Encoding
++	runs in a thread of its own; AddFrame() only copies the frame. Sound is
++	encoded as it comes, from the first picture on. An encoder that can't keep up leaves time out of the
+ 	video rather than falling ever further behind.
+ */
+ class VideoRecorder {
+@@ -31,20 +34,31 @@ public:
+ 
+ 			status_t			Start(const char* path, uint32 width,
+ 									uint32 height, uint32 bytesPerRow,
+-									float frameRate);
++									float frameRate,
++									const media_multi_audio_format* audio
++										= NULL);
+ 			void				AddFrame(const void* bits, bigtime_t when);
++			void				AddAudio(const void* data, size_t size);
++									// in the format Start() was given;
++									// from the first picture on
+ 			status_t			Stop();
+ 
+ 			bool				IsRecording() const { return fFile != NULL; }
+ 			const char*			Path() const { return fPath.String(); }
+ 			const char*			CodecName() const
+ 									{ return fCodecName.String(); }
++			bool				HasAudio() const
++									{ return fAudioTrack != NULL; }
+ 
+ 	static	bool				CanEncodeInHardware();
+ 									// H.264 by the S905's encoder
+ 			bigtime_t			Duration() const;
+ 
+ private:
++			void				_AddAudioTrack(
++									const media_file_format& fileFormat,
++									const media_multi_audio_format& audio);
++
+ 	static	status_t			_ThreadEntry(void* data);
+ 			void				_Thread();
+ 			void				_Cleanup();
+@@ -72,6 +86,10 @@ private:
+ 			bigtime_t			fFirstTime;
+ 			int64				fFramesWritten;
+ 			status_t			fError;
++			BLocker				fAudioLock;
++			BMediaTrack*		fAudioTrack;
++				// under fAudioLock: the sound comes from another thread
++			size_t				fAudioFrameSize;
+ };
+ 
+ 
+diff --git a/src/apps/neocam/AudioCapture.cpp b/src/apps/neocam/AudioCapture.cpp
+new file mode 100644
+index 0000000000..af1ecb5b41
+--- /dev/null
++++ b/src/apps/neocam/AudioCapture.cpp
+@@ -0,0 +1,99 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "AudioCapture.h"
++
++#include <MediaRecorder.h>
++#include <MediaRoster.h>
++
++#include "CameraConsumer.h"
++
++
++AudioCapture::AudioCapture()
++	:
++	fRecorder(NULL)
++{
++}
++
++
++AudioCapture::~AudioCapture()
++{
++	Stop();
++}
++
++
++/*!	Connects to the default audio input; its format is what the clip's
++	sound track gets.
++*/
++status_t
++AudioCapture::Connect(media_multi_audio_format& _format)
++{
++	Stop();
++
++	BMediaRoster* roster = BMediaRoster::Roster();
++	if (roster == NULL)
++		return B_ERROR;
++	media_node input;
++	status_t status = roster->GetAudioInput(&input);
++	if (status != B_OK)
++		return status;
++
++	media_output output;
++	int32 count = 0;
++	status = roster->GetFreeOutputsFor(input, &output, 1, &count,
++		B_MEDIA_RAW_AUDIO);
++	roster->ReleaseNode(input);
++	if (status != B_OK || count < 1)
++		return B_BUSY;
++
++	fRecorder = new BMediaRecorder("NeoCam sound", B_MEDIA_RAW_AUDIO);
++	status = fRecorder->InitCheck();
++	if (status == B_OK) {
++		media_format format;
++		format.type = B_MEDIA_RAW_AUDIO;
++		format.u.raw_audio = output.format.u.raw_audio;
++		fRecorder->SetAcceptedFormat(format);
++		status = fRecorder->Connect(output.node, &output, &format);
++	}
++	if (status != B_OK) {
++		delete fRecorder;
++		fRecorder = NULL;
++		return status;
++	}
++	_format = fRecorder->Format().u.raw_audio;
++	return B_OK;
++}
++
++
++status_t
++AudioCapture::Start(CameraConsumer* consumer)
++{
++	if (fRecorder == NULL)
++		return B_NO_INIT;
++	fRecorder->SetHooks(&_Record, NULL, consumer);
++	return fRecorder->Start();
++}
++
++
++void
++AudioCapture::Stop()
++{
++	if (fRecorder == NULL)
++		return;
++	fRecorder->Stop(true);
++	fRecorder->SetHooks(NULL, NULL, NULL);
++	fRecorder->Disconnect();
++	delete fRecorder;
++	fRecorder = NULL;
++}
++
++
++/*static*/ void
++AudioCapture::_Record(void* cookie, bigtime_t timestamp, void* data,
++	size_t size, const media_format& format)
++{
++	((CameraConsumer*)cookie)->AddAudio(data, size);
++}
+diff --git a/src/apps/neocam/AudioCapture.h b/src/apps/neocam/AudioCapture.h
+new file mode 100644
+index 0000000000..5590ffa3ca
+--- /dev/null
++++ b/src/apps/neocam/AudioCapture.h
+@@ -0,0 +1,38 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef AUDIO_CAPTURE_H
++#define AUDIO_CAPTURE_H
++
++
++#include <MediaDefs.h>
++
++
++class BMediaRecorder;
++class CameraConsumer;
++
++
++/*!	The sound for a clip: the default audio input (a webcam's microphone,
++	say) through a BMediaRecorder, its buffers handed to the camera node's
++	recording. Used from the camera controller's thread.
++*/
++class AudioCapture {
++public:
++								AudioCapture();
++								~AudioCapture();
++
++			status_t			Connect(media_multi_audio_format& _format);
++			status_t			Start(CameraConsumer* consumer);
++			void				Stop();
++
++private:
++	static	void				_Record(void* cookie, bigtime_t timestamp,
++									void* data, size_t size,
++									const media_format& format);
++
++			BMediaRecorder*		fRecorder;
++};
++
++
++#endif	// AUDIO_CAPTURE_H
+diff --git a/src/apps/neocam/CameraConsumer.cpp b/src/apps/neocam/CameraConsumer.cpp
+index bf98bf9b71..40145f49be 100644
+--- a/src/apps/neocam/CameraConsumer.cpp
++++ b/src/apps/neocam/CameraConsumer.cpp
+@@ -84,7 +84,8 @@ CameraConsumer::TakeStill(const char* trigger)
+ 
+ 
+ status_t
+-CameraConsumer::StartRecording(const char* path, float frameRate)
++CameraConsumer::StartRecording(const char* path, float frameRate,
++	const media_multi_audio_format* audio)
+ {
+ 	BAutolock _(fLock);
+ 	if (fRecorder != NULL)
+@@ -94,7 +95,7 @@ CameraConsumer::StartRecording(const char* path, float frameRate)
+ 
+ 	VideoRecorder* recorder = new VideoRecorder();
+ 	status_t status = recorder->Start(path, Width(), Height(),
+-		fBitmaps[0]->BytesPerRow(), frameRate);
++		fBitmaps[0]->BytesPerRow(), frameRate, audio);
+ 	if (status != B_OK) {
+ 		delete recorder;
+ 		return status;
+@@ -104,6 +105,18 @@ CameraConsumer::StartRecording(const char* path, float frameRate)
+ }
+ 
+ 
++/*!	The sound's buffers go to the recording (under the lock: the recorder
++	may be detached and stopped meanwhile).
++*/
++void
++CameraConsumer::AddAudio(const void* data, size_t size)
++{
++	BAutolock _(fLock);
++	if (fRecorder != NULL)
++		fRecorder->AddAudio(data, size);
++}
++
++
+ VideoRecorder*
+ CameraConsumer::DetachRecorder()
+ {
+diff --git a/src/apps/neocam/CameraConsumer.h b/src/apps/neocam/CameraConsumer.h
+index 0cf34df774..ff55b0f8cb 100644
+--- a/src/apps/neocam/CameraConsumer.h
++++ b/src/apps/neocam/CameraConsumer.h
+@@ -36,7 +36,11 @@ public:
+ 
+ 			void				TakeStill(const char* trigger);
+ 			status_t			StartRecording(const char* path,
+-									float frameRate);
++									float frameRate,
++									const media_multi_audio_format* audio
++										= NULL);
++			void				AddAudio(const void* data, size_t size);
++									// from the sound's thread
+ 			VideoRecorder*		DetachRecorder();
+ 									// the caller stops and deletes it
+ 			bool				IsRecording();
+diff --git a/src/apps/neocam/CameraController.cpp b/src/apps/neocam/CameraController.cpp
+index d49ec1772b..18ffdf0c48 100644
+--- a/src/apps/neocam/CameraController.cpp
++++ b/src/apps/neocam/CameraController.cpp
+@@ -17,6 +17,7 @@
+ #include <TimeSource.h>
+ #include <scheduler.h>
+ 
++#include "AudioCapture.h"
+ #include "CameraConsumer.h"
+ #include "NeoCam.h"
+ #include "PreviewView.h"
+@@ -47,13 +48,15 @@ CameraController::CameraController(PreviewView* view,
+ 	fWantedHeight(0),
+ 	fMotionEnabled(false),
+ 	fMotionSensitivity(50),
+-	fShowMotion(false)
++	fShowMotion(false),
++	fAudio(NULL)
+ {
+ }
+ 
+ 
+ CameraController::~CameraController()
+ {
++	delete fAudio;
+ 	_Disconnect(true);
+ }
+ 
+@@ -108,17 +111,31 @@ CameraController::MessageReceived(BMessage* message)
+ 		{
+ 			status_t status = B_NO_INIT;
+ 			const char* trigger = message->GetString("trigger", kTriggerClip);
++			bool sound = false;
+ 			if (fConsumer != NULL && fConnected) {
++				// the sound, from the default audio input, if there is one
++				media_multi_audio_format audioFormat;
++				if (message->GetBool("sound", false)) {
++					if (fAudio == NULL)
++						fAudio = new AudioCapture;
++					sound = fAudio->Connect(audioFormat) == B_OK;
++				}
+ 				status = fConsumer->StartRecording(
+ 					message->GetString("path", ""),
+-					message->GetFloat("fps", 30));
+-				if (status == B_OK)
++					message->GetFloat("fps", 30), sound ? &audioFormat : NULL);
++				if (status == B_OK) {
+ 					fClipTrigger = trigger;
++					if (sound)
++						sound = fAudio->Start(fConsumer) == B_OK;
++				}
++				if (!sound && fAudio != NULL)
++					fAudio->Stop();
+ 			}
+ 			BMessage started(kMsgRecordingStarted);
+ 			started.AddInt32("status", status);
+ 			started.AddString("path", message->GetString("path", ""));
+ 			started.AddString("trigger", trigger);
++			started.AddBool("sound", sound);
+ 			fWindow.SendMessage(&started);
+ 			break;
+ 		}
+@@ -319,6 +336,9 @@ CameraController::_FinishRecording(const char* trigger)
+ {
+ 	if (fConsumer == NULL)
+ 		return;
++	// the sound stops first: nothing more goes to the recorder
++	if (fAudio != NULL)
++		fAudio->Stop();
+ 	VideoRecorder* recorder = fConsumer->DetachRecorder();
+ 	if (recorder == NULL)
+ 		return;
+diff --git a/src/apps/neocam/CameraController.h b/src/apps/neocam/CameraController.h
+index c2eac60e03..7cb95df48f 100644
+--- a/src/apps/neocam/CameraController.h
++++ b/src/apps/neocam/CameraController.h
+@@ -14,6 +14,7 @@
+ #include <VideoFrameSizes.h>
+ 
+ 
++class AudioCapture;
+ class BMediaRoster;
+ class BParameterWeb;
+ class CameraConsumer;
+@@ -35,8 +36,8 @@ public:
+ 										// kMsgCameraReleased
+ 		kMsgGetWeb			= 'gweb',	// the window gets kMsgCameraWeb
+ 		kMsgTakeStill		= 'ctst',	// "trigger"
+-		kMsgStartRecording	= 'cstr',	// "path", "fps", "trigger"; the
+-										// window hears how it went
++		kMsgStartRecording	= 'cstr',	// "path", "fps", "trigger", "sound";
++										// the window hears how it went
+ 		kMsgStopRecording	= 'cstp',	// the clip goes to the capture
+ 										// manager
+ 		kMsgSetMotion		= 'cmot'	// "enabled", "sensitivity", "show"
+@@ -78,6 +79,8 @@ private:
+ 			int32				fMotionSensitivity;
+ 			bool				fShowMotion;
+ 			BString				fClipTrigger;
++			AudioCapture*		fAudio;
++				// the clip's sound, while it records
+ };
+ 
+ 
+diff --git a/src/apps/neocam/Jamfile b/src/apps/neocam/Jamfile
+index ce78908b9a..0eb1535475 100644
+--- a/src/apps/neocam/Jamfile
++++ b/src/apps/neocam/Jamfile
+@@ -6,6 +6,7 @@ UsePrivateHeaders interface media shared ;
+ SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src apps codycam ] ;
+ 
+ Application NeoCam :
++	AudioCapture.cpp
+ 	CameraConsumer.cpp
+ 	CameraController.cpp
+ 	CaptureManager.cpp
+diff --git a/src/apps/neocam/MainWindow.cpp b/src/apps/neocam/MainWindow.cpp
+index 9db8804b5b..b9d85e76ed 100644
+--- a/src/apps/neocam/MainWindow.cpp
++++ b/src/apps/neocam/MainWindow.cpp
+@@ -550,6 +550,11 @@ MainWindow::_CaptureTab()
+ 	BMenuField* rateField = new BMenuField("rate",
+ 		B_TRANSLATE("Clip frame rate:"), fClipRateMenu);
+ 
++	fSoundBox = new BCheckBox("sound",
++		B_TRANSLATE("Record sound (from the audio input)"),
++		new BMessage(kMsgSettingChanged));
++	fSoundBox->SetValue(B_CONTROL_ON);
++
+ 	BStringView* codec = new BStringView("codec", fHardwareEncoding
+ 		? B_TRANSLATE("Clips are H.264, encoded by the S905's encoder.")
+ 		: B_TRANSLATE("Clips are MPEG-4, encoded by the CPU."));
+@@ -565,8 +570,9 @@ MainWindow::_CaptureTab()
+ 			.AddGlue()
+ 		.End()
+ 		.AddMenuField(rateField, 0, 2)
+-		.Add(codec, 1, 3)
+-		.AddGlue(0, 4, 2);
++		.Add(fSoundBox, 1, 3)
++		.Add(codec, 1, 4)
++		.AddGlue(0, 5, 2);
+ 	return view;
+ }
+ 
+@@ -773,6 +779,7 @@ MainWindow::_ApplySettings(const BMessage& settings)
+ 	}
+ 
+ 	fClipLength->SetValue(settings.GetInt32("clip seconds", 10));
++	fSoundBox->SetValue(settings.GetBool("sound", true));
+ 	float rate = settings.GetFloat("clip fps", 0);
+ 	for (int32 i = 0; BMenuItem* item = fClipRateMenu->ItemAt(i); i++) {
+ 		if (item->Message()->GetFloat("fps", -1) == rate)
+@@ -822,6 +829,7 @@ MainWindow::GetSettings(BMessage& settings)
+ 			(uint32)item->Message()->GetInt32("be:type", 'JPEG'));
+ 	}
+ 	settings.AddInt32("clip seconds", fClipLength->Value());
++	settings.AddBool("sound", fSoundBox->Value() == B_CONTROL_ON);
+ 	item = fClipRateMenu->FindMarked();
+ 	settings.AddFloat("clip fps",
+ 		item != NULL ? item->Message()->GetFloat("fps", 0) : 0);
+@@ -921,6 +929,7 @@ MainWindow::_StartClip(const char* trigger)
+ 	start.AddString("path", path);
+ 	start.AddFloat("fps", _ClipFrameRate());
+ 	start.AddString("trigger", trigger);
++	start.AddBool("sound", fSoundBox->Value() == B_CONTROL_ON);
+ 	BMessenger(fController).SendMessage(&start);
+ 	fRecordingPending = true;
+ 	fRecordTrigger = trigger;
+@@ -944,7 +953,11 @@ MainWindow::_RecordingStarted(BMessage* message)
+ 	}
+ 	fRecording = true;
+ 	fPreview->SetRecording(true, system_time());
+-	BString text(B_TRANSLATE("Recording \"%name%\"" B_UTF8_ELLIPSIS));
++	BString text = message->GetBool("sound", false)
++		|| fSoundBox->Value() != B_CONTROL_ON
++		? B_TRANSLATE("Recording \"%name%\"" B_UTF8_ELLIPSIS)
++		: B_TRANSLATE("Recording \"%name%\" without sound (no audio input)"
++			B_UTF8_ELLIPSIS);
+ 	text.ReplaceFirst("%name%", BPath(message->GetString("path", "")).Leaf());
+ 	_SetStatus(text, false);
+ 	_UpdateControls();
+diff --git a/src/apps/neocam/MainWindow.h b/src/apps/neocam/MainWindow.h
+index 4362e37e37..6b981e5c6c 100644
+--- a/src/apps/neocam/MainWindow.h
++++ b/src/apps/neocam/MainWindow.h
+@@ -81,6 +81,7 @@ private:
+ 			BPopUpMenu*			fStillFormatMenu;
+ 			BSpinner*			fClipLength;
+ 			BPopUpMenu*			fClipRateMenu;
++			BCheckBox*			fSoundBox;
+ 
+ 			BCheckBox*			fScheduleBox;
+ 			BSpinner*			fScheduleEvery;

@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 02:12:54 -0400
+Subject: [PATCH 040/342] kernel: Ctrl-K on the serial console enters KDL
+ (serial_kdl_key)
+
+A way into the kernel debugger when userland hangs on a machine without
+a keyboard, such as the ODROID-C2 headless: with "serial_kdl_key true"
+in the kernel settings, a periodic timer polls the serial debug console
+every 250 ms and enters KDL on Ctrl-K (0x0b). Off by default.
+
+Tested on the ODROID-C2: KDL comes up while the desktop runs, and
+"continue" goes back to it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/kernel/debug/debug.cpp | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/src/system/kernel/debug/debug.cpp b/src/system/kernel/debug/debug.cpp
+index d782a1f2c7..8e2d49b73f 100644
+--- a/src/system/kernel/debug/debug.cpp
++++ b/src/system/kernel/debug/debug.cpp
+@@ -30,6 +30,7 @@
+ #include <debug_heap.h>
+ #include <debug_paranoia.h>
+ #include <driver_settings.h>
++#include <timer.h>
+ #include <frame_buffer_console.h>
+ #include <interrupts.h>
+ #include <kernel.h>
+@@ -1783,11 +1784,35 @@ debug_init_post_settings(struct kernel_args* args)
+ }
+ 
+ 
++/*!	Enters the kernel debugger when Ctrl-K arrives on the serial debug
++	console (kernel setting "serial_kdl_key"): a way into KDL when userland
++	hangs on a machine without a keyboard. Runs as a periodic timer.
++*/
++static int32
++check_serial_kdl_key(timer*)
++{
++	if (arch_debug_serial_try_getchar() == 0x0b)
++		kernel_debugger("Ctrl-K on the serial console");
++	return B_HANDLED_INTERRUPT;
++}
++
++
+ void
+ debug_init_post_modules(struct kernel_args* args)
+ {
+ 	syslog_init_post_modules();
+ 
++	if (void* handle = load_driver_settings("kernel")) {
++		if (get_driver_boolean_parameter(handle, "serial_kdl_key", false,
++				false)) {
++			static timer sSerialKDLKeyTimer;
++			add_timer(&sSerialKDLKeyTimer, &check_serial_kdl_key, 250000,
++				B_PERIODIC_TIMER);
++			dprintf("debug: Ctrl-K on the serial console enters KDL\n");
++		}
++		unload_driver_settings(handle);
++	}
++
+ 	// check for dupped lines every 10/10 second
+ 	register_kernel_daemon(check_pending_repeats, NULL, 10);
+ 

@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 08:47:53 -0400
+Subject: [PATCH 164/342] meson_ir: the board's node lists
+ "amlogic,meson-gx-ir" first
+
+The FDT bus gives a node's first compatible string; the C2's IR node
+has "amlogic,meson-gx-ir", "amlogic,meson-gxbb-ir". Either is taken.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/drivers/input/meson_ir/meson_ir.cpp | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/input/meson_ir/meson_ir.cpp b/src/add-ons/kernel/drivers/input/meson_ir/meson_ir.cpp
+index 651a4e43e8..b910bd8d5b 100644
+--- a/src/add-ons/kernel/drivers/input/meson_ir/meson_ir.cpp
++++ b/src/add-ons/kernel/drivers/input/meson_ir/meson_ir.cpp
+@@ -592,8 +592,13 @@ supports_device(device_node* parent)
+ 	if (gDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false)
+ 			!= B_OK || strcmp(bus, "fdt") != 0
+ 		|| gDeviceManager->get_attr_string(parent, "fdt/compatible",
+-			&compatible, false) != B_OK
+-		|| strcmp(compatible, "amlogic,meson-gxbb-ir") != 0) {
++			&compatible, false) != B_OK) {
++		return 0.0f;
++	}
++	// the board's node says "amlogic,meson-gx-ir", "amlogic,meson-gxbb-ir";
++	// the bus gives the first
++	if (strcmp(compatible, "amlogic,meson-gx-ir") != 0
++		&& strcmp(compatible, "amlogic,meson-gxbb-ir") != 0) {
+ 		return 0.0f;
+ 	}
+ 	return 0.8f;

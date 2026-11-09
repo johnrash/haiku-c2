@@ -1,0 +1,780 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 06:51:46 -0400
+Subject: [PATCH 051/342] mmc: large transfers, eMMC DDR52 and SD high speed on
+ the Meson GX
+
+Writes reached the card 4 to 16 KiB at a time: the controller driver
+allowed one contiguous DMA segment per transfer, and the DMA resource's
+bounce buffers hold 16 KiB. SD cards write such pieces very slowly
+(1.3 MB/s on an ODROID-C2's card).
+
+- meson_gx_mmc: an I/O operation of up to 64 scattered segments is
+  gathered into (or, reading, scattered from) a 256 KiB bounce buffer,
+  so one command moves up to 511 blocks; a single contiguous buffer
+  still goes straight to DMA.
+- eMMC DDR52: mmc_disk switches the card's BUS_WIDTH to 8-bit DDR when
+  EXT_CSD's DEVICE_TYPE says so, then the host through a new optional
+  set_ddr() of the bus and device interfaces. meson_gx_mmc runs its clock
+  at twice the bus clock and finds the data resampling step (the ADJUST
+  register) with CRC-checked test reads, keeping the middle of the
+  passing window; without one, both go back to single data rate.
+  "emmc_ddr false" in the meson_gx_mmc driver settings turns it off.
+- SD high speed: after the 4-bit switch, CMD6 selects high speed and the
+  clock goes to 50 MHz, after three test reads at it; else 25 MHz.
+  meson_gx_mmc's short reads take fewer than 512 bytes for CMD6's status.
+
+ODROID-C2, BFS on the eMMC (tools/probes/fsbench.c of the port):
+sequential write 34.7 -> 62.4 MB/s, raw read 45.9 -> 75.5 MB/s, 2000
+files of 8 KiB 569 -> 1075 files/s. DDR52 resampling passed at 8 of 10
+steps on every boot. 480 MB in 7994 files written in DDR mode, and data
+written before at single data rate, verified after a reboot. The SD card
+reads at 22.2 instead of 11.9 MB/s, and its U-Boot read at 50 MHz equals
+the image written to it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/drivers/mmc.h                 |   7 +
+ .../kernel/bus_managers/mmc/mmc_bus.cpp       |   9 +
+ src/add-ons/kernel/bus_managers/mmc/mmc_bus.h |   1 +
+ .../kernel/bus_managers/mmc/mmc_module.cpp    |  15 +-
+ .../kernel/busses/mmc/meson_gx_mmc.cpp        | 306 +++++++++++++++---
+ .../kernel/drivers/disk/mmc/mmc_disk.cpp      | 105 +++++-
+ 6 files changed, 401 insertions(+), 42 deletions(-)
+
+diff --git a/headers/private/drivers/mmc.h b/headers/private/drivers/mmc.h
+index 5c5e2b845a..21e370afd5 100644
+--- a/headers/private/drivers/mmc.h
++++ b/headers/private/drivers/mmc.h
+@@ -109,6 +109,10 @@ typedef struct mmc_bus_interface {
+ 		uint32_t argument, void* buffer, size_t length);
+ 		// Optional (may be NULL): execute a command with a single-block
+ 		// data-in phase into a kernel buffer, such as MMC_SEND_EXT_CSD.
++	status_t (*set_ddr)(void* controller, bool ddr);
++		// Optional (may be NULL): data on both clock edges (eMMC DDR52) or
++		// not; the bus clock stays what set_clock set. B_NOT_SUPPORTED if
++		// the controller cannot or should not.
+ } mmc_bus_interface;
+ 
+ 
+@@ -136,6 +140,9 @@ typedef struct mmc_device_interface {
+ 	void (*set_clock)(device_node* controller, void* cookie,
+ 		uint32_t kilohertz);
+ 		// Change the bus clock, e.g. after switching a card to high speed.
++	status_t (*set_ddr)(device_node* controller, void* cookie, bool ddr);
++		// Data on both clock edges, after switching an eMMC to a DDR bus
++		// width. B_NOT_SUPPORTED if the host controller cannot.
+ } mmc_device_interface;
+ 
+ 
+diff --git a/src/add-ons/kernel/bus_managers/mmc/mmc_bus.cpp b/src/add-ons/kernel/bus_managers/mmc/mmc_bus.cpp
+index 6cd27bd70b..27fa7f8fae 100644
+--- a/src/add-ons/kernel/bus_managers/mmc/mmc_bus.cpp
++++ b/src/add-ons/kernel/bus_managers/mmc/mmc_bus.cpp
+@@ -130,6 +130,15 @@ MMCBus::SetBusWidth(int width)
+ }
+ 
+ 
++status_t
++MMCBus::SetDDR(bool ddr)
++{
++	if (fController->set_ddr == NULL)
++		return B_NOT_SUPPORTED;
++	return fController->set_ddr(fCookie, ddr);
++}
++
++
+ void
+ MMCBus::SetCardType(card_type type)
+ {
+diff --git a/src/add-ons/kernel/bus_managers/mmc/mmc_bus.h b/src/add-ons/kernel/bus_managers/mmc/mmc_bus.h
+index 8827a3db81..b9d68bfdbc 100644
+--- a/src/add-ons/kernel/bus_managers/mmc/mmc_bus.h
++++ b/src/add-ons/kernel/bus_managers/mmc/mmc_bus.h
+@@ -148,6 +148,7 @@ public:
+ 
+ 				void			SetClock(int frequency);
+ 				void			SetBusWidth(int width);
++				status_t		SetDDR(bool ddr);
+ 				void			SetCardType(card_type type);
+ 
+ 				void			AcquireBus() { acquire_sem(fLockSemaphore); }
+diff --git a/src/add-ons/kernel/bus_managers/mmc/mmc_module.cpp b/src/add-ons/kernel/bus_managers/mmc/mmc_module.cpp
+index c597292ece..92f9a15515 100644
+--- a/src/add-ons/kernel/bus_managers/mmc/mmc_module.cpp
++++ b/src/add-ons/kernel/bus_managers/mmc/mmc_module.cpp
+@@ -145,6 +145,18 @@ mmc_bus_set_clock(device_node* node, void* cookie, uint32_t kilohertz)
+ }
+ 
+ 
++static status_t
++mmc_bus_set_ddr(device_node* node, void* cookie, bool ddr)
++{
++	MMCBus* bus = (MMCBus*)cookie;
++
++	bus->AcquireBus();
++	status_t status = bus->SetDDR(ddr);
++	bus->ReleaseBus();
++	return status;
++}
++
++
+ static status_t
+ std_ops(int32 op, ...)
+ {
+@@ -198,7 +210,8 @@ mmc_device_interface mmc_bus_controller_module = {
+ 	mmc_bus_do_io,
+ 	mmc_bus_set_width,
+ 	mmc_bus_execute_read_command,
+-	mmc_bus_set_clock
++	mmc_bus_set_clock,
++	mmc_bus_set_ddr
+ };
+ 
+ 
+diff --git a/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp b/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
+index 8e63b1b664..f7fb6b7753 100644
+--- a/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
++++ b/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
+@@ -14,7 +14,10 @@
+  *   fallback when no interrupt is available);
+  * - every command is a single descriptor written straight into the CMD_*
+  *   registers (writing CMD_ARG starts it), data goes by DMA from one
+- *   contiguous buffer, multi-block transfers are ended with CMD12;
++ *   contiguous buffer, multi-block transfers are ended with CMD12. An I/O
++ *   operation of scattered pages is gathered into (or, reading, scattered
++ *   from) a 256 KiB bounce buffer, so that one command moves up to 511
++ *   blocks: cards, SD cards above all, write small pieces slowly;
+  * - pin muxing, clock gates and card power are left as the firmware
+  *   (U-Boot) set them up;
+  * - removable cards (the SD slot, which holds the firmware on the
+@@ -22,6 +25,8 @@
+  *   change the card are refused. With "sd_writable true" in the driver
+  *   settings (an image that runs from the card) they are writable beyond
+  *   their first 4 MiB, which hold the MBR and U-Boot.
++ * - eMMC data can run at double data rate (DDR52, set_ddr()); "emmc_ddr
++ *   false" in the driver settings turns that off.
+  */
+ 
+ 
+@@ -88,6 +93,11 @@ enum {
+ #define CONFIG_BUS_WIDTH_1		0
+ #define CONFIG_BUS_WIDTH_4		1
+ #define CONFIG_BUS_WIDTH_8		2
++#define CONFIG_DDR				(1 << 2)	// data on both clock edges
++
++// ADJUST: resample the data lines at a given step of the source clock
++#define ADJUST_ENABLE			(1 << 13)
++#define ADJUST_DELAY_SHIFT		16
+ #define CONFIG_BLOCK_LEN_SHIFT	4			// log2 of the block size
+ #define CONFIG_RESP_TIMEOUT_SHIFT 8			// 2^n core clock cycles
+ #define CONFIG_RC_CC_SHIFT		12			// 2^n cycles between commands
+@@ -124,6 +134,10 @@ enum {
+ 
+ static const uint32 kBlockSize = 512;
+ static const uint32 kMaxBlocksPerCommand = COMMAND_LENGTH_MASK;
++static const size_t kBounceSize
++	= ROUNDUP(kMaxBlocksPerCommand * kBlockSize, B_PAGE_SIZE);
++static const uint32 kMaxSegments = 64;
++	// per I/O operation: 64 pages cover the 511 blocks of one command
+ static const uint32 kXtalRate = 24000000;
+ static const uint32 kFclkDiv2Rate = 1000000000;
+ 
+@@ -170,6 +184,9 @@ dcache_maintain(phys_addr_t physical, size_t length, bool invalidate)
+ }
+ 
+ 
++static bool emmc_ddr_allowed();
++
++
+ class MesonMmc {
+ public:
+ 								MesonMmc(area_id area, volatile uint32* registers,
+@@ -180,6 +197,7 @@ public:
+ 			void				Init();
+ 
+ 			status_t			SetClock(uint32 kilohertz);
++			status_t			SetDDR(bool ddr);
+ 			void				SetBusWidth(int width);
+ 			void				SetCardType(card_type type);
+ 			void				SetScanSemaphore(sem_id semaphore);
+@@ -198,12 +216,26 @@ private:
+ 			void				_Write(uint32 offset, uint32 value)
+ 									{ fRegisters[offset / 4] = value; }
+ 
++			void				_CopyVecs(const generic_io_vec*& vecs,
++									const generic_io_vec* vecsEnd,
++									generic_size_t& vecOffset,
++									generic_size_t length, bool toBounce);
++			void				_SkipVecs(const generic_io_vec*& vecs,
++									const generic_io_vec* vecsEnd,
++									generic_size_t& vecOffset,
++									generic_size_t length);
++			status_t			_ApplyClock();
++			bool				_TestRead();
+ 			bool				_IsMmc() const;
+ 			response_type		_ResponseType(uint8 command,
+ 									uint32 argument) const;
+ 			status_t			_Execute(uint8 command, uint32 argument,
+ 									uint32* result, phys_addr_t data,
+-									uint32 blockCount, bool write);
++									uint32 blockCount, bool write,
++									bool quiet = false, uint32 byteCount = 0);
++									// quiet: errors are expected (tuning);
++									// byteCount: a transfer shorter than a
++									// block (blockCount 0)
+ 			uint32				_WaitPolled(bigtime_t timeout);
+ 			uint32				_WaitInterrupt(ConditionVariableEntry& entry,
+ 									bigtime_t timeout);
+@@ -224,9 +256,13 @@ private:
+ 			area_id				fBounceArea;
+ 			void*				fBounceBuffer;
+ 			phys_addr_t			fBouncePhysical;
+-				// one page below 4 GB for short reads (EXT_CSD)
++				// kBounceSize below 4 GB: for scattered I/O operations and
++				// for short reads (EXT_CSD)
+ 			mutex				fLock;
+ 			card_type			fCardType;
++			uint32				fClockKilohertz;	// the bus clock
++			uint32				fDivider;			// of the source clock
++			bool				fDDR;
+ 			bool				fAppCommand;
+ 			sem_id				fScanSemaphore;
+ };
+@@ -248,6 +284,9 @@ MesonMmc::MesonMmc(area_id area, volatile uint32* registers,
+ 	fBounceBuffer(NULL),
+ 	fBouncePhysical(0),
+ 	fCardType(CARD_TYPE_UNKNOWN),
++	fClockKilohertz(0),
++	fDivider(0),
++	fDDR(false),
+ 	fAppCommand(false),
+ 	fScanSemaphore(-1)
+ {
+@@ -285,7 +324,7 @@ MesonMmc::Init()
+ 		| CONFIG_BUS_WIDTH_1);
+ 
+ 	fBounceArea = create_area("meson_gx_mmc bounce", &fBounceBuffer,
+-		B_ANY_KERNEL_ADDRESS, B_PAGE_SIZE, B_32_BIT_CONTIGUOUS,
++		B_ANY_KERNEL_ADDRESS, kBounceSize, B_32_BIT_CONTIGUOUS,
+ 		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
+ 	if (fBounceArea >= 0) {
+ 		physical_entry entry;
+@@ -378,9 +417,101 @@ MesonMmc::_WaitInterrupt(ConditionVariableEntry& entry, bigtime_t timeout)
+ status_t
+ MesonMmc::SetClock(uint32 kilohertz)
+ {
+-	uint32 rate = kilohertz * 1000;
+-	if (rate == 0)
++	if (kilohertz == 0)
+ 		return B_BAD_VALUE;
++	MutexLocker locker(fLock);
++	fClockKilohertz = kilohertz;
++	return _ApplyClock();
++}
++
++
++/*!	In DDR mode the controller clock runs at twice the bus clock, and the
++	data lines need resampling at the right step of the source clock (the
++	ADJUST register, as for HS200 tuning): each step is tried with test
++	reads of the card's first blocks, whose CRCs the controller checks, and
++	the middle of the longest passing window is kept. Without one, single
++	data rate again and B_ERROR (the caller switches the card back).
++*/
++status_t
++MesonMmc::SetDDR(bool ddr)
++{
++	if (ddr && !emmc_ddr_allowed())
++		return B_NOT_SUPPORTED;
++	MutexLocker locker(fLock);
++	fDDR = ddr;
++	_Write(kAdjust, 0);
++	if (fClockKilohertz == 0)
++		return ddr ? B_NO_INIT : B_OK;
++	status_t status = _ApplyClock();
++	if (status != B_OK || !ddr)
++		return status;
++
++	uint32 steps = std::min(fDivider, (uint32)32);
++	bool passed[32];
++	uint32 passCount = 0;
++	for (uint32 step = 0; step < steps; step++) {
++		_Write(kAdjust, ADJUST_ENABLE | (step << ADJUST_DELAY_SHIFT));
++		passed[step] = _TestRead();
++		if (passed[step])
++			passCount++;
++	}
++
++	// the longest run of passing steps, which may wrap around
++	uint32 bestStart = 0;
++	uint32 bestLength = 0;
++	for (uint32 start = 0; start < steps; start++) {
++		uint32 length = 0;
++		while (length < steps && passed[(start + length) % steps])
++			length++;
++		if (length > bestLength) {
++			bestStart = start;
++			bestLength = length;
++		}
++	}
++	if (bestLength == 0) {
++		ERROR("%#" B_PRIxPHYSADDR ": DDR: no resampling step reads without "
++			"errors\n", fPhysicalBase);
++		_Write(kAdjust, 0);
++		fDDR = false;
++		_ApplyClock();
++		return B_ERROR;
++	}
++	uint32 chosen = (bestStart + bestLength / 2) % steps;
++	_Write(kAdjust, ADJUST_ENABLE | (chosen << ADJUST_DELAY_SHIFT));
++	INFO("%#" B_PRIxPHYSADDR ": DDR: %" B_PRIu32 " of %" B_PRIu32
++		" resampling steps read without errors, window %" B_PRIu32 "-%"
++		B_PRIu32 ", using %" B_PRIu32 "\n", fPhysicalBase, passCount, steps,
++		bestStart, (bestStart + bestLength - 1) % steps, chosen);
++	return B_OK;
++}
++
++
++/*!	Reads the card's first 128 blocks three times; true if no read had an
++	error (the controller checks each data line's CRC).
++*/
++bool
++MesonMmc::_TestRead()
++{
++	static const uint32 kTestBlocks = 128;
++	if (fBounceArea < 0)
++		return false;
++	for (int round = 0; round < 3; round++) {
++		uint32 response;
++		status_t status = _Execute(SD_READ_MULTIPLE_BLOCKS, 0, &response,
++			fBouncePhysical, kTestBlocks, false, true);
++		status_t stopStatus = _Execute(SD_STOP_TRANSMISSION, 0, &response,
++			0, 0, false, true);
++		if (status != B_OK || stopStatus != B_OK)
++			return false;
++	}
++	return true;
++}
++
++
++status_t
++MesonMmc::_ApplyClock()
++{
++	uint32 rate = fClockKilohertz * 1000 * (fDDR ? 2 : 1);
+ 
+ 	// Slow clocks come from the 24 MHz crystal, fast ones from the 1 GHz
+ 	// fixed PLL output; never exceed the requested rate.
+@@ -396,16 +527,19 @@ MesonMmc::SetClock(uint32 kilohertz)
+ 	uint32 divider = (parentRate + rate - 1) / rate;
+ 	divider = std::max(std::min(divider, (uint32)CLOCK_DIV_MASK), (uint32)1);
+ 
+-	MutexLocker locker(fLock);
+-
+ 	// The clock may only change while it is stopped.
+ 	uint32 config = _Read(kConfig);
++	if (fDDR)
++		config |= CONFIG_DDR;
++	else
++		config &= ~CONFIG_DDR;
+ 	_Write(kConfig, config | CONFIG_STOP_CLOCK);
+ 	_Write(kClock, CLOCK_ALWAYS_ON | CLOCK_CORE_PHASE_180 | source | divider);
+ 	_Write(kConfig, config & ~CONFIG_STOP_CLOCK);
++	fDivider = divider;
+ 
+-	INFO("%#" B_PRIxPHYSADDR ": bus clock %" B_PRIu32 " kHz\n", fPhysicalBase,
+-		parentRate / divider / 1000);
++	INFO("%#" B_PRIxPHYSADDR ": bus clock %" B_PRIu32 " kHz%s\n", fPhysicalBase,
++		parentRate / divider / 1000 / (fDDR ? 2 : 1), fDDR ? ", DDR" : "");
+ 	return B_OK;
+ }
+ 
+@@ -488,7 +622,8 @@ MesonMmc::_ResponseType(uint8 command, uint32 argument) const
+ 
+ status_t
+ MesonMmc::_Execute(uint8 command, uint32 argument, uint32* result,
+-	phys_addr_t data, uint32 blockCount, bool write)
++	phys_addr_t data, uint32 blockCount, bool write, bool quiet,
++	uint32 byteCount)
+ {
+ 	response_type type = _ResponseType(command, argument);
+ 	fAppCommand = command == SD_APP_CMD;
+@@ -520,13 +655,16 @@ MesonMmc::_Execute(uint8 command, uint32 argument, uint32* result,
+ 		if (write)
+ 			config |= COMMAND_DATA_WRITE;
+ 		timeoutShift = 12;
++	} else if (byteCount > 0) {
++		config |= COMMAND_DATA_IO | byteCount;
++		timeoutShift = 12;
+ 	} else if (type == kR1b)
+ 		timeoutShift = 12;
+ 	config |= timeoutShift << COMMAND_TIMEOUT_SHIFT;
+ 	bigtime_t timeout = (1000LL << timeoutShift) + 1000000;
+ 
+-	size_t dataLength = blockCount * kBlockSize;
+-	if (blockCount > 0)
++	size_t dataLength = blockCount > 0 ? blockCount * kBlockSize : byteCount;
++	if (dataLength > 0)
+ 		dcache_maintain(data, dataLength, !write);
+ 
+ 	ConditionVariableEntry entry;
+@@ -555,12 +693,14 @@ MesonMmc::_Execute(uint8 command, uint32 argument, uint32* result,
+ 	TRACE("CMD%u done: status %#" B_PRIx32 " after %" B_PRIdBIGTIME
+ 		" us\n", command, status, system_time() - started);
+ 
+-	if (blockCount > 0 && !write)
++	if (dataLength > 0 && !write)
+ 		dcache_maintain(data, dataLength, true);
+ 
+ 	if ((status & STATUS_DONE_MASK) == 0) {
+-		ERROR("CMD%u: no completion (status %#" B_PRIx32 ")\n", command,
+-			_Read(kStatus));
++		if (!quiet) {
++			ERROR("CMD%u: no completion (status %#" B_PRIx32 ")\n", command,
++				_Read(kStatus));
++		}
+ 		return B_TIMED_OUT;
+ 	}
+ 	if ((status & (STATUS_RESP_TIMEOUT | STATUS_DESC_TIMEOUT)) != 0) {
+@@ -569,8 +709,10 @@ MesonMmc::_Execute(uint8 command, uint32 argument, uint32* result,
+ 		return B_TIMED_OUT;
+ 	}
+ 	if ((status & STATUS_ERROR_MASK) != 0) {
+-		ERROR("CMD%u arg %#" B_PRIx32 ": error, status %#" B_PRIx32 "\n",
+-			command, argument, status);
++		if (!quiet) {
++			ERROR("CMD%u arg %#" B_PRIx32 ": error, status %#" B_PRIx32 "\n",
++				command, argument, status);
++		}
+ 		return B_IO_ERROR;
+ 	}
+ 
+@@ -666,26 +808,27 @@ MesonMmc::DoIO(uint8 command, IOOperation* operation, bool offsetAsSectors)
+ 	generic_size_t vecOffset = 0;
+ 
+ 	while (length > 0) {
+-		if (vecs >= vecsEnd)
+-			return B_BAD_VALUE;
+-
+-		generic_size_t chunk = std::min(length, vecs->length - vecOffset);
+-		if (chunk == 0) {
++		while (vecs < vecsEnd && vecOffset == vecs->length) {
+ 			vecs++;
+ 			vecOffset = 0;
+-			continue;
+ 		}
+-		chunk = std::min(chunk,
+-			(generic_size_t)kMaxBlocksPerCommand * kBlockSize);
+-		chunk -= chunk % kBlockSize;
+-		if (chunk == 0)
++		if (vecs >= vecsEnd)
+ 			return B_BAD_VALUE;
+ 
++		// One command: straight from the vector if it holds all of it,
++		// else through the bounce buffer.
++		generic_size_t chunk = std::min(length,
++			(generic_size_t)kMaxBlocksPerCommand * kBlockSize);
+ 		phys_addr_t address = vecs->base + vecOffset;
+-		if ((address & 7) != 0 || address + chunk > 0x100000000LL) {
+-			ERROR("unusable DMA buffer %#" B_PRIxPHYSADDR "\n", address);
+-			return B_BAD_VALUE;
++		bool direct = vecs->length - vecOffset >= chunk && (address & 7) == 0
++			&& address + chunk <= 0x100000000LL;
++		if (!direct) {
++			if (fBounceArea < 0)
++				return B_NO_MEMORY;
++			address = fBouncePhysical;
+ 		}
++		if (!direct && write)
++			_CopyVecs(vecs, vecsEnd, vecOffset, chunk, true);
+ 
+ 		uint32 argument = offsetAsSectors
+ 			? (uint32)(offset / kBlockSize) : (uint32)offset;
+@@ -707,30 +850,86 @@ MesonMmc::DoIO(uint8 command, IOOperation* operation, bool offsetAsSectors)
+ 			return status;
+ 		}
+ 
++		if (direct)
++			vecOffset += chunk;
++		else if (!write)
++			_CopyVecs(vecs, vecsEnd, vecOffset, chunk, false);
++		else
++			_SkipVecs(vecs, vecsEnd, vecOffset, chunk);
+ 		offset += chunk;
+ 		length -= chunk;
+-		vecOffset += chunk;
+ 	}
+ 
+ 	return B_OK;
+ }
+ 
+ 
++/*!	Copies \a length bytes between the I/O vectors, starting at \a vecs
++	and \a vecOffset, and the bounce buffer: into it with \a toBounce,
++	else out of it. The vectors are physical; all RAM is mapped at
++	KERNEL_PMAP_BASE. Advances \a vecs and \a vecOffset past them.
++*/
++void
++MesonMmc::_CopyVecs(const generic_io_vec*& vecs,
++	const generic_io_vec* vecsEnd, generic_size_t& vecOffset,
++	generic_size_t length, bool toBounce)
++{
++	uint8* bounce = (uint8*)fBounceBuffer;
++	while (length > 0 && vecs < vecsEnd) {
++		generic_size_t piece = std::min(length, vecs->length - vecOffset);
++		uint8* memory = (uint8*)(KERNEL_PMAP_BASE + vecs->base + vecOffset);
++		if (toBounce)
++			memcpy(bounce, memory, piece);
++		else
++			memcpy(memory, bounce, piece);
++		bounce += piece;
++		length -= piece;
++		vecOffset += piece;
++		if (vecOffset == vecs->length) {
++			vecs++;
++			vecOffset = 0;
++		}
++	}
++}
++
++
++void
++MesonMmc::_SkipVecs(const generic_io_vec*& vecs,
++	const generic_io_vec* vecsEnd, generic_size_t& vecOffset,
++	generic_size_t length)
++{
++	while (length > 0 && vecs < vecsEnd) {
++		generic_size_t piece = std::min(length, vecs->length - vecOffset);
++		length -= piece;
++		vecOffset += piece;
++		if (vecOffset == vecs->length) {
++			vecs++;
++			vecOffset = 0;
++		}
++	}
++}
++
++
+ status_t
+ MesonMmc::ExecuteReadCommand(uint8 command, uint32 argument, void* buffer,
+ 	size_t length)
+ {
+-	if (length != kBlockSize)
++	// a block, or fewer bytes (the SD switch function status: 64)
++	if (length == 0 || length > kBlockSize || (length < kBlockSize
++			&& (length & 3) != 0)) {
+ 		return B_BAD_VALUE;
++	}
+ 	if (fBounceArea < 0)
+ 		return B_NO_MEMORY;
+ 
+ 	MutexLocker locker(fLock);
+ 	uint32 response;
+-	status_t status = _Execute(command, argument, &response, fBouncePhysical,
+-		1, false);
++	status_t status = length == kBlockSize
++		? _Execute(command, argument, &response, fBouncePhysical, 1, false)
++		: _Execute(command, argument, &response, fBouncePhysical, 0, false,
++			false, length);
+ 	if (status == B_OK)
+-		memcpy(buffer, fBounceBuffer, kBlockSize);
++		memcpy(buffer, fBounceBuffer, length);
+ 	return status;
+ }
+ 
+@@ -898,6 +1097,22 @@ supports_device(device_node* parent)
+ }
+ 
+ 
++/*!	eMMC DDR52 unless the driver settings say "emmc_ddr false", should a
++	module not cope.
++*/
++static bool
++emmc_ddr_allowed()
++{
++	void* settings = load_driver_settings("meson_gx_mmc");
++	if (settings == NULL)
++		return true;
++	bool allowed = get_driver_boolean_parameter(settings, "emmc_ddr", true,
++		true);
++	unload_driver_settings(settings);
++	return allowed;
++}
++
++
+ /*!	Removable cards (the microSD slot) are read-only unless the driver
+ 	settings (~/config/settings/kernel/drivers/meson_gx_mmc, passed on by the
+ 	boot loader) say "sd_writable true", as an image that runs from the
+@@ -944,14 +1159,17 @@ register_device(device_node* parent)
+ 		{ kMmcMaxBusWidthAttribute, B_UINT8_TYPE, { .ui8 = busWidth } },
+ 		{ kMmcReadOnlyAttribute, B_UINT8_TYPE, { .ui8 = readOnly } },
+ 
+-		// One descriptor per command: one contiguous segment of at most 511
+-		// blocks below 4 GB. Whole-sector alignment (as sdhci uses) also keeps
+-		// DMA buffers off cache lines shared with other data.
++		// One command moves at most 511 blocks; DoIO() gathers scattered
++		// segments into its bounce buffer. Whole-sector alignment (as sdhci
++		// uses) also keeps DMA buffers off cache lines shared with other
++		// data.
+ 		{ B_DMA_ALIGNMENT, B_UINT32_TYPE, { .ui32 = 511 } },
+ 		{ B_DMA_HIGH_ADDRESS, B_UINT64_TYPE, { .ui64 = 0x100000000LL } },
+-		{ B_DMA_MAX_SEGMENT_COUNT, B_UINT32_TYPE, { .ui32 = 1 } },
++		{ B_DMA_MAX_SEGMENT_COUNT, B_UINT32_TYPE, { .ui32 = kMaxSegments } },
+ 		{ B_DMA_MAX_SEGMENT_BLOCKS, B_UINT32_TYPE,
+ 			{ .ui32 = kMaxBlocksPerCommand } },
++		{ B_DMA_MAX_TRANSFER_BLOCKS, B_UINT32_TYPE,
++			{ .ui32 = kMaxBlocksPerCommand } },
+ 		{ NULL }
+ 	};
+ 
+@@ -1068,6 +1286,13 @@ set_bus_width(void* controller, int width)
+ }
+ 
+ 
++static status_t
++set_ddr(void* controller, bool ddr)
++{
++	return ((MesonMmc*)controller)->SetDDR(ddr);
++}
++
++
+ static void
+ terminate_bus(void* controller)
+ {
+@@ -1110,6 +1335,7 @@ static mmc_bus_interface gMesonGxMmcModule = {
+ 	.terminate_bus = terminate_bus,
+ 	.set_card_type = set_card_type,
+ 	.execute_read_command = execute_read_command,
++	.set_ddr = set_ddr,
+ };
+ 
+ 
+diff --git a/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp b/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
+index c055c9ac68..f533dc2239 100644
+--- a/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
++++ b/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
+@@ -156,6 +156,100 @@ mmc_disk_execute_iorequest(void* data, IOOperation* operation)
+ }
+ 
+ 
++
++/*!	SD high speed: CMD6 (SWITCH_FUNC) mode 1 selects function 1 of group 1
++	(access mode), which allows a 50 MHz clock at 3.3 V. The card answers
++	with its 64-byte switch status, whose bits 379-376 (in byte 16) give the
++	function now selected. A few CRC-checked test reads at 50 MHz follow;
++	on an error, 25 MHz again (a card in high speed mode works there too).
++*/
++static bool
++switch_sd_high_speed(mmc_disk_driver_info* info)
++{
++	static const uint8 kSdSwitchFunction = 6;
++	static const uint32 kSwitchToHighSpeed = 0x80fffff1;
++	if (info->mmc->execute_read_command == NULL
++		|| info->mmc->set_clock == NULL) {
++		return false;
++	}
++
++	uint8 switchStatus[64];
++	status_t status = info->mmc->execute_read_command(info->parent,
++		info->parentCookie, info->rca, kSdSwitchFunction, kSwitchToHighSpeed,
++		switchStatus, sizeof(switchStatus));
++	if (status != B_OK || (switchStatus[16] & 0xf) != 1) {
++		INFO("SD: no high speed (%s, function %u)\n", strerror(status),
++			status == B_OK ? switchStatus[16] & 0xf : 0);
++		return false;
++	}
++
++	info->mmc->set_clock(info->parent, info->parentCookie, 50000);
++	uint8* block = (uint8*)malloc(kBlockSize);
++	if (block == NULL) {
++		info->mmc->set_clock(info->parent, info->parentCookie, 25000);
++		return false;
++	}
++	for (int i = 0; i < 3 && status == B_OK; i++) {
++		status = info->mmc->execute_read_command(info->parent,
++			info->parentCookie, info->rca, SD_READ_SINGLE_BLOCK, 0, block,
++			kBlockSize);
++	}
++	free(block);
++	if (status != B_OK) {
++		ERROR("SD: test reads at 50 MHz failed (%s), back to 25 MHz\n",
++			strerror(status));
++		info->mmc->set_clock(info->parent, info->parentCookie, 25000);
++		return false;
++	}
++	return true;
++}
++
++
++/*!	eMMC DDR52: after the switch to high speed, BUS_WIDTH (EXT_CSD[183])
++	5 or 6 (4 or 8 bits, both edges), then the host controller. The I/O
++	voltage has to be what the card's DDR52 bit is for; the ODROID-C2's
++	eMMC runs at 1.8 V, which EXT_CSD's DEVICE_TYPE bit 2 covers. Goes back
++	to single data rate if anything fails.
++*/
++static bool
++switch_to_ddr(mmc_disk_driver_info* info, int busWidth)
++{
++	static const uint8 kMmcDeviceTypeDdr52 = 1 << 2;
++	static const uint8 kMmcSendStatus = 13;
++	static const uint32 kMmcSwitchError = 1 << 7;
++	if ((info->mmcDeviceType & kMmcDeviceTypeDdr52) == 0
++		|| info->mmc->set_ddr == NULL || (busWidth != 4 && busWidth != 8)) {
++		return false;
++	}
++
++	uint32 cardStatus = 0;
++	const uint32 kSwitchDdrBusWidth = 0x3B70000
++		| ((busWidth == 8 ? 6 : 5) << 8);
++	status_t status = info->mmc->execute_command(info->parent,
++		info->parentCookie, info->rca, MMC_SWITCH, kSwitchDdrBusWidth,
++		&cardStatus);
++	if (status == B_OK) {
++		status = info->mmc->execute_command(info->parent, info->parentCookie,
++			info->rca, kMmcSendStatus, (uint32)info->rca << 16, &cardStatus);
++	}
++	if (status != B_OK || (cardStatus & kMmcSwitchError) != 0) {
++		ERROR("eMMC: DDR bus width switch failed (%s, status %#" B_PRIx32
++			")\n", strerror(status), cardStatus);
++		return false;
++	}
++
++	status = info->mmc->set_ddr(info->parent, info->parentCookie, true);
++	if (status == B_OK)
++		return true;
++
++	// the controller cannot or should not: single data rate again
++	const uint32 kSwitchSdrBusWidth = 0x3B70000
++		| ((busWidth == 8 ? 2 : 1) << 8);
++	info->mmc->execute_command(info->parent, info->parentCookie, info->rca,
++		MMC_SWITCH, kSwitchSdrBusWidth, &cardStatus);
++	return false;
++}
++
+ static status_t
+ mmc_block_get_geometry(mmc_disk_driver_info* info, device_geometry* geometry)
+ {
+@@ -260,6 +354,12 @@ mmc_block_get_geometry(mmc_disk_driver_info* info, device_geometry* geometry)
+ 	if (status == B_OK) {
+ 		TRACE("Switch to %d bit mode for data transfers\n", busWidth);
+ 		info->mmc->set_bus_width(info->parent, info->parentCookie, busWidth);
++		if (!isMMC) {
++			if (switch_sd_high_speed(info))
++				INFO("SD: 4-bit bus, high speed (50 MHz)\n");
++			else
++				INFO("SD: 4-bit bus, default speed (25 MHz)\n");
++		}
+ 	} else {
+ 		ERROR("Switching to %d bit mode failed: %s\n", busWidth,
+ 			strerror(status));
+@@ -283,7 +383,10 @@ mmc_block_get_geometry(mmc_disk_driver_info* info, device_geometry* geometry)
+ 		}
+ 		if (hsStatus == B_OK && (cardStatus & kMmcSwitchError) == 0) {
+ 			info->mmc->set_clock(info->parent, info->parentCookie, 52000);
+-			INFO("eMMC: %d-bit bus, high speed (52 MHz)\n", busWidth);
++			if (switch_to_ddr(info, busWidth))
++				INFO("eMMC: %d-bit bus, DDR52 (52 MHz, both edges)\n", busWidth);
++			else
++				INFO("eMMC: %d-bit bus, high speed (52 MHz)\n", busWidth);
+ 		} else {
+ 			ERROR("eMMC: high speed switch failed (%s, status %#" B_PRIx32
+ 				"), staying at 25 MHz\n", strerror(hsStatus), cardStatus);

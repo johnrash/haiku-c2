@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 16:41:50 -0400
+Subject: [PATCH 120/342] kernel debug level 1
+
+Kept since 2026-10-30, as it's faster and stable: kernel-heavy paths are 20-30% faster than at level 2, and
+the level 1 boot panic is fixed (the kernel stack commit before this).
+Panics, KDL and the debug syslog stay; the ASSERT()s and the paranoid
+heap checks go.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/config_headers/kernel_debug_config.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/build/config_headers/kernel_debug_config.h b/build/config_headers/kernel_debug_config.h
+index 404cb94e48..a3c598b9e5 100644
+--- a/build/config_headers/kernel_debug_config.h
++++ b/build/config_headers/kernel_debug_config.h
+@@ -5,7 +5,7 @@
+ // 0: Disables all debug code that hasn't been enabled otherwise.
+ // 1: Enables some lightweight debug code.
+ // 2: Enables more debug code. Will impact performance.
+-#define KDEBUG_LEVEL 2
++#define KDEBUG_LEVEL 1
+ 
+ #define KDEBUG_LEVEL_2	(KDEBUG_LEVEL >= 2)
+ #define KDEBUG_LEVEL_1	(KDEBUG_LEVEL >= 1)

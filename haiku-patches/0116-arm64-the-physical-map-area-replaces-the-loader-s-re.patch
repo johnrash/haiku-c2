@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 15:59:14 -0400
+Subject: [PATCH 116/342] arm64: the physical map area replaces the loader's
+ reservations
+
+With the physical memory map inside the kernel address space (the
+previous commit), the ranges the loader lists for its mappings are
+reserved by reserve_boot_loader_ranges() before the area is created
+over them, so creating it failed, and the panic for that hung the
+boot before any output. Unreserve the map's range first; a failure is
+only logged again, since the system runs without the area.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/kernel/arch/arm64/arch_vm_translation_map.cpp | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/system/kernel/arch/arm64/arch_vm_translation_map.cpp b/src/system/kernel/arch/arm64/arch_vm_translation_map.cpp
+index 3a00f5bd3a..e108432d18 100644
+--- a/src/system/kernel/arch/arm64/arch_vm_translation_map.cpp
++++ b/src/system/kernel/arch/arm64/arch_vm_translation_map.cpp
+@@ -96,12 +96,15 @@ arch_vm_translation_map_init_post_area(kernel_args* args)
+ {
+ 	dprintf("arch_vm_translation_map_init_post_area\n");
+ 
+-	// Create an area covering the physical map area.
++	// Create an area covering the physical map area. The loader lists the
++	// map's mappings among the ranges it allocated, which the VM reserved;
++	// the area replaces those reservations.
+ 	void* address = (void*) KERNEL_PMAP_BASE;
++	vm_unreserve_address_range(VMAddressSpace::KernelID(), address, KERNEL_PMAP_SIZE);
+ 	area_id area = vm_create_null_area(VMAddressSpace::KernelID(), "physical map area", &address,
+ 		B_EXACT_ADDRESS, KERNEL_PMAP_SIZE, 0);
+ 	if (area < 0)
+-		panic("arm64: no physical map area: %#" B_PRIx32, area);
++		dprintf("arm64: no physical map area: %#" B_PRIx32 "\n", area);
+ 
+ 	if (args->arch_args.uart.kind[0] != 0) {
+ 		// debug uart is already mapped by the efi loader, in whole pages

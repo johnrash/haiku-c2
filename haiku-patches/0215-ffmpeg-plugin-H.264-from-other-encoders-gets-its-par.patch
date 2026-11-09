@@ -1,0 +1,185 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 12:58:19 -0500
+Subject: [PATCH 215/342] ffmpeg plugin: H.264 from other encoders gets its
+ parameter sets
+
+An H.264 stream whose encoder puts the SPS and PPS into the stream (the
+S905's, through meson_encoder) has no extradata, and Matroska and MP4
+need them in their header. The header is written with the stream's
+first chunk then, whose parameter sets become the extradata (in Annex B
+form, which the muxers turn into avcC, and the packets into length
+prefixed NAL units).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../media/plugins/ffmpeg/AVFormatWriter.cpp   | 95 ++++++++++++++++++-
+ .../media/plugins/ffmpeg/AVFormatWriter.h     |  4 +
+ 2 files changed, 98 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.cpp b/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.cpp
+index ca31ed04cf..41c6ba592c 100644
+--- a/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.cpp
++++ b/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.cpp
+@@ -69,6 +69,9 @@ public:
+ 			status_t			AddTrackInfo(uint32 code, const void* data,
+ 									size_t size, uint32 flags);
+ 
++			void				TakeParameterSets(const void* chunkBuffer,
++									size_t chunkSize);
++
+ private:
+ 			AVFormatContext*	fFormatContext;
+ 			AVStream*			fStream;
+@@ -375,6 +378,67 @@ AVFormatWriter::StreamCookie::AddTrackInfo(uint32 code,
+ }
+ 
+ 
++/*!	An H.264 stream without extradata (from an encoder that puts its
++	parameter sets into the stream, as hardware encoders do) gets the
++	sequence and picture parameter sets of its first chunk, Annex B as they
++	are: containers such as Matroska need them in their header.
++*/
++void
++AVFormatWriter::StreamCookie::TakeParameterSets(const void* chunkBuffer,
++	size_t chunkSize)
++{
++	AVCodecParameters* parameters = fStream->codecpar;
++	if (parameters->codec_id != AV_CODEC_ID_H264
++		|| parameters->extradata_size > 0) {
++		return;
++	}
++
++	const uint8* data = (const uint8*)chunkBuffer;
++	uint8 sets[1024];
++	size_t setsSize = 0;
++	size_t position = 0;
++	while (position + 3 < chunkSize) {
++		// the next start code, and the one after it
++		if (data[position] != 0 || data[position + 1] != 0
++			|| data[position + 2] != 1) {
++			position++;
++			continue;
++		}
++		size_t start = position + 3;
++		size_t end = start;
++		while (end + 2 < chunkSize && (data[end] != 0 || data[end + 1] != 0
++				|| data[end + 2] != 1)) {
++			end++;
++		}
++		if (end + 2 >= chunkSize)
++			end = chunkSize;
++		size_t unitEnd = end;
++		// a four byte start code's leading zero belongs to it
++		while (unitEnd > start && data[unitEnd - 1] == 0 && end < chunkSize)
++			unitEnd--;
++
++		int type = data[start] & 0x1f;
++		size_t unitSize = unitEnd - start;
++		if ((type == 7 || type == 8) && setsSize + 4 + unitSize <= sizeof(sets)) {
++			static const uint8 kStartCode[] = { 0, 0, 0, 1 };
++			memcpy(sets + setsSize, kStartCode, 4);
++			memcpy(sets + setsSize + 4, data + start, unitSize);
++			setsSize += 4 + unitSize;
++		}
++		position = end;
++	}
++	if (setsSize == 0)
++		return;
++
++	parameters->extradata = (uint8_t*)av_mallocz(setsSize
++		+ AV_INPUT_BUFFER_PADDING_SIZE);
++	if (parameters->extradata == NULL)
++		return;
++	memcpy(parameters->extradata, sets, setsSize);
++	parameters->extradata_size = setsSize;
++}
++
++
+ // #pragma mark - AVFormatWriter
+ 
+ 
+@@ -383,6 +447,7 @@ AVFormatWriter::AVFormatWriter()
+ 	fFormatContext(avformat_alloc_context()),
+ 	fCodecOpened(false),
+ 	fHeaderError(-1),
++	fHeaderDeferred(false),
+ 	fIOContext(NULL),
+ 	fStreamLock("stream lock")
+ {
+@@ -471,6 +536,25 @@ AVFormatWriter::CommitHeader()
+ 	// We need to close the codecs we opened, even in case of failure.
+ 	fCodecOpened = true;
+ 
++	// An H.264 stream that has no extradata yet gets it from its first
++	// chunk (TakeParameterSets()): the header is written then.
++	for (unsigned i = 0; i < fFormatContext->nb_streams; i++) {
++		AVCodecParameters* parameters = fFormatContext->streams[i]->codecpar;
++		if (parameters->codec_id == AV_CODEC_ID_H264
++			&& parameters->extradata_size == 0) {
++			fHeaderDeferred = true;
++			return B_OK;
++		}
++	}
++
++	return _WriteHeader();
++}
++
++
++status_t
++AVFormatWriter::_WriteHeader()
++{
++	fHeaderDeferred = false;
+ 	fHeaderError = avformat_write_header(fFormatContext, NULL);
+ 
+ 	#ifdef TRACE_AVFORMAT_WRITER
+@@ -513,6 +597,10 @@ AVFormatWriter::Close()
+ 	if (!fCodecOpened)
+ 		return B_NOT_ALLOWED;
+ 
++	// a file without any chunk still gets its header
++	if (fHeaderDeferred)
++		_WriteHeader();
++
+ 	// From ffmpeg documentation: [av_write_trailer] may only be called
+ 	// after a successful call to avformat_write_header.
+ 	if (fHeaderError != 0)
+@@ -602,10 +690,15 @@ AVFormatWriter::WriteChunk(void* _cookie, const void* chunkBuffer,
+ 	TRACE_PACKET("AVFormatWriter::WriteChunk(%p, %ld, %p)\n", chunkBuffer,
+ 		chunkSize, encodeInfo);
+ 
++	StreamCookie* cookie = reinterpret_cast<StreamCookie*>(_cookie);
++	if (fHeaderDeferred) {
++		cookie->TakeParameterSets(chunkBuffer, chunkSize);
++		_WriteHeader();
++	}
++
+ 	if (fHeaderError != 0)
+ 		return B_ERROR;
+ 
+-	StreamCookie* cookie = reinterpret_cast<StreamCookie*>(_cookie);
+ 	return cookie->WriteChunk(chunkBuffer, chunkSize, encodeInfo);
+ }
+ 
+diff --git a/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.h b/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.h
+index 06ef048661..5b56214ef1 100644
+--- a/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.h
++++ b/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.h
+@@ -44,6 +44,8 @@ public:
+ 									media_encode_info* encodeInfo);
+ 
+ private:
++			status_t			_WriteHeader();
++
+ 	static	int					_Write(void* cookie, uint8* buffer,
+ 									int bufferSize);
+ 	static	off_t				_Seek(void* cookie, off_t offset, int whence);
+@@ -54,6 +56,8 @@ private:
+ 			AVFormatContext*	fFormatContext;
+ 			bool				fCodecOpened;
+ 			int					fHeaderError;
++			bool				fHeaderDeferred;
++				// until an H.264 stream's parameter sets came
+ 
+ 			AVIOContext*		fIOContext;
+ 

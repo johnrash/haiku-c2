@@ -1,0 +1,658 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 22:14:16 -0400
+Subject: [PATCH 076/342] Tracker: names wrap onto two lines in icon view, like
+ the Finder
+
+A long name took up to 30 em on one line, wider than the icon grid, so
+it covered its neighbors' names. In icon view a name now wraps at a
+label width (the grid's width, at least 9 em): the first line ends
+between words where that keeps at least half of it, the second line is
+shortened in the middle. Each line is centered under the icon and
+selected on its own. The icon grid grows to fit labels of that width
+and two lines, and the first column keeps its labels inside the view.
+
+Mini icon and list view are unchanged. Renaming still uses a single
+line; the second line is cleared while editing and after a rename.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kits/tracker/Pose.cpp                |  88 +++++++++++--------
+ src/kits/tracker/Pose.h                  |   2 +
+ src/kits/tracker/PoseView.cpp            |  26 +++++-
+ src/kits/tracker/PoseView.h              |   2 +
+ src/kits/tracker/TextWidget.cpp          |  90 ++++++++++++++++---
+ src/kits/tracker/TextWidget.h            |  10 ++-
+ src/kits/tracker/Utilities.h             |   5 ++
+ src/kits/tracker/WidgetAttributeText.cpp | 106 ++++++++++++++++++++++-
+ src/kits/tracker/WidgetAttributeText.h   |  21 +++++
+ 9 files changed, 294 insertions(+), 56 deletions(-)
+
+diff --git a/src/kits/tracker/Pose.cpp b/src/kits/tracker/Pose.cpp
+index bef013d214..84c2f6f0b1 100644
+--- a/src/kits/tracker/Pose.cpp
++++ b/src/kits/tracker/Pose.cpp
+@@ -619,49 +619,61 @@ BPose::Draw(BRect rect, const BRect& updateRect, BPoseView* poseView, BView* dra
+ void
+ BPose::DrawTextWidget(BRect rect, BRect textRect, BTextWidget* widget,
+ 	BPoseView* poseView, BView* drawView, bool selected, uint32 clipboardMode, BPoint offset)
++{
++	widget->Draw(rect, textRect, poseView, drawView, selected, fClipboardMode, offset);
++
++	if (selected) {
++		// the selection rect is alpha-blended on top, line by line for a
++		// wrapped name
++		for (int32 line = 0; line < widget->LineCount(poseView); line++) {
++			_DrawSelection(widget->LineRect(textRect, line, poseView), poseView,
++				drawView, clipboardMode, offset);
++		}
++	}
++}
++
++
++void
++BPose::_DrawSelection(BRect textRect, BPoseView* poseView, BView* drawView,
++	uint32 clipboardMode, BPoint offset)
+ {
+ 	bool direct = drawView == poseView;
+ 	bool windowActive = poseView->Window()->IsActive();
+ 	bool showSelectionWhenInactive = poseView->ShowSelectionWhenInactive();
+ 	bool isDrawingSelectionRect = poseView->IsDrawingSelectionRect();
+ 
+-	widget->Draw(rect, textRect, poseView, drawView, selected, fClipboardMode, offset);
+-
+-	if (selected) {
+-		// the selection rect is alpha-blended on top
+-		BRect invertRect(textRect.OffsetByCopy(offset));
+-		invertRect.left = ceilf(invertRect.left);
+-		invertRect.top = ceilf(invertRect.top);
+-		invertRect.right = floorf(invertRect.right);
+-		invertRect.bottom = floorf(invertRect.bottom);
+-
+-		if (windowActive || isDrawingSelectionRect) {
+-			// invert colors to select label using "reverse video"
+-			drawView->InvertRect(invertRect);
+-		} else if (!windowActive && showSelectionWhenInactive) {
+-			if (direct)
+-				drawView->PushState();
+-
+-			// invert colors to select label using "reverse video"
+-			drawView->InvertRect(invertRect);
+-
+-			drawView->SetDrawingMode(B_OP_BLEND);
+-			if (clipboardMode == kMoveSelectionTo) {
+-				// blend inactive cut item background with less contrast
+-				if (drawView->LowColor().IsLight())
+-					drawView->SetHighColor(192, 192, 192, 255);
+-				else
+-					drawView->SetHighColor(64, 64, 64, 255);
+-			} else {
+-				// blend inactive background with gray
+-				drawView->SetHighColor(128, 128, 128, 255);
+-			}
+-			drawView->FillRect(invertRect);
+-			drawView->SetDrawingMode(B_OP_OVER);
+-
+-			if (direct)
+-				drawView->PopState();
++	BRect invertRect(textRect.OffsetByCopy(offset));
++	invertRect.left = ceilf(invertRect.left);
++	invertRect.top = ceilf(invertRect.top);
++	invertRect.right = floorf(invertRect.right);
++	invertRect.bottom = floorf(invertRect.bottom);
++
++	if (windowActive || isDrawingSelectionRect) {
++		// invert colors to select label using "reverse video"
++		drawView->InvertRect(invertRect);
++	} else if (!windowActive && showSelectionWhenInactive) {
++		if (direct)
++			drawView->PushState();
++
++		// invert colors to select label using "reverse video"
++		drawView->InvertRect(invertRect);
++
++		drawView->SetDrawingMode(B_OP_BLEND);
++		if (clipboardMode == kMoveSelectionTo) {
++			// blend inactive cut item background with less contrast
++			if (drawView->LowColor().IsLight())
++				drawView->SetHighColor(192, 192, 192, 255);
++			else
++				drawView->SetHighColor(64, 64, 64, 255);
++		} else {
++			// blend inactive background with gray
++			drawView->SetHighColor(128, 128, 128, 255);
+ 		}
++		drawView->FillRect(invertRect);
++		drawView->SetDrawingMode(B_OP_OVER);
++
++		if (direct)
++			drawView->PopState();
+ 	}
+ }
+ 
+@@ -926,7 +938,9 @@ BPose::CalcRect(const BPoseView* poseView) const
+ 			rect.left += roundf((rect.Width() - textWidth) / 2.f);
+ 			rect.right = rect.left + ceilf(textWidth);
+ 		}
+-		rect.bottom = rect.top + ceilf(poseView->IconPoseHeight()) + 3;
++		int32 lineCount = widget != NULL ? widget->LineCount(poseView) : 1;
++		rect.bottom = rect.top + ceilf(poseView->IconSizeInt()
++			+ lineCount * poseView->FontHeight()) + 3;
+ 	} else {
+ 		// mini icon mode
+ 		if (widget != NULL)
+diff --git a/src/kits/tracker/Pose.h b/src/kits/tracker/Pose.h
+index df82559124..2faf639912 100644
+--- a/src/kits/tracker/Pose.h
++++ b/src/kits/tracker/Pose.h
+@@ -128,6 +128,8 @@ public:
+ private:
+ 	void DrawTextWidget(BRect rect, BRect textRect, BTextWidget*, BPoseView* poseView,
+ 		BView* drawView, bool selected, uint32 clipboardMode, BPoint offset);
++	void _DrawSelection(BRect textRect, BPoseView* poseView, BView* drawView,
++		uint32 clipboardMode, BPoint offset);
+ 	static bool _PeriodicUpdateCallback(BPose* pose, void* cookie);
+ 	void EditPreviousNextWidgetCommon(BPoseView* poseView, bool next);
+ 	void CreateWidgets(BPoseView*);
+diff --git a/src/kits/tracker/PoseView.cpp b/src/kits/tracker/PoseView.cpp
+index c7568e2d14..b172693a83 100644
+--- a/src/kits/tracker/PoseView.cpp
++++ b/src/kits/tracker/PoseView.cpp
+@@ -1045,7 +1045,7 @@ BPoseView::SetIconPoseHeight()
+ 	switch (ViewMode()) {
+ 		case kIconMode:
+ 			// IconSize should already be set in MessageReceived()
+-			fIconPoseHeight = IconSizeInt() + sFontHeight;
++			fIconPoseHeight = IconSizeInt() + kIconLabelLines * sFontHeight;
+ 			break;
+ 
+ 		case kMiniIconMode:
+@@ -1062,6 +1062,16 @@ BPoseView::SetIconPoseHeight()
+ }
+ 
+ 
++float
++BPoseView::IconLabelWidth() const
++{
++	// as wide as the grid allows, but at least 9 em
++	const float gridWidth = IconSizeInt() + ceilf(IconSizeInt() * 0.875f);
++	return std::max(gridWidth - kIconLabelSpacing,
++		ceilf(StringWidth("M") * 9));
++}
++
++
+ void
+ BPoseView::GetLayoutInfo(uint32 mode, BPoint* grid, BPoint* offset) const
+ {
+@@ -1075,8 +1085,18 @@ BPoseView::GetLayoutInfo(uint32 mode, BPoint* grid, BPoint* offset) const
+ 		{
+ 			const float gridOffset = ceilf(IconSizeInt() * 0.875f),
+ 				offsetValue = ceilf(IconSizeInt() * 0.625f);
+-			grid->Set(IconSizeInt() + gridOffset, IconSizeInt() + gridOffset);
+-			offset->Set(offsetValue, offsetValue);
++			// wide and high enough for labels of the full width and height,
++			// so that they don't cover each other
++			const float labelHeight = ceilf(IconSizeInt()
++				+ kIconLabelLines * sFontHeight) + 4;
++			grid->Set(std::max(IconSizeInt() + gridOffset,
++					IconLabelWidth() + kIconLabelSpacing),
++				std::max(IconSizeInt() + gridOffset,
++					labelHeight + kIconLabelSpacing / 2));
++			// the first column's labels within the view
++			offset->Set(std::max(offsetValue, ceilf((IconLabelWidth()
++					- IconSizeInt()) / 2) + kIconLabelSpacing / 2),
++				offsetValue);
+ 			break;
+ 		}
+ 
+diff --git a/src/kits/tracker/PoseView.h b/src/kits/tracker/PoseView.h
+index 4ae411aea4..93026aaace 100644
+--- a/src/kits/tracker/PoseView.h
++++ b/src/kits/tracker/PoseView.h
+@@ -210,6 +210,8 @@ public:
+ 
+ 	void SetIconPoseHeight();
+ 	float IconPoseHeight() const;
++	float IconLabelWidth() const;
++		// the width names wrap at in icon mode
+ 	uint32 UnscaledIconSizeInt() const;
+ 	uint32 IconSizeInt() const;
+ 	BSize IconSize() const;
+diff --git a/src/kits/tracker/TextWidget.cpp b/src/kits/tracker/TextWidget.cpp
+index 2d97b2f061..425a9fcf6b 100644
+--- a/src/kits/tracker/TextWidget.cpp
++++ b/src/kits/tracker/TextWidget.cpp
+@@ -145,7 +145,7 @@ BTextWidget::ColumnRect(BPoint poseLoc, const BColumn* column,
+ 
+ BRect
+ BTextWidget::CalcRectCommon(BPoint poseLoc, const BColumn* column,
+-	const BPoseView* view, float textWidth)
++	const BPoseView* view, float textWidth, int32 lineCount)
+ {
+ 	BRect rect;
+ 	float viewWidth;
+@@ -191,18 +191,20 @@ BTextWidget::CalcRectCommon(BPoint poseLoc, const BColumn* column,
+ 		if (view->ViewMode() == kIconMode) {
+ 			// icon mode
+ 			viewWidth = roundf(std::min(view->StringWidth("M") * 30, textWidth));
++			float textHeight = view->FontHeight() * lineCount;
+ 
+ 			rect.left = poseLoc.x + roundf((iconSize - viewWidth) / 2.f);
+-			rect.bottom = poseLoc.y + ceilf(view->IconPoseHeight());
++			rect.bottom = poseLoc.y + ceilf(iconSize + textHeight);
++			rect.top = rect.bottom - textHeight + 1;
+ 		} else {
+ 			// mini icon mode
+ 			viewWidth = roundf(textWidth);
+ 
+ 			rect.left = poseLoc.x + iconSize + kMiniIconSeparator;
+ 			rect.bottom = poseLoc.y + roundf((iconSize + view->FontHeight()) / 2.f);
++			rect.top = rect.bottom - view->FontHeight() + 1;
+ 		}
+ 
+-		rect.top = rect.bottom - view->FontHeight() + 1;
+ 		rect.right = rect.left + viewWidth - 1;
+ 	}
+ 
+@@ -213,14 +215,55 @@ BTextWidget::CalcRectCommon(BPoint poseLoc, const BColumn* column,
+ BRect
+ BTextWidget::CalcRect(BPoint poseLoc, const BColumn* column, const BPoseView* view)
+ {
+-	return CalcRectCommon(poseLoc, column, view, fText->Width(view));
++	float width = fText->Width(view);
++	return CalcRectCommon(poseLoc, column, view, width, LineCount(view));
+ }
+ 
+ 
+ BRect
+ BTextWidget::CalcOldRect(BPoint poseLoc, const BColumn* column, const BPoseView* view)
+ {
+-	return CalcRectCommon(poseLoc, column, view, fText->CurrentWidth());
++	return CalcRectCommon(poseLoc, column, view, fText->CurrentWidth(),
++		LineCount(view));
++}
++
++
++int32
++BTextWidget::LineCount(const BPoseView* view) const
++{
++	if (view->ViewMode() != kIconMode || fText->SecondLine()[0] == '\0')
++		return 1;
++
++	return 2;
++}
++
++
++const char*
++BTextWidget::LineText(int32 line, const BPoseView* view) const
++{
++	if (line == 0)
++		return fText->FittingText(view);
++
++	return fText->SecondLine();
++}
++
++
++BRect
++BTextWidget::LineRect(BRect textRect, int32 line, const BPoseView* view) const
++{
++	if (LineCount(view) == 1)
++		return textRect;
++
++	const char* text = LineText(line, view);
++	float width = roundf(view->StringWidth(text, strlen(text)));
++	float textWidth = textRect.Width() + 1;
++
++	BRect rect;
++	rect.left = textRect.left + roundf((textWidth - width) / 2.f);
++	rect.right = rect.left + width - 1;
++	rect.top = textRect.top + line * view->FontHeight();
++	rect.bottom = rect.top + view->FontHeight() - 1;
++	return rect;
+ }
+ 
+ 
+@@ -560,6 +603,10 @@ BTextWidget::StartEdit(BPoseView* view, BPose* pose, BColumn* column)
+ 	// make this text widget invisible while we edit it
+ 	SetVisible(false);
+ 
++	// the text view covers the first line only
++	if (LineCount(view) > 1)
++		view->Invalidate(CalcRect(poseLoc, column, view));
++
+ 	// force immediate redraw so TextView appears instantly
+ 	view->Window()->UpdateIfNeeded();
+ }
+@@ -587,6 +634,9 @@ BTextWidget::StopEdit(bool saveChanges, BPoint poseLoc, BPoseView* view,
+ 	if (column == NULL)
+ 		return;
+ 
++	// a new name can take fewer lines
++	BRect oldRect(ColumnRect(poseLoc, column, view));
++
+ 	if (saveChanges && fText->CommitEditedText(textView)) {
+ 		// we have an actual change, re-sort
+ 		view->CheckPoseSortOrder(pose, poseIndex);
+@@ -594,7 +644,7 @@ BTextWidget::StopEdit(bool saveChanges, BPoint poseLoc, BPoseView* view,
+ 
+ 	// make text widget visible again
+ 	SetVisible(true);
+-	view->Invalidate(ColumnRect(poseLoc, column, view));
++	view->Invalidate(ColumnRect(poseLoc, column, view) | oldRect);
+ 
+ 	// force immediate redraw so TEView disappears
+ 	scrollView->RemoveSelf();
+@@ -662,6 +712,10 @@ BTextWidget::Draw(BRect eraseRect, BRect textRect, BPoseView* view, BView* drawV
+ 	bool drawOutlines = view->WidgetTextOutline() && !selected && (direct || dragging);
+ 	bool drawCut = clipboardMode == kMoveSelectionTo;
+ 
++	fText->FittingText(view);
++		// fit the text before asking how many lines it takes
++	int32 lineCount = LineCount(view);
++
+ 	if (selected) {
+ 		if (dragging) {
+ 			drawView->SetDrawingMode(B_OP_ALPHA);
+@@ -671,7 +725,8 @@ BTextWidget::Draw(BRect eraseRect, BRect textRect, BPoseView* view, BView* drawV
+ 			drawView->SetDrawingMode(B_OP_COPY);
+ 		}
+ 
+-		drawView->FillRect(textRect, B_SOLID_LOW);
++		for (int32 line = 0; line < lineCount; line++)
++			drawView->FillRect(LineRect(textRect, line, view), B_SOLID_LOW);
+ 
+ 		// High color is set to inverted low, then the whole thing is
+ 		// inverted again so that the background color "shines through".
+@@ -692,11 +747,22 @@ BTextWidget::Draw(BRect eraseRect, BRect textRect, BPoseView* view, BView* drawV
+ 
+ 	// high color and drawing mode are set to draw text
+ 
++	for (int32 line = 0; line < lineCount; line++) {
++		_DrawLine(LineRect(textRect, line, view), LineText(line, view), view,
++			drawView, drawOutlines);
++	}
++
++	drawView->ConstrainClippingRegion(NULL);
++}
++
++
++void
++BTextWidget::_DrawLine(BRect textRect, const char* fittingText, BPoseView* view,
++	BView* drawView, bool drawOutlines)
++{
+ 	BPoint location(textRect.left, roundf(textRect.top) + view->FontInfo().ascent + 1);
+ 		// let's determine the baseline position
+ 
+-	const char* fittingText = fText->FittingText(view);
+-
+ 	// Draw text outline if enabled unless selected or column resizing.
+ 	if (drawOutlines) {
+ 		// draw a halo around the text by using the "false bold"
+@@ -758,10 +824,10 @@ BTextWidget::Draw(BRect eraseRect, BRect textRect, BPoseView* view, BView* drawV
+ 		BRect lineRect(textRect);
+ 		lineRect.OffsetTo(location.x, std::min(location.y + 2, textRect.bottom));
+ 			// underline goes 2px under the baseline
+-		lineRect.InsetBy(roundf(textRect.Width() - fText->Width(view)), 0);
++		float textWidth = LineCount(view) == 1 ? fText->Width(view)
++			: view->StringWidth(fittingText, strlen(fittingText));
++		lineRect.InsetBy(roundf(textRect.Width() - textWidth), 0);
+ 			// only underline text part
+ 		drawView->StrokeLine(lineRect.LeftTop(), lineRect.RightTop(), B_MIXED_COLORS);
+ 	}
+-
+-	drawView->ConstrainClippingRegion(NULL);
+ }
+diff --git a/src/kits/tracker/TextWidget.h b/src/kits/tracker/TextWidget.h
+index 63aa21f64f..2db8a36caf 100644
+--- a/src/kits/tracker/TextWidget.h
++++ b/src/kits/tracker/TextWidget.h
+@@ -80,6 +80,11 @@ public:
+ 		// after an update call this to determine the old rect so that
+ 		// we can invalidate properly
+ 
++	int32 LineCount(const BPoseView*) const;
++		// 2 for a name wrapped in icon mode, otherwise 1
++	BRect LineRect(BRect widgetTextRect, int32 line, const BPoseView*) const;
++		// the part of the text rect one line takes, centered
++
+ 	void StartEdit(BPoseView*, BPose*, BColumn*);
+ 	void StopEdit(bool saveChanges, BPoint loc, BPoseView*, BPose*, int32 index);
+ 
+@@ -109,7 +114,10 @@ public:
+ 
+ private:
+ 	BRect CalcRectCommon(BPoint poseLoc, const BColumn*, const BPoseView*,
+-		float width);
++		float width, int32 lineCount);
++	const char* LineText(int32 line, const BPoseView*) const;
++	void _DrawLine(BRect lineRect, const char* text, BPoseView*,
++		BView* drawView, bool drawOutlines);
+ 
+ 	WidgetAttributeText* fText;
+ 	uint32 fAttrHash;
+diff --git a/src/kits/tracker/Utilities.h b/src/kits/tracker/Utilities.h
+index 1b4b741eb3..d6cdf9ab13 100644
+--- a/src/kits/tracker/Utilities.h
++++ b/src/kits/tracker/Utilities.h
+@@ -81,6 +81,11 @@ const int64 kTBSize = kGBSize * kKBSize;
+ 
+ const int32 kMiniIconSeparator = 3;
+ 
++const int32 kIconLabelLines = 2;
++	// names in icon mode wrap onto up to this many lines
++const float kIconLabelSpacing = 10;
++	// the room between the labels of neighboring icons
++
+ const color_space kDefaultIconDepth = B_RGBA32;
+ 
+ 
+diff --git a/src/kits/tracker/WidgetAttributeText.cpp b/src/kits/tracker/WidgetAttributeText.cpp
+index 443092a752..4d874369c9 100644
+--- a/src/kits/tracker/WidgetAttributeText.cpp
++++ b/src/kits/tracker/WidgetAttributeText.cpp
+@@ -37,8 +37,11 @@ All rights reserved.
+ 
+ #include <ctype.h>
+ #include <stdlib.h>
++#include <string.h>
+ #include <strings.h>
+ 
++#include <algorithm>
++
+ #include <fs_attr.h>
+ #include <parsedate.h>
+ 
+@@ -52,6 +55,7 @@ All rights reserved.
+ #include <NodeInfo.h>
+ #include <NumberFormat.h>
+ #include <Path.h>
++#include <StackOrHeapArray.h>
+ #include <StringFormat.h>
+ #include <StringForSize.h>
+ #include <SupportDefs.h>
+@@ -281,7 +285,9 @@ WidgetAttributeText::WidgetAttributeText(const Model* model,
+ 	fOldWidth(-1.0f),
+ 	fTruncatedWidth(-1.0f),
+ 	fDirty(true),
+-	fValueIsDefined(false)
++	fValueIsDefined(false),
++	fFittedViewMode(0),
++	fFittedLabelWidth(-1.0f)
+ {
+ 	ASSERT(fColumn != NULL);
+ 
+@@ -300,7 +306,11 @@ WidgetAttributeText::~WidgetAttributeText()
+ const char*
+ WidgetAttributeText::FittingText(const BPoseView* view)
+ {
+-	bool widthChanged = view->ViewMode() == kListMode ? fColumn->Width() != fOldWidth : false;
++	bool widthChanged = view->ViewMode() != fFittedViewMode;
++	if (view->ViewMode() == kListMode)
++		widthChanged |= fColumn->Width() != fOldWidth;
++	else if (view->ViewMode() == kIconMode)
++		widthChanged |= view->IconLabelWidth() != fFittedLabelWidth;
+ 	if (fDirty || widthChanged || CheckSettingsChanged())
+ 		CheckViewChanged(view);
+ 
+@@ -313,8 +323,11 @@ bool
+ WidgetAttributeText::CheckViewChanged(const BPoseView* view)
+ {
+ 	BString newText;
++	BString oldSecondLine(fSecondLine);
+ 	FitValue(&newText, view);
+-	if (newText == fText)
++	fFittedViewMode = view->ViewMode();
++	fFittedLabelWidth = view->IconLabelWidth();
++	if (newText == fText && fSecondLine == oldSecondLine)
+ 		return false;
+ 
+ 	fText = newText;
+@@ -353,6 +366,82 @@ WidgetAttributeText::TruncTime(BString* outString, int64 value,
+ }
+ 
+ 
++static bool
++IsLineBreak(const char* text, int32 offset)
++{
++	// after spaces and punctuation that separates words in file names,
++	// or before an opening bracket
++	return strchr(" -_.,;", text[offset - 1]) != NULL
++		|| text[offset] == '(' || text[offset] == '[';
++}
++
++
++float
++WidgetAttributeText::WrapString(BString* firstLine, BString* secondLine,
++	const char* text, int32 length, const BPoseView* view, float width)
++{
++	secondLine->Truncate(0);
++
++	float textWidth = view->StringWidth(text, length);
++	if (textWidth <= width || length < 2) {
++		firstLine->SetTo(text, length);
++		return textWidth;
++	}
++
++	// where the characters start
++	BStackOrHeapArray<int32, B_FILE_NAME_LENGTH + 1> starts(length + 1);
++	if (!starts.IsValid())
++		return TruncString(firstLine, text, length, view, width);
++
++	int32 count = 0;
++	for (int32 i = 0; i < length; i++) {
++		if ((text[i] & 0xc0) != 0x80)
++			starts[count++] = i;
++	}
++	starts[count] = length;
++
++	// the most characters that fit on the first line: all of them don't
++	BString prefix;
++	int32 fit = 1;
++	int32 tooMany = count;
++	while (tooMany - fit > 1) {
++		int32 middle = (fit + tooMany) / 2;
++		prefix.SetTo(text, starts[middle]);
++		if (view->StringWidth(prefix.String(), prefix.Length()) <= width)
++			fit = middle;
++		else
++			tooMany = middle;
++	}
++
++	// break between words if that keeps at least half of the line
++	int32 breakAt = starts[fit];
++	for (int32 i = fit; i > fit / 2 && i > 0; i--) {
++		if (IsLineBreak(text, starts[i])) {
++			breakAt = starts[i];
++			break;
++		}
++	}
++
++	int32 firstLength = breakAt;
++	while (firstLength > 1 && text[firstLength - 1] == ' ')
++		firstLength--;
++	firstLine->SetTo(text, firstLength);
++	float firstWidth = view->StringWidth(firstLine->String(),
++		firstLine->Length());
++
++	while (breakAt < length && text[breakAt] == ' ')
++		breakAt++;
++	if (breakAt == length)
++		return firstWidth;
++
++	BString rest(text + breakAt, length - breakAt);
++	float secondWidth = TruncString(secondLine, rest.String(), rest.Length(),
++		view, width, B_TRUNCATE_MIDDLE);
++
++	return std::max(firstWidth, secondWidth);
++}
++
++
+ float
+ WidgetAttributeText::CurrentWidth() const
+ {
+@@ -762,6 +851,17 @@ NameAttributeText::FitValue(BString* outString, const BPoseView* view)
+ 	if (fValueDirty)
+ 		ReadValue(&fFullValueText);
+ 
++	if (view->ViewMode() == kIconMode) {
++		// wrapped onto a second line, like the Finder does
++		fOldWidth = view->IconLabelWidth();
++		fTruncatedWidth = WrapString(outString, &fSecondLine,
++			fFullValueText.String(), fFullValueText.Length(), view,
++			fOldWidth);
++		fDirty = false;
++		return;
++	}
++
++	fSecondLine.Truncate(0);
+ 	if (view->ViewMode() != kListMode)
+ 		fOldWidth = view->StringWidth("M") * 30;
+ 	else
+diff --git a/src/kits/tracker/WidgetAttributeText.h b/src/kits/tracker/WidgetAttributeText.h
+index d21758411a..7dc7e96387 100644
+--- a/src/kits/tracker/WidgetAttributeText.h
++++ b/src/kits/tracker/WidgetAttributeText.h
+@@ -73,6 +73,9 @@ public:
+ 
+ 	const char* FittingText(const BPoseView*);
+ 		// returns text, recalculating if not yet calculated
++	const char* SecondLine() const;
++		// the rest of a name wrapped in icon mode, empty if it fits on
++		// the first line; valid after FittingText()
+ 
+ 	virtual int Compare(WidgetAttributeText&, BPoseView* view) = 0;
+ 		// override to define a compare of two different attributes for
+@@ -119,6 +122,11 @@ protected:
+ 	static float TruncFileSize(BString* result, int64 src,
+ 		const BPoseView* view, float width);
+ 
++	static float WrapString(BString* firstLine, BString* secondLine,
++		const char* src, int32 length, const BPoseView*, float width);
++		// fits src into two lines, the second one shortened in the
++		// middle if needed; returns the width of the wider line
++
+ 	virtual void FitValue(BString* result, const BPoseView*) = 0;
+ 		// override FitValue to do a specific text fitting for a given
+ 		// attribute
+@@ -134,8 +142,21 @@ protected:
+ 	BString fText;
+ 		// holds the truncated text, fit to the parameters passed in
+ 		// in the last FittingText call
++	BString fSecondLine;
++		// the second line of a name in icon mode
++	uint32 fFittedViewMode;
++	float fFittedLabelWidth;
++		// what the text was fitted for
+ };
+ 
++
++inline const char*
++WidgetAttributeText::SecondLine() const
++{
++	return fSecondLine.String();
++}
++
++
+ inline Model*
+ WidgetAttributeText::TargetModel() const
+ {

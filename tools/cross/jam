@@ -1,0 +1,10 @@
+#!/bin/sh
+# jam for apps built with their own Jam rules on Haiku: the Haiku
+# build's jam told it runs on Haiku. OSPLAT=X86 picks those rules' gcc
+# options (their other branch is for BeOS's Metrowerks compiler), not a CPU;
+# the compiler is the cross gcc of cc/c++ here, and the output goes to
+# generated.arm64 as it would on an arm64 Haiku.
+exec /usr/local/bin/jam -sOS=HAIKU -sOSPLAT=X86 -sCC=cc -sC++=c++ \
+	-sLINK=c++ -sAR="$HAIKU_TOOLS/aarch64-unknown-haiku-ar ru" \
+	-sRANLIB="$HAIKU_TOOLS/aarch64-unknown-haiku-ranlib" \
+	-sGENERATED_DIR="$(pwd)/generated.arm64" "$@"

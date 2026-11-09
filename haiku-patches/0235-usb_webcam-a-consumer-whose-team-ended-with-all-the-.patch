@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 15:55:18 -0500
+Subject: [PATCH 235/342] usb_webcam: a consumer whose team ended with all the
+ buffers
+
+The frame generator noticed a killed consumer only when a send failed.
+A consumer held by the debugger after a crash took every buffer while
+its port lasted; when its team ended, none came back, nothing was sent,
+and the camera streamed on with its output taken ("in use by another
+application" until the media services restarted). With no buffer free,
+the generator now checks the consumer's port and disconnects as for a
+failed send.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../media/media-add-ons/usb_webcam/Producer.cpp     | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp b/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
+index 36c5ae4528..4375576655 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
+@@ -1091,8 +1091,19 @@ VideoProducer::FrameGenerator()
+ 		BBuffer *buffer = fBufferGroup->RequestBuffer(
+ 						4 * fConnectedFormat.display.line_width *
+ 						fConnectedFormat.display.line_count, 0LL);
+-		if (!buffer)
++		if (!buffer) {
++			// all with the consumer: a consumer whose team ended with them
++			// (one held by the debugger after a crash took them all) gives
++			// none back, and no send fails to tell it's gone
++			port_info info;
++			if (!fConsumerGone && get_port_info(fOutput.destination.port,
++					&info) == B_BAD_PORT_ID) {
++				fConsumerGone = true;
++				write_port_etc(ControlPort(), kMsgConsumerGone, NULL, 0,
++					B_RELATIVE_TIMEOUT, 0);
++			}
+ 			continue;
++		}
+ 
+ 		/* Fill out the details about this buffer. */
+ 		media_header *h = buffer->Header();

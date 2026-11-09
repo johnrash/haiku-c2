@@ -1,0 +1,18 @@
+--- a/pyqtbuild/bindings.py
++++ b/pyqtbuild/bindings.py
+@@ -184,7 +184,14 @@
+                 path_parts.insert(0, qt_bin_dir)
+                 os.environ['PATH'] = os.pathsep.join(path_parts)
+ 
+-        self.project.run_command([test_exe, out_file], fatal=False)
++        # A cross build can't run the test program: the command in
++        # PYQTBUILD_TEST_RUNNER gets it and the output file to write instead.
++        runner = os.environ.get('PYQTBUILD_TEST_RUNNER')
++        if runner:
++            self.project.run_command([runner, test_exe, out_file],
++                    fatal=False)
++        else:
++            self.project.run_command([test_exe, out_file], fatal=False)
+ 
+         if original_path is not None:
+             os.environ['PATH'] = original_path

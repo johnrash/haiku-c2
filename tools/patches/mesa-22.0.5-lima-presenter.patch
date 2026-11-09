@@ -1,0 +1,312 @@
+diff -ru a/src/gallium/targets/haiku-lima/LimaRenderer.cpp b/src/gallium/targets/haiku-lima/LimaRenderer.cpp
+--- a/src/gallium/targets/haiku-lima/LimaRenderer.cpp	2026-11-01 20:45:38.347634657 -0500
++++ b/src/gallium/targets/haiku-lima/LimaRenderer.cpp	2026-11-01 20:51:07.366203790 -0500
+@@ -31,8 +31,16 @@
+ #include "pipe/p_state.h"
+ #include "util/debug.h"
+ 
++#include "util/u_inlines.h"
++#include "lima/lima_resource.h"
++#include "drm-uapi/lima_drm.h"
++
+ extern "C" {
+ #include "lima/drm/lima_drm_public.h"
++
++// lima_bo.h's, which can't be included here
++void* lima_bo_map(struct lima_bo* bo);
++bool lima_bo_wait(struct lima_bo* bo, uint32_t op, uint64_t timeout_ns);
+ }
+ 
+ 
+@@ -244,7 +252,19 @@
+ 	fHeight(0),
+ 	fColorSpace(B_NO_COLOR_SPACE),
+ 	fBitmap(NULL),
+-	fBitmapLocker("lima frame locker")
++	fBitmapLocker("lima frame locker"),
++	fPresenter(-1),
++	fFrameSem(-1),
++	fIdleSem(-1),
++	fQuitting(false),
++	fPending(NULL),
++	fPendingSource(NULL),
++	fPendingStride(0),
++	fPendingWidth(0),
++	fPendingHeight(0),
++	fPendingColorSpace(B_NO_COLOR_SPACE),
++	fPendingBytesPerPixel(0),
++	fLastResource(NULL)
+ {
+ 	CALLED();
+ 
+@@ -253,6 +273,16 @@
+ 	if (fContextObj->InitCheck() != B_OK)
+ 		return;
+ 
++	// without the presenter, frames are read back in the GL thread
++	fFrameSem = create_sem(0, "lima frame");
++	fIdleSem = create_sem(1, "lima presenter idle");
++	if (fFrameSem >= 0 && fIdleSem >= 0) {
++		fPresenter = spawn_thread(&_PresenterEntry, "lima presenter",
++			B_DISPLAY_PRIORITY, this);
++		if (fPresenter >= 0)
++			resume_thread(fPresenter);
++	}
++
+ 	BRect b = view->Bounds();
+ 	fColorSpace = BScreen(view->Window()).ColorSpace();
+ 
+@@ -274,6 +304,17 @@
+ {
+ 	CALLED();
+ 
++	// the presenter's frame is the screen's: before the context goes
++	if (fPresenter >= 0) {
++		fQuitting = true;
++		release_sem(fFrameSem);
++		status_t result;
++		wait_for_thread(fPresenter, &result);
++	}
++	pipe_resource_reference(&fPending, NULL);
++	delete_sem(fFrameSem);
++	delete_sem(fIdleSem);
++
+ 	delete fContextObj;
+ 	delete fBitmap;
+ 	free(fInfo);
+@@ -330,9 +371,19 @@
+ {
+ //	CALLED();
+ 
++	_Show(bitmap, 1000);
++}
++
++
++/*!	Shows \a bitmap in the view, waiting at most \a lockTimeout for its
++	window (the presenter waits longer than the GL thread, which may hold
++	what the window thread waits for).
++*/
++void
++LimaRenderer::_Show(BBitmap* bitmap, bigtime_t lockTimeout)
++{
+ 	if (!fDirectModeEnabled) {
+-		// TODO: avoid timeout
+-		if (GLView()->LockLooperWithTimeout(1000) == B_OK) {
++		if (GLView()->LockLooperWithTimeout(lockTimeout) == B_OK) {
+ 			GLView()->DrawBitmap(bitmap, B_ORIGIN);
+ 			GLView()->UnlockLooper();
+ 		}
+@@ -383,6 +434,44 @@
+ 	uint32 width = resource->width0;
+ 	uint32 height = resource->height0;
+ 
++	struct lima_resource* limaResource = lima_resource(resource);
++	BLooper* looper = GLView()->Looper();
++	bool windowHeld = !fDirectModeEnabled && looper != NULL
++		&& looper->IsLocked();
++	void* map = NULL;
++	if (fPresenter >= 0 && !windowHeld && !limaResource->tiled
++		&& limaResource->bo != NULL) {
++		map = lima_bo_map(limaResource->bo);
++	}
++	if (map != NULL) {
++		// The jobs drawing the frame go to the GPU, the presenter waits for
++		// them. The frame after this one draws into the buffer the presenter
++		// took last: it must be done with that first. With one buffer only,
++		// before the GPU draws into it again.
++		bool sameBuffer = resource == fLastResource;
++		fLastResource = resource;
++		if (sameBuffer)
++			acquire_sem(fIdleSem);
++		context->flush(context, NULL, 0);
++		if (!sameBuffer)
++			acquire_sem(fIdleSem);
++
++		pipe_resource_reference(&fPending, resource);
++		fPendingSource = (const uint8*)map + limaResource->levels[0].offset;
++		fPendingStride = limaResource->levels[0].stride;
++		fPendingWidth = width;
++		fPendingHeight = height;
++		fPendingColorSpace = colorSpace;
++		fPendingBytesPerPixel = bytesPerPixel;
++		release_sem(fFrameSem);
++		return;
++	}
++
++	// read back here: wait until the presenter is done with its frame
++	if (fPresenter >= 0) {
++		acquire_sem(fIdleSem);
++		release_sem(fIdleSem);
++	}
+ 	struct pipe_box box;
+ 	memset(&box, 0, sizeof(box));
+ 	box.width = width;
+@@ -396,39 +485,84 @@
+ 		return;
+ 	}
+ 
+-	{
+-		BAutolock lock(fBitmapLocker);
+-		if (fBitmap == NULL || fBitmap->ColorSpace() != colorSpace
+-			|| fBitmap->Bounds().IntegerWidth() + 1 != (int32)width
+-			|| fBitmap->Bounds().IntegerHeight() + 1 != (int32)height) {
+-			delete fBitmap;
+-			fBitmap = new(std::nothrow) BBitmap(
+-				BRect(0, 0, width - 1, height - 1), colorSpace);
+-			if (fBitmap != NULL && fBitmap->InitCheck() != B_OK) {
+-				delete fBitmap;
+-				fBitmap = NULL;
+-			}
+-		}
+-		if (fBitmap != NULL) {
+-			uint8* target = (uint8*)fBitmap->Bits();
+-			int32 targetStride = fBitmap->BytesPerRow();
+-			size_t rowBytes = width * bytesPerPixel;
+-			for (uint32 y = 0; y < height; y++) {
+-				memcpy(target + y * targetStride,
+-					source + y * transfer->stride, rowBytes);
+-			}
+-		}
+-	}
++	_CopyFrame(source, transfer->stride, width, height, colorSpace,
++		bytesPerPixel);
+ 	context->texture_unmap(context, transfer);
+ 
+-	// Only this thread changes fBitmap; not holding fBitmapLocker here
+-	// keeps Display() (which locks the window) clear of a window thread
+-	// waiting for it in ShowLastFrame().
++	// Only this thread (or the presenter, which is idle now) changes
++	// fBitmap; not holding fBitmapLocker here keeps Display() (which locks
++	// the window) clear of a window thread waiting for it in ShowLastFrame().
+ 	if (fBitmap != NULL)
+ 		Display(fBitmap, NULL);
+ }
+ 
+ 
++/*!	The frame into fBitmap, made anew for another size or colour space. */
++void
++LimaRenderer::_CopyFrame(const uint8* source, uint32 stride, uint32 width,
++	uint32 height, color_space colorSpace, uint32 bytesPerPixel)
++{
++	BAutolock lock(fBitmapLocker);
++	if (fBitmap == NULL || fBitmap->ColorSpace() != colorSpace
++		|| fBitmap->Bounds().IntegerWidth() + 1 != (int32)width
++		|| fBitmap->Bounds().IntegerHeight() + 1 != (int32)height) {
++		delete fBitmap;
++		fBitmap = new(std::nothrow) BBitmap(
++			BRect(0, 0, width - 1, height - 1), colorSpace);
++		if (fBitmap != NULL && fBitmap->InitCheck() != B_OK) {
++			delete fBitmap;
++			fBitmap = NULL;
++		}
++	}
++	if (fBitmap == NULL)
++		return;
++	uint8* target = (uint8*)fBitmap->Bits();
++	int32 targetStride = fBitmap->BytesPerRow();
++	size_t rowBytes = width * bytesPerPixel;
++	for (uint32 y = 0; y < height; y++)
++		memcpy(target + y * targetStride, source + y * stride, rowBytes);
++}
++
++
++/*static*/ status_t
++LimaRenderer::_PresenterEntry(void* data)
++{
++	((LimaRenderer*)data)->_PresenterThread();
++	return B_OK;
++}
++
++
++/*!	Each frame handed over: waits until the GPU wrote it (its buffer's
++	jobs), reads it back and shows it. The kernel driver invalidated the
++	CPU's lines of the buffer after the jobs.
++*/
++void
++LimaRenderer::_PresenterThread()
++{
++	while (acquire_sem(fFrameSem) == B_OK) {
++		if (fQuitting)
++			break;
++		struct pipe_resource* resource = fPending;
++		fPending = NULL;
++		if (resource == NULL) {
++			release_sem(fIdleSem);
++			continue;
++		}
++		lima_bo_wait(lima_resource(resource)->bo, LIMA_GEM_WAIT_READ,
++			10000000000ULL);
++		_CopyFrame(fPendingSource, fPendingStride, fPendingWidth,
++			fPendingHeight, fPendingColorSpace, fPendingBytesPerPixel);
++		pipe_resource_reference(&resource, NULL);
++		release_sem(fIdleSem);
++
++		// Only this thread changes fBitmap while the GL thread presents
++		// through it (see Present())
++		if (fBitmap != NULL)
++			_Show(fBitmap, 100000);
++	}
++}
++
++
+ /*!	Shows the last frame again, without touching the GPU (the window
+ 	thread, when the view needs redrawing).
+ */
+diff -ru a/src/gallium/targets/haiku-lima/LimaRenderer.h b/src/gallium/targets/haiku-lima/LimaRenderer.h
+--- a/src/gallium/targets/haiku-lima/LimaRenderer.h	2026-11-01 20:45:38.348715717 -0500
++++ b/src/gallium/targets/haiku-lima/LimaRenderer.h	2026-11-01 20:51:07.366240290 -0500
+@@ -24,6 +24,13 @@
+ 	as Software Pipe does, but the GPU renders into buffers of its own: each
+ 	frame presented is read back into a BBitmap, which is shown as Software
+ 	Pipe shows its own (docs/m43-mesa-lima-haiku.md §3.3, §3.4).
++
++	A presenter thread waits for the GPU and reads the frame back, while the
++	GL thread goes on with the next frame, into the other buffer: the GL
++	thread waits only until the presenter is done with the frame before. A
++	GL thread holding the view's window (one that draws in Draw(), say)
++	reads the frame back itself: the presenter couldn't show it before the
++	window is free again.
+ */
+ class LimaRenderer : public BGLRenderer, public HGLWinsysContext {
+ public:
+@@ -54,6 +61,15 @@
+ 			void				ShowLastFrame();
+ 
+ private:
++			void				_Show(BBitmap* bitmap,
++									bigtime_t lockTimeout);
++	static	status_t			_PresenterEntry(void* data);
++			void				_PresenterThread();
++			void				_CopyFrame(const uint8* source,
++									uint32 stride, uint32 width,
++									uint32 height, color_space colorSpace,
++									uint32 bytesPerPixel);
++
+ 			GalliumContext*		fContextObj;
+ 			context_id			fContextID;
+ 
+@@ -69,6 +85,24 @@
+ 				// the last frame; made and filled by the GL thread
+ 			BLocker				fBitmapLocker;
+ 				// against the window thread, which shows it again
++
++			// the presenter
++			thread_id			fPresenter;
++			sem_id				fFrameSem;
++				// a frame waits for the presenter
++			sem_id				fIdleSem;
++				// one count while the presenter has no frame
++			volatile bool		fQuitting;
++			struct pipe_resource* fPending;
++				// the frame handed over, with a reference
++			const uint8*		fPendingSource;
++			uint32				fPendingStride;
++			uint32				fPendingWidth;
++			uint32				fPendingHeight;
++			color_space			fPendingColorSpace;
++			uint32				fPendingBytesPerPixel;
++			struct pipe_resource* fLastResource;
++				// the buffer presented last (only compared)
+ };
+ 
+ #endif	// LIMARENDERER_H

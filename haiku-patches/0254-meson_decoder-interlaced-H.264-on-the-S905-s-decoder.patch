@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Mon, 2 Nov 2026 01:38:56 -0500
+Subject: [PATCH 254/342] meson_decoder: interlaced H.264 on the S905's decoder
+
+Field-coded and MBAFF streams went to FFmpeg. The firmware decodes them
+and gives both fields woven in one frame, as for MPEG-2, the way FFmpeg's
+decoder gives them.
+
+Checked against FFmpeg's decoding (x264's MBAFF, top field first): a
+720x480 Main stream bit for bit, all 300 frames; a 1080i High stream
+bit for bit but for 4 of 300 frames, each with one patch of about a
+macroblock pair (up to 510 pixels, at most 44 off) in the picture's
+lower half, not carried into later frames; not the motion vector
+buffer's size (doubled, the same). MediaPlayer, 1080i: 2.9% of the CPU
+against FFmpeg's 58.7%. MESON_DECODER_DISABLE still leaves it to FFmpeg.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../media/plugins/meson_decoder/MesonVdecDecoder.cpp   | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
+index 99bcb54a1f..fef6ffed47 100644
+--- a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
++++ b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
+@@ -15,10 +15,10 @@
+  *
+  * Setup() fails when the decoder is in use (for a second: see Setup()), the
+  * firmware is missing or the stream is one the hardware can't decode (more
+- * than 1920x1088 or 1088x1920, not 4:2:0; H.264: 10 bits, fields; HEVC:
+- * more than 10 bits): the Media Kit then takes the next decoder (FFmpeg's).
+- * MPEG-2's interlaced pictures come back as frames, both fields woven, as
+- * FFmpeg's decoder gives them.
++ * than 1920x1088 or 1088x1920, not 4:2:0; H.264: 10 bits; HEVC: more than
++ * 10 bits): the Media Kit then takes the next decoder (FFmpeg's).
++ * Interlaced pictures (MPEG-2, H.264's fields or MBAFF) come back as frames,
++ * both fields woven, as FFmpeg's decoder gives them.
+  * MESON_DECODER_DISABLE in the environment makes it fail always (to compare
+  * with FFmpeg); MESON_DECODER_NO_REFERENCES makes it copy every frame;
+  * MESON_DECODER_TRACE logs what it is asked to stderr.
+@@ -256,7 +256,7 @@ MesonVdecDecoder::Setup(media_format* ioEncodedFormat, const void* infoBuffer,
+ 		bool profileOkay = sequence.profile == 66 || sequence.profile == 77
+ 			|| sequence.profile == 100;
+ 		if (!profileOkay || sequence.chroma_format != 1
+-			|| sequence.bit_depth != 8 || !sequence.frame_only
++			|| sequence.bit_depth != 8
+ 			|| !picture_fits(sequence.coded_width, sequence.coded_height)) {
+ 			TRACE("not for the hardware: profile %" B_PRIu32 ", chroma %"
+ 				B_PRIu32 ", %" B_PRIu32 " bits%s\n", sequence.profile,

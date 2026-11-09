@@ -1,0 +1,161 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Tue, 3 Nov 2026 14:14:47 -0500
+Subject: [PATCH 267/342] usb_audio, dwc2: several full speed audio adapters at
+ once
+
+usb_audio took any device with the IDs of one it already had for a replug of
+that one, even with the first still plugged in: of two identical adapters only
+one had a device, and it ran on the second's pipes.
+
+dwc2 kept a stream with its pipe until the pipe was gone, so the first adapter
+to play held both full speed streams for good and the next got B_BUSY. A
+canceled stream now goes to whichever pipe needs one once its slots are back,
+and there are six full speed streams (channels 3 to 8) for three adapters that
+play and record; the high speed ones move to channels 9 and 10.
+
+An IN packet's place in the bounce slot was as large as the endpoint's maximum.
+The AB13X adapter declares 384 bytes for the 192 of 48 kHz stereo, so 42 of
+them did not fit the 16 KiB slot and every buffer was refused with B_BAD_VALUE.
+A place is now at most what the slot can spare, and the channel's transfer
+size keeps a larger packet out of the next one's place.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/busses/usb/dwc2.h          | 11 +++++---
+ .../kernel/busses/usb/dwc2_isochronous.cpp    | 27 ++++++++++++-------
+ .../kernel/drivers/audio/usb/Device.cpp       |  4 +++
+ 3 files changed, 29 insertions(+), 13 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.h b/src/add-ons/kernel/busses/usb/dwc2.h
+index 45f0f92b8a..88e612dd5f 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.h
++++ b/src/add-ons/kernel/busses/usb/dwc2.h
+@@ -29,10 +29,11 @@ typedef DoublyLinkedList<dwc2_transfer> dwc2_transfer_list;
+ 
+ 
+ static const uint32 kLaneCount = 3;		// channels 0, 1, 2
+-static const uint32 kIsoStreamCount = 4;	// channels 3 to 6
+-static const uint32 kIsoFirstHighSpeedStream = 2;
+-	// 2, 3: high speed devices (a webcam's video and its microphone at
+-	// once); 0, 1: full speed devices behind the hub
++static const uint32 kIsoStreamCount = 8;	// channels 3 to 10
++static const uint32 kIsoFirstHighSpeedStream = 6;
++	// 6, 7: high speed devices (a webcam's video and its microphone at
++	// once); 0 to 5: full speed devices behind the hub (three audio adapters
++	// playing and recording)
+ static const uint32 kIsoHighSpeedStreams
+ 	= kIsoStreamCount - kIsoFirstHighSpeedStream;
+ static const uint32 kIsoSlotCount = 4;
+@@ -103,6 +104,8 @@ struct dwc2_iso_stream {
+ 	timer					armTimer;		// first: the hook's argument
+ 	DWC2*					dwc2;
+ 	Pipe*					pipe;			// NULL: unused
++	bool					released;		// canceled: another pipe may have
++											// it once its slots are all back
+ 	uint32					channel;
+ 	bool					in;
+ 	bool					highSpeed;
+diff --git a/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp b/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
+index 279c8b32ea..baf40efe9e 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
+@@ -102,6 +102,7 @@ DWC2::_InitIsochronous(uint8* bounce, phys_addr_t physical)
+ 		memset(&stream.armTimer, 0, sizeof(stream.armTimer));
+ 		stream.dwc2 = this;
+ 		stream.pipe = NULL;
++		stream.released = false;
+ 		stream.channel = kLaneCount + i;
+ 		stream.in = false;
+ 		stream.highSpeed = i >= kIsoFirstHighSpeedStream;
+@@ -129,7 +130,8 @@ DWC2::_InitIsochronous(uint8* bounce, phys_addr_t physical)
+ 
+ 
+ /*!	The stream of \a pipe, a new one if \a create is set and one of its
+-	kind (full speed behind the hub, or high speed) is free. Called with
++	kind (full speed behind the hub, or high speed) is free: never used, its
++	pipe gone, or canceled with nothing left of its transfers. Called with
+ 	fIsoLock held.
+ */
+ dwc2_iso_stream*
+@@ -140,10 +142,11 @@ DWC2::_IsoStreamFor(Pipe* pipe, bool create)
+ 	for (uint32 i = 0; i < kIsoStreamCount; i++) {
+ 		if (fIsoStreams[i].pipe == pipe)
+ 			return &fIsoStreams[i];
+-		if (fIsoStreams[i].pipe == NULL && unused == NULL
+-			&& fIsoStreams[i].highSpeed == highSpeed) {
++		bool free = fIsoStreams[i].pipe == NULL
++			|| (fIsoStreams[i].released
++				&& fIsoStreams[i].freeSlots == (1 << kIsoSlotCount) - 1);
++		if (free && unused == NULL && fIsoStreams[i].highSpeed == highSpeed)
+ 			unused = &fIsoStreams[i];
+-		}
+ 	}
+ 	if (!create || unused == NULL)
+ 		return NULL;
+@@ -184,7 +187,10 @@ DWC2::_SubmitIsochronous(Transfer* transfer)
+ 	// each packet at a 32-bit aligned place for the controller's DMA: OUT
+ 	// packets as large as the largest, IN packets as large as the endpoint
+ 	// allows (high speed: all of a microframe's transactions), with room
+-	// for the alignment of their pieces (full speed)
++	// for the alignment of their pieces (full speed). An adapter may declare
++	// far more than its format sends (384 bytes for the 192 of 48 kHz
++	// stereo): its packets get what the slot can spare, and the channel's
++	// transfer size keeps a larger one out of the next packet's place.
+ 	uint32 maxPacket = pipe->MaxPacketSize();
+ 	if (highSpeed)
+ 		maxPacket *= pipe->MaxBurst() + 1;
+@@ -194,9 +200,10 @@ DWC2::_SubmitIsochronous(Transfer* transfer)
+ 	uint32 stride = 0;
+ 	if (highSpeed)
+ 		stride = maxPacket;
+-	else if (pipe->Direction() == Pipe::In)
+-		stride = maxPacket + 3 * (kIsoMaxPieces - 1);
+-	else {
++	else if (pipe->Direction() == Pipe::In) {
++		stride = min_c(maxPacket + 3 * (kIsoMaxPieces - 1),
++			(uint32)(kIsoSlotSize / count) & ~(uint32)3);
++	} else {
+ 		for (uint32 i = 0; i < count; i++) {
+ 			stride = max_c(stride,
+ 				(uint32)isochronousData->packet_descriptors[i].request_length);
+@@ -216,7 +223,7 @@ DWC2::_SubmitIsochronous(Transfer* transfer)
+ 	size_t total = 0;
+ 	for (uint32 i = 0; i < count; i++) {
+ 		uint32 length = isochronousData->packet_descriptors[i].request_length;
+-		if (length > maxPacket)
++		if (length > maxPacket || length > stride)
+ 			return B_BAD_VALUE;
+ 		entry->length[i] = length;
+ 		entry->actual[i] = 0;
+@@ -235,6 +242,7 @@ DWC2::_SubmitIsochronous(Transfer* transfer)
+ 	dwc2_iso_stream* stream = _IsoStreamFor(pipe, true);
+ 	if (stream == NULL || stream->freeSlots == 0)
+ 		return B_BUSY;
++	stream->released = false;
+ 	entry->stream = stream;
+ 	entry->slot = 0;
+ 	while ((stream->freeSlots & (1 << entry->slot)) == 0)
+@@ -346,6 +354,7 @@ DWC2::_CancelIsochronous(Pipe* pipe, bool force)
+ 	stream->stopping = false;
+ 	stream->targetFrame = UINT32_MAX;
+ 	stream->pendingFrame = UINT32_MAX;
++	stream->released = !force;
+ 	bool in = stream->in;
+ 	bool highSpeed = stream->highSpeed;
+ 	dwc2_iso_statistics stats = stream->stats;
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Device.cpp b/src/add-ons/kernel/drivers/audio/usb/Device.cpp
+index 8fe6d0fa2b..45dbb17998 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Device.cpp
++++ b/src/add-ons/kernel/drivers/audio/usb/Device.cpp
+@@ -425,6 +425,10 @@ Device::SetupDevice(bool deviceReplugged)
+ status_t
+ Device::CompareAndReattach(usb_device device)
+ {
++	// still here: the new one is a second adapter of the same kind
++	if (!fRemoved)
++		return B_BUSY;
++
+ 	const usb_device_descriptor* deviceDescriptor
+ 		= gUSBModule->get_device_descriptor(device);
+ 

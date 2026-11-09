@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 18:09:08 -0400
+Subject: [PATCH 127/342] arm64: edge-triggered interrupts on the GICv2
+
+arch_int_configure_io_interrupt() sets an SPI's trigger in GICD_ICFGR (with
+the interrupt disabled meanwhile, as the GIC requires) and io_interrupt_handler()
+gets the trigger mode. A level-sensitive SPI whose line only pulses may be
+gone by the time the CPU acknowledges it (IAR reads 1023): the S905's video
+decoder's interrupts are such edges.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/kernel/arch/arm/arch_int_gicv2.cpp | 42 ++++++++++++++++++-
+ src/system/kernel/arch/arm/arch_int_gicv2.h   |  4 ++
+ src/system/kernel/arch/arm/soc.h              |  5 +++
+ src/system/kernel/arch/arm64/arch_int.cpp     | 11 +++++
+ 4 files changed, 61 insertions(+), 1 deletion(-)
+
+diff --git a/src/system/kernel/arch/arm/arch_int_gicv2.cpp b/src/system/kernel/arch/arm/arch_int_gicv2.cpp
+index 77c67f2b5c..7cf2f55304 100644
+--- a/src/system/kernel/arch/arm/arch_int_gicv2.cpp
++++ b/src/system/kernel/arch/arm/arch_int_gicv2.cpp
+@@ -9,6 +9,7 @@
+ #include <vm/vm.h>
+ #include <smp.h>
+ #include <KernelExport.h>
++#include <string.h>
+ 
+ #include "arch_int_gicv2.h"
+ #include "gicv2_regs.h"
+@@ -49,6 +50,8 @@ GICv2InterruptController::GICv2InterruptController(phys_addr_t gicd_addr, phys_a
+ 	// how many registers cover all IRQs?
+ 	uint32 typer = fGicdRegs[GICD_REG_TYPER];
+ 	uint32 lineRegs = (typer & 0x1f) + 1;
++	fLineCount = 32 * lineRegs;
++	memset(fEdgeTriggered, 0, sizeof(fEdgeTriggered));
+ 	reserve_io_interrupt_vectors(32 * lineRegs, 0, INTERRUPT_TYPE_IRQ);
+ 
+ 	for (uint32 i = 1; i < lineRegs; i++) { // 1 bit per IRQ
+@@ -116,6 +119,40 @@ GICv2InterruptController::DisableInterrupt(int32 irq)
+ }
+ 
+ 
++/*!	An SPI's trigger: a level-sensitive interrupt is pending only while its
++	line is asserted, so one that only pulses its line may be gone by the time
++	the CPU acknowledges it (IAR then reads 1023); an edge-triggered one stays
++	pending until acknowledged. The configuration may only change while the
++	interrupt is disabled.
++*/
++void
++GICv2InterruptController::ConfigureInterrupt(int32 irq,
++	interrupt_trigger_mode mode)
++{
++	if (irq < 32 || irq >= (int32)fLineCount)
++		return;
++
++	uint32 enableBit = 1 << (irq % 32);
++	bool enabled = (fGicdRegs[GICD_REG_ISENABLER + irq / 32] & enableBit) != 0;
++	if (enabled)
++		fGicdRegs[GICD_REG_ICENABLER + irq / 32] = enableBit;
++
++	uint32 configBit = 2 << (irq % 16 * 2);
++	uint32 config = fGicdRegs[GICD_REG_ICFGR + irq / 16];
++	if (mode == B_EDGE_TRIGGERED) {
++		config |= configBit;
++		fEdgeTriggered[irq / 32] |= enableBit;
++	} else {
++		config &= ~configBit;
++		fEdgeTriggered[irq / 32] &= ~enableBit;
++	}
++	fGicdRegs[GICD_REG_ICFGR + irq / 16] = config;
++
++	if (enabled)
++		fGicdRegs[GICD_REG_ISENABLER + irq / 32] = enableBit;
++}
++
++
+ void GICv2InterruptController::HandleInterrupt()
+ {
+ 	uint32_t iar = fGiccRegs[GICC_REG_IAR];
+@@ -126,7 +163,10 @@ void GICv2InterruptController::HandleInterrupt()
+ 	} else if (irqnr == ICI_IRQ) {
+ 		smp_intercpu_interrupt_handler(smp_get_current_cpu());
+ 	} else {
+-		io_interrupt_handler(irqnr, B_LEVEL_TRIGGERED);
++		bool edge = irqnr < fLineCount
++			&& (fEdgeTriggered[irqnr / 32] & (1 << (irqnr % 32))) != 0;
++		io_interrupt_handler(irqnr,
++			edge ? B_EDGE_TRIGGERED : B_LEVEL_TRIGGERED);
+ 	}
+ 
+ 	fGiccRegs[GICC_REG_EOIR] = iar;
+diff --git a/src/system/kernel/arch/arm/arch_int_gicv2.h b/src/system/kernel/arch/arm/arch_int_gicv2.h
+index 40e2c3bce1..37823bd3d2 100644
+--- a/src/system/kernel/arch/arm/arch_int_gicv2.h
++++ b/src/system/kernel/arch/arm/arch_int_gicv2.h
+@@ -14,6 +14,7 @@ public:
+ 	GICv2InterruptController(phys_addr_t gicd_regs = 0, phys_addr_t gicc_regs = 0);
+ 	void EnableInterrupt(int32 irq);
+ 	void DisableInterrupt(int32 irq);
++	void ConfigureInterrupt(int32 irq, interrupt_trigger_mode mode);
+ 	void HandleInterrupt();
+ 	void SendMulticastIci(CPUSet& cpuSet);
+ 	void SendBroadcastIci();
+@@ -21,6 +22,9 @@ public:
+ private:
+ 	volatile uint32_t *fGicdRegs;
+ 	volatile uint32_t *fGiccRegs;
++	uint32 fLineCount;
++	uint32 fEdgeTriggered[32];
++		// one bit per interrupt configured edge-triggered
+ };
+ 
+ #endif /* ARCH_ARM_GICV2_H */
+diff --git a/src/system/kernel/arch/arm/soc.h b/src/system/kernel/arch/arm/soc.h
+index b89294d7d7..fcd0a687f6 100644
+--- a/src/system/kernel/arch/arm/soc.h
++++ b/src/system/kernel/arch/arm/soc.h
+@@ -3,6 +3,8 @@
+ 
+ class InterruptController;
+ 
++#include <SupportDefs.h>
++#include <arch/int.h>
+ #include <smp.h>
+ 
+ // ------------------------------------------------------ InterruptController
+@@ -16,6 +18,9 @@ public:
+ 
+ 	virtual void HandleInterrupt() = 0;
+ 
++	virtual void ConfigureInterrupt(int32 irq, interrupt_trigger_mode mode) {
++	}
++
+ 	virtual void SendMulticastIci(CPUSet& cpuSet) {
+ 		panic("SendMulticastIci unimplemented");
+ 	}
+diff --git a/src/system/kernel/arch/arm64/arch_int.cpp b/src/system/kernel/arch/arm64/arch_int.cpp
+index 53ccfb20f5..bf2d7a96e1 100644
+--- a/src/system/kernel/arch/arm64/arch_int.cpp
++++ b/src/system/kernel/arch/arm64/arch_int.cpp
+@@ -60,6 +60,17 @@ arch_int_disable_io_interrupt(int32 irq)
+ }
+ 
+ 
++void
++arch_int_configure_io_interrupt(int32 irq, interrupt_trigger_mode mode,
++	interrupt_trigger_polarity polarity)
++{
++	// The GIC only knows active-high levels and rising edges.
++	InterruptController *ic = InterruptController::Get();
++	if (ic != NULL)
++		ic->ConfigureInterrupt(irq, mode);
++}
++
++
+ int32
+ arch_int_assign_to_cpu(int32 irq, int32 cpu)
+ {

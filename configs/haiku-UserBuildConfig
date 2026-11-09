@@ -1,0 +1,125 @@
+# Haiku UserBuildConfig for the ODROID-C2 test images, linked as
+# generated.arm64/UserBuildConfig (Jamrules reads one per output directory).
+# The @minimum image has no grep, sed or awk; the remote shell (tools/c2sh)
+# and the guest scripts are much more useful with them. These are the
+# HaikuPorts arm64 bootstrap builds listed in
+# build/jam/repositories/HaikuPorts/arm64.
+AddHaikuImageSystemPackages grep sed gawk less findutils ;
+
+# A host name (system/settings/network/hostname): without one gethostname()
+# fails, and with it the first boot's "ssh-keygen -A", so sshd has no keys.
+HAIKU_IMAGE_HOST_NAME = odroid-c2 ;
+
+# The system volume is laid out to grow up to 256 GB in place (BFS grow_limit:
+# its log sits behind a block bitmap sized for that, 24 MB of the image), so
+# a first boot can grow it to the whole card while it is mounted
+# (tools/image-add-diag.sh --grow-on-boot, tools/guest/c2-grow.cpp).
+HAIKU_IMAGE_GROW_LIMIT = 256G ;
+
+# @c2-mmc: Haiku's regular image (the minimum one plus the standard apps,
+# demos, Media Kit, translators, ...) without the HaikuPorts packages the
+# nightly and release profiles add, which have no arm64 builds. Items that
+# need a build feature with no arm64 package (mesa, ffmpeg, libpng, ...)
+# drop out by themselves.
+DefineBuildProfile c2-mmc : haiku-mmc-image : "haiku-c2.mmc" ;
+
+# Build features for libraries the HaikuPorts arm64 repository has no
+# packages of, from tools/mesa-build.sh (Mesa) and tools/ports-build.sh
+# (glu, libedit, tiff, libwebp, libavif with dav1d): jam uses their installed
+# trees in place, and their packages go into the image, so that the
+# dependency resolution finds what haiku (lib:libedit) and
+# haiku_datatranslators (lib:libtiff, ...) require. They enable the Debugger,
+# GLTeapot, GLInfo, libglut, the GL screen savers (Haiku3d too, but it
+# needs the trademarks, which this build leaves out), the TIFF, WebP, AVIF,
+# JPEG 2000 and ICNS translators, libraw for the RAW translator, the FFmpeg
+# media plugin, libmidi (Media preferences, MidiPlayer, PatchBay), and the
+# Debugger's arm64 disassembler.
+# The JPEG and PNG translators stay in tools/translators-build.sh's
+# haiku_translators_c2 (libjpeg-turbo and libpng linked statically).
+C2_DEPS = [ FDirName $(HAIKU_TOP) .. deps ] ;
+C2_PORTS = [ FDirName $(C2_DEPS) ports ] ;
+
+rule C2BuildFeature feature : headers : library
+{
+	EnableBuildFeatures QUALIFIED arm64:$(feature) ;
+	SetBuildFeatureAttribute QUALIFIED arm64:$(feature) : headers : $(headers) ;
+	SetBuildFeatureAttribute QUALIFIED arm64:$(feature) : library : $(library) ;
+	# some features name it "libraries"
+	SetBuildFeatureAttribute QUALIFIED arm64:$(feature) : libraries : $(library) ;
+}
+
+rule C2PortFeature feature : port : headerSubdirs : library
+{
+	local develop = [ FDirName $(C2_PORTS) $(port) develop ] ;
+	local headers = [ FDirName $(develop) headers ] ;
+	C2BuildFeature $(feature)
+		: $(headers) $(headers)/$(headerSubdirs)
+		: [ FDirName $(develop) lib $(library) ] ;
+}
+
+C2BuildFeature mesa
+	: [ FDirName $(C2_DEPS) mesa pkg devel develop headers os opengl ]
+	: [ FDirName $(C2_DEPS) mesa pkg mesa lib libGL.so.1 ] ;
+C2PortFeature glu : glu : : libGLU.so ;
+C2_FFMPEG_LIB = [ FDirName $(C2_PORTS) ffmpeg6 develop lib ] ;
+C2BuildFeature ffmpeg
+	: [ FDirName $(C2_PORTS) ffmpeg6 develop headers ]
+	: $(C2_FFMPEG_LIB)/libavformat.so $(C2_FFMPEG_LIB)/libavcodec.so
+	  $(C2_FFMPEG_LIB)/libavfilter.so $(C2_FFMPEG_LIB)/libswscale.so
+	  $(C2_FFMPEG_LIB)/libavutil.so $(C2_FFMPEG_LIB)/libswresample.so ;
+C2PortFeature libvorbis : libvorbis : : libvorbisfile.so ;
+C2PortFeature fluidlite : fluidlite : : libfluidlite-static.a ;
+C2PortFeature jasper : jasper : jasper : libjasper.so ;
+C2PortFeature libicns : libicns : : libicns.so ;
+C2PortFeature libraw : libraw : : libraw.so ;
+C2PortFeature libedit : libedit : : libedit.so ;
+C2PortFeature tiff : tiff : : libtiff.so ;
+C2PortFeature libwebp : libwebp : webp : libwebp.so ;
+C2PortFeature libavif : libavif1.0 : avif : libavif.so ;
+# Capstone (static) for the Debugger's arm64 disassembler
+C2PortFeature capstone : capstone : : libcapstone.a ;
+# libjpeg-turbo's TurboJPEG API (static, NEON, from tools/deps-build.sh) for
+# usb_webcam's MJPEG; not "jpeg", which would bring the JPEG translator into
+# haiku_datatranslators beside haiku_translators_c2's
+C2BuildFeature turbojpeg
+	: [ FDirName $(C2_DEPS) prefix include ]
+	: [ FDirName $(C2_DEPS) prefix lib libturbojpeg.a ] ;
+# zstd: libbe's BZstdCompressionAlgorithm, and packages compressed with it
+# (pkgman and packagefs; the boot loader too, from the sources). The
+# package tools still write zlib (src/bin/package, src/tools/package): the
+# loaders on the boards' EFI partitions are older and read only zlib.
+C2PortFeature zstd : zstd : : libzstd.so ;
+SetBuildFeatureAttribute QUALIFIED arm64:zstd : sources
+	: [ FDirName $(C2_PORTS) zstd develop sources zstd-1.5.7 ] ;
+
+AddPackageFilesToHaikuImage system packages :
+	[ FDirName $(C2_DEPS) mesa mesa-22.0.5-6-arm64.hpkg ]
+	[ FDirName $(C2_DEPS) mesa mesa_swpipe-22.0.5-6-arm64.hpkg ]
+	[ FDirName $(C2_DEPS) mesa mesa_lima-22.0.5-6-arm64.hpkg ]
+	[ FDirName $(C2_DEPS) llvm llvm12_libs-12.0.1-1-arm64.hpkg ]
+	[ FDirName $(C2_PORTS) glu-9.0.0-1-arm64.hpkg ]
+	[ FDirName $(C2_PORTS) libedit-20260512_3.1-1-arm64.hpkg ]
+	[ FDirName $(C2_PORTS) tiff-4.7.0-1-arm64.hpkg ]
+	[ FDirName $(C2_PORTS) libwebp-1.6.0-1-arm64.hpkg ]
+	[ FDirName $(C2_PORTS) dav1d-1.5.4-1-arm64.hpkg ]
+	[ FDirName $(C2_PORTS) libavif1.0-1.4.2-1-arm64.hpkg ]
+	[ FDirName $(C2_PORTS) ffmpeg6-6.1.6-1-arm64.hpkg ]
+	[ FDirName $(C2_PORTS) libogg-1.3.6-1-arm64.hpkg ]
+	[ FDirName $(C2_PORTS) libvorbis-1.3.7-1-arm64.hpkg ]
+	[ FDirName $(C2_PORTS) jasper-2.0.33-1-arm64.hpkg ]
+	[ FDirName $(C2_PORTS) libicns-0.8.1-1-arm64.hpkg ]
+	[ FDirName $(C2_PORTS) libraw-0.20.2-1-arm64.hpkg ]
+	[ FDirName $(C2_PORTS) zstd-1.5.7-1-arm64.hpkg ]
+	# command line tools the regular image has on other architectures
+	[ FDirName $(C2_PORTS) xz_utils-5.8.4-1-arm64.hpkg ]
+	[ FDirName $(C2_PORTS) bzip2-1.0.8-1-arm64.hpkg ]
+	[ FDirName $(C2_PORTS) gzip-1.14-1-arm64.hpkg ]
+	[ FDirName $(C2_PORTS) tar-1.35-1-arm64.hpkg ]
+	[ FDirName $(C2_PORTS) unzip-6.10c23-1-arm64.hpkg ]
+	[ FDirName $(C2_PORTS) zip-3.0-1-arm64.hpkg ]
+	[ FDirName $(C2_PORTS) zstd_bin-1.5.7-1-arm64.hpkg ]
+	;
+
+# An unofficial build (HAIKU_DISTRO_COMPATIBILITY "default"): no Haiku
+# trademarks, so no Haiku logos and no Haiku3d, as Haiku's guidelines for
+# builds by others ask.

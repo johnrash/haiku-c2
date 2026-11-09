@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 14:13:59 -0500
+Subject: [PATCH 222/342] dwc2: a high speed isochronous packet is armed only
+ in the microframe before its own
+
+Armed two microframes ahead (in one of its parity) the channel ran in
+that microframe, too late to finish: a webcam microphone's packets had
+22% frame overruns.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/busses/usb/dwc2.h               |  5 ++---
+ src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp | 14 +++++++++-----
+ 2 files changed, 11 insertions(+), 8 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.h b/src/add-ons/kernel/busses/usb/dwc2.h
+index 2ac0d40b52..61c4355e8a 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.h
++++ b/src/add-ons/kernel/busses/usb/dwc2.h
+@@ -95,9 +95,8 @@ struct dwc2_iso_statistics {
+ 	channel for the frame's packet and its start-split parts (and
+ 	complete-splits, IN) follow from the channel's halt interrupt; or of a
+ 	high speed device (kIsoFirstHighSpeedStream on), a packet every
+-	2^(bInterval-1) microframes, armed from the halt of the one before
+-	(every microframe or every other one) or by the timer in the microframe
+-	before its own.
++	2^(bInterval-1) microframes, armed in the microframe before its own:
++	from the halt of the one before (every microframe) or by the timer.
+ 	State changes under DWC2::fIsoLock.
+ */
+ struct dwc2_iso_stream {
+diff --git a/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp b/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
+index 0217ef0d1c..279c8b32ea 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
+@@ -38,10 +38,11 @@
+  * wMaxPacketSize times the endpoint's transactions per microframe (1 to 3,
+  * "high bandwidth"). The channel runs all of a microframe's transactions
+  * from one enable (HCCHAR.MC, PKTCNT; IN starts at DATA0, DATA1 or DATA2
+- * for 1, 2 or 3) and halts when they are done. Each packet is armed from
+- * the halt of the one before (ODDFRM: the parity of its microframe) when
+- * its microframe is at most two away; otherwise the timer arms it in the
+- * microframe before, as for full speed. A microframe the stream could not
++ * for 1, 2 or 3) and halts when they are done. Each packet is armed in the
++ * microframe before its own (ODDFRM: its parity): from the halt of the one
++ * before when that is the next microframe, otherwise by the timer, as for
++ * full speed. (Armed in a microframe of its own parity, the channel may run
++ * in that one, too late to finish: a frame overrun.) A microframe the stream could not
+  * catch is counted as missed, and the stream goes on from the next one.
+  * HS isochronous OUT is not done yet.
+  */
+@@ -536,7 +537,10 @@ DWC2::_IsoStartHighSpeed(dwc2_iso_stream* stream)
+ 			frame = (now + 1) & 0x3fff;
+ 			ahead = 1;
+ 		}
+-		if (ahead > 2) {
++		if (ahead > 1) {
++			// armed in a microframe of the packet's parity, the channel may
++			// run in that one, too late to finish (frame overrun): only in
++			// the microframe before
+ 			stream->pendingFrame = frame;
+ 			_IsoScheduleFrameTimer(stream, ahead);
+ 			return;

@@ -1,0 +1,767 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 23:21:29 -0400
+Subject: [PATCH 146/342] meson_saradc: the S905's SAR ADC, the ODROID-C2's
+ analog inputs
+
+/dev/misc/adc/0 (header pin 40) and /dev/misc/adc/1 (pin 37) read as
+millivolts, 0 to 1.8 V; an ioctl gives the converter's value too, and its
+internal references for a self-test. A sample is the mean of 8
+conversions, polled, with the lock the converter's other user, the system
+control firmware, keeps in its DELAY register. The firmware's setup stays
+when it made one; the switches that can drive an input are never set.
+Readings are corrected piecewise by the five internal references (ground
+to 1.8 V in quarters): on the ODROID-C2 they read 0, 249, 506, 765 and
+1020, exact after the correction. Facts: the port's
+docs/m27-geekport-facts.md.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/jam/packages/Haiku                      |   2 +-
+ headers/private/drivers/meson_saradc.h        |  45 ++
+ src/add-ons/kernel/drivers/misc/Jamfile       |   1 +
+ .../kernel/drivers/misc/meson_saradc/Jamfile  |  10 +
+ .../misc/meson_saradc/meson_saradc.cpp        | 643 ++++++++++++++++++
+ 5 files changed, 700 insertions(+), 1 deletion(-)
+ create mode 100644 headers/private/drivers/meson_saradc.h
+ create mode 100644 src/add-ons/kernel/drivers/misc/meson_saradc/Jamfile
+ create mode 100644 src/add-ons/kernel/drivers/misc/meson_saradc/meson_saradc.cpp
+
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index 277b9596d2..5ac6657661 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -146,7 +146,7 @@ AddNewDriversToPackage power
+ 	: $(SYSTEM_ADD_ONS_DRIVERS_POWER) ;
+ AddNewDriversToPackage power : meson_scpi@arm64 ;
+ AddNewDriversToPackage rtc : pcf8563@arm64 ;
+-AddNewDriversToPackage misc : meson_gpio@arm64 ;
++AddNewDriversToPackage misc : meson_gpio@arm64 meson_saradc@arm64 ;
+ AddNewDriversToPackage video : meson_vdec@arm64 ;
+ AddNewDriversToPackage sensor
+ 	: $(SYSTEM_ADD_ONS_DRIVERS_SENSOR) ;
+diff --git a/headers/private/drivers/meson_saradc.h b/headers/private/drivers/meson_saradc.h
+new file mode 100644
+index 0000000000..c59c7be5be
+--- /dev/null
++++ b/headers/private/drivers/meson_saradc.h
+@@ -0,0 +1,45 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef _MESON_SARADC_H
++#define _MESON_SARADC_H
++
++
++#include <Drivers.h>
++
++
++/*!	The S905's SAR ADC (meson_saradc): one device for each input on the
++	ODROID-C2's header, /dev/misc/adc/0 (header pin 40) and /dev/misc/adc/1
++	(pin 37), 0 to 1.8 V. Reading one gives a sample in millivolts as text
++	("1234\n"); the ioctl gives the converter's value too.
++*/
++
++
++#define MESON_SARADC_DEVICE_DIRECTORY	"/dev/misc/adc"
++
++enum {
++	MESON_SARADC_READ = B_DEVICE_OP_CODES_END + 0x4144,
++		// meson_saradc_sample: a sample of the device's input
++	MESON_SARADC_READ_REFERENCE,
++		// meson_saradc_reference: a sample of one of the converter's
++		// internal voltages, for a self-test
++};
++
++
++struct meson_saradc_sample {
++	uint32		raw;			// the converter's value, 0 to 1023
++	uint32		millivolts;		// 0 to 1800
++};
++
++
++struct meson_saradc_reference {
++	uint32		reference;		// in: 0 ground, 1 to 4 a quarter of the
++								// reference voltage to all of it
++	uint32		uncalibrated;	// out: the converter's value
++	uint32		raw;			// out: calibrated (expected: reference *
++								// 256, at most 1023)
++};
++
++
++#endif	// _MESON_SARADC_H
+diff --git a/src/add-ons/kernel/drivers/misc/Jamfile b/src/add-ons/kernel/drivers/misc/Jamfile
+index e8f308a385..3f895da5f0 100644
+--- a/src/add-ons/kernel/drivers/misc/Jamfile
++++ b/src/add-ons/kernel/drivers/misc/Jamfile
+@@ -20,3 +20,4 @@ KernelAddon <driver>test :
+ 	;
+ 
+ SubInclude HAIKU_TOP src add-ons kernel drivers misc meson_gpio ;
++SubInclude HAIKU_TOP src add-ons kernel drivers misc meson_saradc ;
+diff --git a/src/add-ons/kernel/drivers/misc/meson_saradc/Jamfile b/src/add-ons/kernel/drivers/misc/meson_saradc/Jamfile
+new file mode 100644
+index 0000000000..a76cbe9e24
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/misc/meson_saradc/Jamfile
+@@ -0,0 +1,10 @@
++SubDir HAIKU_TOP src add-ons kernel drivers misc meson_saradc ;
++
++UsePrivateKernelHeaders ;
++UsePrivateHeaders drivers ;
++
++if $(TARGET_ARCH) = arm64 {
++	KernelAddon meson_saradc :
++		meson_saradc.cpp
++	;
++}
+diff --git a/src/add-ons/kernel/drivers/misc/meson_saradc/meson_saradc.cpp b/src/add-ons/kernel/drivers/misc/meson_saradc/meson_saradc.cpp
+new file mode 100644
+index 0000000000..59c745c2a5
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/misc/meson_saradc/meson_saradc.cpp
+@@ -0,0 +1,643 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * The Amlogic S905's (GXBB) SAR ADC, 10 bits, 0 to 1.8 V, for the
++ * ODROID-C2's two analog inputs: /dev/misc/adc/0 (header pin 40, AIN0) and
++ * /dev/misc/adc/1 (pin 37, AIN1). Reading one gives a sample in millivolts
++ * as text; the ioctls (headers/private/drivers/meson_saradc.h) give the
++ * converter's value too, and its internal reference voltages for a
++ * self-test.
++ *
++ * Each sample is the mean of 8 conversions, read by polling. The
++ * converter is shared with the board's system control firmware (BL30):
++ * each use takes the lock the two sides keep in the DELAY register. If the
++ * firmware set the converter up already (REG3 bit 28), its settings stay.
++ * Readings are corrected piecewise by the five internal reference voltages
++ * (ground, a quarter to all of 1.8 V), measured at attach: Linux's
++ * correction by the 1/4 and 3/4 points alone puts ground 9 steps up on
++ * the ODROID-C2.
++ *
++ * Register facts: the port's docs/m27-geekport-facts.md (from Linux's and
++ * U-Boot's drivers and the S905 datasheet).
++ */
++
++
++#include <new>
++#include <stdio.h>
++#include <string.h>
++
++#include <KernelExport.h>
++#include <bus/FDT.h>
++#include <device_manager.h>
++#include <kernel.h>
++#include <lock.h>
++#include <util/AutoLock.h>
++
++#include <meson_saradc.h>
++
++
++#define DRIVER_MODULE_NAME	"drivers/misc/meson_saradc/driver_v1"
++#define DEVICE_MODULE_NAME	"drivers/misc/meson_saradc/device_v1"
++
++#define INFO(x...) dprintf("meson_saradc: " x)
++
++
++static const phys_addr_t kCbusPage = 0xc1108000;
++static const uint32 kAdcOffset = 0x680;
++static const phys_addr_t kHhiPage = 0xc883c000;
++
++// SAR ADC registers (byte offsets from the block)
++enum {
++	REG0				= 0x00,
++	CHAN_LIST			= 0x04,
++	AVG_CNTL			= 0x08,
++	REG3				= 0x0c,
++	DELAY				= 0x10,
++	FIFO_RD				= 0x18,
++	AUX_SW				= 0x1c,
++	CHAN_10_SW			= 0x20,
++	DETECT_IDLE_SW		= 0x24,
++	REG11				= 0x2c,
++};
++
++// REG0
++#define REG0_ENGINE_ENABLE		(1u << 0)
++#define REG0_START				(1u << 2)
++#define REG0_FIFO_IRQ			(1u << 3)
++#define REG0_FIFO_THRESHOLD		(0x1fu << 4)
++#define REG0_STOP				(1u << 14)
++#define REG0_TEMP_SELECT		(1u << 15)
++#define REG0_FIFO_COUNT(r)		(((r) >> 21) & 0x1f)
++#define REG0_BUSY				(7u << 28)
++
++// REG3
++#define REG3_CHAN7_MUX_SHIFT	23
++#define REG3_CHAN7_MUX			(7u << REG3_CHAN7_MUX_SHIFT)
++#define REG3_ADC_ENABLE			(1u << 21)
++#define REG3_CLOCK_PHASE		(1u << 26)
++#define REG3_RING_COUNTER		(1u << 27)
++#define REG3_FIRMWARE_INIT		(1u << 28)	// BL30 set the converter up
++#define REG3_SAMPLE_DELAY		(1u << 31)
++
++// DELAY
++#define DELAY_KERNEL_BUSY		(1u << 14)
++#define DELAY_FIRMWARE_BUSY		(1u << 15)
++
++// REG11
++#define REG11_EOC				(1u << 1)
++#define REG11_VREF_VOLTAGE		(1u << 5)
++#define REG11_CMV_SELECT		(1u << 6)
++#define REG11_BANDGAP			(1u << 13)
++
++// HHI
++enum {
++	HHI_GCLK_MPEG0		= 0x140,
++	HHI_GCLK_MPEG2		= 0x148,
++	HHI_SAR_CLK_CNTL	= 0x3d8,
++};
++#define GCLK_MPEG0_SAR_ADC		(1u << 10)	// the datasheet's and U-Boot's
++#define GCLK_MPEG2_SAR_ADC		(1u << 22)	// Linux's
++#define SAR_CLK_GATE			(1u << 8)
++
++static const uint32 kChan7Pin = 7;
++	// channel 7's mux: its pin; 0 to 4: ground to the reference voltage
++static const uint32 kChannelCount = 2;		// on the header
++static const bigtime_t kTimeout = 10000;
++static const uint32 kReferences[] = { 0, 256, 512, 768, 1023 };
++	// what the internal references (ground to all) should read
++static const uint32 kReferenceCount = B_COUNT_OF(kReferences);
++
++
++static device_manager_info* gDeviceManager;
++
++
++class MesonSaradc {
++public:
++								MesonSaradc(device_node* node);
++								~MesonSaradc();
++
++			status_t			Init();
++			device_node*		Node() const { return fNode; }
++
++			status_t			Sample(uint32 channel, uint32 mux,
++									uint32* _raw);
++			uint32				Calibrated(uint32 raw) const;
++	static	uint32				Millivolts(uint32 raw)
++									{ return (raw * 1800 + 512) / 1024; }
++
++private:
++			uint32				_Read(uint32 offset)
++									{ return fRegisters[offset / 4]; }
++			void				_Write(uint32 offset, uint32 value)
++									{ fRegisters[offset / 4] = value; }
++			void				_Change(uint32 offset, uint32 clear,
++									uint32 set);
++			status_t			_Lock();
++			void				_Unlock();
++			status_t			_WaitIdle();
++			void				_SetChan7Mux(uint32 mux);
++			void				_Calibrate();
++
++			device_node*		fNode;
++			area_id				fArea;
++			area_id				fHhiArea;
++			volatile uint32*	fRegisters;
++			volatile uint32*	fHhi;
++			mutex				fLock;
++			bool				fCalibrated;
++			uint32				fMeasured[kReferenceCount];
++				// what the references read
++};
++
++
++struct adc_cookie {
++	MesonSaradc*	adc;
++	uint32			channel;
++};
++
++
++MesonSaradc::MesonSaradc(device_node* node)
++	:
++	fNode(node),
++	fArea(-1),
++	fHhiArea(-1),
++	fRegisters(NULL),
++	fHhi(NULL),
++	fCalibrated(false)
++{
++	mutex_init(&fLock, "meson saradc");
++}
++
++
++MesonSaradc::~MesonSaradc()
++{
++	if (fArea >= 0)
++		delete_area(fArea);
++	if (fHhiArea >= 0)
++		delete_area(fHhiArea);
++	mutex_destroy(&fLock);
++}
++
++
++void
++MesonSaradc::_Change(uint32 offset, uint32 clear, uint32 set)
++{
++	_Write(offset, (_Read(offset) & ~clear) | set);
++}
++
++
++/*!	Takes the converter from the firmware: our busy bit, then the wait
++	for the firmware's to clear.
++*/
++status_t
++MesonSaradc::_Lock()
++{
++	_Change(DELAY, 0, DELAY_KERNEL_BUSY);
++	spin(1);
++	bigtime_t timeout = system_time() + kTimeout;
++	while ((_Read(DELAY) & DELAY_FIRMWARE_BUSY) != 0) {
++		if (system_time() > timeout) {
++			_Change(DELAY, DELAY_KERNEL_BUSY, 0);
++			INFO("the firmware does not give the converter up\n");
++			return B_BUSY;
++		}
++		spin(1);
++	}
++	return B_OK;
++}
++
++
++void
++MesonSaradc::_Unlock()
++{
++	_Change(DELAY, DELAY_KERNEL_BUSY, 0);
++}
++
++
++status_t
++MesonSaradc::_WaitIdle()
++{
++	spin(1);
++	bigtime_t timeout = system_time() + kTimeout;
++	while ((_Read(REG0) & REG0_BUSY) != 0) {
++		if (system_time() > timeout)
++			return B_TIMED_OUT;
++		spin(1);
++	}
++	return B_OK;
++}
++
++
++void
++MesonSaradc::_SetChan7Mux(uint32 mux)
++{
++	if (((_Read(REG3) & REG3_CHAN7_MUX) >> REG3_CHAN7_MUX_SHIFT) == mux)
++		return;
++	_Change(REG3, REG3_CHAN7_MUX, mux << REG3_CHAN7_MUX_SHIFT);
++	spin(20);
++}
++
++
++status_t
++MesonSaradc::Init()
++{
++	void* address;
++	fArea = map_physical_memory("meson saradc", kCbusPage, B_PAGE_SIZE,
++		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++		&address);
++	if (fArea < 0)
++		return fArea;
++	fRegisters = (volatile uint32*)((uint8*)address + kAdcOffset);
++	fHhiArea = map_physical_memory("meson saradc hhi", kHhiPage,
++		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++	if (fHhiArea < 0)
++		return fHhiArea;
++	fHhi = (volatile uint32*)address;
++
++	// the bus clock: Linux and the datasheet disagree on the gate, both on
++	{
++		InterruptsLocker locker;
++		fHhi[HHI_GCLK_MPEG2 / 4] |= GCLK_MPEG2_SAR_ADC;
++		fHhi[HHI_GCLK_MPEG0 / 4] |= GCLK_MPEG0_SAR_ADC;
++	}
++
++	MutexLocker locker(fLock);
++	bool firmwareInit = (_Read(REG3) & REG3_FIRMWARE_INIT) != 0;
++	_SetChan7Mux(kChan7Pin);
++	if (!firmwareInit) {
++		// stopped, one channel, our delays and switches, 1.2 MHz
++		_Change(REG0, REG0_FIFO_IRQ, REG0_STOP);
++		_WaitIdle();
++		_Change(REG0, REG0_ENGINE_ENABLE | REG0_TEMP_SELECT, 0);
++		_Write(CHAN_LIST, 0);
++		_Change(REG3, REG3_CLOCK_PHASE | REG3_RING_COUNTER,
++			REG3_SAMPLE_DELAY);
++		// 11 us between a channel's samples (10 + 1 ticks of 1 us)
++		_Change(DELAY, (3u << 24) | (0xffu << 16) | (3u << 8),
++			(1u << 24) | (10u << 16));
++		// channel 0 from input 0, channel 1 from input 1, channels 2 to 7
++		// from their own inputs: only the input selects change. The
++		// switches next to them (for resistive touch panels, some drive
++		// an input) stay as they are: Linux turns two on, U-Boot doesn't,
++		// and which way is off isn't known.
++		_Change(CHAN_10_SW, (7u << 23) | (7u << 7), 1u << 23);
++		_Change(AUX_SW, 0x03ffff00u, 0x03eb1a00u);
++		_Change(REG11, REG11_EOC, REG11_VREF_VOLTAGE | REG11_CMV_SELECT);
++		fHhi[HHI_SAR_CLK_CNTL / 4] = (fHhi[HHI_SAR_CLK_CNTL / 4]
++			& ~((3u << 9) | 0xffu)) | 19;
++	}
++
++	status_t status = _Lock();
++	if (status != B_OK)
++		return status;
++	_Change(REG0, REG0_FIFO_THRESHOLD, 1u << 4);
++	_Change(REG11, 0, REG11_BANDGAP);
++	_Change(REG3, 0, REG3_ADC_ENABLE);
++	spin(5);
++	fHhi[HHI_SAR_CLK_CNTL / 4] |= SAR_CLK_GATE;
++	_Unlock();
++
++	_Calibrate();
++	INFO("%s (switches %#" B_PRIx32 ", %#" B_PRIx32 "), inputs at "
++		"/dev/misc/adc/0 and 1; references read %" B_PRIu32 " %" B_PRIu32
++		" %" B_PRIu32 " %" B_PRIu32 " %" B_PRIu32 "%s\n",
++		firmwareInit ? "set up by the firmware" : "set up here",
++		_Read(CHAN_10_SW), _Read(AUX_SW), fMeasured[0], fMeasured[1],
++		fMeasured[2], fMeasured[3], fMeasured[4],
++		fCalibrated ? "" : ": not calibrated");
++	return B_OK;
++}
++
++
++/*!	One sample of \a channel (for channel 7: of what \a mux selects), the
++	mean of 8 conversions, uncalibrated.
++*/
++status_t
++MesonSaradc::Sample(uint32 channel, uint32 mux, uint32* _raw)
++{
++	status_t status = _Lock();
++	if (status != B_OK)
++		return status;
++
++	for (int32 i = 0; i < 32 && REG0_FIFO_COUNT(_Read(REG0)) != 0; i++)
++		_Read(FIFO_RD);
++	// 8 samples, their mean
++	_Change(AVG_CNTL, (3u << (2 * channel)) | (3u << (16 + 2 * channel)),
++		(3u << (2 * channel)) | (1u << (16 + 2 * channel)));
++	_Write(CHAN_LIST, channel);
++	_Change(DETECT_IDLE_SW, (7u << 23) | (7u << 7),
++		(channel << 23) | (channel << 7));
++	if (channel == 7)
++		_SetChan7Mux(mux);
++
++	_Change(REG0, 0, REG0_FIFO_IRQ);
++	_Change(REG0, 0, REG0_ENGINE_ENABLE);
++	_Change(REG0, 0, REG0_START);
++	status = _WaitIdle();
++
++	uint32 count = REG0_FIFO_COUNT(_Read(REG0));
++	uint32 value = count > 0 ? _Read(FIFO_RD) : 0;
++
++	_Change(REG0, REG0_FIFO_IRQ, 0);
++	_Change(REG0, 0, REG0_STOP);
++	_WaitIdle();
++	_Change(REG0, REG0_ENGINE_ENABLE, 0);
++	if (channel == 7)
++		_SetChan7Mux(kChan7Pin);
++	_Unlock();
++
++	if (status != B_OK) {
++		INFO("channel %" B_PRIu32 ": the conversion does not end\n",
++			channel);
++		return status;
++	}
++	if (count != 1 || ((value >> 12) & 7) != channel) {
++		INFO("channel %" B_PRIu32 ": %" B_PRIu32 " results, the first %#"
++			B_PRIx32 "\n", channel, count, value);
++		return B_IO_ERROR;
++	}
++	*_raw = value & 0x3ff;
++	return B_OK;
++}
++
++
++/*!	\a raw corrected: what reads as a reference becomes its value, and
++	values between two references are put between them in proportion.
++*/
++uint32
++MesonSaradc::Calibrated(uint32 raw) const
++{
++	if (!fCalibrated)
++		return raw;
++	uint32 segment = 0;
++	while (segment < kReferenceCount - 2 && raw > fMeasured[segment + 1])
++		segment++;
++	int32 value = (int32)kReferences[segment]
++		+ ((int32)raw - (int32)fMeasured[segment])
++			* (int32)(kReferences[segment + 1] - kReferences[segment])
++			/ (int32)(fMeasured[segment + 1] - fMeasured[segment]);
++	return value < 0 ? 0 : value > 1023 ? 1023 : value;
++}
++
++
++/*!	Measures the internal references. They must read in order. */
++void
++MesonSaradc::_Calibrate()
++{
++	for (uint32 i = 0; i < kReferenceCount; i++) {
++		if (Sample(7, i, &fMeasured[i]) != B_OK
++			|| (i > 0 && fMeasured[i] <= fMeasured[i - 1])) {
++			return;
++		}
++	}
++	fCalibrated = true;
++}
++
++
++//	#pragma mark - driver module
++
++
++static float
++supports_device(device_node* parent)
++{
++	const char* bus;
++	const char* compatible;
++	if (gDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false)
++			!= B_OK || strcmp(bus, "fdt") != 0
++		|| gDeviceManager->get_attr_string(parent, "fdt/compatible",
++			&compatible, false) != B_OK
++		|| strcmp(compatible, "amlogic,meson-gxbb-saradc") != 0) {
++		return 0.0f;
++	}
++	return 0.8f;
++}
++
++
++static status_t
++register_device(device_node* parent)
++{
++	device_attr attrs[] = {
++		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE,
++			{ .string = "Amlogic Meson GXBB SAR ADC" } },
++		{ NULL }
++	};
++	return gDeviceManager->register_node(parent, DRIVER_MODULE_NAME, attrs,
++		NULL, NULL);
++}
++
++
++static status_t
++init_driver(device_node* node, void** _cookie)
++{
++	MesonSaradc* adc = new(std::nothrow) MesonSaradc(node);
++	if (adc == NULL)
++		return B_NO_MEMORY;
++	status_t status = adc->Init();
++	if (status != B_OK) {
++		delete adc;
++		return status;
++	}
++	*_cookie = adc;
++	return B_OK;
++}
++
++
++static void
++uninit_driver(void* cookie)
++{
++	delete (MesonSaradc*)cookie;
++}
++
++
++static status_t
++register_child_devices(void* cookie)
++{
++	MesonSaradc* adc = (MesonSaradc*)cookie;
++	for (uint32 i = 0; i < kChannelCount; i++) {
++		char path[32];
++		snprintf(path, sizeof(path), "misc/adc/%" B_PRIu32, i);
++		status_t status = gDeviceManager->publish_device(adc->Node(), path,
++			DEVICE_MODULE_NAME);
++		if (status != B_OK)
++			return status;
++	}
++	return B_OK;
++}
++
++
++//	#pragma mark - device module
++
++
++static status_t
++device_init(void* driverCookie, void** _deviceCookie)
++{
++	*_deviceCookie = driverCookie;
++	return B_OK;
++}
++
++
++static void
++device_uninit(void* deviceCookie)
++{
++}
++
++
++static status_t
++device_open(void* deviceCookie, const char* path, int openMode,
++	void** _cookie)
++{
++	size_t length = strlen(path);
++	if (length == 0 || path[length - 1] < '0'
++		|| path[length - 1] >= '0' + (char)kChannelCount) {
++		return B_ENTRY_NOT_FOUND;
++	}
++	adc_cookie* cookie = new(std::nothrow) adc_cookie;
++	if (cookie == NULL)
++		return B_NO_MEMORY;
++	cookie->adc = (MesonSaradc*)deviceCookie;
++	cookie->channel = path[length - 1] - '0';
++	*_cookie = cookie;
++	return B_OK;
++}
++
++
++static status_t
++device_close(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++device_free(void* cookie)
++{
++	delete (adc_cookie*)cookie;
++	return B_OK;
++}
++
++
++/*!	A sample in millivolts, as text. */
++static status_t
++device_read(void* _cookie, off_t position, void* buffer, size_t* _length)
++{
++	adc_cookie* cookie = (adc_cookie*)_cookie;
++	if (position != 0) {
++		*_length = 0;
++		return B_OK;
++	}
++	uint32 raw;
++	status_t status = cookie->adc->Sample(cookie->channel, 0, &raw);
++	if (status != B_OK)
++		return status;
++	char text[16];
++	size_t length = snprintf(text, sizeof(text), "%" B_PRIu32 "\n",
++		MesonSaradc::Millivolts(cookie->adc->Calibrated(raw)));
++	if (length > *_length)
++		length = *_length;
++	if (user_memcpy(buffer, text, length) != B_OK)
++		return B_BAD_ADDRESS;
++	*_length = length;
++	return B_OK;
++}
++
++
++static status_t
++device_write(void* cookie, off_t position, const void* buffer,
++	size_t* _length)
++{
++	*_length = 0;
++	return B_NOT_ALLOWED;
++}
++
++
++static status_t
++device_control(void* _cookie, uint32 op, void* buffer, size_t length)
++{
++	adc_cookie* cookie = (adc_cookie*)_cookie;
++	MesonSaradc* adc = cookie->adc;
++	switch (op) {
++		case MESON_SARADC_READ:
++		{
++			uint32 raw;
++			status_t status = adc->Sample(cookie->channel, 0, &raw);
++			if (status != B_OK)
++				return status;
++			meson_saradc_sample sample;
++			sample.raw = adc->Calibrated(raw);
++			sample.millivolts = MesonSaradc::Millivolts(sample.raw);
++			return user_memcpy(buffer, &sample, sizeof(sample));
++		}
++
++		case MESON_SARADC_READ_REFERENCE:
++		{
++			meson_saradc_reference reference;
++			if (user_memcpy(&reference, buffer, sizeof(reference)) != B_OK)
++				return B_BAD_ADDRESS;
++			if (reference.reference > 4)
++				return B_BAD_VALUE;
++			status_t status = adc->Sample(7, reference.reference,
++				&reference.uncalibrated);
++			if (status != B_OK)
++				return status;
++			reference.raw = adc->Calibrated(reference.uncalibrated);
++			return user_memcpy(buffer, &reference, sizeof(reference));
++		}
++	}
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++module_dependency module_dependencies[] = {
++	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&gDeviceManager },
++	{}
++};
++
++
++static struct device_module_info sMesonSaradcDevice = {
++	{
++		DEVICE_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	device_init,
++	device_uninit,
++	NULL,	// remove
++
++	device_open,
++	device_close,
++	device_free,
++	device_read,
++	device_write,
++	NULL,	// io
++	device_control,
++
++	NULL,	// select
++	NULL,	// deselect
++};
++
++
++static struct driver_module_info sMesonSaradcDriver = {
++	{
++		DRIVER_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	supports_device,
++	register_device,
++	init_driver,
++	uninit_driver,
++	register_child_devices,
++	NULL,	// rescan
++	NULL,	// removed
++};
++
++
++module_info* modules[] = {
++	(module_info*)&sMesonSaradcDriver,
++	(module_info*)&sMesonSaradcDevice,
++	NULL
++};

@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Tue, 3 Nov 2026 17:16:54 -0500
+Subject: [PATCH 275/342] usb_audio: a device's name ends at its first NUL
+
+The Y-247A pads its product string with NUL characters, which showed as
+question marks.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/drivers/audio/usb/Device.cpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Device.cpp b/src/add-ons/kernel/drivers/audio/usb/Device.cpp
+index 0ba520d78e..aea3b48e49 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Device.cpp
++++ b/src/add-ons/kernel/drivers/audio/usb/Device.cpp
+@@ -444,6 +444,8 @@ Device::_ReadName(uint8 stringIndex)
+ 	char name[sizeof(fName)];
+ 	size_t count = 0;
+ 	for (size_t i = 2; i + 1 < length; i += 2) {
++		if (descriptor[i] == 0 && descriptor[i + 1] == 0)
++			break;
+ 		name[count++] = descriptor[i + 1] == 0 && descriptor[i] >= 0x20
+ 			&& descriptor[i] < 0x7f ? descriptor[i] : '?';
+ 	}

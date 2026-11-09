@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 05:17:20 -0400
+Subject: [PATCH 162/342] MediaPlayer: B_NV12 also for video without a color
+ space of its own
+
+10-bit HEVC has none that the Media Kit names, so the track supplier
+settles on B_YCbCr422 and MediaPlayer never asked for B_NV12: the
+decoder converted every frame, and couldn't hand frames to the overlay.
+When the overlay takes B_NV12, it is tried first in that case too.
+
+HEVC 1080p30 10-bit through the hardware decoder: MediaPlayer 3.7% ->
+2.0% of the CPU.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apps/mediaplayer/Controller.cpp | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/src/apps/mediaplayer/Controller.cpp b/src/apps/mediaplayer/Controller.cpp
+index efa89a5c1d..18c12e904f 100644
+--- a/src/apps/mediaplayer/Controller.cpp
++++ b/src/apps/mediaplayer/Controller.cpp
+@@ -366,8 +366,13 @@ Controller::SetTo(const PlaylistItemRef& item)
+ 	if (fVideoTrackSupplier != NULL) {
+ 		const media_format& format = fVideoTrackSupplier->Format();
+ 		preferredVideoFormat = format.u.raw_video.display.format;
+-		if (useOverlays && preferredVideoFormat == B_RGB32
+-			&& _OverlayNeedsYCbCr()) {
++		// B_YCbCr422 is what the supplier falls back to when the track has
++		// no color space of its own (10-bit HEVC, for one): B_NV12 may still
++		// be had, and shown without a copy.
++		if (useOverlays && ((preferredVideoFormat == B_RGB32
++				&& _OverlayNeedsYCbCr())
++			|| (preferredVideoFormat == B_YCbCr422
++				&& _OverlaySupports(B_NV12)))) {
+ 			// Switch the decoder now, to the overlay's row stride: doing it
+ 			// at the first frame takes long enough (more than a second for
+ 			// H.264) to lose the frames up to the next keyframe. NodeManager

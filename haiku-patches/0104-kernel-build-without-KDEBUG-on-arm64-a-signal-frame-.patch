@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 14:17:46 -0400
+Subject: [PATCH 104/342] kernel: build without KDEBUG on arm64; a signal frame
+ bug it hid
+
+arch_setup_signal_frame() read the commpage's signal handler address
+inside ASSERT(): without KDEBUG the read was compiled out, and every
+signal handler would have been entered at an uninitialized address.
+Read it, then check the result.
+
+Two build failures without KDEBUG: arch_int_gicv3.cpp relied on cpu.h
+and interrupts.h coming in through debug headers; dec_vnode_ref_count()
+returns B_BAD_VALUE for a NULL vnode, since AutoLocker accepts NULL and
+GCC otherwise warns of a NULL reaching atomic_add().
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/kernel/arch/arm64/arch_int_gicv3.cpp | 2 ++
+ src/system/kernel/arch/arm64/arch_thread.cpp    | 7 +++++--
+ src/system/kernel/fs/vfs.cpp                    | 5 +++++
+ 3 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/src/system/kernel/arch/arm64/arch_int_gicv3.cpp b/src/system/kernel/arch/arm64/arch_int_gicv3.cpp
+index d067512798..bb32e0d2d6 100644
+--- a/src/system/kernel/arch/arm64/arch_int_gicv3.cpp
++++ b/src/system/kernel/arch/arm64/arch_int_gicv3.cpp
+@@ -6,8 +6,10 @@
+ 
+ #include "arch_int_gicv3.h"
+ 
++#include "cpu.h"
+ #include "debug.h"
+ #include "gicv3_regs.h"
++#include "interrupts.h"
+ #include "smp.h"
+ #include "vm/vm.h"
+ 
+diff --git a/src/system/kernel/arch/arm64/arch_thread.cpp b/src/system/kernel/arch/arm64/arch_thread.cpp
+index a3f60bcacf..263c74cf36 100644
+--- a/src/system/kernel/arch/arm64/arch_thread.cpp
++++ b/src/system/kernel/arch/arm64/arch_thread.cpp
+@@ -201,9 +201,12 @@ arch_setup_signal_frame(Thread *thread, struct sigaction *sa,
+ 
+ 	addr_t commpageAddr = (addr_t)thread->team->commpage_address;
+ 	addr_t signalHandlerAddr;
+-	ASSERT(user_memcpy(&signalHandlerAddr,
++	// not inside ASSERT(): without KDEBUG it would not be read at all
++	res = user_memcpy(&signalHandlerAddr,
+ 		&((addr_t*)commpageAddr)[COMMPAGE_ENTRY_ARM64_SIGNAL_HANDLER],
+-		sizeof(signalHandlerAddr)) >= B_OK);
++		sizeof(signalHandlerAddr));
++	if (res < B_OK)
++		return res;
+ 	signalHandlerAddr += commpageAddr;
+ 
+ 	frame->lr = frame->elr;
+diff --git a/src/system/kernel/fs/vfs.cpp b/src/system/kernel/fs/vfs.cpp
+index e155fa895e..ac36768e00 100644
+--- a/src/system/kernel/fs/vfs.cpp
++++ b/src/system/kernel/fs/vfs.cpp
+@@ -1062,6 +1062,11 @@ free_vnode(struct vnode* vnode, bool reenter)
+ static status_t
+ dec_vnode_ref_count(struct vnode* vnode, bool alwaysFree, bool reenter)
+ {
++	// AutoLocker accepts NULL; without KDEBUG's checks GCC then sees a NULL
++	// vnode reaching atomic_add() (-Wstringop-overflow)
++	if (vnode == NULL)
++		return B_BAD_VALUE;
++
+ 	ReadLocker locker(sVnodeLock);
+ 	AutoLocker<Vnode> nodeLocker(vnode);
+ 

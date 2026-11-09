@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 01:26:45 -0400
+Subject: [PATCH 014/342] efi: keep the firmware frame buffer out of the free
+ page pool
+
+build_physical_memory_list() treats EFI boot services code/data as free
+RAM. U-Boot places its GOP frame buffer at the end of RAM inside such a
+region (ODROID-C2: EfiBootServicesCode around 0x7f...), so the kernel
+could hand out pages that app_server keeps drawing into. Mark the frame
+buffer's pages allocated in build_physical_allocated_list().
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../platform/efi/arch/generic/generic_mmu.cpp     | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/src/system/boot/platform/efi/arch/generic/generic_mmu.cpp b/src/system/boot/platform/efi/arch/generic/generic_mmu.cpp
+index 09d7993c92..29ef5e2ccd 100644
+--- a/src/system/boot/platform/efi/arch/generic/generic_mmu.cpp
++++ b/src/system/boot/platform/efi/arch/generic/generic_mmu.cpp
+@@ -97,6 +97,21 @@ build_physical_allocated_list(size_t memoryMapSize, efi_memory_descriptor* memor
+ 		}
+ 	}
+ 
++	// The firmware's frame buffer can live in boot services memory, which
++	// the kernel reclaims as free RAM (U-Boot puts it at the end of RAM):
++	// keep those pages out of the free pool while the frame buffer is used.
++	if (gKernelArgs.frame_buffer.enabled) {
++		const uint64_t pageMask = B_PAGE_SIZE - 1;
++		uint64_t base = gKernelArgs.frame_buffer.physical_buffer.start
++			& ~pageMask;
++		uint64_t end = (gKernelArgs.frame_buffer.physical_buffer.start
++			+ gKernelArgs.frame_buffer.physical_buffer.size + pageMask)
++			& ~pageMask;
++		dprintf("Reserving frame buffer %#" B_PRIx64 "-%#" B_PRIx64 "\n",
++			base, end);
++		ASSERT_ALWAYS(insert_physical_allocated_range(base, end - base) == B_OK);
++	}
++
+ 	sort_address_ranges(gKernelArgs.physical_allocated_range,
+ 		gKernelArgs.num_physical_allocated_ranges);
+ }

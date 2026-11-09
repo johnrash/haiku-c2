@@ -1,0 +1,61 @@
+Qt 6.12: the Haiku theme's fonts without QFontDatabase::font(), which asked
+QGuiApplication::font() for defaults while that held its lock and called
+the theme: QApplication deadlocked at start (seen with PySide6).
+
+Copyright 2026, haiku-odroid-c2 port authors. MIT License.
+
+--- a/src/platform/qhaikutheme.cpp	2025-12-27 21:46:20.000000000 -0500
++++ b/src/platform/qhaikutheme.cpp	2026-11-07 14:51:49.464747939 -0500
+@@ -217,13 +217,23 @@
+ }
+ 
+ 
++// A font from Haiku's family, style and size. QFontDatabase::font() asked
++// QGuiApplication::font() for defaults, which in Qt 6.12 holds its lock while
++// it calls this theme: a deadlock when QApplication started.
++static QFont haikuFont(const char *family, const char *style, float size)
++{
++	QFont font(QString::fromUtf8(family));
++	font.setStyleName(QString::fromUtf8(style));
++	if (size > 0)
++		font.setPointSizeF(size);
++	return font;
++}
++
+ const QFont *QHaikuTheme::font(Font type) const
+ {
+     QPlatformFontDatabase *fontDatabase = m_integration->fontDatabase();
+ 
+     if (fontDatabase && m_fonts.isEmpty()) {
+-		QFontDatabase db;
+-
+ 	    font_family plainFontFamily;
+ 	    font_style plainFontStyle;
+ 		BFont haikuPlainFont = *be_plain_font;
+@@ -245,22 +255,22 @@
+ 		float kSmallFont = 0.72;
+ 		float kBold = 0.96;
+ 
+-	    QFont baseFont = db.font(plainFontFamily, plainFontStyle, haikuPlainFont.Size());
++	    QFont baseFont = haikuFont(plainFontFamily, plainFontStyle, haikuPlainFont.Size());
+ 	    if (haikuPlainFont.Size() >= 0)
+ 			baseFont.setPointSizeF(haikuPlainFont.Size());
+ 	    baseFont.setStretch(QFont::Unstretched);
+ 
+-	    QFont boldFont = db.font(boldFontFamily, boldFontStyle, haikuBoldFont.Size() * kBold);
++	    QFont boldFont = haikuFont(boldFontFamily, boldFontStyle, haikuBoldFont.Size() * kBold);
+ 	    if (haikuBoldFont.Size() >= 0)
+ 			boldFont.setPointSizeF(haikuBoldFont.Size() * kBold);
+ 	    boldFont.setStretch(QFont::Unstretched);
+ 
+-	    QFont monoFont = db.font(fixedFontFamily, fixedFontStyle, haikuFixedFont.Size());
++	    QFont monoFont = haikuFont(fixedFontFamily, fixedFontStyle, haikuFixedFont.Size());
+ 	    if (haikuFixedFont.Size() >= 0)
+ 			monoFont.setPointSizeF(haikuFixedFont.Size());
+ 	    monoFont.setStretch(QFont::Unstretched);
+ 
+-	    QFont menuFont = db.font(haikuMenuFontInfo.f_family, haikuMenuFontInfo.f_style, haikuMenuFontInfo.font_size);
++	    QFont menuFont = haikuFont(haikuMenuFontInfo.f_family, haikuMenuFontInfo.f_style, haikuMenuFontInfo.font_size);
+ 	    if (haikuMenuFontInfo.font_size >= 0)
+ 			menuFont.setPointSizeF(haikuMenuFontInfo.font_size);
+ 	    menuFont.setStretch(QFont::Unstretched);

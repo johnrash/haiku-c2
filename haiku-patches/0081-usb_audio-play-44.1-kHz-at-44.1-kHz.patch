@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 02:00:58 -0400
+Subject: [PATCH 081/342] usb_audio: play 44.1 kHz at 44.1 kHz
+
+Every isochronous packet carried the rate's frames per millisecond
+rounded down, so 44.1 kHz went out as 44 frames per packet, 44.0 kHz.
+Output packets now carry the remainder spread over them (nine packets
+of 44 frames, one of 45, every 10 ms), and a buffer holds whole cycles
+of that so its frame count stays exact: 40 packets, 1764 frames. 48 kHz
+and input streams keep their previous layout.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/drivers/audio/usb/Stream.cpp       | 45 ++++++++++++++++---
+ src/add-ons/kernel/drivers/audio/usb/Stream.h |  1 +
+ 2 files changed, 39 insertions(+), 7 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Stream.cpp b/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
+index 9e50dd9bdb..f6f7157e00 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
++++ b/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
+@@ -187,6 +187,22 @@ Stream::_SetupBuffers()
+ 		return B_BAD_VALUE;
+ 	}
+ 
++	// Output packets carry whole frames, the rate's remainder spread over
++	// them: at 44.1 kHz nine packets of 44 frames and one of 45 in every 10
++	// ms. A buffer holds whole cycles of that, so its frame count is exact.
++	// Input keeps packets of the rounded down size.
++	uint32 packetsPerCycle = 1;
++	if (!fIsInput)
++		packetsPerCycle = 1000 / _GreatestCommonDivisor(samplingRate, 1000);
++	uint32 packetsPerBuffer = kSamplesBufferSize * 1000 / samplingRate;
++	packetsPerBuffer -= packetsPerBuffer % packetsPerCycle;
++	if (packetsPerBuffer == 0) {
++		TRACE(ERR, "sampling rate %" B_PRIu32 " too low\n", samplingRate);
++		return B_BAD_VALUE;
++	}
++	uint32 framesPerBuffer = fIsInput ? packetsPerBuffer * packetSize
++		/ sampleSize : packetsPerBuffer * samplingRate / 1000;
++
+ 	if (fArea != -1) {
+ 		Stop();
+ 		delete_area(fArea);
+@@ -194,7 +210,7 @@ Stream::_SetupBuffers()
+ 		delete fDescriptors;
+ 	}
+ 
+-	fAreaSize = sampleSize * kSamplesBufferSize * kSamplesBufferCount;
++	fAreaSize = sampleSize * framesPerBuffer * kSamplesBufferCount;
+ 	TRACE(INF, "estimate fAreaSize:%d\n", fAreaSize);
+ 
+ 	// round up to B_PAGE_SIZE and create area
+@@ -224,19 +240,22 @@ Stream::_SetupBuffers()
+ 	TRACE(INF, "Created area id:%d at addr:%#010x size:%#010lx\n",
+ 		fArea, fDescriptors, fAreaSize);
+ 
+-	fDescriptorsCount = fAreaSize / packetSize;
+-	// we need same size sub-buffers. round it
+-	fDescriptorsCount = ROUNDDOWN(fDescriptorsCount, kSamplesBufferCount);
++	fDescriptorsCount = packetsPerBuffer * kSamplesBufferCount;
+ 	fDescriptors = new usb_iso_packet_descriptor[fDescriptorsCount];
+ 	TRACE(INF, "descriptorsCount:%d\n", fDescriptorsCount);
+ 
+ 	// samples count
+-	fSamplesCount = fDescriptorsCount * packetSize / sampleSize;
++	fSamplesCount = framesPerBuffer * kSamplesBufferCount;
+ 	TRACE(INF, "samplesCount:%d\n", fSamplesCount);
+ 
+-	// initialize descriptors array
++	// initialize descriptors array: the frames up to the end of packet i
++	// of a buffer, minus those up to its start
+ 	for (size_t i = 0; i < fDescriptorsCount; i++) {
+-		fDescriptors[i].request_length = packetSize;
++		uint32 packet = i % packetsPerBuffer;
++		uint32 frames = fIsInput ? packetSize / sampleSize
++			: (uint64)(packet + 1) * samplingRate / 1000
++				- (uint64)packet * samplingRate / 1000;
++		fDescriptors[i].request_length = frames * sampleSize;
+ 		fDescriptors[i].actual_length = 0;
+ 		fDescriptors[i].status = B_OK;
+ 	}
+@@ -373,6 +392,18 @@ Stream::_TransferCallback(void* cookie, status_t status, void* data,
+ }
+ 
+ 
++/*static*/ uint32
++Stream::_GreatestCommonDivisor(uint32 a, uint32 b)
++{
++	while (b != 0) {
++		uint32 remainder = a % b;
++		a = b;
++		b = remainder;
++	}
++	return a;
++}
++
++
+ void
+ Stream::_DumpDescriptors()
+ {
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Stream.h b/src/add-ons/kernel/drivers/audio/usb/Stream.h
+index 472deb5aef..b7cd7315a5 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Stream.h
++++ b/src/add-ons/kernel/drivers/audio/usb/Stream.h
+@@ -72,6 +72,7 @@ private:
+ 	static	void			_TransferCallback(void* cookie, status_t status,
+ 								void* data, size_t actualLength);
+ 			void			_DumpDescriptors();
++	static	uint32			_GreatestCommonDivisor(uint32 a, uint32 b);
+ };
+ 
+ 

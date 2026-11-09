@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 23:45:44 -0400
+Subject: [PATCH 190/342] arm64: a cache maintenance fault is a read
+
+A data abort from a cache maintenance instruction (DC CVAU, IC IVAU)
+always has ESR's WnR bit set, and the CM bit says where it came from;
+the instruction needs only read access. The handler took WnR alone, so
+when such an instruction touched a page of a read-only area that wasn't
+mapped yet, vm_page_fault() saw a write to a read-only page and the team
+got SIGSEGV. LLVM's JIT (llvmpipe) does exactly that: it writes code,
+makes the memory read-only and executable, then cleans it with
+__clear_cache(), and gltest's texture scene crashed in
+llvm::sys::Memory::InvalidateInstructionCache().
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/kernel/arch/arm64/arch_int.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/system/kernel/arch/arm64/arch_int.cpp b/src/system/kernel/arch/arm64/arch_int.cpp
+index bf2d7a96e1..6e9b2ecd2d 100644
+--- a/src/system/kernel/arch/arm64/arch_int.cpp
++++ b/src/system/kernel/arch/arm64/arch_int.cpp
+@@ -318,7 +318,11 @@ do_sync_handler(iframe * frame)
+ 		case EXCP_DATA_ABORT_L:
+ 		case EXCP_DATA_ABORT:
+ 		{
+-			bool write = (frame->esr & ISS_DATA_WnR) != 0;
++			// a cache maintenance instruction (DC CVAU, IC IVAU...) always
++			// reports WnR, but needs only read access: JIT compilers clean
++			// the code they wrote after making it read-only and executable
++			bool write = (frame->esr & ISS_DATA_WnR) != 0
++				&& (frame->esr & ISS_DATA_CM) == 0;
+ 			bool known = false;
+ 
+ 			int initialLevel = VMSAv8TranslationMap::CalcStartLevel(48, 12);

@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 04:13:19 -0400
+Subject: [PATCH 159/342] scheduler: give up on interrupts that can't move to
+ another CPU
+
+Power saving mode packs interrupts on one core: pack_irqs() moved the
+interrupts of the current CPU one by one until its list was empty. When
+the architecture can't route an interrupt elsewhere (arm64's
+arch_int_assign_to_cpu() keeps every one on CPU 0), the interrupt went
+back onto the same list, so the loop never ended, in the scheduler, with
+interrupts disabled: choosing "Power saving" in ProcessController hung
+an ODROID-C2 (CPU 0 stuck, KDL unreachable). It now stops when an
+interrupt stays. CPUEntry::Stop(), which moves the interrupts away from
+a CPU being disabled, had the same loop.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/kernel/scheduler/power_saving.cpp  | 6 ++++++
+ src/system/kernel/scheduler/scheduler_cpu.cpp | 5 +++++
+ 2 files changed, 11 insertions(+)
+
+diff --git a/src/system/kernel/scheduler/power_saving.cpp b/src/system/kernel/scheduler/power_saving.cpp
+index 600c1cd471..c138e0b2e0 100644
+--- a/src/system/kernel/scheduler/power_saving.cpp
++++ b/src/system/kernel/scheduler/power_saving.cpp
+@@ -215,6 +215,12 @@ pack_irqs()
+ 
+ 		if (newCPU != cpu->cpu_num)
+ 			assign_io_interrupt_to_cpu(irq->irq, newCPU);
++		if (irq->cpu == cpu->cpu_num) {
++			// It stayed: the architecture can't route it elsewhere (arm64
++			// keeps every interrupt on CPU 0). Trying the next ones would
++			// go on forever, with interrupts disabled.
++			return;
++		}
+ 
+ 		locker.Lock();
+ 	}
+diff --git a/src/system/kernel/scheduler/scheduler_cpu.cpp b/src/system/kernel/scheduler/scheduler_cpu.cpp
+index 380b7ffcf3..d1b00442bc 100644
+--- a/src/system/kernel/scheduler/scheduler_cpu.cpp
++++ b/src/system/kernel/scheduler/scheduler_cpu.cpp
+@@ -117,6 +117,11 @@ CPUEntry::Stop()
+ 		locker.Unlock();
+ 
+ 		assign_io_interrupt_to_cpu(irq->irq, -1);
++		if (irq->cpu == fCPUNumber) {
++			// It stayed: the architecture can't route it elsewhere (arm64
++			// keeps every interrupt on CPU 0), and the others would stay too.
++			return;
++		}
+ 
+ 		locker.Lock();
+ 		irq = entry->irqs.First();

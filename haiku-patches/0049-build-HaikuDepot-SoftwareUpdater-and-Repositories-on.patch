@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 02:15:43 -0400
+Subject: [PATCH 049/342] build: HaikuDepot, SoftwareUpdater and Repositories
+ on arm64 again
+
+They were left out of arm64 regular images because arm64 has no
+package repositories with more than bootstrap packages. A port that
+serves its own repository (the ODROID-C2 one does) needs them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/jam/images/definitions/regular | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/build/jam/images/definitions/regular b/build/jam/images/definitions/regular
+index 4c46a86ee3..0398c92c98 100644
+--- a/build/jam/images/definitions/regular
++++ b/build/jam/images/definitions/regular
+@@ -35,7 +35,7 @@ SYSTEM_APPS += [ FFilterByBuildFeatures
+ 	AutoRaise
+ 	CodyCam
+ 	GLInfo@mesa
+-	HaikuDepot@!arm64
++	HaikuDepot
+ 	Icon-O-Matic@expat
+ 	LaunchBox
+ 	LegacyPackageInstaller
+@@ -50,7 +50,7 @@ SYSTEM_APPS += [ FFilterByBuildFeatures
+ 	RemoteDesktop
+ 	Screenshot
+ 	SerialConnect
+-	SoftwareUpdater@!arm64
++	SoftwareUpdater
+ 	SoundRecorder
+ ] ;
+ 
+@@ -83,7 +83,7 @@ SYSTEM_PREFERENCES += [ FFilterByBuildFeatures
+ 	E-mail
+ 	Media@fluidlite
+ 	Printers
+-	Repositories@!arm64
++	Repositories
+ 	ScreenSaver
+ 	Sounds
+ ] ;

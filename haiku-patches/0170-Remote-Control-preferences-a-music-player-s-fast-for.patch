@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 10:23:16 -0400
+Subject: [PATCH 170/342] Remote Control preferences: a music player's fast forward
+ and rewind
+
+The music player fast forwards and rewinds with Command + > / <,
+scanning while the key is held: the template's buttons send them once and hold.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/preferences/remotecontrol/KeyNames.h    | 1 +
+ src/preferences/remotecontrol/Templates.cpp | 7 ++++++-
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/preferences/remotecontrol/KeyNames.h b/src/preferences/remotecontrol/KeyNames.h
+index 19344b2771..425d4d3400 100644
+--- a/src/preferences/remotecontrol/KeyNames.h
++++ b/src/preferences/remotecontrol/KeyNames.h
+@@ -34,6 +34,7 @@ enum {
+ 	kKeyM			= 0x52,
+ 	kKeyF			= 0x3f,
+ 	kKeyPeriod		= 0x54,
++	kKeyComma		= 0x53,
+ 
+ 	kKeyVolumeUp	= 0x0c00e9,
+ 	kKeyVolumeDown	= 0x0c00ea,
+diff --git a/src/preferences/remotecontrol/Templates.cpp b/src/preferences/remotecontrol/Templates.cpp
+index d4f1480915..530c71052d 100644
+--- a/src/preferences/remotecontrol/Templates.cpp
++++ b/src/preferences/remotecontrol/Templates.cpp
+@@ -3,7 +3,8 @@
+  * Distributed under the terms of the MIT License.
+  *
+  * The keystrokes come from the applications' own key handling: MediaPlayer
+- * (MainWin::_KeyDown), BeTunes (its Controls menu, and Space for play),
++ * (MainWin::_KeyDown), BeTunes (its Controls menu, Space for play, and
++ * Command + > / < to scan while held),
+  * and the media keys the Shortcuts preferences bind to setvolume.
+  */
+ 
+@@ -39,6 +40,10 @@ static const TemplateButton kBeTunes[] = {
+ 	{ "Stop", kKeyPeriod, kCommand, false },
+ 	{ "Next song", kKeyRight, kCommand, false },
+ 	{ "Previous song", kKeyLeft, kCommand, false },
++	// BeTunes 1.0.1-5: Command + > / < scan while the key is held, so the
++	// button sends it once and holds it
++	{ "Fast forward", kKeyPeriod, kCommand | kShift, false },
++	{ "Rewind", kKeyComma, kCommand | kShift, false },
+ 	{ "Volume up", kKeyUp, kCommand, true },
+ 	{ "Volume down", kKeyDown, kCommand, true },
+ 	{ "Mute", kKeyM, kCommand, false },

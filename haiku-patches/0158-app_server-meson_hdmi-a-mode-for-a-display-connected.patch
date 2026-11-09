@@ -1,0 +1,506 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 03:41:12 -0400
+Subject: [PATCH 158/342] app_server, meson_hdmi: a mode for a display
+ connected after boot
+
+app_server picked a mode once, at start; a display connected later (a TV
+switched on after the ODROID-C2, another monitor) kept that mode, even
+one it doesn't list. The driver already noticed the display, read its
+EDID and listed its modes, with no way to tell app_server.
+
+A new optional accelerant hook, B_ACCELERANT_DISPLAY_CHANGE_SEMAPHORE,
+gives a semaphore released when another display is connected. meson_hdmi
+creates it for the calling team (app_server) and releases it when the
+EDID of a display connected differs from the previous one; a display
+plugged in again changes nothing. AccelerantHWInterface watches it from
+a thread, reads the mode list again and tells its listeners
+(DisplayChanged()); the desktop then, from its own thread (posted
+AS_DISPLAY_CHANGED, as the screen manager is locked), applies the
+workspace's configuration as at start: the mode stored for that monitor,
+else its preferred mode, and B_SCREEN_CHANGED to the windows.
+
+ODROID-C2, the capture stick connected after boot: at 720p without a
+display it came up in the display's 1080p60; with 720p stored for that
+monitor, in 720p.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/os/add-ons/graphics/Accelerant.h      |  3 +
+ headers/private/app/ServerProtocol.h          |  3 +
+ .../graphics/meson_hdmi/meson_hdmi_info.h     |  3 +
+ .../accelerants/meson_hdmi/accelerant.cpp     | 17 ++++++
+ .../graphics/meson_hdmi/meson_hdmi.cpp        | 49 ++++++++++++++-
+ src/servers/app/Desktop.cpp                   | 25 ++++++++
+ src/servers/app/Desktop.h                     |  1 +
+ src/servers/app/ScreenManager.cpp             | 21 +++++++
+ src/servers/app/ScreenManager.h               |  2 +
+ src/servers/app/drawing/HWInterface.cpp       | 13 ++++
+ src/servers/app/drawing/HWInterface.h         |  5 ++
+ .../interface/local/AccelerantHWInterface.cpp | 59 +++++++++++++++++++
+ .../interface/local/AccelerantHWInterface.h   |  4 ++
+ 13 files changed, 203 insertions(+), 2 deletions(-)
+
+diff --git a/headers/os/add-ons/graphics/Accelerant.h b/headers/os/add-ons/graphics/Accelerant.h
+index 1d9e72d325..f73970e236 100644
+--- a/headers/os/add-ons/graphics/Accelerant.h
++++ b/headers/os/add-ons/graphics/Accelerant.h
+@@ -33,6 +33,8 @@ enum {
+ 	B_UNINIT_ACCELERANT,				/* required */
+ 	B_GET_ACCELERANT_DEVICE_INFO,		/* required */
+ 	B_ACCELERANT_RETRACE_SEMAPHORE,		/* optional */
++	B_ACCELERANT_DISPLAY_CHANGE_SEMAPHORE,	/* optional: released when a
++										   display is connected or replaced */
+ 
+ 	/* mode configuration */
+ 	B_ACCELERANT_MODE_COUNT = 0x100,	/* required */
+@@ -312,6 +314,7 @@ typedef status_t (*set_brightness)(float brightness);
+ typedef status_t (*get_brightness)(float* brightness);
+ 
+ typedef sem_id (*accelerant_retrace_semaphore)(void);
++typedef sem_id (*accelerant_display_change_semaphore)(void);
+ 
+ typedef status_t (*set_cursor_shape)(uint16 width, uint16 height,
+ 	uint16 hotX, uint16 hotY, const uint8* andMask, const uint8* xorMask);
+diff --git a/headers/private/app/ServerProtocol.h b/headers/private/app/ServerProtocol.h
+index b9fc05b207..b24b0baaca 100644
+--- a/headers/private/app/ServerProtocol.h
++++ b/headers/private/app/ServerProtocol.h
+@@ -368,6 +368,9 @@ enum {
+ 	AS_VIEW_CLIP_TO_RECT,
+ 	AS_VIEW_CLIP_TO_SHAPE,
+ 
++	// app_server internal: another display was connected
++	AS_DISPLAY_CHANGED,
++
+ 	AS_LAST_CODE
+ };
+ 
+diff --git a/headers/private/graphics/meson_hdmi/meson_hdmi_info.h b/headers/private/graphics/meson_hdmi/meson_hdmi_info.h
+index bcb9dd44c6..21801d53c8 100644
+--- a/headers/private/graphics/meson_hdmi/meson_hdmi_info.h
++++ b/headers/private/graphics/meson_hdmi/meson_hdmi_info.h
+@@ -34,6 +34,9 @@ enum {
+ 		// meson_hdmi_overlay_config
+ 	MESON_HDMI_SET_DPMS_MODE,
+ 		// uint32: B_DPMS_ON, B_DPMS_STAND_BY, B_DPMS_SUSPEND or B_DPMS_OFF
++	MESON_HDMI_GET_DISPLAY_CHANGE_SEMAPHORE,
++		// sem_id, the calling team's: released when a display with another
++		// EDID is connected (its modes are in the shared info then)
+ };
+ 
+ 
+diff --git a/src/add-ons/accelerants/meson_hdmi/accelerant.cpp b/src/add-ons/accelerants/meson_hdmi/accelerant.cpp
+index cf5e644768..5deb8b3aaa 100644
+--- a/src/add-ons/accelerants/meson_hdmi/accelerant.cpp
++++ b/src/add-ons/accelerants/meson_hdmi/accelerant.cpp
+@@ -492,6 +492,21 @@ meson_set_dpms_mode(uint32 mode)
+ }
+ 
+ 
++/*!	Released by the driver when another display is connected; the mode list
++	and EDID in the shared info are the new display's then.
++*/
++static sem_id
++meson_accelerant_display_change_semaphore(void)
++{
++	sem_id semaphore;
++	if (ioctl(sInfo.device, MESON_HDMI_GET_DISPLAY_CHANGE_SEMAPHORE,
++			&semaphore, sizeof(semaphore)) != 0) {
++		return B_ERROR;
++	}
++	return semaphore;
++}
++
++
+ extern "C" void*
+ get_accelerant_hook(uint32 feature, void* data)
+ {
+@@ -510,6 +525,8 @@ get_accelerant_hook(uint32 feature, void* data)
+ 			return (void*)meson_get_accelerant_device_info;
+ 		case B_ACCELERANT_RETRACE_SEMAPHORE:
+ 			return (void*)meson_accelerant_retrace_semaphore;
++		case B_ACCELERANT_DISPLAY_CHANGE_SEMAPHORE:
++			return (void*)meson_accelerant_display_change_semaphore;
+ 
+ 		case B_ACCELERANT_MODE_COUNT:
+ 			return (void*)meson_accelerant_mode_count;
+diff --git a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+index 18c091ae99..e5f99cb64a 100644
+--- a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
++++ b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+@@ -610,6 +610,7 @@ public:
+ 									{ return fFrameBufferMapArea; }
+ 			status_t			SetDisplayMode(const display_mode& mode);
+ 			status_t			SetDpmsMode(uint32 mode);
++			status_t			DisplayChangeSemaphore(sem_id* _semaphore);
+ 			void				RestoreBootMode();
+ 			void				DumpState();
+ 			void				DumpRegisters();
+@@ -733,6 +734,8 @@ private:
+ 				// U-Boot or _BringUpHdmi() set the HDMI path up
+ 			thread_id			fHotPlugThread;
+ 			sem_id				fHotPlugSem;
++			sem_id				fDisplayChangeSem;
++				// app_server's, see DisplayChangeSemaphore()
+ 				// deleted to stop the thread
+ 
+ 			struct overlay_buffer_info {
+@@ -809,6 +812,7 @@ MesonHdmi::MesonHdmi(device_node* node)
+ 	fHdmiReady(false),
+ 	fHotPlugThread(-1),
+ 	fHotPlugSem(-1),
++	fDisplayChangeSem(-1),
+ 	fOverlayPhysical(0),
+ 	fOverlayCanvas(0),
+ 	fOverlayEndian(CANVAS_SWAP_64)
+@@ -1457,8 +1461,9 @@ MesonHdmi::_BringUpHdmi()
+ 
+ 
+ /*!	A display was connected: sets the HDMI path up if U-Boot didn't, reads
+-	its EDID and lists its modes, and shows it the current mode. app_server
+-	isn't told: it keeps its mode, also one the display doesn't list.
++	its EDID and lists its modes, and shows it the current mode. If it is
++	another display than before, app_server is told (the display change
++	semaphore), and picks a mode for it.
+ */
+ void
+ MesonHdmi::_DisplayConnected()
+@@ -1492,6 +1497,10 @@ MesonHdmi::_DisplayConnected()
+ 					fMode.hActive, fMode.vActive);
+ 			}
+ 		}
++		if (fDisplayChangeSem >= 0) {
++			INFO("telling app_server about the new display\n");
++			release_sem_etc(fDisplayChangeSem, 1, B_DO_NOT_RESCHEDULE);
++		}
+ 	}
+ 
+ 	if (fShared->dpms_mode != B_DPMS_ON) {
+@@ -1746,6 +1755,33 @@ MesonHdmi::SetDpmsMode(uint32 mode)
+ }
+ 
+ 
++/*!	The semaphore released when another display is connected, owned by the
++	calling team (userland can't acquire the kernel's semaphores): one, for
++	app_server; a new one if its team is gone.
++*/
++status_t
++MesonHdmi::DisplayChangeSemaphore(sem_id* _semaphore)
++{
++	MutexLocker locker(fModeLock);
++	sem_info info;
++	if (fDisplayChangeSem < 0
++		|| get_sem_info(fDisplayChangeSem, &info) != B_OK) {
++		sem_id semaphore = create_sem(0, "meson_hdmi display change");
++		if (semaphore < 0)
++			return semaphore;
++		thread_info threadInfo;
++		if (get_thread_info(find_thread(NULL), &threadInfo) != B_OK
++			|| set_sem_owner(semaphore, threadInfo.team) != B_OK) {
++			delete_sem(semaphore);
++			return B_ERROR;
++		}
++		fDisplayChangeSem = semaphore;
++	}
++	*_semaphore = fDisplayChangeSem;
++	return B_OK;
++}
++
++
+ /*!	Puts U-Boot's registers and frame buffer back; works from KDL too. */
+ void
+ MesonHdmi::RestoreBootMode()
+@@ -2794,6 +2830,15 @@ device_control(void* cookie, uint32 op, void* buffer, size_t length)
+ 				return B_BAD_ADDRESS;
+ 			return device->SetDpmsMode(mode);
+ 		}
++
++		case MESON_HDMI_GET_DISPLAY_CHANGE_SEMAPHORE:
++		{
++			sem_id semaphore;
++			status_t status = device->DisplayChangeSemaphore(&semaphore);
++			if (status != B_OK)
++				return status;
++			return user_memcpy(buffer, &semaphore, sizeof(semaphore));
++		}
+ 	}
+ 	return B_DEV_INVALID_IOCTL;
+ }
+diff --git a/src/servers/app/Desktop.cpp b/src/servers/app/Desktop.cpp
+index ffaee878b1..b1bcec6379 100644
+--- a/src/servers/app/Desktop.cpp
++++ b/src/servers/app/Desktop.cpp
+@@ -2831,6 +2831,20 @@ Desktop::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
+ 			break;
+ 		}
+ 
++		case AS_DISPLAY_CHANGED:
++		{
++			// another display: a mode for it as at boot, this workspace's
++			// stored one for this monitor if there is one, else the
++			// display's preferred one
++			syslog(LOG_INFO, "app_server: another display was connected, "
++				"setting its mode\n");
++			AutoWriteLocker locker(fWindowLock);
++			_SuspendDirectFrameBufferAccess();
++			_SetCurrentWorkspaceConfiguration();
++			_ResumeDirectFrameBufferAccess();
++			break;
++		}
++
+ 		case AS_TALK_TO_DESKTOP_LISTENER:
+ 		{
+ 			port_id clientReplyPort;
+@@ -3637,6 +3651,17 @@ Desktop::ScreenChanged(Screen* screen)
+ }
+ 
+ 
++/*!	Another display was connected (a hot-plug the graphics driver reported).
++	Called with the screen manager locked: the work is left to the desktop's
++	thread, which takes the locks in the usual order.
++*/
++void
++Desktop::DisplayChanged(Screen* screen)
++{
++	PostMessage(AS_DISPLAY_CHANGED, 0);
++}
++
++
+ void
+ Desktop::_ScreenChanged(Screen* screen)
+ {
+diff --git a/src/servers/app/Desktop.h b/src/servers/app/Desktop.h
+index 1657262b0e..cce6e82cc8 100644
+--- a/src/servers/app/Desktop.h
++++ b/src/servers/app/Desktop.h
+@@ -152,6 +152,7 @@ public:
+ 	virtual	void				ScreenRemoved(Screen* screen) {}
+ 	virtual	void				ScreenAdded(Screen* screen) {}
+ 	virtual	void				ScreenChanged(Screen* screen);
++	virtual	void				DisplayChanged(Screen* screen);
+ 	virtual	bool				ReleaseScreen(Screen* screen) { return false; }
+ 
+ 	// Workspace methods
+diff --git a/src/servers/app/ScreenManager.cpp b/src/servers/app/ScreenManager.cpp
+index b3299ad545..e0c72ea47d 100644
+--- a/src/servers/app/ScreenManager.cpp
++++ b/src/servers/app/ScreenManager.cpp
+@@ -43,6 +43,7 @@ public:
+ 
+ private:
+ virtual	void					ScreenChanged(HWInterface* interface);
++virtual	void					DisplayChanged(HWInterface* interface);
+ 
+ 			ScreenManager&		fManager;
+ 			Screen*				fScreen;
+@@ -65,6 +66,13 @@ ScreenChangeListener::ScreenChanged(HWInterface* interface)
+ }
+ 
+ 
++void
++ScreenChangeListener::DisplayChanged(HWInterface* interface)
++{
++	fManager.DisplayChanged(fScreen);
++}
++
++
+ ScreenManager::ScreenManager()
+ 	:
+ 	BLooper("screen manager"),
+@@ -189,6 +197,19 @@ ScreenManager::ScreenChanged(Screen* screen)
+ }
+ 
+ 
++void
++ScreenManager::DisplayChanged(Screen* screen)
++{
++	BAutolock locker(this);
++
++	for (int32 i = 0; i < fScreenList.CountItems(); i++) {
++		screen_item* item = fScreenList.ItemAt(i);
++		if (item->screen.Get() == screen && item->owner != NULL)
++			item->owner->DisplayChanged(screen);
++	}
++}
++
++
+ void
+ ScreenManager::_ScanDrivers()
+ {
+diff --git a/src/servers/app/ScreenManager.h b/src/servers/app/ScreenManager.h
+index f8c762a8ef..25254366e1 100644
+--- a/src/servers/app/ScreenManager.h
++++ b/src/servers/app/ScreenManager.h
+@@ -31,6 +31,7 @@ class ScreenOwner {
+ 		virtual void	ScreenRemoved(Screen* screen) = 0;
+ 		virtual void	ScreenAdded(Screen* screen) = 0;
+ 		virtual void	ScreenChanged(Screen* screen) = 0;
++		virtual void	DisplayChanged(Screen* screen) {}
+ 
+ 		virtual bool	ReleaseScreen(Screen* screen) = 0;
+ };
+@@ -50,6 +51,7 @@ class ScreenManager : public BLooper {
+ 		void			ReleaseScreens(ScreenList& list);
+ 
+ 		void			ScreenChanged(Screen* screen);
++		void			DisplayChanged(Screen* screen);
+ 
+ 		virtual void	MessageReceived(BMessage* message);
+ 
+diff --git a/src/servers/app/drawing/HWInterface.cpp b/src/servers/app/drawing/HWInterface.cpp
+index 503d4508b9..beec4c19a7 100644
+--- a/src/servers/app/drawing/HWInterface.cpp
++++ b/src/servers/app/drawing/HWInterface.cpp
+@@ -1097,6 +1097,19 @@ HWInterface::_NotifyScreenChanged()
+ }
+ 
+ 
++void
++HWInterface::_NotifyDisplayChanged()
++{
++	BList listeners(fListeners);
++	int32 count = listeners.CountItems();
++	for (int32 i = 0; i < count; i++) {
++		HWInterfaceListener* listener
++			= (HWInterfaceListener*)listeners.ItemAtFast(i);
++		listener->DisplayChanged(this);
++	}
++}
++
++
+ /*static*/ bool
+ HWInterface::_IsValidMode(const display_mode& mode)
+ {
+diff --git a/src/servers/app/drawing/HWInterface.h b/src/servers/app/drawing/HWInterface.h
+index 65992d56ed..17c43b6683 100644
+--- a/src/servers/app/drawing/HWInterface.h
++++ b/src/servers/app/drawing/HWInterface.h
+@@ -44,6 +44,10 @@ public:
+ 
+ 	virtual	void				ScreenChanged(HWInterface* interface) {};
+ 		// Informs an upstream client of a changed screen configuration.
++
++	virtual	void				DisplayChanged(HWInterface* interface) {};
++		// Another display was connected: its modes may differ, a mode
++		// should be picked for it.
+ };
+ 
+ 
+@@ -187,6 +191,7 @@ protected:
+ 
+ 			void				_NotifyFrameBufferChanged();
+ 			void				_NotifyScreenChanged();
++			void				_NotifyDisplayChanged();
+ 
+ 	static	bool				_IsValidMode(const display_mode& mode);
+ 
+diff --git a/src/servers/app/drawing/interface/local/AccelerantHWInterface.cpp b/src/servers/app/drawing/interface/local/AccelerantHWInterface.cpp
+index 6b122d67ef..f62f56d244 100644
+--- a/src/servers/app/drawing/interface/local/AccelerantHWInterface.cpp
++++ b/src/servers/app/drawing/interface/local/AccelerantHWInterface.cpp
+@@ -150,6 +150,8 @@ AccelerantHWInterface::AccelerantHWInterface()
+ 	fInitialModeSwitch(true),
+ 
+ 	fRetraceSemaphore(-1),
++	fDisplayChangeSemaphore(-1),
++	fDisplayChangeThread(-1),
+ 
+ 	fRectParams(new (nothrow) fill_rect_params[kDefaultParamsCount]),
+ 	fRectParamsCount(kDefaultParamsCount),
+@@ -203,6 +205,8 @@ AccelerantHWInterface::Initialize()
+ 			// _OpenAccelerant() failed, try to open next graphics card
+ 		}
+ 
++		if (fCardFD >= 0)
++			_StartDisplayChangeWatcher();
+ 		return fCardFD >= 0 ? B_OK : fCardFD;
+ 	}
+ 	return ret;
+@@ -437,9 +441,64 @@ AccelerantHWInterface::_UpdateHooksAfterModeChange()
+ }
+ 
+ 
++/*!	Watches for another display being connected, if the accelerant can tell
++	(B_ACCELERANT_DISPLAY_CHANGE_SEMAPHORE): the mode list is read again,
++	and the desktop picks a mode for the display.
++*/
++void
++AccelerantHWInterface::_StartDisplayChangeWatcher()
++{
++	accelerant_display_change_semaphore displayChangeSemaphore
++		= (accelerant_display_change_semaphore)fAccelerantHook(
++			B_ACCELERANT_DISPLAY_CHANGE_SEMAPHORE, NULL);
++	if (displayChangeSemaphore == NULL)
++		return;
++	fDisplayChangeSemaphore = displayChangeSemaphore();
++	if (fDisplayChangeSemaphore < 0)
++		return;
++	fDisplayChangeThread = spawn_thread(&_DisplayChangeWatcher,
++		"display change watcher", B_NORMAL_PRIORITY, this);
++	if (fDisplayChangeThread >= 0)
++		resume_thread(fDisplayChangeThread);
++}
++
++
++/*static*/ status_t
++AccelerantHWInterface::_DisplayChangeWatcher(void* data)
++{
++	AccelerantHWInterface* interface = (AccelerantHWInterface*)data;
++	while (true) {
++		status_t status = acquire_sem(interface->fDisplayChangeSemaphore);
++		if (status == B_INTERRUPTED)
++			continue;
++		if (status != B_OK)
++			break;
++
++		{
++			AutoWriteLocker locker(interface);
++			delete[] interface->fModeList;
++			interface->fModeList = NULL;
++			interface->fModeCount = 0;
++			interface->_UpdateModeList();
++		}
++		interface->_NotifyDisplayChanged();
++	}
++	return B_OK;
++}
++
++
+ status_t
+ AccelerantHWInterface::Shutdown()
+ {
++	if (fDisplayChangeThread >= 0) {
++		// the semaphore is ours: deleting it ends the watcher
++		delete_sem(fDisplayChangeSemaphore);
++		status_t result;
++		wait_for_thread(fDisplayChangeThread, &result);
++		fDisplayChangeThread = -1;
++		fDisplayChangeSemaphore = -1;
++	}
++
+ 	if (fAccelerantHook != NULL) {
+ 		uninit_accelerant uninitAccelerant
+ 			= (uninit_accelerant)fAccelerantHook(B_UNINIT_ACCELERANT, NULL);
+diff --git a/src/servers/app/drawing/interface/local/AccelerantHWInterface.h b/src/servers/app/drawing/interface/local/AccelerantHWInterface.h
+index 7717b03f8e..e012e33042 100644
+--- a/src/servers/app/drawing/interface/local/AccelerantHWInterface.h
++++ b/src/servers/app/drawing/interface/local/AccelerantHWInterface.h
+@@ -99,6 +99,8 @@ private:
+ 			status_t			_SetupDefaultHooks();
+ 			void				_UpdateHooksAfterModeChange();
+ 			status_t			_UpdateModeList();
++			void				_StartDisplayChangeWatcher();
++	static	status_t			_DisplayChangeWatcher(void* data);
+ 			status_t			_UpdateFrameBufferConfig();
+ 			void				_RegionToRectParams(/*const*/ BRegion* region,
+ 									uint32* count) const;
+@@ -170,6 +172,8 @@ private:
+ 			bool				fInitialModeSwitch;
+ 
+ 			sem_id				fRetraceSemaphore;
++			sem_id				fDisplayChangeSemaphore;
++			thread_id			fDisplayChangeThread;
+ 
+ 	mutable	fill_rect_params*	fRectParams;
+ 	mutable	uint32				fRectParamsCount;

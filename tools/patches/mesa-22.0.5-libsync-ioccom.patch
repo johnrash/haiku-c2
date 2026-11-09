@@ -1,0 +1,12 @@
+--- a/src/util/libsync.h
++++ b/src/util/libsync.h
+@@ -34,6 +34,9 @@
+ #include <stdint.h>
+ #include <string.h>
+ #include <sys/ioctl.h>
++#ifdef __HAIKU__
++#include <sys/ioccom.h> /* _IOWR */
++#endif
+ #include <sys/poll.h>
+ #include <unistd.h>
+ #include <time.h>

@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 20:33:48 -0500
+Subject: [PATCH 242/342] app_server: B_RGB32 bitmaps drawn four pixels at a
+ time
+
+Making a B_RGB32 bitmap's pixels opaque (0eaf5fa94d) went one pixel at a
+time, which GCC doesn't vectorize at -O2: a 1900x1000 bitmap took 13 ms
+to draw, more than half of it in that loop (an OpenGL view's every
+frame, through Lima Pipe). Now with GCC's vector types, 16 pixels an
+iteration.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../Painter/bitmap_painter/DrawBitmapNoScale.h  | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/src/servers/app/drawing/Painter/bitmap_painter/DrawBitmapNoScale.h b/src/servers/app/drawing/Painter/bitmap_painter/DrawBitmapNoScale.h
+index fb18bd7b06..b1120a6e33 100644
+--- a/src/servers/app/drawing/Painter/bitmap_painter/DrawBitmapNoScale.h
++++ b/src/servers/app/drawing/Painter/bitmap_painter/DrawBitmapNoScale.h
+@@ -133,12 +133,29 @@ struct Bgr32Copy : public DrawBitmapNoScale<Bgr32Copy>
+ // B_RGB32 sources have no alpha: what is in their fourth byte (often 0) must
+ // not end up in the frame buffer, where meson_hdmi keys its video overlay
+ // by the alpha.
++// Four pixels at a time (GCC's vector types, any alignment): a 1900x1000
++// bitmap took 13 ms to draw one at a time, an OpenGL view's every frame.
++typedef uint32 bgr32_vector __attribute__((vector_size(16), aligned(4),
++	may_alias));
++
+ struct Bgr32CopyOpaque : public DrawBitmapNoScale<Bgr32CopyOpaque>
+ {
+ 	void BlendRow(uint8* dst, const uint8* src, int32 numPixels)
+ 	{
+ 		uint32* d = (uint32*)dst;
+ 		const uint32* s = (const uint32*)src;
++		const bgr32_vector opaque = { 0xff000000, 0xff000000, 0xff000000,
++			0xff000000 };
++		for (; numPixels >= 16; numPixels -= 16, s += 16, d += 16) {
++			bgr32_vector a = *(const bgr32_vector*)s | opaque;
++			bgr32_vector b = *(const bgr32_vector*)(s + 4) | opaque;
++			bgr32_vector c = *(const bgr32_vector*)(s + 8) | opaque;
++			bgr32_vector e = *(const bgr32_vector*)(s + 12) | opaque;
++			*(bgr32_vector*)d = a;
++			*(bgr32_vector*)(d + 4) = b;
++			*(bgr32_vector*)(d + 8) = c;
++			*(bgr32_vector*)(d + 12) = e;
++		}
+ 		while (numPixels--)
+ 			*d++ = *s++ | 0xff000000;
+ 	}

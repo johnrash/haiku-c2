@@ -1,0 +1,845 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 14:40:09 -0400
+Subject: [PATCH 108/342] meson_hdmi: modes at any pixel clock the HDMI PLL can
+ make
+
+The driver offered seven CEA modes and only switched the PLL's OD2
+between 74.25 and 148.5 MHz. It now solves for M, the fraction and
+OD1/OD2 (VCO 48 MHz * (M + frac/4096), M 53 to 123, the highest VCO the
+dividers allow, which is U-Boot's 5940 MHz for its two clocks) and
+restarts the PLL when M or the fraction change; only the dividers
+changing, it keeps running as before.
+
+The mode list (now up to 32) has the CEA modes the EDID lists by video
+code or detailed timing (480p, 576p and VGA added), the VESA DMT modes
+of its established and standard timings, and its other detailed
+timings, 25 to 297 MHz, up to 1920x1200, progressive only, sorted by
+size and refresh. Preferred stays 1080p60, else the boot mode's size,
+else the EDID's first detailed timing.
+
+The VPU's sync polarity bits (VPU_HDMI_SETTING 2 and 3, which U-Boot
+sets for its positive syncs) now follow the mode, for the VESA modes'
+negative ones. SET_DISPLAY_MODE also takes a complete timing that is
+not in the list, if the hardware can make it. The frame buffer is
+sized for 1920x1200.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../graphics/meson_hdmi/meson_hdmi_info.h     |   5 +-
+ .../graphics/meson_hdmi/meson_hdmi.cpp        | 598 +++++++++++++++---
+ 2 files changed, 513 insertions(+), 90 deletions(-)
+
+diff --git a/headers/private/graphics/meson_hdmi/meson_hdmi_info.h b/headers/private/graphics/meson_hdmi/meson_hdmi_info.h
+index 1611e02cda..c1d7b4bafb 100644
+--- a/headers/private/graphics/meson_hdmi/meson_hdmi_info.h
++++ b/headers/private/graphics/meson_hdmi/meson_hdmi_info.h
+@@ -11,7 +11,7 @@
+ 
+ 
+ #define MESON_HDMI_ACCELERANT_NAME	"meson_hdmi.accelerant"
+-#define MESON_HDMI_MAX_MODES		8
++#define MESON_HDMI_MAX_MODES		32
+ #define MESON_HDMI_EDID_SIZE		256
+ 
+ 
+@@ -22,7 +22,8 @@ enum {
+ 	MESON_HDMI_CLONE_FRAME_BUFFER,
+ 		// clones the frame buffer into the calling team; area_info
+ 	MESON_HDMI_SET_DISPLAY_MODE,
+-		// display_mode; must be one of the modes in the shared info
++		// display_mode: one of the shared info's modes, or else a complete
++		// timing the hardware can make
+ 	MESON_HDMI_GET_DEVICE_NAME,
+ 		// char[B_PATH_NAME_LENGTH], for clone accelerants
+ 	MESON_HDMI_ALLOCATE_OVERLAY_BUFFER,
+diff --git a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+index 6d469a5876..f3cc998272 100644
+--- a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
++++ b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+@@ -73,7 +73,9 @@ static const phys_addr_t kHdmiTxBase = 0xc883a000;
+ static const phys_addr_t kDmcBase = 0xc8838000;
+ 
+ static const uint32 kMaxWidth = 1920;
+-static const uint32 kMaxHeight = 1080;
++static const uint32 kMaxHeight = 1200;
++static const uint32 kMinPixelClock = 25000;		// kHz, the HDMI minimum
++static const uint32 kMaxPixelClock = 297000;	// the PHY band U-Boot set
+ static const uint32 kOsdCanvas = 0x4e;		// U-Boot's OSD1 canvas
+ 
+ // VPU registers (word numbers; byte offset = word * 4)
+@@ -211,8 +213,24 @@ enum {
+ };
+ 
+ #define HDMI_PLL_LOCK				(1u << 31)	// HHI_HDMI_PLL_CNTL
+-#define HDMI_PLL_OD2_SHIFT			22			// HHI_HDMI_PLL_CNTL2
+-#define HDMI_PLL_OD2_MASK			(3 << HDMI_PLL_OD2_SHIFT)
++#define HDMI_PLL_RESET				(1 << 28)
++#define HDMI_PLL_M_MASK				0x1ff
++#define HDMI_PLL_FRAC_MASK			0xfff		// HHI_HDMI_PLL_CNTL2
++#define HDMI_PLL_FRAC_ENABLE		(1 << 14)
++#define HDMI_PLL_OD1_SHIFT			16			// 0: /1, 1: /2, 2: /4, 3: /8
++#define HDMI_PLL_OD2_SHIFT			22			// OD3 is [19:18]
++#define HDMI_PLL_OD_MASK			((3 << HDMI_PLL_OD1_SHIFT) \
++										| (3 << HDMI_PLL_OD2_SHIFT))
++
++// The PLL runs at 48 MHz * (M + frac / 4096), M 53 to 123. OD3, VID_PLL_DIV
++// (/5) and the VCLK divider (/2) stay as U-Boot set them, so the pixel clock
++// is VCO / (10 * OD1 * OD2) and the PHY's TMDS clock ten times that.
++static const uint32 kHdmiPllMinM = 53;
++static const uint32 kHdmiPllMaxM = 123;
++
++// VPU_HDMI_SETTING: U-Boot sets both for its modes' positive syncs
++#define VPU_HDMI_HSYNC_HIGH			(1 << 2)
++#define VPU_HDMI_VSYNC_HIGH			(1 << 3)
+ 
+ // DMC canvas lookup table (byte offsets)
+ enum {
+@@ -290,9 +308,8 @@ struct meson_mode {
+ 	uint8	vic;			// CEA-861 video identification code
+ };
+ 
+-// U-Boot's HDMI PLL runs the VCO at 5940 MHz: OD2 /2 gives a 74.25 MHz
+-// pixel clock, /1 148.5 MHz. These modes need nothing else from the clock
+-// tree; the 50, 25 and 24 Hz ones only have longer lines (CEA-861 timings).
++// CEA-861 modes, which the EDID lists by video code. 720x480 and 720x576
++// come twice, as 4:3 and as 16:9: the timing is the same.
+ static const meson_mode kModes[] = {
+ 	{ 74250, 1280, 110, 40, 220, 720, 5, 5, 20, true, true, 4 },		// 720p60
+ 	{ 74250, 1280, 440, 40, 220, 720, 5, 5, 20, true, true, 19 },		// 720p50
+@@ -301,9 +318,136 @@ static const meson_mode kModes[] = {
+ 	{ 74250, 1920, 638, 44, 148, 1080, 4, 5, 36, true, true, 32 },		// 1080p24
+ 	{ 148500, 1920, 88, 44, 148, 1080, 4, 5, 36, true, true, 16 },		// 1080p60
+ 	{ 148500, 1920, 528, 44, 148, 1080, 4, 5, 36, true, true, 31 },	// 1080p50
++	{ 25175, 640, 16, 96, 48, 480, 10, 2, 33, false, false, 1 },		// 480p VGA
++	{ 27000, 720, 16, 62, 60, 480, 9, 6, 30, false, false, 2 },		// 480p
++	{ 27000, 720, 16, 62, 60, 480, 9, 6, 30, false, false, 3 },
++	{ 27000, 720, 12, 64, 68, 576, 5, 5, 39, false, false, 17 },		// 576p
++	{ 27000, 720, 12, 64, 68, 576, 5, 5, 39, false, false, 18 },
+ };
+ static const uint8 kPreferredVic = 16;
+ 
++/*!	VESA DMT modes, for the EDID's established and standard timings. */
++struct dmt_mode {
++	meson_mode	mode;
++	int8		established;
++		// bit of EDID bytes 0x23 to 0x25 read as one big-endian number;
++		// -1: only a standard timing names it
++};
++
++static const dmt_mode kDmtModes[] = {
++	{ { 25175, 640, 16, 96, 48, 480, 10, 2, 33, false, false, 1 }, 21 },
++	{ { 31500, 640, 24, 40, 128, 480, 9, 3, 28, false, false, 0 }, 19 },
++	{ { 31500, 640, 16, 64, 120, 480, 1, 3, 16, false, false, 0 }, 18 },
++	{ { 36000, 800, 24, 72, 128, 600, 1, 2, 22, true, true, 0 }, 17 },
++	{ { 40000, 800, 40, 128, 88, 600, 1, 4, 23, true, true, 0 }, 16 },
++	{ { 50000, 800, 56, 120, 64, 600, 37, 6, 23, true, true, 0 }, 15 },
++	{ { 49500, 800, 16, 80, 160, 600, 1, 3, 21, true, true, 0 }, 14 },
++	{ { 65000, 1024, 24, 136, 160, 768, 3, 6, 29, false, false, 0 }, 11 },
++	{ { 75000, 1024, 24, 136, 144, 768, 3, 6, 29, false, false, 0 }, 10 },
++	{ { 78750, 1024, 16, 96, 176, 768, 1, 3, 28, true, true, 0 }, 9 },
++	{ { 135000, 1280, 16, 144, 248, 1024, 1, 3, 38, true, true, 0 }, 8 },
++	{ { 108000, 1152, 64, 128, 256, 864, 1, 3, 32, true, true, 0 }, -1 },
++	{ { 83500, 1280, 72, 128, 200, 800, 3, 6, 22, false, true, 0 }, -1 },
++	{ { 108000, 1280, 96, 112, 312, 960, 1, 3, 36, true, true, 0 }, -1 },
++	{ { 108000, 1280, 48, 112, 248, 1024, 1, 3, 38, true, true, 0 }, -1 },
++	{ { 121750, 1400, 88, 144, 232, 1050, 3, 4, 32, false, true, 0 }, -1 },
++	{ { 106500, 1440, 80, 152, 232, 900, 3, 6, 25, false, true, 0 }, -1 },
++	{ { 108000, 1600, 24, 80, 96, 900, 1, 3, 96, true, true, 0 }, -1 },
++	{ { 162000, 1600, 64, 192, 304, 1200, 1, 3, 46, true, true, 0 }, -1 },
++	{ { 146250, 1680, 104, 176, 280, 1050, 3, 6, 30, false, true, 0 }, -1 },
++	{ { 193250, 1920, 136, 200, 336, 1200, 3, 6, 36, false, true, 0 }, -1 },
++};
++
++
++static uint32
++mode_h_total(const meson_mode& mode)
++{
++	return mode.hActive + mode.hFront + mode.hSync + mode.hBack;
++}
++
++
++static uint32
++mode_v_total(const meson_mode& mode)
++{
++	return mode.vActive + mode.vFront + mode.vSync + mode.vBack;
++}
++
++
++static uint32
++mode_refresh(const meson_mode& mode)
++{
++	uint32 frame = mode_h_total(mode) * mode_v_total(mode);
++	return (mode.pixelClock * 1000 + frame / 2) / frame;
++}
++
++
++/*!	The same picture: equal sizes and totals, clocks within 0.5% (so that
++	VIC 1's 25.2 MHz is DMT's 25.175 MHz).
++*/
++static bool
++same_timing(const meson_mode& a, const meson_mode& b)
++{
++	uint32 difference = a.pixelClock > b.pixelClock
++		? a.pixelClock - b.pixelClock : b.pixelClock - a.pixelClock;
++	return a.hActive == b.hActive && a.vActive == b.vActive
++		&& mode_h_total(a) == mode_h_total(b)
++		&& mode_v_total(a) == mode_v_total(b)
++		&& difference * 200 <= a.pixelClock;
++}
++
++
++/*!	What the PLL, the encoder and the frame composer can make: a progressive
++	mode in the frame buffer, with blanking the composer's registers hold.
++*/
++static bool
++mode_is_valid(const meson_mode& mode)
++{
++	return mode.pixelClock >= kMinPixelClock
++		&& mode.pixelClock < kMaxPixelClock
++		&& mode.hActive >= 320 && mode.hActive <= kMaxWidth
++		&& mode.vActive >= 200 && mode.vActive <= kMaxHeight
++		&& mode.hFront > 0 && mode.hSync > 0 && mode.hBack > 0
++		&& mode.vFront > 0 && mode.vSync > 0 && mode.vBack > 0
++		&& mode.hFront + mode.hSync + mode.hBack < 4096
++		&& mode.vFront + mode.vSync + mode.vBack < 256
++		&& mode.vSync < 64;
++}
++
++
++struct hdmi_pll {
++	uint32	m;
++	uint32	frac;
++	uint32	od1, od2;		// register codes: log2 of the divider
++};
++
++
++/*!	The PLL setting for a pixel clock: the highest VCO the dividers allow,
++	which is U-Boot's 5940 MHz for 74.25 and 148.5 MHz.
++*/
++static bool
++compute_hdmi_pll(uint32 pixelClock, hdmi_pll& pll)
++{
++	for (int32 log2Divider = 6; log2Divider >= 0; log2Divider--) {
++		uint64 vco = (uint64)pixelClock * 10 << log2Divider;		// kHz
++		uint32 m = vco / 48000;
++		uint32 frac = ((vco % 48000) * 4096 + 24000) / 48000;
++		if (frac == 4096) {
++			m++;
++			frac = 0;
++		}
++		if (m < kHdmiPllMinM || m > kHdmiPllMaxM)
++			continue;
++		pll.m = m;
++		pll.frac = frac;
++		// OD1 up to /4 first, as U-Boot has it; OD2 the rest
++		pll.od1 = log2Divider > 5 ? log2Divider - 3 : min_c(log2Divider, 2);
++			// 64 is /8 twice
++		pll.od2 = log2Divider - pll.od1;
++		return true;
++	}
++	return false;
++}
++
+ 
+ static void
+ mode_to_display_mode(const meson_mode& mode, display_mode& displayMode)
+@@ -328,16 +472,47 @@ mode_to_display_mode(const meson_mode& mode, display_mode& displayMode)
+ }
+ 
+ 
++/*!	A display_mode with a complete timing as a mode; false if its timing is
++	not one or not one the hardware can make.
++*/
++static bool
++display_mode_to_mode(const display_mode& displayMode, meson_mode& mode)
++{
++	const display_timing& timing = displayMode.timing;
++	if (timing.h_sync_start <= timing.h_display
++		|| timing.h_sync_end <= timing.h_sync_start
++		|| timing.h_total <= timing.h_sync_end
++		|| timing.v_sync_start <= timing.v_display
++		|| timing.v_sync_end <= timing.v_sync_start
++		|| timing.v_total <= timing.v_sync_end
++		|| (timing.flags & B_TIMING_INTERLACED) != 0) {
++		return false;
++	}
++	mode.pixelClock = timing.pixel_clock;
++	mode.hActive = timing.h_display;
++	mode.hFront = timing.h_sync_start - timing.h_display;
++	mode.hSync = timing.h_sync_end - timing.h_sync_start;
++	mode.hBack = timing.h_total - timing.h_sync_end;
++	mode.vActive = timing.v_display;
++	mode.vFront = timing.v_sync_start - timing.v_display;
++	mode.vSync = timing.v_sync_end - timing.v_sync_start;
++	mode.vBack = timing.v_total - timing.v_sync_end;
++	mode.hSyncPositive = (timing.flags & B_POSITIVE_HSYNC) != 0;
++	mode.vSyncPositive = (timing.flags & B_POSITIVE_VSYNC) != 0;
++	mode.vic = 0;
++	hdmi_pll pll;
++	return mode_is_valid(mode) && compute_hdmi_pll(mode.pixelClock, pll);
++}
++
++
+ static bool
+ display_mode_matches(const display_mode& displayMode, const meson_mode& mode)
+ {
+ 	const display_timing& timing = displayMode.timing;
+ 	return timing.h_display == mode.hActive
+ 		&& timing.v_display == mode.vActive
+-		&& timing.h_total == mode.hActive + mode.hFront + mode.hSync
+-			+ mode.hBack
+-		&& timing.v_total == mode.vActive + mode.vFront + mode.vSync
+-			+ mode.vBack
++		&& timing.h_total == mode_h_total(mode)
++		&& timing.v_total == mode_v_total(mode)
+ 		&& timing.pixel_clock >= mode.pixelClock - 100
+ 		&& timing.pixel_clock <= mode.pixelClock + 100;
+ }
+@@ -448,10 +623,14 @@ private:
+ 
+ 			status_t			_ReadEdidBlock(uint32 block, uint8* data);
+ 			status_t			_ReadEdid();
++			const uint8*		_CtaExtension();
++			uint32				_DetailedTimings(const uint8** timings,
++									uint32 maxCount);
+ 			bool				_EdidLists(const meson_mode& mode);
+ 			void				_CheckBootMode();
+ 			void				_SaveBootState();
+ 			status_t			_AllocateFrameBuffer();
++			void				_AddMode(const meson_mode& mode);
+ 			void				_BuildModeList();
+ 
+ 			void				_SetCanvas(phys_addr_t address,
+@@ -466,6 +645,7 @@ private:
+ 			void				_HideOverlay();
+ 			void				_ResetPhy();
+ 			status_t			_WaitForPllLock();
++			status_t			_SetHdmiPll(uint32 control, uint32 control2);
+ 			status_t			_ProgramMode(const meson_mode& mode,
+ 									phys_addr_t frameBuffer,
+ 									uint32 bytesPerRow);
+@@ -509,11 +689,16 @@ private:
+ 			};
+ 			saved_register		fBootVpu[48];
+ 			uint32				fBootVpuCount;
++			uint32				fBootPllCntl;
+ 			uint32				fBootPllCntl2;
+ 			uint8				fBootComposer[14];
+ 			bool				fBootStateSaved;
+-			const meson_mode*	fMode;
+-				// set by SetDisplayMode(); NULL: U-Boot's
++			meson_mode			fModes[MESON_HDMI_MAX_MODES];
++			uint32				fModeCount;
++				// the list in the shared info, as modes
++			meson_mode			fMode;
++			bool				fModeSet;
++				// by SetDisplayMode(); false: U-Boot's mode is shown
+ 			uint32				fPhyControl0;
+ 				// while the output is off (DPMS)
+ 
+@@ -541,6 +726,7 @@ static const uint32 kSavedVpuWords[] = {
+ 	ENCP_DE_H_BEGIN, ENCP_DE_H_END, ENCP_DE_V_BEGIN_EVEN, ENCP_DE_V_END_EVEN,
+ 	ENCP_DVI_HSO_BEGIN, ENCP_DVI_HSO_END, ENCP_DVI_VSO_BLINE_EVN,
+ 	ENCP_DVI_VSO_ELINE_EVN, ENCP_DVI_VSO_BEGIN_EVN, ENCP_DVI_VSO_END_EVN,
++	VPU_HDMI_SETTING,
+ };
+ 
+ static const uint32 kSavedComposer[] = {
+@@ -580,9 +766,11 @@ MesonHdmi::MesonHdmi(device_node* node)
+ 	fBootFrameBuffer(0),
+ 	fEdidSize(0),
+ 	fBootVpuCount(0),
++	fBootPllCntl(0),
+ 	fBootPllCntl2(0),
+ 	fBootStateSaved(false),
+-	fMode(NULL),
++	fModeCount(0),
++	fModeSet(false),
+ 	fPhyControl0(0),
+ 	fOverlayPhysical(0),
+ 	fOverlayCanvas(0),
+@@ -770,78 +958,259 @@ MesonHdmi::_AllocateFrameBuffer()
+ }
+ 
+ 
+-/*!	The modes of kModes that the EDID lists (as a detailed timing or a CTA
+-	video code); all of them without an EDID.
++/*!	A detailed timing descriptor as a mode; false for an interlaced one. */
++static bool
++dtd_to_mode(const uint8* dtd, meson_mode& mode)
++{
++	if ((dtd[17] & 0x80) != 0)
++		return false;
++	uint32 hBlank = dtd[3] | ((dtd[4] & 0x0f) << 8);
++	uint32 vBlank = dtd[6] | ((dtd[7] & 0x0f) << 8);
++	mode.pixelClock = (dtd[0] | (dtd[1] << 8)) * 10;
++	mode.hActive = dtd[2] | ((dtd[4] & 0xf0) << 4);
++	mode.vActive = dtd[5] | ((dtd[7] & 0xf0) << 4);
++	mode.hFront = dtd[8] | ((dtd[11] & 0xc0) << 2);
++	mode.hSync = dtd[9] | ((dtd[11] & 0x30) << 4);
++	mode.vFront = (dtd[10] >> 4) | ((dtd[11] & 0x0c) << 2);
++	mode.vSync = (dtd[10] & 0x0f) | ((dtd[11] & 0x03) << 4);
++	if (hBlank <= (uint32)mode.hFront + mode.hSync
++		|| vBlank <= (uint32)mode.vFront + mode.vSync) {
++		return false;
++	}
++	mode.hBack = hBlank - mode.hFront - mode.hSync;
++	mode.vBack = vBlank - mode.vFront - mode.vSync;
++	// digital separate syncs: bit 2 is the vertical, bit 1 the horizontal
++	// polarity
++	mode.vSyncPositive = (dtd[17] & 0x1c) == 0x1c;
++	mode.hSyncPositive = (dtd[17] & 0x02) != 0;
++	mode.vic = 0;
++	return true;
++}
++
++
++/*!	The DMT or CEA mode a standard timing (two bytes) names, if any. */
++static const meson_mode*
++standard_timing_mode(const uint8* timing, bool squareIsZero)
++{
++	if (timing[0] <= 0x01)
++		return NULL;		// unused (0x01 0x01)
++	uint32 width = (timing[0] + 31) * 8;
++	uint32 height;
++	switch (timing[1] >> 6) {
++		case 0:
++			// 16:10 since EDID 1.3, 1:1 before
++			height = squareIsZero ? width : width * 10 / 16;
++			break;
++		case 1:
++			height = width * 3 / 4;
++			break;
++		case 2:
++			height = width * 4 / 5;
++			break;
++		default:
++			height = width * 9 / 16;
++			break;
++	}
++	uint32 refresh = (timing[1] & 0x3f) + 60;
++	for (size_t i = 0; i < B_COUNT_OF(kDmtModes); i++) {
++		const meson_mode& mode = kDmtModes[i].mode;
++		if (mode.hActive == width && mode.vActive == height
++			&& mode_refresh(mode) == refresh) {
++			return &mode;
++		}
++	}
++	for (size_t i = 0; i < B_COUNT_OF(kModes); i++) {
++		if (kModes[i].hActive == width && kModes[i].vActive == height
++			&& mode_refresh(kModes[i]) == refresh) {
++			return &kModes[i];
++		}
++	}
++	return NULL;
++}
++
++
++/*!	Adds a mode to the list unless the hardware can't make it or the list
++	has its timing already.
++*/
++void
++MesonHdmi::_AddMode(const meson_mode& mode)
++{
++	hdmi_pll pll;
++	if (!mode_is_valid(mode) || !compute_hdmi_pll(mode.pixelClock, pll))
++		return;
++	for (uint32 i = 0; i < fModeCount; i++) {
++		if (same_timing(fModes[i], mode))
++			return;
++	}
++	if (fModeCount == MESON_HDMI_MAX_MODES) {
++		INFO("mode list full, %ux%u left out\n", mode.hActive, mode.vActive);
++		return;
++	}
++	fModes[fModeCount++] = mode;
++}
++
++
++/*!	The modes the EDID lists that the hardware can make, in order of size and
++	refresh rate: the CEA modes by video code or detailed timing, the DMT
++	modes by established or standard timing, and the other detailed timings
++	as they are. Without an EDID, the CEA modes of U-Boot's clock.
++	Preferred is 1080p60 or else the boot mode's size, as before there were
++	other modes, then the EDID's first detailed timing (the display's
++	native mode).
+ */
+ void
+ MesonHdmi::_BuildModeList()
+ {
+-	fShared->mode_count = 0;
+-	fShared->preferred_mode = 0;
++	fModeCount = 0;
+ 	for (size_t i = 0; i < B_COUNT_OF(kModes); i++) {
+-		if (fEdidSize > 0 && !_EdidLists(kModes[i]))
+-			continue;
+-		uint32 index = fShared->mode_count++;
+-		mode_to_display_mode(kModes[i], fShared->modes[index]);
+-		if (kModes[i].vic == kPreferredVic
+-			|| (kModes[i].hActive == fBootWidth
+-				&& kModes[i].vActive == fBootHeight
+-				&& kModes[fShared->preferred_mode].vic != kPreferredVic)) {
+-			fShared->preferred_mode = index;
++		if (fEdidSize > 0 ? _EdidLists(kModes[i])
++				: kModes[i].pixelClock % 74250 == 0) {
++			_AddMode(kModes[i]);
+ 		}
+-		INFO("mode %ux%u, %" B_PRIu32 " kHz (VIC %u)\n", kModes[i].hActive,
+-			kModes[i].vActive, kModes[i].pixelClock, kModes[i].vic);
+ 	}
++
++	const uint8* timings[16];
++	uint32 timingCount = 0;
++	if (fEdidSize > 0) {
++		uint32 established = ((uint32)fEdid[0x23] << 16)
++			| ((uint32)fEdid[0x24] << 8) | fEdid[0x25];
++		for (size_t i = 0; i < B_COUNT_OF(kDmtModes); i++) {
++			if (kDmtModes[i].established >= 0
++				&& (established & (1u << kDmtModes[i].established)) != 0) {
++				_AddMode(kDmtModes[i].mode);
++			}
++		}
++		bool squareIsZero = fEdid[0x12] == 1 && fEdid[0x13] < 3;
++		for (uint32 offset = 0x26; offset < 0x36; offset += 2) {
++			const meson_mode* mode = standard_timing_mode(fEdid + offset,
++				squareIsZero);
++			if (mode != NULL)
++				_AddMode(*mode);
++		}
++		timingCount = _DetailedTimings(timings, B_COUNT_OF(timings));
++		for (uint32 i = 0; i < timingCount; i++) {
++			meson_mode mode;
++			if (dtd_to_mode(timings[i], mode))
++				_AddMode(mode);
++		}
++	}
++
++	// in order of width, height, then refresh rate
++	for (uint32 i = 1; i < fModeCount; i++) {
++		meson_mode mode = fModes[i];
++		uint32 j = i;
++		for (; j > 0; j--) {
++			const meson_mode& other = fModes[j - 1];
++			if (other.hActive < mode.hActive
++				|| (other.hActive == mode.hActive
++					&& (other.vActive < mode.vActive
++						|| (other.vActive == mode.vActive
++							&& mode_refresh(other) <= mode_refresh(mode))))) {
++				break;
++			}
++			fModes[j] = other;
++		}
++		fModes[j] = mode;
++	}
++
++	meson_mode native;
++	bool haveNative = timingCount > 0 && dtd_to_mode(timings[0], native);
++	int32 preferred = -1;
++	int32 bootSize = -1;
++	int32 nativeIndex = -1;
++	fShared->mode_count = fModeCount;
++	for (uint32 i = 0; i < fModeCount; i++) {
++		const meson_mode& mode = fModes[i];
++		mode_to_display_mode(mode, fShared->modes[i]);
++		if (mode.vic == kPreferredVic)
++			preferred = i;
++		if (bootSize < 0 && mode.hActive == fBootWidth
++			&& mode.vActive == fBootHeight) {
++			bootSize = i;
++		}
++		if (haveNative && same_timing(mode, native))
++			nativeIndex = i;
++		INFO("mode %ux%u@%" B_PRIu32 ", %" B_PRIu32 " kHz%s%s\n", mode.hActive,
++			mode.vActive, mode_refresh(mode), mode.pixelClock,
++			mode.hSyncPositive ? " +h" : " -h",
++			mode.vSyncPositive ? "+v" : "-v");
++	}
++	if (preferred < 0)
++		preferred = bootSize;
++	if (preferred < 0)
++		preferred = nativeIndex;
++	fShared->preferred_mode = max_c(preferred, 0);
+ }
+ 
+ 
+-static bool
+-dtd_matches(const uint8* dtd, const meson_mode& mode)
++/*!	The CTA-861 extension, if the EDID has one: data blocks from byte 4,
++	detailed timings from the offset in byte 2.
++*/
++const uint8*
++MesonHdmi::_CtaExtension()
+ {
+-	uint32 clock = dtd[0] | (dtd[1] << 8);		// 10 kHz units
+-	uint32 hActive = dtd[2] | ((dtd[4] & 0xf0) << 4);
+-	uint32 vActive = dtd[5] | ((dtd[7] & 0xf0) << 4);
+-	return clock == mode.pixelClock / 10 && hActive == mode.hActive
+-		&& vActive == mode.vActive;
++	if (fEdidSize < 256 || fEdid[128] != 0x02)
++		return NULL;
++	const uint8* cta = fEdid + 128;
++	if (cta[2] < 4 || cta[2] > 127)
++		return NULL;
++	return cta;
+ }
+ 
+ 
+-bool
+-MesonHdmi::_EdidLists(const meson_mode& mode)
++/*!	The detailed timings of the base block and the CTA-861 extension, the
++	display's preferred one first. Descriptors with a zero clock are
++	monitor descriptors.
++*/
++uint32
++MesonHdmi::_DetailedTimings(const uint8** timings, uint32 maxCount)
+ {
+-	// detailed timings of the base block (descriptors with a zero clock
+-	// are monitor descriptors)
+-	for (uint32 offset = 54; offset <= 108; offset += 18) {
+-		if (dtd_matches(fEdid + offset, mode))
+-			return true;
++	uint32 count = 0;
++	for (uint32 offset = 54; offset <= 108 && count < maxCount;
++			offset += 18) {
++		if (fEdid[offset] != 0 || fEdid[offset + 1] != 0)
++			timings[count++] = fEdid + offset;
+ 	}
+-	if (fEdidSize < 256 || fEdid[128] != 0x02)
+-		return false;
++	const uint8* cta = _CtaExtension();
++	if (cta == NULL)
++		return count;
++	for (uint32 offset = cta[2]; offset + 18 <= 127 && count < maxCount;
++			offset += 18) {
++		if (cta[offset] == 0 && cta[offset + 1] == 0)
++			break;
++		timings[count++] = cta + offset;
++	}
++	return count;
++}
+ 
+-	// CTA-861 extension: data blocks from byte 4, detailed timings from
+-	// the offset in byte 2
+-	const uint8* cta = fEdid + 128;
+-	uint32 dtdOffset = cta[2];
+-	if (dtdOffset < 4 || dtdOffset > 127)
+-		return false;
+-	for (uint32 i = 4; i < dtdOffset;) {
+-		uint8 header = cta[i];
+-		uint32 length = header & 0x1f;
+-		if ((header >> 5) == 2) {	// video data block
+-			for (uint32 j = 1; j <= length && i + j < dtdOffset; j++) {
+-				uint8 vic = cta[i + j];
+-				if (vic >= 129 && vic <= 192)
+-					vic &= 0x7f;	// "native" flag
+-				if (vic == mode.vic)
+-					return true;
++
++bool
++MesonHdmi::_EdidLists(const meson_mode& mode)
++{
++	const uint8* cta = _CtaExtension();
++	if (cta != NULL) {
++		uint32 dtdOffset = cta[2];
++		for (uint32 i = 4; i < dtdOffset;) {
++			uint8 header = cta[i];
++			uint32 length = header & 0x1f;
++			if ((header >> 5) == 2) {	// video data block
++				for (uint32 j = 1; j <= length && i + j < dtdOffset; j++) {
++					uint8 vic = cta[i + j];
++					if (vic >= 129 && vic <= 192)
++						vic &= 0x7f;	// "native" flag
++					if (vic == mode.vic)
++						return true;
++				}
+ 			}
++			i += length + 1;
+ 		}
+-		i += length + 1;
+ 	}
+-	for (uint32 offset = dtdOffset; offset + 18 <= 127; offset += 18) {
+-		if (cta[offset] == 0 && cta[offset + 1] == 0)
+-			break;
+-		if (dtd_matches(cta + offset, mode))
++
++	const uint8* timings[16];
++	uint32 count = _DetailedTimings(timings, B_COUNT_OF(timings));
++	for (uint32 i = 0; i < count; i++) {
++		meson_mode listed;
++		if (dtd_to_mode(timings[i], listed) && same_timing(listed, mode))
+ 			return true;
+ 	}
+ 	return false;
+@@ -857,6 +1226,7 @@ MesonHdmi::_SaveBootState()
+ 		fBootVpu[fBootVpuCount].value = _Vpu(kSavedVpuWords[i]);
+ 		fBootVpuCount++;
+ 	}
++	fBootPllCntl = _Hhi(HHI_HDMI_PLL_CNTL);
+ 	fBootPllCntl2 = _Hhi(HHI_HDMI_PLL_CNTL2);
+ 	for (size_t i = 0; i < B_COUNT_OF(kSavedComposer); i++)
+ 		fBootComposer[i] = _DwRead(kSavedComposer[i]);
+@@ -894,7 +1264,7 @@ MesonHdmi::_ResetPhy()
+ status_t
+ MesonHdmi::_WaitForPllLock()
+ {
+-	for (int32 i = 0; i < 100; i++) {
++	for (int32 i = 0; i < 500; i++) {
+ 		if ((_Hhi(HHI_HDMI_PLL_CNTL) & HDMI_PLL_LOCK) != 0)
+ 			return B_OK;
+ 		spin(100);
+@@ -903,7 +1273,32 @@ MesonHdmi::_WaitForPllLock()
+ }
+ 
+ 
+-/*!	Blanks, programs a mode from kModes and shows \a frameBuffer in it. */
++/*!	Gives the HDMI PLL new control words and waits for its lock. Only the
++	post dividers changing, the VCO keeps running; a new M or fraction
++	restarts it: reset, the dividers, out of reset. CNTL3 to CNTL6 keep
++	U-Boot's values, which are the same for every rate.
++*/
++status_t
++MesonHdmi::_SetHdmiPll(uint32 control, uint32 control2)
++{
++	const uint32 vcoMask = HDMI_PLL_FRAC_ENABLE | HDMI_PLL_FRAC_MASK;
++	control &= ~(HDMI_PLL_LOCK | HDMI_PLL_RESET);
++	if ((_Hhi(HHI_HDMI_PLL_CNTL) & HDMI_PLL_M_MASK)
++			== (control & HDMI_PLL_M_MASK)
++		&& (_Hhi(HHI_HDMI_PLL_CNTL2) & vcoMask) == (control2 & vcoMask)) {
++		if (_Hhi(HHI_HDMI_PLL_CNTL2) != control2)
++			_SetHhi(HHI_HDMI_PLL_CNTL2, control2);
++		return _WaitForPllLock();
++	}
++	_SetHhi(HHI_HDMI_PLL_CNTL, control | HDMI_PLL_RESET);
++	_SetHhi(HHI_HDMI_PLL_CNTL2, control2);
++	spin(10);
++	_SetHhi(HHI_HDMI_PLL_CNTL, control);
++	return _WaitForPllLock();
++}
++
++
++/*!	Blanks, programs a mode and shows \a frameBuffer in it. */
+ status_t
+ MesonHdmi::_ProgramMode(const meson_mode& mode, phys_addr_t frameBuffer,
+ 	uint32 bytesPerRow)
+@@ -911,19 +1306,37 @@ MesonHdmi::_ProgramMode(const meson_mode& mode, phys_addr_t frameBuffer,
+ 	encp_timing timing;
+ 	compute_encp(mode, timing);
+ 
++	hdmi_pll pll;
++	if (!compute_hdmi_pll(mode.pixelClock, pll))
++		return B_BAD_VALUE;
++
+ 	_SetVpu(VIU_OSD1_CTRL_STAT, _Vpu(VIU_OSD1_CTRL_STAT) & ~OSD_ENABLE);
+ 	_SetVpu(ENCP_VIDEO_EN, 0);
+ 
+-	uint32 od2 = mode.pixelClock == 148500 ? 0 : 1;
+-	uint32 cntl2 = _Hhi(HHI_HDMI_PLL_CNTL2);
+-	if ((cntl2 & HDMI_PLL_OD2_MASK) != (od2 << HDMI_PLL_OD2_SHIFT)) {
+-		_SetHhi(HHI_HDMI_PLL_CNTL2, (cntl2 & ~HDMI_PLL_OD2_MASK)
+-			| (od2 << HDMI_PLL_OD2_SHIFT));
+-	}
+-	if (_WaitForPllLock() != B_OK) {
+-		INFO("HDMI PLL does not lock\n");
++	uint32 control = (_Hhi(HHI_HDMI_PLL_CNTL) & ~HDMI_PLL_M_MASK) | pll.m;
++	uint32 control2 = (_Hhi(HHI_HDMI_PLL_CNTL2)
++			& ~(HDMI_PLL_OD_MASK | HDMI_PLL_FRAC_ENABLE | HDMI_PLL_FRAC_MASK))
++		| (pll.frac != 0 ? HDMI_PLL_FRAC_ENABLE | pll.frac : 0)
++		| (pll.od1 << HDMI_PLL_OD1_SHIFT) | (pll.od2 << HDMI_PLL_OD2_SHIFT);
++	bigtime_t start = system_time();
++	if (_SetHdmiPll(control, control2) != B_OK) {
++		INFO("HDMI PLL does not lock (M %" B_PRIu32 ", frac %#" B_PRIx32
++			")\n", pll.m, pll.frac);
+ 		return B_ERROR;
+ 	}
++	INFO("HDMI PLL M %" B_PRIu32 ", frac %#" B_PRIx32 ", OD /%d /%d: locked "
++		"in %" B_PRIdBIGTIME " us\n", pll.m, pll.frac, 1 << pll.od1,
++		1 << pll.od2, system_time() - start);
++
++	// the VPU hands the HDMI controller syncs of the mode's polarity, and
++	// the frame composer expects them so
++	uint32 hdmiSetting = _Vpu(VPU_HDMI_SETTING)
++		& ~(VPU_HDMI_HSYNC_HIGH | VPU_HDMI_VSYNC_HIGH);
++	if (mode.hSyncPositive)
++		hdmiSetting |= VPU_HDMI_HSYNC_HIGH;
++	if (mode.vSyncPositive)
++		hdmiSetting |= VPU_HDMI_VSYNC_HIGH;
++	_SetVpu(VPU_HDMI_SETTING, hdmiSetting);
+ 
+ 	_SetVpu(ENCP_VIDEO_MAX_PXCNT, timing.maxPixel);
+ 	_SetVpu(ENCP_VIDEO_MAX_LNCNT, timing.maxLine);
+@@ -991,18 +1404,27 @@ MesonHdmi::_ProgramMode(const meson_mode& mode, phys_addr_t frameBuffer,
+ }
+ 
+ 
++/*!	Sets a mode of the list, or else any whose complete timing the
++	hardware can make (for trying modes the EDID doesn't list).
++*/
+ status_t
+ MesonHdmi::SetDisplayMode(const display_mode& displayMode)
+ {
++	if (displayMode.space != B_RGB32)
++		return B_BAD_VALUE;
++	meson_mode listed;
+ 	const meson_mode* mode = NULL;
+-	for (size_t i = 0; i < B_COUNT_OF(kModes); i++) {
+-		if (display_mode_matches(displayMode, kModes[i])) {
+-			mode = &kModes[i];
++	for (uint32 i = 0; i < fModeCount; i++) {
++		if (display_mode_matches(displayMode, fModes[i])) {
++			mode = &fModes[i];
+ 			break;
+ 		}
+ 	}
+-	if (mode == NULL || displayMode.space != B_RGB32)
+-		return B_BAD_VALUE;
++	if (mode == NULL) {
++		if (!display_mode_to_mode(displayMode, listed))
++			return B_BAD_VALUE;
++		mode = &listed;
++	}
+ 
+ 	MutexLocker locker(fModeLock);
+ 	// the overlay's position and scaling depend on the mode; app_server
+@@ -1017,12 +1439,13 @@ MesonHdmi::SetDisplayMode(const display_mode& displayMode)
+ 	}
+ 
+ 	mode_to_display_mode(*mode, fShared->current_mode);
+-	fMode = mode;
++	fMode = *mode;
++	fModeSet = true;
+ 	fShared->bytes_per_row = bytesPerRow;
+ 	frame_buffer_update((addr_t)fFrameBuffer, mode->hActive, mode->vActive,
+ 		32, bytesPerRow);
+-	INFO("mode %ux%u, %" B_PRIu32 " kHz\n", mode->hActive, mode->vActive,
+-		mode->pixelClock);
++	INFO("mode %ux%u@%" B_PRIu32 ", %" B_PRIu32 " kHz\n", mode->hActive,
++		mode->vActive, mode_refresh(*mode), mode->pixelClock);
+ 	locker.Unlock();
+ 
+ 	// the audio sampler measured CTS against the old pixel clock
+@@ -1060,8 +1483,8 @@ MesonHdmi::SetDpmsMode(uint32 mode)
+ 		INFO("display off (DPMS %" B_PRIu32 ")\n", mode);
+ 	} else {
+ 		_SetHhi(HHI_HDMI_PHY_CNTL0, fPhyControl0);
+-		if (fMode != NULL) {
+-			status_t status = _ProgramMode(*fMode, fFrameBufferPhysical,
++		if (fModeSet) {
++			status_t status = _ProgramMode(fMode, fFrameBufferPhysical,
+ 				fShared->bytes_per_row);
+ 			if (status != B_OK)
+ 				return status;
+@@ -1083,11 +1506,10 @@ MesonHdmi::RestoreBootMode()
+ {
+ 	if (!fBootStateSaved)
+ 		return;
+-	fMode = NULL;
++	fModeSet = false;
+ 	_SetVpu(VIU_OSD1_CTRL_STAT, _Vpu(VIU_OSD1_CTRL_STAT) & ~OSD_ENABLE);
+ 	_SetVpu(ENCP_VIDEO_EN, 0);
+-	_SetHhi(HHI_HDMI_PLL_CNTL2, fBootPllCntl2);
+-	_WaitForPllLock();
++	_SetHdmiPll(fBootPllCntl, fBootPllCntl2);
+ 	for (uint32 i = 0; i < fBootVpuCount; i++) {
+ 		if (fBootVpu[i].word != VIU_OSD1_CTRL_STAT)
+ 			_SetVpu(fBootVpu[i].word, fBootVpu[i].value);

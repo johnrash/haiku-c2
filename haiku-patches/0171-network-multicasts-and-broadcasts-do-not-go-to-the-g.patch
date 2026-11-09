@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 12:02:00 -0400
+Subject: [PATCH 171/342] network: multicasts and broadcasts do not go to the
+ gateway
+
+A multicast to a group without a route of its own (224.0.0.251 for
+multicast DNS, say) takes the default route, and send_routed_data()
+put the gateway's address in the buffer's destination. ARP then made
+the Ethernet multicast address from the gateway's IPv4 address
+(01:00:5e:2a:00:01 for 10.42.0.1 instead of 01:00:5e:00:00:fb), and
+only hosts whose interface takes every frame saw the packet: a music
+player's queries for shared music libraries reached one server and not another.
+Broadcasts and multicasts now keep their destination address.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/network/stack/datalink.cpp | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/src/add-ons/kernel/network/stack/datalink.cpp b/src/add-ons/kernel/network/stack/datalink.cpp
+index df4fae254c..2d9b7ad2dc 100644
+--- a/src/add-ons/kernel/network/stack/datalink.cpp
++++ b/src/add-ons/kernel/network/stack/datalink.cpp
+@@ -400,11 +400,16 @@ datalink_send_routed_data(struct net_route* route, net_buffer* buffer)
+ 		return status;
+ 	}
+ 
+-	if ((route->flags & RTF_GATEWAY) != 0) {
++	if ((route->flags & RTF_GATEWAY) != 0
++		&& (buffer->msg_flags & (MSG_BCAST | MSG_MCAST)) == 0) {
+ 		TRACE("  gateway route\n");
+ 
+ 		// This route involves a gateway, we need to use the gateway address
+-		// instead of the destination address:
++		// instead of the destination address. Not for broadcasts and
++		// multicasts, though: they stay on the link (a multicast to a group
++		// without a route of its own takes the default route), and their
++		// link address comes from the destination address; the gateway's
++		// would give a multicast address nobody listens to.
+ 		if (route->gateway == NULL)
+ 			return B_MISMATCHED_VALUES;
+ 		memcpy(buffer->destination, route->gateway, route->gateway->sa_len);

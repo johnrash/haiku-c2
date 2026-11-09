@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 01:38:06 -0500
+Subject: [PATCH 195/342] dwc2: an isochronous stream is released with its pipe
+
+A pipe being destroyed cancels its transfers from Pipe's destructor,
+where Type() no longer says it is an isochronous pipe, so the stream was
+never released: the C920's second stream (a new alternate setting, a new
+pipe) found no free high speed stream. CancelQueuedTransfers() now looks
+for a stream of the pipe whatever its type says. The debug output of the
+high speed tests is gone (serial output keeps interrupts off for
+milliseconds, longer than a microframe).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/busses/usb/dwc2.cpp         | 18 +++++++-----------
+ .../kernel/busses/usb/dwc2_isochronous.cpp     |  9 ---------
+ 2 files changed, 7 insertions(+), 20 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.cpp b/src/add-ons/kernel/busses/usb/dwc2.cpp
+index 806a8b8bfe..c5ea567abb 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2.cpp
+@@ -686,10 +686,13 @@ DWC2::SubmitTransfer(Transfer* transfer)
+ status_t
+ DWC2::CancelQueuedTransfers(Pipe* pipe, bool force)
+ {
+-	if ((pipe->Type() & USB_OBJECT_ISO_PIPE) != 0) {
+-		_CancelIsochronous(pipe, force);
++	// an isochronous stream is found by the pipe itself: a pipe being
++	// destroyed comes here from Pipe's destructor, where Type() no longer
++	// says it is an isochronous one (and its stream was never released, so
++	// the next alternate setting's pipe found no free one)
++	_CancelIsochronous(pipe, force);
++	if ((pipe->Type() & USB_OBJECT_ISO_PIPE) != 0)
+ 		return B_OK;
+-	}
+ 
+ 	dwc2_transfer_list canceled;
+ 	dwc2_transfer* running[kLaneCount];
+@@ -1160,15 +1163,8 @@ DWC2::_Transaction(dwc2_lane* lane, Pipe* pipe, uint32 pid, bool in,
+ 
+ 	*_nextPid = (transferSize >> HCTSIZ_PID_SHIFT) & 3;
+ 	result = dwc2_channel_error(status);
+-	if (result != B_OK) {
+-		// DEBUG M45
+-		dprintf("dwc2: DEBUG device %d endpoint %d %s pid %u size %u: HCINT "
+-			"%#" B_PRIx32 ", HCTSIZ %#" B_PRIx32 ", HCCHAR %#" B_PRIx32 "\n",
+-			pipe->DeviceAddress(), pipe->EndpointAddress() & 0xf,
+-			in ? "in" : "out", pid, size, status, transferSize,
+-			_ChannelCharacteristics(pipe, in, false));
++	if (result != B_OK)
+ 		return result;
+-	}
+ 	if ((status & HCINT_XFERCOMPL) == 0) {
+ 		if ((status & HCINT_NAK) != 0) {
+ 			*_nak = true;
+diff --git a/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp b/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
+index fb5aa6b12d..03079b814b 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
+@@ -162,15 +162,6 @@ DWC2::_SubmitIsochronous(Transfer* transfer)
+ 	if (!fIsoAvailable || isochronousData == NULL)
+ 		return B_NOT_SUPPORTED;
+ 	bool highSpeed = !_NeedsSplit(pipe);
+-	// DEBUG M45
+-	dprintf("dwc2: DEBUG iso submit: high speed %d, interval %u, in %d, mps %"
+-		B_PRIu32 ", burst %u, packets %" B_PRIu32 ", length %" B_PRIuSIZE
+-		", first request %d\n", highSpeed, pipe->Interval(),
+-		pipe->Direction() == Pipe::In, (uint32)pipe->MaxPacketSize(),
+-		pipe->MaxBurst(), isochronousData->packet_count,
+-		transfer->DataLength(),
+-		isochronousData->packet_count > 0
+-			? isochronousData->packet_descriptors[0].request_length : -1);
+ 	if (highSpeed && (pipe->Interval() != 1
+ 			|| pipe->Direction() != Pipe::In)) {
+ 		// so far a packet every microframe, IN: a webcam's video

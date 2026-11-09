@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 19:39:01 -0400
+Subject: [PATCH 182/342] meson_vdec: forget hand-backs from before the
+ firmware got its frames
+
+With its frames (the answer to its command 1), the H.264 firmware takes all
+of them as free. Frames given back before that, still in the driver's queue
+or in its two places (AV_SCRATCH_7/8), were taken back once more later, when
+they could hold new pictures the reader had: after a size change, one frame
+showed the picture of a later one. The setup now drops them. The KDL dump
+names HEVC sessions.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/drivers/video/meson_vdec/meson_vdec.cpp       | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+index cb19cd193c..15907a83d7 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+@@ -1038,6 +1038,13 @@ MesonVdec::_SetupH264Frames(const uint32* info)
+ 	fHeight = 16 * mbHeight - cropBottom;
+ 	fBytesPerRow = bytesPerRow;
+ 	fLumaSize = lumaSize;
++	// With its frames, the firmware takes all of them as free: frames given
++	// back before (still queued, or in its two places) would be taken back
++	// again later, when they may hold new pictures the reader has.
++	fBackHead = 0;
++	fBackCount = 0;
++	_SetDos(AV_SCRATCH_7, 0);
++	_SetDos(AV_SCRATCH_8, 0);
+ 	_SetDos(AV_SCRATCH_1, fMotionVectors.physical);
+ 	_SetDos(AV_SCRATCH_4, fMotionVectors.physical + motionVectors);
+ 	_SetDos(AV_SCRATCH_0, (maxReferences << 24) | (count << 16)
+@@ -1597,7 +1604,7 @@ MesonVdec::Dump()
+ 	kprintf("meson_vdec: %s %s, %" B_PRIu32 "x%" B_PRIu32 ", %" B_PRIu32
+ 		" frames, %" B_PRIu32 " decoded, %" B_PRIu32 " skipped, queue %"
+ 		B_PRIu32 ", held %#" B_PRIx32 "%s%s%s\n",
+-		fCodec == MESON_VDEC_H264 ? "H.264" : "MPEG-1/2",
++		fCodec == MESON_VDEC_H264 ? "H.264" : _IsHevc() ? "HEVC" : "MPEG-1/2",
+ 		fRunning ? "running" : "stopped", fWidth, fHeight, fFrameCount,
+ 		fFramesDecoded, fFramesSkipped, fQueueCount, fHeld,
+ 		fFatal ? ", fatal error" : "",

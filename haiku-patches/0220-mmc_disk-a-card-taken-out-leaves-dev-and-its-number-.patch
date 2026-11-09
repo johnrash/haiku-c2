@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 14:04:55 -0500
+Subject: [PATCH 220/342] mmc_disk: a card taken out leaves /dev, and its
+ number is free again
+
+The device node goes only once nothing has it open, and the disk device
+manager keeps a disk open until its device leaves devfs: a removed
+card's disk/mmc/<n>/raw stayed published, and the next card got the
+next number. Now device_removed() unpublishes the raw device itself
+(open handles are disconnected) and frees its number.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/drivers/disk/mmc/mmc_disk.cpp        | 17 +++++++++++++++++
+ src/add-ons/kernel/drivers/disk/mmc/mmc_disk.h  |  2 ++
+ 2 files changed, 19 insertions(+)
+
+diff --git a/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp b/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
+index f7bff0b068..d65e5e1ba6 100644
+--- a/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
++++ b/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
+@@ -420,6 +420,7 @@ mmc_disk_init_driver(device_node* node, void** cookie)
+ 		return B_NO_MEMORY;
+ 
+ 	memset(info, 0, sizeof(*info));
++	info->publishedId = -1;
+ 
+ 	void* unused2;
+ 	info->node = node;
+@@ -513,6 +514,8 @@ mmc_disk_uninit_driver(void* _cookie)
+ {
+ 	CALLED();
+ 	mmc_disk_driver_info* info = (mmc_disk_driver_info*)_cookie;
++	if (info->publishedId >= 0)
++		sDeviceManager->free_id(MMC_DEVICE_ID_GENERATOR, info->publishedId);
+ 	delete info->scheduler;
+ 	delete info->dmaResource;
+ 	sDeviceManager->put_node(info->parent);
+@@ -528,6 +531,18 @@ mmc_disk_device_removed(void* _cookie)
+ {
+ 	mmc_disk_driver_info* info = (mmc_disk_driver_info*)_cookie;
+ 	info->removed = true;
++
++	// The device goes from /dev now: the node goes only once it isn't in
++	// use, and the disk device manager, which keeps it open, lets go of it
++	// only when the device goes. Its number is free for the next card.
++	if (info->publishedId >= 0) {
++		char name[64];
++		snprintf(name, sizeof(name), "disk/mmc/%" B_PRId32 "/raw",
++			info->publishedId);
++		sDeviceManager->unpublish_device(info->node, name);
++		sDeviceManager->free_id(MMC_DEVICE_ID_GENERATOR, info->publishedId);
++		info->publishedId = -1;
++	}
+ }
+ 
+ 
+@@ -549,6 +564,8 @@ mmc_disk_register_child_devices(void* _cookie)
+ 		MMC_DISK_DEVICE_MODULE_NAME);
+ 	if (status != B_OK)
+ 		sDeviceManager->free_id(MMC_DEVICE_ID_GENERATOR, id);
++	else
++		info->publishedId = id;
+ 	return status;
+ }
+ 
+diff --git a/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.h b/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.h
+index cdc282c956..6b2ea7768a 100644
+--- a/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.h
++++ b/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.h
+@@ -40,6 +40,8 @@ typedef struct {
+ 	uint32_t flags;
+ 	bool removed;
+ 		// the card was taken out: I/O fails at once
++	int32 publishedId;
++		// its number in /dev/disk/mmc/<n>/raw, -1 once unpublished
+ 
+ 	device_geometry geometry;
+ 

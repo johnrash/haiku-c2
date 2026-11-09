@@ -1,0 +1,335 @@
+Small test programs for the board (build: . tools/haiku-arm64-env.sh;
+$CC -O2 $HAIKU_CPPFLAGS -o <name> <name>.c; copy with tools/c2put). They
+were used to find the ICU setlocale() crash: Cortex-A53 erratum 843419
+(milestone M7 (docs/milestones.md)).
+  fptest.c    fills all 32 SIMD registers, spins, checks them (kernel FP
+              save/restore under preemption); fptest <seconds>
+  icutest.c   opens an ICU hash table as XLikelySubtagsData::load does and
+              prints its resize fields
+  icudata.c   checksums ICU's built-in data as mapped, then calls setlocale()
+  icutrace.c  LD_PRELOAD library ($CC -O2 -fPIC -shared ...): logs huge ICU
+              allocations, failed hash puts and tables opened with bad resize
+              ratios to /dev/dprintf (serial)
+To run against another libicudata/libicuuc without reflashing, copy them to
+a directory on the board and put it first in LIBRARY_PATH.
+
+Translators and the Debugger (milestone M8 (docs/milestones.md)):
+  imgcheck.cpp   which translator identifies each image and the colors
+                 GetBitmap() decodes at the quadrant centers
+  dbgtarget.c    debuggee: calls c2_target() every 200 ms (build with -O0)
+  dbgtest.cpp    dbgtest <team> <c2_target> <gCounter>: the kernel's debug
+                 support through the debug nub (breakpoints, software
+                 breakpoints, single steps, a watchpoint, a register write)
+  crashtest.cpp  crashes N calls deep (Leaf <- Recurse x N <- main), for
+                 debug_server reports and the Debugger; build with and
+                 without -g
+
+Storage and processes (milestone M10 (docs/milestones.md), M11):
+  fsbench.c      fsbench <dir> [MiB [raw device]]: sequential, small-file
+                 and random 4 KiB throughput through the file system
+  spawnrace.c    posix_spawn() through its fork path while 8 threads use
+                 malloc(); exits 1 if a spawn hangs (the vfork() heap lock
+                 bug that kept net_server from configuring the network).
+                 Against another libroot: LIBRARY_PATH must keep the default
+                 entries after the new directory (SSH sessions have none
+                 set): <dir>:%A/lib:/boot/home/config/non-packaged/lib:
+                 /boot/home/config/lib:/boot/system/non-packaged/lib:
+                 /boot/system/lib
+  audiotest.cpp  audiotest <device> [seconds [tone Hz [rate Hz]]]: a multi_audio
+                 driver (/dev/audio/hmulti/usb/1) without the media_server
+                 (launch_roster stop x-vnd.haiku-media_server, then kill
+                 media_addon_server): plays a tone, records, prints frames
+                 per second both ways, the input level and the input's
+                 frequency from its zero crossings: a cable from the output
+                 to the input gives the tone back (milestone M12 (docs/milestones.md)).
+                 Build with -I$HAIKU_SRC/headers/private/audio.
+                 AUDIOTEST_DUMP=<file>: the first input channel as raw
+                 16-bit samples, for a look at the waveform elsewhere
+  usbctl.cpp     usbctl <device> [count]: control transfers to a USB device
+                 (device descriptor, strings, status), successes and errors
+                 per request (-ldevice)
+  hubport.cpp    hubport <hub> <port>: a hub port's power off, as over-current
+                 does; the USB stack powers it again (a replug without hands)
+  tcpchurn.c     tcpchurn server|client: closes TCP connections with a reset while the peer
+                 still sends; the regression test for socket and endpoint lifetimes
+  procchurn.sh   procchurn.sh <seconds>: starts programs as fast as it can, no network
+  killblast.sh   killblast.sh [keep]: ends the board's tcpblast programs, sparing any with "keep"
+  rate2.sh       rate2.sh up|down: the Wi-Fi rate while tcpblast runs, from the interface counters
+  usbhub.cpp     usbhub <hub> status|power-cycle|clear-tt|reset-tt <port>:
+                 a hub's port status; power, transaction translator
+                 (-ldevice)
+  netwatch.cpp   netwatch [seconds [repeat]]: start_watching_network() for
+                 interface and link changes, printing each notification;
+                 first starts and stops watching <repeat> times (-lbe
+                 -lbnetapi). Change the MTU with ifconfig to see one.
+
+Crash reports (milestone M15 (docs/milestones.md)):
+  loopercrash.cpp  loopercrash [debugger|segv]: a crash in a BLooper's
+                   MessageReceived(), for checking the Debugger's reports
+  winmsg.cpp       winmsg <signature> <window> <what>: a numeric message to an
+                   app's window (MediaPlayer full screen: ... 0 0x1008)
+  beepflash.cpp    beepflash <device> [<s>]: a beep written into a multi_audio
+                   ring and a screen flash when the driver says it plays
+
+Network (milestone M17 (docs/milestones.md)):
+  ifflags.cpp    ifflags <interface> +configuring|-configuring|show: sets or
+                 clears IFF_CONFIGURING as net_server's DHCP client does,
+                 keeping the address (-lbnetapi)
+  stray-syn.py   sudo stray-syn.py <interface> <source ip> <dest ip>
+                 <dest mac> [port]: one TCP SYN for an address the board
+                 doesn't have, sent to its MAC address (run on the laptop)
+
+Registers:
+  physread.c     physread <physical address> [<words>]: 32-bit words of
+                 physical memory or device registers through /dev/misc/mem
+                 (root; reads only). The SD slot (milestone M40 (docs/milestones.md)): GPIOY_12,
+                 TFLASH_VDD_EN, is bit 12 of 0xc883443c (direction, 0 =
+                 output) and 0xc8834440 (output); GPIOAO_3, TF_IO at 3.3 V
+                 when low, bits 3 and 19 of 0xc8100024; the card pins' mux
+                 is bits 10-15 of 0xc88344b8; CARD_0-6 inputs from bit 20 of
+                 0xc8834450 (CARD_6 low: a card)
+
+Disks (milestone M46 (docs/milestones.md)):
+  bfsraw.c       bfsraw <file>...: a BFS file's block runs (direct and
+                 indirect) from its inode on the partition, and each 4 KiB
+                 page read through the file system compared with the same
+                 bytes read from the partition (root; reads only)
+  rawfind.c      rawfind <device> <start> <length> <needle>...: where in the
+                 device, at 2048-byte steps, the first 4 KiB of each needle
+                 file are (reads only)
+
+Webcam (milestone M45 (docs/milestones.md)):
+  uvcprobe.cpp   a UVC camera through usb_raw: "uvcprobe <device> modes
+                 [<format>]" probes every frame size and prints the frame
+                 and payload sizes the camera asks for and the alternate
+                 setting; "uvcprobe <device> stream <format> <frame> <fps>
+                 <seconds> [<packets>] [<file>|-] [<queued>]" commits a mode
+                 and reads isochronous transfers (<queued> of them in flight
+                 together), counting frames, payload headers, empty and
+                 failed packets, and saves the last whole frame (-lbe
+                 -ldevice)
+  medianodes.cpp medianodes: the media_server's live and dormant nodes and
+                 its defaults; medianodes video-input <node id> sets the
+                 default video input; medianodes params <node id> lists a
+                 node's discrete and continuous parameters, medianodes
+                 set-param <node id> <name> <value> sets one (-lmedia -lbe)
+  camview.cpp    camview <width> <height> <seconds> [window] [repeat <n>]:
+                 connects the default video input to a consumer of its own
+                 at that size (B_RGB32) and prints the frames a second, bad
+                 buffers and the producer team's CPU; window shows the video
+                 (at most 960 wide); repeat connects and tears down n times;
+                 exit status 0 if every run got frames (-lmedia -lbe)
+  mjpegbench.cpp mjpegbench <file.jpg> <frames> [<threads>]: a frame of a
+                 webcam's MJPEG to B_RGB32 with libjpeg-turbo (default and
+                 fast) and with FFmpeg and swscale, on 1, 2 and 4 threads
+                 (-I and the static libturbojpeg.a from deps/prefix, -I and
+                 -L for deps/ports/ffmpeg6/develop, -lavcodec -lswscale
+                 -lavutil -lbe)
+
+NeoCam and video encoding (milestone M47 (docs/milestones.md)):
+  encbench.cpp   encbench [<codec> <width> <height> <frames> [<quality>
+                 [<Mbit/s>]]]: the Media Kit's encoders writing B_RGB32
+                 frames into Matroska (/boot/home/encbench.mkv), frames a
+                 second, CPU and size a frame; with a bit rate, it is asked
+                 for (avg_field_size) and the rate written printed; without
+                 arguments the encoders there are (-lmedia -lbe)
+  avencbench.c   avencbench <codec> <width> <height> <frames> <threads>
+                 [neon]: the same through libavcodec directly, as the FFmpeg
+                 plugin drives it, conversion and encoding timed apart; with
+                 "neon" the plugin's own B_RGB32 to YUV420P converter, also
+                 compared with swscale (build in the file's comment)
+  mjpegvdec.cpp  mjpegvdec <gxl_mjpeg.bin> <file.jpg> [pictures] [out.yuv|-]
+                 [cut every]: meson_vdec's MJPEG session on a JPEG picture
+                 written that many times: when each frame comes, frame
+                 hashes, cut-short pictures; the first frame as planar YUV
+                 and as B_RGB32 through usb_webcam's i420_neon.c (build with
+                 it and -I its directory, and -I headers/private/drivers)
+  mictest.cpp    mictest [seconds] [output]: records the default audio
+                 input through BMediaRecorder as NeoCam does; the format,
+                 buffers, bytes and level (-lmedia -lbe)
+  aactest.cpp    aactest <file.mkv> [seconds] [video codec|none]: a Matroska
+                 file as NeoCam's VideoRecorder writes it, a 440 Hz tone in
+                 AAC (else FLAC) next to a moving bar in H.264 (or another
+                 encoder), one thread each; each step's status (-lmedia -lbe)
+  aacopen.c      aacopen [rate] [channels] [bit rate]: FFmpeg's AAC encoder
+                 opened as the plugin opens it, with FFmpeg's log, and the
+                 16-bit to planar float conversion (build in the file)
+  neocamset.cpp  neocamset [<name>:<type>=<value>...]: shows or changes
+                 NeoCam's settings file, for tests without typing into its
+                 window (-lbe)
+
+Hardware H.264 encoding (milestone M48 (docs/milestones.md); build: $CXX -O2 $HAIKU_CPPFLAGS
+-I<haiku>/headers/private/drivers):
+  venctest.cpp   venctest <microcode> <width> <height> <frames> <out.h264>
+                 [nv12|nv21|rgb24|rgb32] [qp <n>] [gop <n>] [nr]
+                 [raw <file>]: a moving test picture through meson_venc (the
+                 microcode from tools/venc-firmware.sh), the stream in Annex
+                 B form for FFmpeg on the laptop, each picture's size and
+                 the hardware's time; raw writes the input pictures too, for
+                 a PSNR against the decoded stream
+
+Screen savers (milestone M19 (docs/milestones.md)):
+  saverrun.cpp   saverrun <add-on> [-direct] [<seconds> [<width> <height>]]
+                 [<setting>=<int32>...]: runs a screen saver add-on in a window
+                 as the runner does, with those settings, and prints its
+                 Draw() calls per second, their average and longest time and
+                 how many took over 16.7 ms; -direct: a BDirectWindow, as the
+                 runner's, with DirectConnected() and DirectDraw() for the
+                 saver (-lbe -lgame -lscreensaver,
+                 -I.../headers/os/add-ons/screen_saver)
+  saverset.cpp   saverset [<module> [<setting>=<int32>...]]: shows or sets the
+                 ScreenSaver module and that module's integer settings, which
+                 screen_blanker reads when it starts (-lbe -lscreensaver,
+                 -I.../headers/private/screen_saver)
+
+Scheduling (milestone M21 (docs/milestones.md)):
+  condwake.c     condwake m|s|sn [pin]: how soon four waiting threads start
+                 when one thread signals them (mutex and condition variable,
+                 a semaphore each, or with B_DO_NOT_RESCHEDULE), and how long
+                 the signalling thread then waits beyond their work; release_sem()
+                 that reschedules cost the releasing thread 120-560 us each
+
+Media (milestone M21 (docs/milestones.md)):
+  mediadecode.cpp mediadecode <file> [<frames> [yuv420|ycbcr422|rgb32
+                 [<seek s> [<after frames> [frame]]]]]: decodes the first
+                 video track through BMediaFile/BMediaTrack (the codec
+                 add-ons MediaPlayer uses): each frame's start time and
+                 decoding time, errors, and a hash of all decoded bytes
+                 (-lmedia -lbe)
+
+File systems (milestone M21 (docs/milestones.md)):
+  smallfiles.c   smallfiles <dir> [<count>]: creates <count> 8 KiB files
+                 without syncing, timed
+  fillfs.c       fillfs <dir> [<rounds>]: fills a volume until it runs out
+                 of space, deletes half, again: BFS aborts sub transactions
+                 (a RAM disk, or since M25 7b a disk image)
+
+Display (milestone M21 (docs/milestones.md)):
+  hdmitest.cpp   hdmitest dpms [on|standby|suspend|off [<s>]]: DPMS through
+                 app_server; hdmitest list: meson_hdmi's mode list;
+                 hdmitest set <index> [<s>]: a mode of the list through
+                 app_server for <s> seconds (M25); hdmitest mode <w> <h>
+                 <total w> <total h> <kHz>: a listed mode straight through
+                 meson_hdmi; hdmitest timing <kHz> <w> <hss> <hse> <htotal>
+                 <h> <vss> <vse> <vtotal> [+h] [+v]: any timing that way
+                 (-lbe, -I.../headers/private/graphics/meson_hdmi)
+
+Scheduler (milestone M21 (docs/milestones.md), M25):
+  condwake.c     condwake m|s|sn [p]: how soon four threads start once one
+                 thread signals them (mutex+cond, semaphores, semaphores
+                 without rescheduling); per-thread median, 90% and maximum;
+                 CONDWAKE_SLOW=1 lists the rounds over 1 ms with their times
+                 and thread IDs, for a kernel trace
+  pingpong.c     pingpong s|p|t [<rounds>]: request/reply round trips
+                 between two threads (semaphores, ports) or two teams
+
+Video decoder (milestone M26 (docs/milestones.md)):
+  vdectest.cpp   vdectest <firmware> <stream> <output> [<write KB>]: decodes
+                 an MPEG-1/2, H.264 (.h264) or HEVC (.hevc) elementary
+                 stream with meson_vdec and writes the frames as NV12 for
+                 tools/vdec-compare.py (streams and FFmpeg's checksums:
+                 tools/vdec-streams.sh); VDECTEST_NO_EOS=1,
+                 VDECTEST_NO_OUTPUT=1, VDECTEST_VERBOSE=1 (each frame, with
+                 its size)
+
+Real-time clock (milestone M23 (docs/milestones.md)):
+  i2cregs.c      i2cregs <bus device> <address> <register> <count> [-r <n>]:
+                 reads registers through the I2C bus manager's raw device
+                 (/dev/bus/i2c/0/bus_raw), n times with each read's time;
+                 i2cregs ... <register> -w <byte>...: writes them
+                 (-I.../headers/private/i2c). The system's "i2c" tool only
+                 scans a bus.
+  rtcgmt.c       rtcgmt: whether the kernel takes the hardware clock as GMT
+                 or local time (RTC_time_settings, read at boot), and its
+                 time zone
+
+The header's I/O (milestone M27 (docs/milestones.md); build: $CXX -O2 $CPPFLAGS
+-I<haiku>/headers/private/drivers -o <name> <name>.cpp -ldevice -lbe):
+  geekporttest.cpp  geekporttest digital|adc|pwm|pin|bpwm|geekport|edge|
+                 serial|i2c: libdevice's header classes with nothing wired
+                 to the header (BDigitalPort, BA2D, BD2A, BDigitalPin with
+                 edges, BPWM, BGeekPort, BSerialPort "header", BI2CDevice);
+                 prints each check, exits 1 if one failed. "serial" writes
+                 GPIOX pull registers through /dev/misc/mem (root)
+  pwmprobe.cpp   pwmprobe <period ns>:<high ns> | m | w<ms> ...: steps PWM E
+                 (pin 11) through periods and pulses, printing the EF
+                 controller's registers and the pin's measured high share
+                 after each (how the controller takes new counts)
+
+The CPU clock (milestone M30 (docs/milestones.md)):
+  clocktest.c    clocktest power|latency: sets the scheduler mode;
+                 clocktest busy <n>: times n loops of 200 M iterations, one
+                 after the other; clocktest burst <n>: n times, idles 2 s,
+                 then times 20 M iterations (how soon the clock comes up)
+
+The infrared receiver (milestone M24 (docs/milestones.md); build: $CXX -O2 $HAIKU_CXX_INCLUDES
+-I<haiku>/headers/private/drivers -o irraw irraw.cpp -lgcc_s):
+  irraw.cpp      irraw pulses <s>: the raw marks and spaces meson_ir
+                 measures, one "m <us>"/"s <us>" per line (replay them on
+                 the build host with tools/tests/irdecoder/irdecoder-test
+                 <file>); irraw events <s>: the decoded presses and the
+                 driver's counters
+
+The Remote Control add-on (milestone M24 (docs/milestones.md), M42; build: $CXX -O2
+$HAIKU_CPPFLAGS ... -lbe; rcprofile also with the add-on's RemoteProfile.cpp
+and -I its directory and <haiku>/headers/private/drivers):
+  rcpress.cpp    rcpress <protocol> <address> <command>: a press as the
+                 preferences' Test button makes one; rcpress reload: the
+                 add-on reads the profiles again
+  rcprofile.cpp  rcprofile <name> <protocol> <address> <application|->
+                 <command>:<key>...: writes a profile of keystrokes (raw
+                 key codes), for one application or any; rcprofile -r <name>
+  keylog.cpp     keylog <signature> <file>: an application of that signature
+                 whose window logs every key it gets (two with different
+                 signatures are two applications)
+
+The Mali-450 (milestone M43 (docs/milestones.md); build: $CXX -O2 $HAIKU_CPPFLAGS
+-I<haiku>/headers/private/drivers):
+  malitest.cpp   meson_mali's lima interface without Mesa: parameters,
+                 contexts, buffers (create, info, clone, write, read, close),
+                 a heap buffer, sync objects, buffer waits, refused submits,
+                 1000 buffers made and closed; exit status 0 if all passed
+  glpresent.cpp  glpresent [frames] [rounds] [single]: what an OpenGL view
+                 shows once it stops drawing, read back from the screen:
+                 the last of the frames drawn (a colour and a square each),
+                 whole (Lima Pipe's presenter; same build as gltest)
+  drawbitmap.cpp drawbitmap <w> <h> [s] [rgba]: app_server's time to draw a
+                 whole B_RGB32 (B_RGBA32) bitmap 1:1 into a window (-lbe)
+  opaquecopy.cpp opaquecopy [w h [rounds [offset]]]: app_server's B_RGB32
+                 to back buffer copy, four ways, in one process
+  gltest.cpp     OpenGL through the GL kit (build: add -I and -L for Mesa's
+                 develop headers/opengl and lib, and -lbe -lGL):
+                 gltest <dir> writes five fixed scenes (lit, prims, texture,
+                 lines, fog) as <dir>/<scene>.ppm, to compare Lima Pipe with
+                 LIBGL_ALWAYS_SOFTWARE=1 (GALLIUM_DRIVER=softpipe);
+                 gltest bench <w> <h> <s> [thread]: nine lit spheres,
+                 frames/s, drawn in the window's thread (or a thread of
+                 its own, as most applications draw);
+                 gltest cells <n> <s>: cubes drawn as the GLife saver draws
+                 them, frames/s and CPU time a frame
+
+Colour emoji (milestone M56 (docs/milestones.md); build: $CXX -O2 $HAIKU_CPPFLAGS ... -lbe):
+  emojitext.cpp  emojitext [seconds]: colour emoji through the app_server,
+                 drawn into a bitmap: the family is installed, widths, colours
+                 at 9 to 200 points, the drawing modes, the clipping region
+                 and ClipToPicture()'s alpha mask, rotated text, the look
+                 U+FE0E and U+FE0F ask for; the time 32 new emoji take, then
+                 from the glyph cache; exit status 0 if all passed; then a
+                 window of emoji in text for <seconds>
+  emojitime.cpp  emojitime: DrawString() and Sync() into a bitmap, four
+                 times each, for ASCII and emoji strings in sizes of their
+                 own: the first draw makes the glyphs, the rest are cached
+
+USB hubs (milestone M59 (docs/milestones.md); build: $CXX -O2 $HAIKU_CPPFLAGS ... -ldevice -lbe):
+  usbport.cpp    usbport <hub> status: the hub's ports (connected, enabled,
+                 powered, speed) and its power switching; usbport <hub>
+                 <port> off|on|cycle [ms]|disable|reset: port features. The
+                 C2's hub switches power ganged: all four ports off (one by
+                 one) unplugs every device on it, on again plugs them back
+
+USB and Wi-Fi timing (milestone M82 (docs/milestones.md)):
+  usbqtime.c     usbqtime [seconds [rounds]]: prints the counters a temporary
+                 realtekwifi build keeps in the kernel area "usb_test_stats"
+                 (logs/wifi-queue-timing/queue-timing.patch): USB callback
+                 delays per direction, frames per transfer, the send queue
+                 and what it dropped; resets the maxima after each read

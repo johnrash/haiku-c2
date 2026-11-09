@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 18:52:17 -0400
+Subject: [PATCH 135/342] meson_vdec: the warm-up decodes its picture for sure
+
+The 16x16 picture is written twice: followed by nothing but zeros, the
+firmware decoded it only sometimes (the next start code ends a slice), and
+the first session after boot then had its first pictures wrong again
+(1 boot of 2). With it twice and 100 ms for it: right in 5 boots of 5.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/drivers/video/meson_vdec/meson_vdec.cpp  | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+index b67172af53..8ad01b1dc2 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+@@ -1114,9 +1114,14 @@ MesonVdec::_WarmUp(const meson_vdec_start& start, const void* userFirmware)
+ 	meson_vdec_start warmUp = start;
+ 	if (_StartSession(warmUp, userFirmware) != B_OK)
+ 		return;
+-	memcpy(fInput.address, kH264EndOfStream, sizeof(kH264EndOfStream));
+-	_Submit(sizeof(kH264EndOfStream), true);
+-	// until the firmware got its frames and decoded the picture
++	// The picture twice: the second's start code ends the first's slice
++	// (followed by nothing but zeros, it was decoded only sometimes).
++	for (int32 i = 0; i < 2; i++) {
++		memcpy(fInput.address, kH264EndOfStream, sizeof(kH264EndOfStream));
++		_Submit(sizeof(kH264EndOfStream), true);
++	}
++	// until the firmware got its frames and decoded the picture (which it
++	// doesn't report)
+ 	bigtime_t timeout = system_time() + 300000;
+ 	while (system_time() < timeout) {
+ 		InterruptsSpinLocker locker(fStateLock);
+@@ -1126,7 +1131,7 @@ MesonVdec::_WarmUp(const meson_vdec_start& start, const void* userFirmware)
+ 			break;
+ 		snooze(2000);
+ 	}
+-	snooze(20000);
++	snooze(100000);
+ 	INFO("warm-up session done\n");
+ 	_Stop(true);
+ 	fWarmedUp = true;

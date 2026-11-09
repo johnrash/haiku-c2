@@ -1,0 +1,861 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 14:07:51 -0400
+Subject: [PATCH 101/342] meson_gpio and gpio: the ODROID-C2's header pins as
+ GPIO
+
+/dev/misc/gpio reads as a table of the 40-pin header's GPIO pins (the
+SoC pin, its function, direction, level, pull) and takes "<pin> out
+0|1", "<pin> in [up|down|none]" and "<pin> release", by header pin
+number or SoC pin name. Making a pin GPIO clears the mux bits of its
+alternate functions; the first command saves the pin's bits for release.
+Only header pins are offered, and the I2C pins only while I2C isn't
+selected (I2C A carries the RTC shield). The "gpio" command wraps it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/jam/images/definitions/regular          |   1 +
+ build/jam/packages/Haiku                      |   1 +
+ src/add-ons/kernel/drivers/misc/Jamfile       |   2 +
+ .../kernel/drivers/misc/meson_gpio/Jamfile    |   9 +
+ .../drivers/misc/meson_gpio/meson_gpio.cpp    | 635 ++++++++++++++++++
+ src/bin/Jamfile                               |   1 +
+ src/bin/gpio/Jamfile                          |   5 +
+ src/bin/gpio/gpio.cpp                         | 112 +++
+ 8 files changed, 766 insertions(+)
+ create mode 100644 src/add-ons/kernel/drivers/misc/meson_gpio/Jamfile
+ create mode 100644 src/add-ons/kernel/drivers/misc/meson_gpio/meson_gpio.cpp
+ create mode 100644 src/bin/gpio/Jamfile
+ create mode 100644 src/bin/gpio/gpio.cpp
+
+diff --git a/build/jam/images/definitions/regular b/build/jam/images/definitions/regular
+index cea3ca898c..f390eaf10c 100644
+--- a/build/jam/images/definitions/regular
++++ b/build/jam/images/definitions/regular
+@@ -13,6 +13,7 @@ SYSTEM_BIN += [ FFilterByBuildFeatures
+ 	CortexAddOnHost
+ 	dpms
+ 	FirstBootPrompt
++	<bin>gpio@arm64
+ 	<bin>i2c@x86,x86_64,arm64
+ 	installsound
+ 	mail
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index 4146c061fc..fa50a20ce7 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -145,6 +145,7 @@ AddNewDriversToPackage power
+ 	: $(SYSTEM_ADD_ONS_DRIVERS_POWER) ;
+ AddNewDriversToPackage power : meson_scpi@arm64 ;
+ AddNewDriversToPackage rtc : pcf8563@arm64 ;
++AddNewDriversToPackage misc : meson_gpio@arm64 ;
+ AddNewDriversToPackage sensor
+ 	: $(SYSTEM_ADD_ONS_DRIVERS_SENSOR) ;
+ AddNewDriversToPackage network :
+diff --git a/src/add-ons/kernel/drivers/misc/Jamfile b/src/add-ons/kernel/drivers/misc/Jamfile
+index b6ecbaf1e1..e8f308a385 100644
+--- a/src/add-ons/kernel/drivers/misc/Jamfile
++++ b/src/add-ons/kernel/drivers/misc/Jamfile
+@@ -18,3 +18,5 @@ KernelAddon <driver>kdl :
+ KernelAddon <driver>test :
+ 	test.c
+ 	;
++
++SubInclude HAIKU_TOP src add-ons kernel drivers misc meson_gpio ;
+diff --git a/src/add-ons/kernel/drivers/misc/meson_gpio/Jamfile b/src/add-ons/kernel/drivers/misc/meson_gpio/Jamfile
+new file mode 100644
+index 0000000000..56a6906460
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/misc/meson_gpio/Jamfile
+@@ -0,0 +1,9 @@
++SubDir HAIKU_TOP src add-ons kernel drivers misc meson_gpio ;
++
++UsePrivateKernelHeaders ;
++
++if $(TARGET_ARCH) = arm64 {
++	KernelAddon meson_gpio :
++		meson_gpio.cpp
++	;
++}
+diff --git a/src/add-ons/kernel/drivers/misc/meson_gpio/meson_gpio.cpp b/src/add-ons/kernel/drivers/misc/meson_gpio/meson_gpio.cpp
+new file mode 100644
+index 0000000000..0c48195d5c
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/misc/meson_gpio/meson_gpio.cpp
+@@ -0,0 +1,635 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * The ODROID-C2's 40-pin header (J2) as GPIO, on the Amlogic Meson GXBB
++ * (S905): /dev/misc/gpio, used through the "gpio" command.
++ *
++ * Reading the device gives a table of the header's GPIO pins: the SoC pin,
++ * the function it has (GPIO, or the alternate function its mux selects),
++ * direction, level and pull. Writing it takes commands, one per line:
++ *
++ *   <pin> out 0|1               a GPIO output at that level
++ *   <pin> in [up|down|none]     a GPIO input, with that pull
++ *   <pin> release               the pin as it was before the first command
++ *
++ * <pin> is the header pin number or the SoC pin's name (GPIOX_21). Only
++ * the header's pins are offered, and the I2C pins only while their I2C
++ * function isn't selected (I2C A carries the RTC shield). Switching a pin
++ * to GPIO clears the mux bits of its alternate functions; the first command
++ * on a pin saves its mux, direction, output and pull bits for "release".
++ *
++ * Registers (the periphs pin controller at 0xc8834000): the mux at 0x4b0,
++ * the GPIO direction (1 = input), output and input words at 0x430, pull
++ * (1 = up) at 0x4e8, pull enable at 0x520; per bank a word and a first bit
++ * (U-Boot's pinctrl-meson-gxbb.c). Which mux bits select which functions,
++ * and the header's pins (the device tree's gpio-line-names): facts from
++ * Linux's GXBB pin tables.
++ */
++
++
++#include <new>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <KernelExport.h>
++#include <bus/FDT.h>
++#include <device_manager.h>
++#include <kernel.h>
++#include <lock.h>
++#include <util/AutoLock.h>
++
++
++#define DRIVER_MODULE_NAME	"drivers/misc/meson_gpio/driver_v1"
++#define DEVICE_MODULE_NAME	"drivers/misc/meson_gpio/device_v1"
++
++#define INFO(x...) dprintf("meson_gpio: " x)
++
++
++static const phys_addr_t kPinControllerPage = 0xc8834000;
++static const uint32 kMuxOffset = 0x4b0;
++static const uint32 kGpioOffset = 0x430;
++static const uint32 kPullOffset = 0x4e8;
++static const uint32 kPullEnableOffset = 0x520;
++
++
++struct Bank {
++	const char*	prefix;
++	uint8		pullEnableWord, pullEnableBit;
++	uint8		pullWord, pullBit;
++	uint8		directionWord, directionBit;
++	uint8		outputWord, outputBit;
++	uint8		inputWord, inputBit;
++};
++
++enum {
++	kBankX,
++	kBankY,
++	kBankDV
++};
++
++static const Bank kBanks[] = {
++	{ "GPIOX_", 4, 0, 4, 0, 12, 0, 13, 0, 14, 0 },
++	{ "GPIOY_", 1, 0, 1, 0, 3, 0, 4, 0, 5, 0 },
++	{ "GPIODV_", 0, 0, 0, 0, 0, 0, 1, 0, 2, 0 },
++};
++
++
++struct MuxBit {
++	uint8		word;
++	uint8		bit;
++	const char*	function;
++};
++
++struct HeaderPin {
++	uint8		pin;
++	uint8		bank;
++	uint8		offset;
++	MuxBit		functions[3];
++	bool		i2c;
++		// not while its I2C function is selected
++};
++
++static const HeaderPin kPins[] = {
++	{ 3, kBankDV, 24, { { 7, 26, "I2C A" }, { 2, 29, "UART B" } }, true },
++	{ 5, kBankDV, 25, { { 7, 27, "I2C A" }, { 2, 28, "UART B" } }, true },
++	{ 7, kBankX, 21, {}, false },
++	{ 8, kBankX, 12, { { 4, 13, "UART A" } }, false },
++	{ 10, kBankX, 13, { { 4, 12, "UART A" } }, false },
++	{ 11, kBankX, 19, { { 2, 30, "PWM E" } }, false },
++	{ 12, kBankX, 10, {}, false },
++	{ 13, kBankX, 11, {}, false },
++	{ 15, kBankX, 9, { { 3, 7, "TS B" } }, false },
++	{ 16, kBankX, 8, { { 3, 10, "TS B" } }, false },
++	{ 18, kBankX, 5, { { 8, 0, "SDIO" } }, false },
++	{ 19, kBankX, 7, { { 8, 11, "SDIO" }, { 3, 18, "PWM F" },
++		{ 3, 8, "TS B" } }, false },
++	{ 21, kBankX, 4, { { 8, 1, "SDIO" } }, false },
++	{ 22, kBankX, 3, { { 8, 2, "SDIO" } }, false },
++	{ 23, kBankX, 2, { { 8, 3, "SDIO" } }, false },
++	{ 24, kBankX, 1, { { 8, 4, "SDIO" } }, false },
++	{ 26, kBankY, 14, { { 1, 18, "UART C" } }, false },
++	{ 27, kBankDV, 26, { { 7, 24, "I2C B" }, { 2, 27, "UART B" } }, true },
++	{ 28, kBankDV, 27, { { 7, 25, "I2C B" }, { 2, 26, "UART B" } }, true },
++	{ 29, kBankX, 0, { { 8, 5, "SDIO" } }, false },
++	{ 31, kBankY, 8, { { 3, 5, "TS A" }, { 1, 5, "I2S" } }, false },
++	{ 32, kBankY, 13, { { 1, 19, "UART C" } }, false },
++	{ 33, kBankX, 6, { { 3, 17, "PWM A" }, { 3, 9, "TS B" } }, false },
++	{ 35, kBankY, 3, { { 3, 4, "TS A" } }, false },
++	{ 36, kBankY, 7, { { 3, 5, "TS A" } }, false },
++};
++static const size_t kPinCount = B_COUNT_OF(kPins);
++
++
++static device_manager_info* gDeviceManager;
++
++
++class MesonGpio {
++public:
++								MesonGpio(device_node* node);
++								~MesonGpio();
++
++			status_t			Init();
++			device_node*		Node() const { return fNode; }
++
++			status_t			Read(off_t position, char* buffer,
++									size_t* _length);
++			status_t			Write(const char* buffer, size_t length);
++
++private:
++	struct SavedPin {
++		bool		saved;
++		uint32		mux[3];
++		bool		input, output, pull, pullEnable;
++	};
++
++			volatile uint32&	_Word(uint32 offset, uint32 word)
++									{ return fRegisters[(offset + word * 4)
++										/ 4]; }
++			bool				_Get(uint32 offset, uint32 word, uint32 bit)
++									{ return (_Word(offset, word) >> bit) & 1; }
++			void				_Set(uint32 offset, uint32 word, uint32 bit,
++									bool value);
++
++			const char*			_Function(const HeaderPin& pin);
++			status_t			_Command(char* line);
++			status_t			_Configure(size_t index, bool output,
++									bool level, int pull);
++			status_t			_Release(size_t index);
++			void				_Save(size_t index);
++			ssize_t				_Find(const char* name);
++	static	void				_Name(const HeaderPin& pin, char* buffer,
++									size_t size);
++
++			device_node*		fNode;
++			area_id				fArea;
++			volatile uint32*	fRegisters;
++			mutex				fLock;
++			SavedPin			fSaved[kPinCount];
++};
++
++
++MesonGpio::MesonGpio(device_node* node)
++	:
++	fNode(node),
++	fArea(-1),
++	fRegisters(NULL)
++{
++	mutex_init(&fLock, "meson gpio");
++	memset(fSaved, 0, sizeof(fSaved));
++}
++
++
++MesonGpio::~MesonGpio()
++{
++	if (fArea >= 0)
++		delete_area(fArea);
++	mutex_destroy(&fLock);
++}
++
++
++status_t
++MesonGpio::Init()
++{
++	void* address;
++	fArea = map_physical_memory("meson gpio", kPinControllerPage, B_PAGE_SIZE,
++		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++		&address);
++	if (fArea < 0)
++		return fArea;
++	fRegisters = (volatile uint32*)address;
++	INFO("%" B_PRIuSIZE " header pins at /dev/misc/gpio\n", kPinCount);
++	return B_OK;
++}
++
++
++void
++MesonGpio::_Set(uint32 offset, uint32 word, uint32 bit, bool value)
++{
++	volatile uint32& registerWord = _Word(offset, word);
++	if (value)
++		registerWord |= 1u << bit;
++	else
++		registerWord &= ~(1u << bit);
++}
++
++
++/*!	The alternate function the pin's mux selects, or NULL: GPIO. */
++const char*
++MesonGpio::_Function(const HeaderPin& pin)
++{
++	for (size_t i = 0; i < B_COUNT_OF(pin.functions); i++) {
++		const MuxBit& mux = pin.functions[i];
++		if (mux.function != NULL && _Get(kMuxOffset, mux.word, mux.bit))
++			return mux.function;
++	}
++	return NULL;
++}
++
++
++/*static*/ void
++MesonGpio::_Name(const HeaderPin& pin, char* buffer, size_t size)
++{
++	snprintf(buffer, size, "%s%u", kBanks[pin.bank].prefix, pin.offset);
++}
++
++
++ssize_t
++MesonGpio::_Find(const char* name)
++{
++	char* end;
++	long number = strtol(name, &end, 10);
++	for (size_t i = 0; i < kPinCount; i++) {
++		char pinName[16];
++		_Name(kPins[i], pinName, sizeof(pinName));
++		if ((*end == '\0' && end != name && kPins[i].pin == number)
++			|| strcasecmp(name, pinName) == 0) {
++			return i;
++		}
++	}
++	return -1;
++}
++
++
++void
++MesonGpio::_Save(size_t index)
++{
++	SavedPin& saved = fSaved[index];
++	if (saved.saved)
++		return;
++	const HeaderPin& pin = kPins[index];
++	const Bank& bank = kBanks[pin.bank];
++	for (size_t i = 0; i < B_COUNT_OF(pin.functions); i++) {
++		const MuxBit& mux = pin.functions[i];
++		saved.mux[i] = mux.function != NULL
++			? _Get(kMuxOffset, mux.word, mux.bit) : 0;
++	}
++	saved.input = _Get(kGpioOffset, bank.directionWord,
++		bank.directionBit + pin.offset);
++	saved.output = _Get(kGpioOffset, bank.outputWord,
++		bank.outputBit + pin.offset);
++	saved.pull = _Get(kPullOffset, bank.pullWord, bank.pullBit + pin.offset);
++	saved.pullEnable = _Get(kPullEnableOffset, bank.pullEnableWord,
++		bank.pullEnableBit + pin.offset);
++	saved.saved = true;
++}
++
++
++/*!	\a pull: 1 up, 0 down, -1 none, -2 as it is. */
++status_t
++MesonGpio::_Configure(size_t index, bool output, bool level, int pull)
++{
++	const HeaderPin& pin = kPins[index];
++	const Bank& bank = kBanks[pin.bank];
++	const char* function = _Function(pin);
++	if (pin.i2c && function != NULL && strncmp(function, "I2C", 3) == 0) {
++		INFO("pin %u is in use by %s\n", pin.pin, function);
++		return B_BUSY;
++	}
++
++	_Save(index);
++	uint32 bit = pin.offset;
++	if (output) {
++		_Set(kGpioOffset, bank.outputWord, bank.outputBit + bit, level);
++		_Set(kGpioOffset, bank.directionWord, bank.directionBit + bit, false);
++	} else {
++		_Set(kGpioOffset, bank.directionWord, bank.directionBit + bit, true);
++		if (pull >= 0)
++			_Set(kPullOffset, bank.pullWord, bank.pullBit + bit, pull == 1);
++		if (pull >= -1) {
++			_Set(kPullEnableOffset, bank.pullEnableWord,
++				bank.pullEnableBit + bit, pull >= 0);
++		}
++	}
++	// the GPIO function: the alternate ones off
++	for (size_t i = 0; i < B_COUNT_OF(pin.functions); i++) {
++		const MuxBit& mux = pin.functions[i];
++		if (mux.function != NULL)
++			_Set(kMuxOffset, mux.word, mux.bit, false);
++	}
++	return B_OK;
++}
++
++
++status_t
++MesonGpio::_Release(size_t index)
++{
++	SavedPin& saved = fSaved[index];
++	if (!saved.saved)
++		return B_OK;
++	const HeaderPin& pin = kPins[index];
++	const Bank& bank = kBanks[pin.bank];
++	uint32 bit = pin.offset;
++	_Set(kGpioOffset, bank.outputWord, bank.outputBit + bit, saved.output);
++	_Set(kGpioOffset, bank.directionWord, bank.directionBit + bit,
++		saved.input);
++	_Set(kPullOffset, bank.pullWord, bank.pullBit + bit, saved.pull);
++	_Set(kPullEnableOffset, bank.pullEnableWord, bank.pullEnableBit + bit,
++		saved.pullEnable);
++	for (size_t i = 0; i < B_COUNT_OF(pin.functions); i++) {
++		const MuxBit& mux = pin.functions[i];
++		if (mux.function != NULL)
++			_Set(kMuxOffset, mux.word, mux.bit, saved.mux[i]);
++	}
++	saved.saved = false;
++	return B_OK;
++}
++
++
++/*!	One command: "<pin> out 0|1", "<pin> in [up|down|none]",
++	"<pin> release".
++*/
++status_t
++MesonGpio::_Command(char* line)
++{
++	char* words[4];
++	int count = 0;
++	char* save;
++	for (char* word = strtok_r(line, " \t\r", &save); word != NULL
++			&& count < 4; word = strtok_r(NULL, " \t\r", &save)) {
++		words[count++] = word;
++	}
++	if (count == 0)
++		return B_OK;
++	if (count < 2)
++		return B_BAD_VALUE;
++
++	ssize_t index = _Find(words[0]);
++	if (index < 0) {
++		INFO("no header pin \"%s\"\n", words[0]);
++		return B_ENTRY_NOT_FOUND;
++	}
++	if (strcmp(words[1], "out") == 0 && count == 3
++		&& (strcmp(words[2], "0") == 0 || strcmp(words[2], "1") == 0)) {
++		return _Configure(index, true, words[2][0] == '1', -2);
++	}
++	if (strcmp(words[1], "in") == 0) {
++		int pull = -2;
++		if (count == 3) {
++			if (strcmp(words[2], "up") == 0)
++				pull = 1;
++			else if (strcmp(words[2], "down") == 0)
++				pull = 0;
++			else if (strcmp(words[2], "none") == 0)
++				pull = -1;
++			else
++				return B_BAD_VALUE;
++		}
++		return _Configure(index, false, false, pull);
++	}
++	if (strcmp(words[1], "release") == 0 && count == 2)
++		return _Release(index);
++	return B_BAD_VALUE;
++}
++
++
++status_t
++MesonGpio::Write(const char* buffer, size_t length)
++{
++	char text[256];
++	if (length >= sizeof(text))
++		return B_BAD_VALUE;
++	if (user_memcpy(text, buffer, length) != B_OK)
++		return B_BAD_ADDRESS;
++	text[length] = '\0';
++
++	MutexLocker locker(fLock);
++	char* save;
++	for (char* line = strtok_r(text, "\n", &save); line != NULL;
++			line = strtok_r(NULL, "\n", &save)) {
++		status_t status = _Command(line);
++		if (status != B_OK)
++			return status;
++	}
++	return B_OK;
++}
++
++
++status_t
++MesonGpio::Read(off_t position, char* buffer, size_t* _length)
++{
++	char text[2048];
++	size_t length = snprintf(text, sizeof(text),
++		"pin  gpio       function  dir  level  pull\n");
++
++	MutexLocker locker(fLock);
++	for (size_t i = 0; i < kPinCount && length < sizeof(text); i++) {
++		const HeaderPin& pin = kPins[i];
++		const Bank& bank = kBanks[pin.bank];
++		char name[16];
++		_Name(pin, name, sizeof(name));
++		const char* function = _Function(pin);
++		bool input = _Get(kGpioOffset, bank.directionWord,
++			bank.directionBit + pin.offset);
++		bool level = _Get(kGpioOffset, bank.inputWord,
++			bank.inputBit + pin.offset);
++		bool pullEnable = _Get(kPullEnableOffset, bank.pullEnableWord,
++			bank.pullEnableBit + pin.offset);
++		bool pullUp = _Get(kPullOffset, bank.pullWord,
++			bank.pullBit + pin.offset);
++		length += snprintf(text + length, sizeof(text) - length,
++			"%3u  %-9s  %-8s  %-3s  %-5d  %s\n", pin.pin, name,
++			function != NULL ? function : "gpio", input ? "in" : "out",
++			level ? 1 : 0, pullEnable ? (pullUp ? "up" : "down") : "none");
++	}
++	locker.Unlock();
++	if (length > sizeof(text) - 1)
++		length = sizeof(text) - 1;
++
++	if (position >= (off_t)length) {
++		*_length = 0;
++		return B_OK;
++	}
++	size_t count = length - position;
++	if (count > *_length)
++		count = *_length;
++	if (user_memcpy(buffer, text + position, count) != B_OK)
++		return B_BAD_ADDRESS;
++	*_length = count;
++	return B_OK;
++}
++
++
++//	#pragma mark - driver module
++
++
++static float
++supports_device(device_node* parent)
++{
++	const char* bus;
++	const char* compatible;
++	if (gDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false)
++			!= B_OK || strcmp(bus, "fdt") != 0
++		|| gDeviceManager->get_attr_string(parent, "fdt/compatible",
++			&compatible, false) != B_OK
++		|| strcmp(compatible, "amlogic,meson-gxbb-periphs-pinctrl") != 0) {
++		return 0.0f;
++	}
++	return 0.8f;
++}
++
++
++static status_t
++register_device(device_node* parent)
++{
++	device_attr attrs[] = {
++		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE,
++			{ .string = "Amlogic Meson GXBB GPIO (ODROID-C2 header)" } },
++		{ NULL }
++	};
++	return gDeviceManager->register_node(parent, DRIVER_MODULE_NAME, attrs,
++		NULL, NULL);
++}
++
++
++static status_t
++init_driver(device_node* node, void** _cookie)
++{
++	MesonGpio* gpio = new(std::nothrow) MesonGpio(node);
++	if (gpio == NULL)
++		return B_NO_MEMORY;
++	status_t status = gpio->Init();
++	if (status != B_OK) {
++		delete gpio;
++		return status;
++	}
++	*_cookie = gpio;
++	return B_OK;
++}
++
++
++static void
++uninit_driver(void* cookie)
++{
++	delete (MesonGpio*)cookie;
++}
++
++
++static status_t
++register_child_devices(void* cookie)
++{
++	MesonGpio* gpio = (MesonGpio*)cookie;
++	return gDeviceManager->publish_device(gpio->Node(), "misc/gpio",
++		DEVICE_MODULE_NAME);
++}
++
++
++//	#pragma mark - device module
++
++
++static status_t
++device_init(void* driverCookie, void** _deviceCookie)
++{
++	*_deviceCookie = driverCookie;
++	return B_OK;
++}
++
++
++static void
++device_uninit(void* deviceCookie)
++{
++}
++
++
++static status_t
++device_open(void* deviceCookie, const char* path, int openMode,
++	void** _cookie)
++{
++	*_cookie = deviceCookie;
++	return B_OK;
++}
++
++
++static status_t
++device_close(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++device_free(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++device_read(void* cookie, off_t position, void* buffer, size_t* _length)
++{
++	return ((MesonGpio*)cookie)->Read(position, (char*)buffer, _length);
++}
++
++
++static status_t
++device_write(void* cookie, off_t position, const void* buffer,
++	size_t* _length)
++{
++	status_t status = ((MesonGpio*)cookie)->Write((const char*)buffer,
++		*_length);
++	if (status != B_OK)
++		*_length = 0;
++	return status;
++}
++
++
++static status_t
++device_control(void* cookie, uint32 op, void* buffer, size_t length)
++{
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++module_dependency module_dependencies[] = {
++	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&gDeviceManager },
++	{}
++};
++
++
++static struct device_module_info sMesonGpioDevice = {
++	{
++		DEVICE_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	device_init,
++	device_uninit,
++	NULL,	// remove
++
++	device_open,
++	device_close,
++	device_free,
++	device_read,
++	device_write,
++	NULL,	// io
++	device_control,
++
++	NULL,	// select
++	NULL,	// deselect
++};
++
++
++static struct driver_module_info sMesonGpioDriver = {
++	{
++		DRIVER_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	supports_device,
++	register_device,
++	init_driver,
++	uninit_driver,
++	register_child_devices,
++	NULL,	// rescan
++	NULL,	// removed
++};
++
++
++module_info* modules[] = {
++	(module_info*)&sMesonGpioDriver,
++	(module_info*)&sMesonGpioDevice,
++	NULL
++};
+diff --git a/src/bin/Jamfile b/src/bin/Jamfile
+index 5214328c81..1390869479 100644
+--- a/src/bin/Jamfile
++++ b/src/bin/Jamfile
+@@ -252,6 +252,7 @@ SubInclude HAIKU_TOP src bin cddb_lookup ;
+ SubInclude HAIKU_TOP src bin consoled ;
+ SubInclude HAIKU_TOP src bin desklink ;
+ SubInclude HAIKU_TOP src bin fwcontrol ;
++SubInclude HAIKU_TOP src bin gpio ;
+ SubInclude HAIKU_TOP src bin hid_decode ;
+ SubInclude HAIKU_TOP src bin i2c ;
+ SubInclude HAIKU_TOP src bin keymap ;
+diff --git a/src/bin/gpio/Jamfile b/src/bin/gpio/Jamfile
+new file mode 100644
+index 0000000000..4e6b41d4a4
+--- /dev/null
++++ b/src/bin/gpio/Jamfile
+@@ -0,0 +1,5 @@
++SubDir HAIKU_TOP src bin gpio ;
++
++Application <bin>gpio :
++	gpio.cpp
++;
+diff --git a/src/bin/gpio/gpio.cpp b/src/bin/gpio/gpio.cpp
+new file mode 100644
+index 0000000000..1384f3e09c
+--- /dev/null
++++ b/src/bin/gpio/gpio.cpp
+@@ -0,0 +1,112 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * gpio: the board's header pins as GPIO, through /dev/misc/gpio (the
++ * ODROID-C2's meson_gpio driver).
++ */
++
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++
++static const char* kDevice = "/dev/misc/gpio";
++
++
++static void
++usage(int status)
++{
++	fprintf(stderr,
++		"usage: gpio                          the header's GPIO pins\n"
++		"       gpio <pin>                    one pin\n"
++		"       gpio <pin> out 0|1            an output at that level\n"
++		"       gpio <pin> in [up|down|none]  an input, with that pull\n"
++		"       gpio <pin> release            the pin as it was before\n"
++		"<pin> is the header pin number or the SoC pin's name (GPIOX_21).\n");
++	exit(status);
++}
++
++
++static int
++list(const char* pin)
++{
++	int fd = open(kDevice, O_RDONLY);
++	if (fd < 0) {
++		fprintf(stderr, "gpio: %s: %s\n", kDevice, strerror(errno));
++		return 1;
++	}
++	char text[4096];
++	ssize_t length = read(fd, text, sizeof(text) - 1);
++	close(fd);
++	if (length < 0) {
++		fprintf(stderr, "gpio: reading %s: %s\n", kDevice, strerror(errno));
++		return 1;
++	}
++	text[length] = '\0';
++
++	bool found = pin == NULL;
++	char* save;
++	bool first = true;
++	for (char* line = strtok_r(text, "\n", &save); line != NULL;
++			line = strtok_r(NULL, "\n", &save), first = false) {
++		if (pin == NULL || first) {
++			puts(line);
++			continue;
++		}
++		// "<pin>  <name>  ..."
++		char number[16], name[32];
++		if (sscanf(line, "%15s %31s", number, name) == 2
++			&& (strcmp(number, pin) == 0 || strcasecmp(name, pin) == 0)) {
++			puts(line);
++			found = true;
++		}
++	}
++	if (!found) {
++		fprintf(stderr, "gpio: no header pin \"%s\"\n", pin);
++		return 1;
++	}
++	return 0;
++}
++
++
++int
++main(int argc, char** argv)
++{
++	if (argc > 1 && (strcmp(argv[1], "-h") == 0
++			|| strcmp(argv[1], "--help") == 0)) {
++		usage(0);
++	}
++	if (argc <= 2)
++		return list(argc == 2 ? argv[1] : NULL);
++	if (argc > 4)
++		usage(1);
++
++	char command[128];
++	snprintf(command, sizeof(command), "%s %s%s%s\n", argv[1], argv[2],
++		argc > 3 ? " " : "", argc > 3 ? argv[3] : "");
++	int fd = open(kDevice, O_WRONLY);
++	if (fd < 0) {
++		fprintf(stderr, "gpio: %s: %s\n", kDevice, strerror(errno));
++		return 1;
++	}
++	if (write(fd, command, strlen(command)) < 0) {
++		int error = errno;
++		close(fd);
++		fprintf(stderr, "gpio: %s", strerror(error));
++		if (error == EBUSY)
++			fprintf(stderr, " (the pin's I2C function is in use)");
++		else if (error == ENOENT)
++			fprintf(stderr, " (no such header pin)");
++		else if (error == EINVAL)
++			fprintf(stderr, " (see gpio --help)");
++		fprintf(stderr, "\n");
++		return 1;
++	}
++	close(fd);
++	return list(argv[1]);
++}

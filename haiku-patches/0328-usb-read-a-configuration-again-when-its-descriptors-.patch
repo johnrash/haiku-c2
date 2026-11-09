@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 6 Nov 2026 23:03:42 -0500
+Subject: [PATCH 328/342] usb: read a configuration again when its descriptors
+ come back broken
+
+On the test board an AB13X whose hub port was switched off and on during
+playback answered with broken lengths among its configuration's
+descriptors (255, 109, 101: "invalid descriptor length ... ignoring"):
+the parse stopped there and its drivers got a configuration without the
+interfaces and endpoints after it, which usb_audio's replug and new
+device paths both tripped over (kernel page faults at 0x30 and 0x6).
+
+After reading the full configuration, its descriptor chain is checked; if
+a descriptor's length is broken, it is read again every 250 ms for up to
+2 seconds, before parsing what there is as before. In 15 replugs during
+playback, 9 of 10 broken reads were whole on the first read again, one
+not after 300 ms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/bus_managers/usb/Device.cpp        | 27 +++++++++++++++++--
+ 1 file changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/src/add-ons/kernel/bus_managers/usb/Device.cpp b/src/add-ons/kernel/bus_managers/usb/Device.cpp
+index 14c167fdb4..fb4f8270f2 100644
+--- a/src/add-ons/kernel/bus_managers/usb/Device.cpp
++++ b/src/add-ons/kernel/bus_managers/usb/Device.cpp
+@@ -127,8 +127,31 @@ Device::Device(Object* parent, int8 hubAddress, uint8 hubPort,
+ 			return;
+ 		}
+ 
+-		status = GetDescriptor(USB_DESCRIPTOR_CONFIGURATION, i, 0,
+-			(void*)configData, configDescriptor.total_length, &actualLength);
++		// A device just powered on (a replug, a port powered again) may still
++		// be settling and answer with a broken descriptor length among its
++		// descriptors (an AB13X gave 255, 109, 101): the parse below would
++		// stop there and hand its drivers a configuration without the
++		// interfaces after it. Read it again for up to 2 seconds first.
++		for (int32 attempt = 0; attempt < 8; attempt++) {
++			if (attempt > 0) {
++				TRACE_ERROR("configuration %" B_PRId32 " descriptors broken,"
++					" reading them again\n", i);
++				snooze(250000);
++			}
++			status = GetDescriptor(USB_DESCRIPTOR_CONFIGURATION, i, 0,
++				(void*)configData, configDescriptor.total_length,
++				&actualLength);
++			if (status < B_OK || actualLength != configDescriptor.total_length)
++				break;
++
++			uint32 offset = sizeof(usb_configuration_descriptor);
++			while (offset + 2 <= actualLength && configData[offset] >= 2
++				&& offset + configData[offset] <= actualLength) {
++				offset += configData[offset];
++			}
++			if (offset == actualLength)
++				break;
++		}
+ 
+ 		if (status < B_OK || actualLength != configDescriptor.total_length) {
+ 			TRACE_ERROR("error fetching full configuration"

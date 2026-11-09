@@ -1,0 +1,4 @@
+#!/bin/sh
+# Copy a file to Haiku on the C2 over FTP: c2put <local file> <absolute remote path>
+"$(dirname "$0")/c2sh" true > /dev/null || exit 1
+exec curl -sS --ftp-create-dirs -T "$1" "ftp://baron:haiku@10.42.0.2/$2"

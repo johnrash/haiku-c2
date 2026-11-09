@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 13:24:58 -0400
+Subject: [PATCH 029/342] AboutSystem: spell out the uptime without ICU locale
+ data
+
+BDurationFormat gives an empty string when ICU has no locale data, as
+with the arm64 bootstrap ICU package (a stub libicudata), so "Time
+running:" stayed empty. When the formatter fails or gives nothing,
+the uptime is spelled out with the non-zero units ("3 minutes, 11
+seconds").
+
+Tested on the ODROID-C2.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apps/aboutsystem/AboutSystem.cpp | 32 +++++++++++++++++++++++++++-
+ 1 file changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/src/apps/aboutsystem/AboutSystem.cpp b/src/apps/aboutsystem/AboutSystem.cpp
+index 635a5fb837..d4850110cc 100644
+--- a/src/apps/aboutsystem/AboutSystem.cpp
++++ b/src/apps/aboutsystem/AboutSystem.cpp
+@@ -1162,7 +1162,37 @@ SysInfoView::_GetUptime()
+ 
+ 	bigtime_t uptime = system_time();
+ 	bigtime_t now = (bigtime_t)time(NULL) * 1000000;
+-	formatter.Format(uptimeText, now - uptime, now);
++	if (formatter.Format(uptimeText, now - uptime, now) == B_OK
++		&& !uptimeText.IsEmpty()) {
++		return uptimeText;
++	}
++
++	// Without ICU's locale data (the arm64 bootstrap ICU package has only
++	// a stub) the formatter has nothing to give: spell out the non-zero
++	// units the way it would.
++	static const struct {
++		bigtime_t	seconds;
++		const char*	one;
++		const char*	many;
++	} kUnits[] = {
++		{ 86400, "%d day", "%d days" },
++		{ 3600, "%d hour", "%d hours" },
++		{ 60, "%d minute", "%d minutes" },
++		{ 1, "%d second", "%d seconds" }
++	};
++	bigtime_t seconds = uptime / 1000000;
++	uptimeText.Truncate(0);
++	for (size_t i = 0; i < B_COUNT_OF(kUnits); i++) {
++		int count = seconds / kUnits[i].seconds;
++		seconds %= kUnits[i].seconds;
++		if (count == 0 && (i + 1 < B_COUNT_OF(kUnits) || !uptimeText.IsEmpty()))
++			continue;
++		BString unit;
++		unit.SetToFormat(count == 1 ? kUnits[i].one : kUnits[i].many, count);
++		if (!uptimeText.IsEmpty())
++			uptimeText << ", ";
++		uptimeText << unit;
++	}
+ 
+ 	return uptimeText;
+ }

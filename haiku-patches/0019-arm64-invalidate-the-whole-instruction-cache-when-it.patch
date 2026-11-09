@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 04:09:25 -0400
+Subject: [PATCH 019/342] arm64: invalidate the whole instruction cache when it
+ is VIPT
+
+arch_cpu_sync_icache() is called by the translation map with the
+physical map alias of a page (KERNEL_PMAP_BASE + pa), and invalidated
+the instruction cache by that address. The Cortex-A53's L1 instruction
+cache is VIPT with 16 KiB ways (CTR_EL0 0x84448004), so it aliases:
+lines cached under the address the code runs at survived, and the CPU
+could execute a previous mapping's instructions.
+
+On the ODROID-C2 this showed as intermittent boot failures: a PC
+alignment fault in xhci's supports_device(), where the CPU executed
+"blr x4" (from ehci/ohci/uhci, loaded at the same address just before)
+while memory held the correct "movi", and desktop hangs. QEMU models no
+caches, so it never happens there.
+
+When CTR_EL0.L1Ip is not PIPT, invalidate the whole instruction cache
+on all CPUs (ic ialluis), as Linux does for aliasing instruction
+caches. Also fix the instruction cache line size, which was computed
+from "ctr_el0 << 0xF" and came out as 4 bytes, and print CTR_EL0 at
+boot.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/kernel/arch/arm64/arch_cpu.cpp | 33 +++++++++++++++++------
+ 1 file changed, 25 insertions(+), 8 deletions(-)
+
+diff --git a/src/system/kernel/arch/arm64/arch_cpu.cpp b/src/system/kernel/arch/arm64/arch_cpu.cpp
+index 8f622310d0..4763a0a78d 100644
+--- a/src/system/kernel/arch/arm64/arch_cpu.cpp
++++ b/src/system/kernel/arch/arm64/arch_cpu.cpp
+@@ -54,6 +54,11 @@ arch_cpu_init(kernel_args *args)
+ {
+ 	sPsciConduit = args->arch_args.psci_conduit;
+ 
++	uint64_t ctr_el0;
++	asm volatile ("mrs\t%0, ctr_el0":"=r" (ctr_el0));
++	dprintf("arm64: CTR_EL0 %#" B_PRIx64 ", instruction cache %s\n", ctr_el0,
++		((ctr_el0 >> 14) & 3) == 3 ? "PIPT" : "VIPT (synced by invalidating all)");
++
+ 	for (uint32 i = 0; i < args->num_cpus; i++) {
+ 		cpu_ent* cpu = &gCPU[i];
+ 
+@@ -109,7 +114,7 @@ arch_cpu_sync_icache(void *address, size_t len)
+ 	uint64_t ctr_el0 = 0;
+ 	asm volatile ("mrs\t%0, ctr_el0":"=r" (ctr_el0));
+ 
+-	uint64_t icache_line_size = 4 << (ctr_el0 << 0xF);
++	uint64_t icache_line_size = 4 << (ctr_el0 & 0xF);
+ 	uint64_t dcache_line_size = 4 << ((ctr_el0 >> 16) & 0xF);
+ 	uint64_t addr = (uint64_t)address;
+ 	uint64_t end = addr + len;
+@@ -119,14 +124,26 @@ arch_cpu_sync_icache(void *address, size_t len)
+ 		asm volatile ("dc cvau, %0" : : "r"(address_dcache) : "memory");
+ 	}
+ 
+-	asm("dsb ish");
+-
+-	for (uint64_t address_icache = ROUNDDOWN(addr, icache_line_size);
+-         address_icache < end; address_icache += icache_line_size) {
+-		asm volatile ("ic ivau, %0" : : "r"(address_icache) : "memory");
++	asm volatile("dsb ish" : : : "memory");
++
++	// The translation map passes the physical map alias of a page here, not
++	// the address the code runs at. In a VIPT instruction cache
++	// (CTR_EL0.L1Ip != PIPT; the Cortex-A53's is VIPT with 16 KiB ways)
++	// invalidating by that alias misses lines cached under the code's own
++	// address, and the CPU can go on executing a previous mapping's
++	// instructions (seen with kernel add-ons loaded at the address of one
++	// just unloaded). Invalidate the whole instruction cache then, on all
++	// CPUs, as Linux does for aliasing instruction caches.
++	if (((ctr_el0 >> 14) & 3) != 3) {
++		asm volatile("ic ialluis" : : : "memory");
++	} else {
++		for (uint64_t address_icache = ROUNDDOWN(addr, icache_line_size);
++				address_icache < end; address_icache += icache_line_size) {
++			asm volatile ("ic ivau, %0" : : "r"(address_icache) : "memory");
++		}
+ 	}
+-	asm("dsb ish");
+-	asm("isb");
++	asm volatile("dsb ish" : : : "memory");
++	asm volatile("isb" : : : "memory");
+ }
+ 
+ 

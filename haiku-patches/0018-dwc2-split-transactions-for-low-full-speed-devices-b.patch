@@ -1,0 +1,363 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 02:45:30 -0400
+Subject: [PATCH 018/342] dwc2: split transactions for low/full speed devices
+ behind a hub
+
+Keyboards and mice on the ODROID-C2 sit behind the onboard GL852G high
+speed hub and need its transaction translator: one packet per
+start-split (must be ACKed by the hub) and complete-split (retried each
+microframe while NYET), toggles carried from packet to packet, a short
+IN packet ends the transfer. As in FreeBSD's dwc_otg, interrupt
+endpoints are issued as control type through the translator, so there is
+no periodic complete-split window to hit; an interrupt NAK reschedules
+the transfer.
+
+The channel programming is shared with the high speed path
+(_RunChannel). NOT YET TESTED on hardware: no low/full speed device was
+plugged into the board. The high speed path (hub enumeration) was
+re-tested after the refactoring.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/busses/usb/dwc2.cpp | 226 +++++++++++++++++++++----
+ src/add-ons/kernel/busses/usb/dwc2.h   |  11 ++
+ 2 files changed, 207 insertions(+), 30 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.cpp b/src/add-ons/kernel/busses/usb/dwc2.cpp
+index b4b9e98e2c..0ca5a2ab75 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2.cpp
+@@ -18,9 +18,12 @@
+  * - runs transfers one at a time on host channel 0 from a worker thread:
+  *   control transfers stage by stage, bulk in one go, interrupt IN as one
+  *   attempt that is retried every 10 ms while the device NAKs;
+- * - does not do split transactions yet, so low/full speed devices behind a
+- *   high speed hub (keyboards and mice behind the ODROID-C2's GL852G hub)
+- *   are refused with B_NOT_SUPPORTED.
++ * - reaches low/full speed devices behind a high speed hub (keyboards and
++ *   mice behind the ODROID-C2's GL852G hub) with split transactions, one
++ *   packet per start-split/complete-split pair; like FreeBSD, interrupt
++ *   endpoints are issued as control type so the hub's transaction
++ *   translator handles them as non-periodic traffic. (Not yet tested on
++ *   hardware: no such device was plugged in.)
+  */
+ 
+ 
+@@ -131,12 +134,18 @@ enum {
+ #define HCINT_AHBERR			(1 << 2)
+ #define HCINT_STALL				(1 << 3)
+ #define HCINT_NAK				(1 << 4)
++#define HCINT_ACK				(1 << 5)
++#define HCINT_NYET				(1 << 6)
+ #define HCINT_XACTERR			(1 << 7)
+ #define HCINT_BBLERR			(1 << 8)
+ #define HCINT_FRMOVRUN			(1 << 9)
+ #define HCINT_DATATGLERR		(1 << 10)
+ #define HCINT_ALL				0x7ff
+ 
++#define HCSPLT_HUBADDR_SHIFT	7
++#define HCSPLT_COMPSPLT			(1 << 16)
++#define HCSPLT_SPLTENA			(1u << 31)
++
+ #define HCTSIZ_PKTCNT_SHIFT		19
+ #define HCTSIZ_PID_SHIFT		29
+ #define HCTSIZ_XFERSIZE_MASK	0x7ffff
+@@ -663,15 +672,12 @@ DWC2::SubmitTransfer(Transfer* transfer)
+ 	if ((pipe->Type() & USB_OBJECT_ISO_PIPE) != 0)
+ 		return B_NOT_SUPPORTED;
+ 
+-	if (pipe->Speed() != USB_SPEED_HIGHSPEED
+-		&& pipe->HubAddress() != fRootHubAddress) {
+-		if (!fWarnedSplit) {
+-			ERROR("device %d behind hub %d needs split transactions, which"
+-				" are not implemented yet\n", pipe->DeviceAddress(),
+-				pipe->HubAddress());
+-			fWarnedSplit = true;
+-		}
+-		return B_NOT_SUPPORTED;
++	if (_NeedsSplit(pipe) && !fWarnedSplit) {
++		INFO("device %d (%s speed) behind hub %d port %d: using split"
++			" transactions\n", pipe->DeviceAddress(),
++			pipe->Speed() == USB_SPEED_LOWSPEED ? "low" : "full",
++			pipe->HubAddress(), pipe->HubPort());
++		fWarnedSplit = true;
+ 	}
+ 
+ 	if (transfer->DataLength() > kBounceSize - kDataOffset)
+@@ -910,27 +916,29 @@ DWC2::_DataTransfer(Transfer* transfer, bool in, size_t* _actual, bool* _nak)
+ }
+ 
+ 
+-/*!	One transfer on host channel 0: \a length bytes (whole packets for IN)
+-	at \a offset in the bounce buffer. Returns with \a nak set if the device
+-	NAKed and nothing was transferred.
+-*/
+-status_t
+-DWC2::_Transaction(Pipe* pipe, uint32 pid, bool in, uint32 offset,
+-	uint32 length, uint32* _nextPid, size_t* _actual, bool* _nak)
++bool
++DWC2::_NeedsSplit(Pipe* pipe)
++{
++	return pipe->Speed() != USB_SPEED_HIGHSPEED
++		&& pipe->HubAddress() != fRootHubAddress;
++}
++
++
++uint32
++DWC2::_ChannelCharacteristics(Pipe* pipe, bool in, bool split)
+ {
+ 	uint32 maxPacket = pipe->MaxPacketSize();
+ 	if (maxPacket == 0)
+ 		maxPacket = 8;
+-	uint32 packets = length == 0 ? 1 : (length + maxPacket - 1) / maxPacket;
+-	uint32 size = in ? packets * maxPacket : length;
+-	if (offset + size > kBounceSize)
+-		return B_BAD_VALUE;
+ 
+ 	uint32 type = EPTYPE_BULK;
+ 	if ((pipe->Type() & USB_OBJECT_CONTROL_PIPE) != 0)
+ 		type = EPTYPE_CONTROL;
+-	else if ((pipe->Type() & USB_OBJECT_INTERRUPT_PIPE) != 0)
+-		type = EPTYPE_INTERRUPT;
++	else if ((pipe->Type() & USB_OBJECT_INTERRUPT_PIPE) != 0) {
++		// through a transaction translator interrupt endpoints go as
++		// non-periodic transactions: no periodic complete-split window
++		type = split ? EPTYPE_CONTROL : EPTYPE_INTERRUPT;
++	}
+ 
+ 	uint32 character = maxPacket
+ 		| ((pipe->EndpointAddress() & 0xf) << HCCHAR_EPNUM_SHIFT)
+@@ -942,7 +950,18 @@ DWC2::_Transaction(Pipe* pipe, uint32 pid, bool in, uint32 offset,
+ 		character |= HCCHAR_LSPDDEV;
+ 	if (type == EPTYPE_INTERRUPT && ((_Read(kHfnum) + 1) & 1) != 0)
+ 		character |= HCCHAR_ODDFRM;
++	return character;
++}
+ 
++
++/*!	Runs host channel 0 once and waits for it to halt. \a size bytes in
++	\a packets packets at \a offset in the bounce buffer.
++*/
++status_t
++DWC2::_RunChannel(uint32 character, uint32 split, uint32 size,
++	uint32 packets, uint32 pid, uint32 offset, bool in, uint32* _status,
++	uint32* _transferSize)
++{
+ 	phys_addr_t physical = fBouncePhysical + offset;
+ 	dcache_maintain(physical, size, in);
+ 
+@@ -950,7 +969,7 @@ DWC2::_Transaction(Pipe* pipe, uint32 pid, bool in, uint32 offset,
+ 	atomic_set(&fChannelStatus, 0);
+ 	fChannelHalted.Add(&entry);
+ 
+-	_Write(HC_SPLT(0), 0);
++	_Write(HC_SPLT(0), split);
+ 	_Write(HC_INT(0), HCINT_ALL);
+ 	_Write(HC_INTMSK(0), HCINT_CHHLTD);
+ 	_Write(HC_TSIZ(0), size | (packets << HCTSIZ_PKTCNT_SHIFT)
+@@ -963,17 +982,20 @@ DWC2::_Transaction(Pipe* pipe, uint32 pid, bool in, uint32 offset,
+ 	uint32 status = atomic_get(&fChannelStatus);
+ 	if ((status & HCINT_CHHLTD) == 0) {
+ 		_HaltChannel();
+-		ERROR("device %d endpoint %d: no response\n", pipe->DeviceAddress(),
+-			pipe->EndpointAddress() & 0xf);
+ 		return B_DEV_TIMEOUT;
+ 	}
+ 
+ 	if (in)
+ 		dcache_maintain(physical, size, true);
++	*_status = status;
++	*_transferSize = _Read(HC_TSIZ(0));
++	return B_OK;
++}
+ 
+-	uint32 transferSize = _Read(HC_TSIZ(0));
+-	*_nextPid = (transferSize >> HCTSIZ_PID_SHIFT) & 3;
+ 
++static status_t
++channel_error(uint32 status)
++{
+ 	if ((status & HCINT_STALL) != 0)
+ 		return B_DEV_STALLED;
+ 	if ((status & HCINT_BBLERR) != 0)
+@@ -982,6 +1004,45 @@ DWC2::_Transaction(Pipe* pipe, uint32 pid, bool in, uint32 offset,
+ 			| HCINT_FRMOVRUN)) != 0) {
+ 		return B_DEV_CRC_ERROR;
+ 	}
++	return B_OK;
++}
++
++
++/*!	One transfer: \a length bytes (whole packets for IN) at \a offset in
++	the bounce buffer. Returns with \a nak set if the device NAKed and
++	nothing was transferred.
++*/
++status_t
++DWC2::_Transaction(Pipe* pipe, uint32 pid, bool in, uint32 offset,
++	uint32 length, uint32* _nextPid, size_t* _actual, bool* _nak)
++{
++	if (_NeedsSplit(pipe)) {
++		return _SplitTransaction(pipe, pid, in, offset, length, _nextPid,
++			_actual, _nak);
++	}
++
++	uint32 maxPacket = pipe->MaxPacketSize();
++	if (maxPacket == 0)
++		maxPacket = 8;
++	uint32 packets = length == 0 ? 1 : (length + maxPacket - 1) / maxPacket;
++	uint32 size = in ? packets * maxPacket : length;
++	if (offset + size > kBounceSize)
++		return B_BAD_VALUE;
++
++	uint32 status;
++	uint32 transferSize;
++	status_t result = _RunChannel(_ChannelCharacteristics(pipe, in, false), 0,
++		size, packets, pid, offset, in, &status, &transferSize);
++	if (result != B_OK) {
++		ERROR("device %d endpoint %d: no response\n", pipe->DeviceAddress(),
++			pipe->EndpointAddress() & 0xf);
++		return result;
++	}
++
++	*_nextPid = (transferSize >> HCTSIZ_PID_SHIFT) & 3;
++	result = channel_error(status);
++	if (result != B_OK)
++		return result;
+ 	if ((status & HCINT_XFERCOMPL) == 0) {
+ 		if ((status & HCINT_NAK) != 0) {
+ 			*_nak = true;
+@@ -995,6 +1056,111 @@ DWC2::_Transaction(Pipe* pipe, uint32 pid, bool in, uint32 offset,
+ }
+ 
+ 
++/*!	A transfer to a low/full speed device behind a high speed hub, one
++	packet per start-split/complete-split pair.
++*/
++status_t
++DWC2::_SplitTransaction(Pipe* pipe, uint32 pid, bool in, uint32 offset,
++	uint32 length, uint32* _nextPid, size_t* _actual, bool* _nak)
++{
++	uint32 maxPacket = pipe->MaxPacketSize();
++	if (maxPacket == 0)
++		maxPacket = 8;
++	if (offset + length + maxPacket > kBounceSize)
++		return B_BAD_VALUE;
++
++	uint32 character = _ChannelCharacteristics(pipe, in, true);
++	uint32 split = HCSPLT_SPLTENA
++		| ((uint32)pipe->HubAddress() << HCSPLT_HUBADDR_SHIFT)
++		| (pipe->HubPort() & 0x7f);
++
++	uint32 done = 0;
++	uint32 currentPid = pid;
++	int32 nakRetries = 0;
++	do {
++		uint32 chunk = min_c(length - done, maxPacket);
++		uint32 size = in ? maxPacket : chunk;
++		uint32 status;
++		uint32 transferSize;
++
++		// start-split: the hub's transaction translator takes the request
++		status_t result = _RunChannel(character, split, size, 1, currentPid,
++			offset + done, in, &status, &transferSize);
++		if (result != B_OK)
++			return result;
++		result = channel_error(status);
++		if (result != B_OK)
++			return result;
++		if ((status & HCINT_NAK) != 0) {
++			// the translator is busy: try again a little later
++			if (done == 0 && (pipe->Type() & USB_OBJECT_INTERRUPT_PIPE) != 0) {
++				*_nak = true;
++				return B_OK;
++			}
++			if (++nakRetries > 1000)
++				return B_DEV_TIMEOUT;
++			snooze(1000);
++			continue;
++		}
++		if ((status & HCINT_ACK) == 0)
++			return B_ERROR;
++
++		// complete-split: ask for the result, NYET means "not yet"
++		bool packetNak = false;
++		uint32 got = 0;
++		int32 tries;
++		for (tries = 0; tries < 64; tries++) {
++			uint32 frame = _Read(kHfnum) & 0xffff;
++			for (int32 i = 0; i < 200 && (_Read(kHfnum) & 0xffff) == frame;
++					i++) {
++				spin(5);
++			}
++
++			result = _RunChannel(character, split | HCSPLT_COMPSPLT, size, 1,
++				currentPid, offset + done, in, &status, &transferSize);
++			if (result != B_OK)
++				return result;
++			if ((status & HCINT_NYET) != 0)
++				continue;
++			result = channel_error(status);
++			if (result != B_OK)
++				return result;
++			if ((status & HCINT_NAK) != 0) {
++				packetNak = true;
++				break;
++			}
++			if ((status & (HCINT_XFERCOMPL | HCINT_ACK)) != 0) {
++				got = in ? size - (transferSize & HCTSIZ_XFERSIZE_MASK) : chunk;
++				currentPid = (transferSize >> HCTSIZ_PID_SHIFT) & 3;
++				break;
++			}
++			return B_ERROR;
++		}
++		if (tries == 64)
++			return B_DEV_TIMEOUT;
++
++		if (packetNak) {
++			if (done == 0 && (pipe->Type() & USB_OBJECT_INTERRUPT_PIPE) != 0) {
++				*_nak = true;
++				return B_OK;
++			}
++			if (++nakRetries > 1000)
++				return B_DEV_TIMEOUT;
++			snooze(1000);
++			continue;
++		}
++
++		done += got;
++		if (in && got < maxPacket)
++			break;
++	} while (done < length);
++
++	*_nextPid = currentPid;
++	*_actual = done;
++	return B_OK;
++}
++
++
+ void
+ DWC2::_HaltChannel()
+ {
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.h b/src/add-ons/kernel/busses/usb/dwc2.h
+index f2b75aeba1..7400e43190 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.h
++++ b/src/add-ons/kernel/busses/usb/dwc2.h
+@@ -74,6 +74,17 @@ private:
+ 									uint32 offset, uint32 length,
+ 									uint32* nextPid, size_t* actual,
+ 									bool* nak);
++			status_t			_SplitTransaction(Pipe* pipe, uint32 pid,
++									bool in, uint32 offset, uint32 length,
++									uint32* nextPid, size_t* actual,
++									bool* nak);
++			bool				_NeedsSplit(Pipe* pipe);
++			uint32				_ChannelCharacteristics(Pipe* pipe, bool in,
++									bool split);
++			status_t			_RunChannel(uint32 character, uint32 split,
++									uint32 size, uint32 packets, uint32 pid,
++									uint32 offset, bool in, uint32* status,
++									uint32* transferSize);
+ 			void				_HaltChannel();
+ 
+ 			status_t			_CopyToBounce(Transfer* transfer, uint32 offset,

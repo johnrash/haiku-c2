@@ -1,0 +1,12 @@
+#!/bin/sh
+# Haiku's mimeset, the build's host tool, with the build's MIME database for
+# Haiku's own: in place of /boot/system/data/mime_db, or when none is given
+db=$HAIKU_GEN/objects/common/data/mime_db/mime_db
+for a in "$@"; do
+	case "$a" in --mimedb|-m) given=1 ;; esac
+	[ "$a" = /boot/system/data/mime_db ] && a=$db
+	set -- "$@" "$a"
+	shift
+done
+[ -n "$given" ] || set -- --mimedb "$db" "$@"
+exec "$HAIKU_HOST_TOOLS/mimeset" "$@"

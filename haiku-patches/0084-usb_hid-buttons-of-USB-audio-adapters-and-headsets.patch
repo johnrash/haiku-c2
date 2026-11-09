@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 02:17:56 -0400
+Subject: [PATCH 084/342] usb_hid: buttons of USB audio adapters and headsets
+
+Their volume up/down, mute and play buttons are consumer controls with a
+bit each (variable, 0..1) in a Consumer Control collection; the keyboard
+handler only took consumer controls reported as arrays, so these devices
+got no handler ("no handlers for hid device"). Such a button is now a
+key too, sent as (usage page << 16) | usage, which is how the PS/2 keymap
+sends media keys and what the default Shortcuts settings bind to
+setvolume -i/-d/-t.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../drivers/input/hid_shared/HIDReportItem.h  |  1 +
+ .../hid_shared/KeyboardProtocolHandler.cpp    | 22 ++++++++++++++++---
+ .../hid_shared/KeyboardProtocolHandler.h      |  1 +
+ 3 files changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/input/hid_shared/HIDReportItem.h b/src/add-ons/kernel/drivers/input/hid_shared/HIDReportItem.h
+index b77f4be524..8b81614b93 100644
+--- a/src/add-ons/kernel/drivers/input/hid_shared/HIDReportItem.h
++++ b/src/add-ons/kernel/drivers/input/hid_shared/HIDReportItem.h
+@@ -24,6 +24,7 @@ public:
+ 		bool					Array() { return fArray; };
+ 		bool					Signed() { return fMinimum > fMaximum; };
+ 		uint32					Minimum() { return fMinimum; }
++		uint32					Maximum() { return fMaximum; }
+ 
+ 		uint16					UsagePage();
+ 		uint16					UsageID();
+diff --git a/src/add-ons/kernel/drivers/input/hid_shared/KeyboardProtocolHandler.cpp b/src/add-ons/kernel/drivers/input/hid_shared/KeyboardProtocolHandler.cpp
+index 32969edb90..646082a7cb 100644
+--- a/src/add-ons/kernel/drivers/input/hid_shared/KeyboardProtocolHandler.cpp
++++ b/src/add-ons/kernel/drivers/input/hid_shared/KeyboardProtocolHandler.cpp
+@@ -253,11 +253,13 @@ KeyboardProtocolHandler::AddHandlers(HIDDevice &device,
+ 
+ 			if (item->UsagePage() == B_HID_USAGE_PAGE_KEYBOARD
+ 				|| (item->UsagePage() == B_HID_USAGE_PAGE_CONSUMER
+-					&& item->Array())
++					&& (item->Array() || _IsOnOffControl(item)))
+ 				|| (item->UsagePage() == B_HID_USAGE_PAGE_BUTTON
+ 					&& item->Array())) {
+ 				// found at least one item with a keyboard usage or with
+-				// a consumer/button usage that is handled like a key
++				// a consumer/button usage that is handled like a key; the
++				// buttons of headsets and USB audio adapters (volume, mute,
++				// play) are consumer controls with a bit each
+ //				mayHaveOutput = item->UsagePage() == B_HID_USAGE_PAGE_KEYBOARD;
+ 				foundKeyboardUsage = true;
+ 				break;
+@@ -504,6 +506,14 @@ KeyboardProtocolHandler::_SetLEDs(uint8 *data)
+ }
+ 
+ 
++/*static*/ bool
++KeyboardProtocolHandler::_IsOnOffControl(HIDReportItem* item)
++{
++	return !item->Array() && !item->Relative() && item->Minimum() == 0
++		&& item->Maximum() == 1;
++}
++
++
+ status_t
+ KeyboardProtocolHandler::_ReadReport(bigtime_t timeout, uint32 *cookie)
+ {
+@@ -811,7 +821,13 @@ KeyboardProtocolHandler::_ReadReport(bigtime_t timeout, uint32 *cookie)
+ 				}
+ 			}
+ 
+-			if (key == 0) {
++			if (key == 0 && !fKeys[i]->Array()
++				&& fKeys[i]->UsagePage() != B_HID_USAGE_PAGE_KEYBOARD) {
++				// a consumer control with a bit of its own: its usage, as
++				// the PS/2 keymap sends media keys (the Shortcuts
++				// preferences bind volume up, down and mute to setvolume)
++				key = (fKeys[i]->UsagePage() << 16) | current[i];
++			} else if (key == 0) {
+ 				// unmapped normal key or consumer/button key
+ 				key = fInputReport.Usages()[0] + current[i];
+ 			}
+diff --git a/src/add-ons/kernel/drivers/input/hid_shared/KeyboardProtocolHandler.h b/src/add-ons/kernel/drivers/input/hid_shared/KeyboardProtocolHandler.h
+index 51f144e357..29c28a94f8 100644
+--- a/src/add-ons/kernel/drivers/input/hid_shared/KeyboardProtocolHandler.h
++++ b/src/add-ons/kernel/drivers/input/hid_shared/KeyboardProtocolHandler.h
+@@ -40,6 +40,7 @@ private:
+ 			void				_WriteKey(uint32 key, bool down);
+ 			status_t			_SetLEDs(uint8 *data);
+ 			status_t			_ReadReport(bigtime_t timeout, uint32 *cookie);
++	static	bool				_IsOnOffControl(HIDReportItem* item);
+ 
+ private:
+ 			mutex				fLock;

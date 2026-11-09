@@ -1,0 +1,314 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 00:52:28 -0400
+Subject: [PATCH 009/342] mmc: read EXT_CSD for the size of eMMC cards
+
+- mmc_bus_interface/mmc_device_interface: optional execute_read_command
+  hook (single-block data-in into a kernel buffer) and, for devices,
+  set_clock; sdhci leaves the new controller hook NULL
+- mmc_bus: forward both after selecting the card
+- meson_gx_mmc: implement execute_read_command through a one-page bounce
+  buffer below 4 GB
+- mmc_disk: on MMC cards read EXT_CSD, take the capacity from SEC_COUNT
+  and remember DEVICE_TYPE (supported speed modes)
+
+ODROID-C2 eMMC: EXT_CSD rev 8, 244629504 sectors (116.6 GiB), device type
+0x57.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/drivers/mmc.h                 | 13 +++++
+ .../kernel/bus_managers/mmc/mmc_bus.cpp       | 14 ++++++
+ src/add-ons/kernel/bus_managers/mmc/mmc_bus.h |  3 ++
+ .../kernel/bus_managers/mmc/mmc_module.cpp    | 30 ++++++++++-
+ .../kernel/busses/mmc/meson_gx_mmc.cpp        | 50 +++++++++++++++++++
+ .../kernel/drivers/disk/mmc/mmc_disk.cpp      | 26 +++++++++-
+ .../kernel/drivers/disk/mmc/mmc_disk.h        |  2 +
+ 7 files changed, 136 insertions(+), 2 deletions(-)
+
+diff --git a/headers/private/drivers/mmc.h b/headers/private/drivers/mmc.h
+index e81947f0c9..c50edb89c0 100644
+--- a/headers/private/drivers/mmc.h
++++ b/headers/private/drivers/mmc.h
+@@ -105,6 +105,10 @@ typedef struct mmc_bus_interface {
+ 		// Set the data bus width to 1, 4 or 8 bit mode.
+ 	void (*terminate_bus)(void* controller);
+ 	void (*set_card_type)(void* controller, card_type type);
++	status_t (*execute_read_command)(void* controller, uint8_t command,
++		uint32_t argument, void* buffer, size_t length);
++		// Optional (may be NULL): execute a command with a single-block
++		// data-in phase into a kernel buffer, such as MMC_SEND_EXT_CSD.
+ } mmc_bus_interface;
+ 
+ 
+@@ -123,6 +127,15 @@ typedef struct mmc_device_interface {
+ 		// Execute a command that involves a data transfer.
+ 	void (*set_bus_width)(device_node* controller, void* cookie, int width);
+ 		// Set the data bus width to 1, 4 or 8 bit mode.
++	status_t (*execute_read_command)(device_node* controller, void* cookie,
++		uint16_t rca, uint8_t command, uint32_t argument, void* buffer,
++		size_t length);
++		// Execute a command with a single-block data-in phase into a kernel
++		// buffer (e.g. MMC_SEND_EXT_CSD). B_NOT_SUPPORTED if the host
++		// controller driver cannot.
++	void (*set_clock)(device_node* controller, void* cookie,
++		uint32_t kilohertz);
++		// Change the bus clock, e.g. after switching a card to high speed.
+ } mmc_device_interface;
+ 
+ 
+diff --git a/src/add-ons/kernel/bus_managers/mmc/mmc_bus.cpp b/src/add-ons/kernel/bus_managers/mmc/mmc_bus.cpp
+index 1842391d74..6cd27bd70b 100644
+--- a/src/add-ons/kernel/bus_managers/mmc/mmc_bus.cpp
++++ b/src/add-ons/kernel/bus_managers/mmc/mmc_bus.cpp
+@@ -102,6 +102,20 @@ MMCBus::DoIO(uint16_t rca, uint8_t command, IOOperation* operation,
+ }
+ 
+ 
++status_t
++MMCBus::ExecuteReadCommand(uint16_t rca, uint8_t command, uint32_t argument,
++	void* buffer, size_t length)
++{
++	if (fController->execute_read_command == NULL)
++		return B_NOT_SUPPORTED;
++	status_t status = _ActivateDevice(rca);
++	if (status != B_OK)
++		return status;
++	return fController->execute_read_command(fCookie, command, argument,
++		buffer, length);
++}
++
++
+ void
+ MMCBus::SetClock(int frequency)
+ {
+diff --git a/src/add-ons/kernel/bus_managers/mmc/mmc_bus.h b/src/add-ons/kernel/bus_managers/mmc/mmc_bus.h
+index 8640b12098..f8859421d8 100644
+--- a/src/add-ons/kernel/bus_managers/mmc/mmc_bus.h
++++ b/src/add-ons/kernel/bus_managers/mmc/mmc_bus.h
+@@ -142,6 +142,9 @@ public:
+ 				status_t		DoIO(uint16_t rca, uint8_t command,
+ 									IOOperation* operation,
+ 									bool offsetAsSectors);
++				status_t		ExecuteReadCommand(uint16_t rca,
++									uint8_t command, uint32_t argument,
++									void* buffer, size_t length);
+ 
+ 				void			SetClock(int frequency);
+ 				void			SetBusWidth(int width);
+diff --git a/src/add-ons/kernel/bus_managers/mmc/mmc_module.cpp b/src/add-ons/kernel/bus_managers/mmc/mmc_module.cpp
+index cfb87f2972..c597292ece 100644
+--- a/src/add-ons/kernel/bus_managers/mmc/mmc_module.cpp
++++ b/src/add-ons/kernel/bus_managers/mmc/mmc_module.cpp
+@@ -119,6 +119,32 @@ mmc_bus_set_width(device_node* node, void* cookie, int width)
+ }
+ 
+ 
++static status_t
++mmc_bus_execute_read_command(device_node* node, void* cookie, uint16_t rca,
++	uint8_t command, uint32_t argument, void* buffer, size_t length)
++{
++	MMCBus* bus = (MMCBus*)cookie;
++
++	bus->AcquireBus();
++	status_t error = bus->ExecuteReadCommand(rca, command, argument, buffer,
++		length);
++	bus->ReleaseBus();
++
++	return error;
++}
++
++
++static void
++mmc_bus_set_clock(device_node* node, void* cookie, uint32_t kilohertz)
++{
++	MMCBus* bus = (MMCBus*)cookie;
++
++	bus->AcquireBus();
++	bus->SetClock(kilohertz);
++	bus->ReleaseBus();
++}
++
++
+ static status_t
+ std_ops(int32 op, ...)
+ {
+@@ -170,7 +196,9 @@ mmc_device_interface mmc_bus_controller_module = {
+ 	},
+ 	mmc_bus_execute_command,
+ 	mmc_bus_do_io,
+-	mmc_bus_set_width
++	mmc_bus_set_width,
++	mmc_bus_execute_read_command,
++	mmc_bus_set_clock
+ };
+ 
+ 
+diff --git a/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp b/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
+index b182be9860..bee8dbe548 100644
+--- a/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
++++ b/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
+@@ -184,6 +184,9 @@ public:
+ 									uint32* result);
+ 			status_t			DoIO(uint8 command, IOOperation* operation,
+ 									bool offsetAsSectors);
++			status_t			ExecuteReadCommand(uint8 command,
++									uint32 argument, void* buffer,
++									size_t length);
+ 
+ private:
+ 			uint32				_Read(uint32 offset)
+@@ -213,6 +216,10 @@ private:
+ 			int32				fIrqStatus;
+ 				// status bits collected by the interrupt handler
+ 			bool				fReadOnly;
++			area_id				fBounceArea;
++			void*				fBounceBuffer;
++			phys_addr_t			fBouncePhysical;
++				// one page below 4 GB for short reads (EXT_CSD)
+ 			mutex				fLock;
+ 			card_type			fCardType;
+ 			bool				fAppCommand;
+@@ -230,6 +237,9 @@ MesonMmc::MesonMmc(area_id area, volatile uint32* registers,
+ 	fUseInterrupts(false),
+ 	fIrqStatus(0),
+ 	fReadOnly(readOnly),
++	fBounceArea(-1),
++	fBounceBuffer(NULL),
++	fBouncePhysical(0),
+ 	fCardType(CARD_TYPE_UNKNOWN),
+ 	fAppCommand(false),
+ 	fScanSemaphore(-1)
+@@ -246,6 +256,8 @@ MesonMmc::~MesonMmc()
+ 		remove_io_interrupt_handler(fIrq, _InterruptHandler, this);
+ 	}
+ 	mutex_destroy(&fLock);
++	if (fBounceArea >= 0)
++		delete_area(fBounceArea);
+ 	delete_area(fArea);
+ }
+ 
+@@ -265,6 +277,15 @@ MesonMmc::Init()
+ 		| (8 << CONFIG_RESP_TIMEOUT_SHIFT) | (9 << CONFIG_BLOCK_LEN_SHIFT)
+ 		| CONFIG_BUS_WIDTH_1);
+ 
++	fBounceArea = create_area("meson_gx_mmc bounce", &fBounceBuffer,
++		B_ANY_KERNEL_ADDRESS, B_PAGE_SIZE, B_32_BIT_CONTIGUOUS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
++	if (fBounceArea >= 0) {
++		physical_entry entry;
++		get_memory_map(fBounceBuffer, B_PAGE_SIZE, &entry, 1);
++		fBouncePhysical = entry.address;
++	}
++
+ 	if (fIrq > 0 && install_io_interrupt_handler(fIrq, _InterruptHandler, this,
+ 			0) == B_OK) {
+ 		fUseInterrupts = true;
+@@ -647,6 +668,25 @@ MesonMmc::DoIO(uint8 command, IOOperation* operation, bool offsetAsSectors)
+ }
+ 
+ 
++status_t
++MesonMmc::ExecuteReadCommand(uint8 command, uint32 argument, void* buffer,
++	size_t length)
++{
++	if (length != kBlockSize)
++		return B_BAD_VALUE;
++	if (fBounceArea < 0)
++		return B_NO_MEMORY;
++
++	MutexLocker locker(fLock);
++	uint32 response;
++	status_t status = _Execute(command, argument, &response, fBouncePhysical,
++		1, false);
++	if (status == B_OK)
++		memcpy(buffer, fBounceBuffer, kBlockSize);
++	return status;
++}
++
++
+ //	#pragma mark - device tree helpers
+ 
+ 
+@@ -964,6 +1004,15 @@ set_card_type(void* controller, card_type type)
+ }
+ 
+ 
++static status_t
++execute_read_command(void* controller, uint8_t command, uint32_t argument,
++	void* buffer, size_t length)
++{
++	return ((MesonMmc*)controller)->ExecuteReadCommand(command, argument,
++		buffer, length);
++}
++
++
+ static mmc_bus_interface gMesonGxMmcModule = {
+ 	.info = {
+ 		.info = {
+@@ -983,6 +1032,7 @@ static mmc_bus_interface gMesonGxMmcModule = {
+ 	.set_bus_width = set_bus_width,
+ 	.terminate_bus = terminate_bus,
+ 	.set_card_type = set_card_type,
++	.execute_read_command = execute_read_command,
+ };
+ 
+ 
+diff --git a/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp b/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
+index ec7964f220..245077936a 100644
+--- a/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
++++ b/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
+@@ -35,6 +35,7 @@
+ #	define TRACE(x...) ;
+ #endif
+ #define ERROR(x...)			dprintf("\33[33mmmc_disk:\33[0m " x)
++#define INFO(x...)			dprintf("\33[33mmmc_disk:\33[0m " x)
+ #define CALLED() 			TRACE("CALLED %s\n", __PRETTY_FUNCTION__)
+ 
+ #define MMC_DISK_DRIVER_MODULE_NAME "drivers/disk/mmc/mmc_disk/driver_v1"
+@@ -181,8 +182,31 @@ mmc_block_get_geometry(mmc_disk_driver_info* info, device_geometry* geometry)
+ 	geometry->cylinder_count = 1 << (csd.c_size_mult(isMMC) + 2);
+ 	geometry->head_count = 1;
+ 	geometry->device_type = B_DISK;
+-	// TODO: cards over 2 GB (all eMMC "extended capacity" parts) report a
++	// Cards over 2 GB (all eMMC "extended capacity" parts) report a
+ 	// placeholder size in the CSD; the real one is SEC_COUNT in EXT_CSD.
++	if (isMMC && info->mmc->execute_read_command != NULL) {
++		uint8* extCsd = (uint8*)malloc(kBlockSize);
++		if (extCsd != NULL) {
++			status_t extStatus = info->mmc->execute_read_command(info->parent,
++				info->parentCookie, info->rca, MMC_SEND_EXT_CSD, 0, extCsd,
++				kBlockSize);
++			if (extStatus == B_OK) {
++				uint32 sectors = extCsd[212] | (extCsd[213] << 8)
++					| (extCsd[214] << 16) | ((uint32)extCsd[215] << 24);
++				info->mmcDeviceType = extCsd[196];
++				INFO("EXT_CSD rev %u, %" B_PRIu32 " sectors, device "
++					"type %#x\n", extCsd[192], sectors, extCsd[196]);
++				if (sectors != 0) {
++					geometry->bytes_per_sector = kBlockSize;
++					geometry->sectors_per_track = sectors;
++					geometry->cylinder_count = 1;
++				}
++			} else
++				INFO("Could not read EXT_CSD: %s\n", strerror(extStatus));
++			free(extCsd);
++		}
++	}
++
+ 	geometry->removable = !isMMC;
+ 	geometry->read_only = false; // TODO check write protect switch?
+ 	geometry->write_once = false;
+diff --git a/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.h b/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.h
+index ea73a99b96..c9657e3a8a 100644
+--- a/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.h
++++ b/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.h
+@@ -35,6 +35,8 @@ typedef struct {
+ 	uint16_t rca;
+ 	uint8_t type;
+ 		// card_type of the card
++	uint8_t mmcDeviceType;
++		// EXT_CSD DEVICE_TYPE (supported eMMC speed modes), 0 if unknown
+ 	uint32_t flags;
+ 
+ 	device_geometry geometry;

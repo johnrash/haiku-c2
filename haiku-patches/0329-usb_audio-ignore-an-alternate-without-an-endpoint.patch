@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 6 Nov 2026 23:03:42 -0500
+Subject: [PATCH 329/342] usb_audio: ignore an alternate without an endpoint
+
+A streaming interface's alternate whose endpoint descriptor is missing
+(a configuration read while the device was still settling) was chosen
+like any other, and Stream::_ChooseAlternate() then read its endpoint
+address through NULL: a kernel page fault at 0x6 when such a device was
+offered as new. It is skipped now, like one without its format.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/drivers/audio/usb/Stream.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Stream.cpp b/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
+index 474c2cbd9f..0f88f2b7f8 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
++++ b/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
+@@ -66,6 +66,12 @@ Stream::_ChooseAlternate()
+ 			continue;
+ 		}
+ 
++		if (fAlternates[i]->Endpoint() == NULL) {
++			// a configuration read badly (see OnSetConfiguration())
++			TRACE(ERR, "Ignore alternate %d - no endpoint.\n", i);
++			continue;
++		}
++
+ 		if (fAlternates[i]->Format()->fFormatType
+ 				!= USB_AUDIO_FORMAT_TYPE_I) {
+ 			TRACE(ERR, "Ignore alternate %d - format type %#02x "

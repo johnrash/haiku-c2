@@ -1,0 +1,195 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 16:08:54 -0500
+Subject: [PATCH 238/342] VideoRecorder: the sound written by the recorder's
+ thread, the pictures to the stop
+
+The sound's thread wrote into the file itself, and waited for it while
+the pictures were written (a 1920x1080 H.264 chunk to the disk): the
+sound's buffers came late, and the microphone's node lost some. It is
+now queued, and the recorder's thread writes it between pictures.
+
+At the stop, the thread ended after the picture it was writing, and the
+newest one (the camera's last, up to 0.6 s later) was left out; it is
+written too now. The log line for each clip says when the last picture
+and sound came and when the stop did.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apps/codycam/VideoRecorder.cpp | 58 +++++++++++++++++++++++++-----
+ src/apps/codycam/VideoRecorder.h   |  8 +++++
+ 2 files changed, 57 insertions(+), 9 deletions(-)
+
+diff --git a/src/apps/codycam/VideoRecorder.cpp b/src/apps/codycam/VideoRecorder.cpp
+index 30e4741dc1..75da0d42a3 100644
+--- a/src/apps/codycam/VideoRecorder.cpp
++++ b/src/apps/codycam/VideoRecorder.cpp
+@@ -43,6 +43,8 @@ VideoRecorder::VideoRecorder()
+ 	fError(B_OK),
+ 	fAudioLock("video recorder sound"),
+ 	fAudioTrack(NULL),
++	fAudioPending(new BMallocIO),
++	fAudioWriting(new BMallocIO),
+ 	fAudioFrameSize(0),
+ 	fAudioFrameRate(0),
+ 	fAudioUnsigned(false),
+@@ -51,6 +53,7 @@ VideoRecorder::VideoRecorder()
+ 	fAudioAligned(0),
+ 	fLastAudioArrival(-1),
+ 	fLastPictureArrival(-1),
++	fLastAdded(-1),
+ 	fAudioLate(0)
+ {
+ }
+@@ -59,6 +62,8 @@ VideoRecorder::VideoRecorder()
+ VideoRecorder::~VideoRecorder()
+ {
+ 	Stop();
++	delete fAudioPending;
++	delete fAudioWriting;
+ }
+ 
+ 
+@@ -172,6 +177,8 @@ VideoRecorder::Start(const char* path, uint32 width, uint32 height,
+ 	fFirstPictureArrival = -1;
+ 	fAudioFrames = 0;
+ 	fAudioAligned = 0;
++	fAudioPending->SetSize(0);
++	fAudioPending->Seek(0, SEEK_SET);
+ 	fLastAudioArrival = -1;
+ 	fLastPictureArrival = -1;
+ 	fAudioLate = 0;
+@@ -197,6 +204,7 @@ VideoRecorder::AddFrame(const void* bits, bigtime_t when)
+ 	memcpy(fPending, bits, fFrameSize);
+ 	fPendingTime = when;
+ 	fPendingArrival = system_time();
++	fLastAdded = fPendingArrival;
+ 	bool wake = !fHasPending;
+ 	fHasPending = true;
+ 	fLock.Unlock();
+@@ -221,6 +229,7 @@ VideoRecorder::Stop()
+ 	fThread = -1;
+ 
+ 	// no more sound
++	_WriteAudio();
+ 	fAudioLock.Lock();
+ 	BMediaTrack* audioTrack = fAudioTrack;
+ 	fAudioTrack = NULL;
+@@ -234,9 +243,10 @@ VideoRecorder::Stop()
+ 				/ fAudioFrameRate,
+ 			fAudioAligned < 0 ? "left out" : "silence");
+ 		printf("VideoRecorder: after the first picture, the last picture "
+-			"came at %.3f s, the last sound at %.3f s, the stop at %.3f s; "
+-			"%" B_PRId32 " sound buffers late\n",
++			"came at %.3f s (the last added at %.3f s), the last sound at "
++			"%.3f s, the stop at %.3f s; %" B_PRId32 " sound buffers late\n",
+ 			(fLastPictureArrival - fFirstPictureArrival) / 1000000.0,
++			(fLastAdded - fFirstPictureArrival) / 1000000.0,
+ 			(fLastAudioArrival - fFirstPictureArrival) / 1000000.0,
+ 			(stopTime - fFirstPictureArrival) / 1000000.0, fAudioLate);
+ 		fflush(stdout);
+@@ -315,10 +325,10 @@ VideoRecorder::AddAudio(const void* data, size_t size)
+ 		if (offset > 0) {
+ 			uint8 silence[4096];
+ 			memset(silence, fAudioUnsigned ? 0x80 : 0, sizeof(silence));
+-			int64 perWrite = sizeof(silence) / fAudioFrameSize;
+-			for (int64 left = offset; left > 0; left -= perWrite) {
+-				fAudioTrack->WriteFrames(silence,
+-					left < perWrite ? left : perWrite);
++			for (size_t left = offset * fAudioFrameSize; left > 0;) {
++				size_t piece = left < sizeof(silence) ? left : sizeof(silence);
++				fAudioPending->Write(silence, piece);
++				left -= piece;
+ 			}
+ 		} else if (offset < 0) {
+ 			int64 skip = -offset < frames ? -offset : frames;
+@@ -331,7 +341,29 @@ VideoRecorder::AddAudio(const void* data, size_t size)
+ 	if (frames <= 0)
+ 		return;
+ 	fAudioFrames += frames;
+-	fAudioTrack->WriteFrames(data, frames);
++	fAudioPending->Write(data, frames * fAudioFrameSize);
++}
++
++
++/*!	The sound that came meanwhile, into the file. In the recorder's thread,
++	or after it ended.
++*/
++void
++VideoRecorder::_WriteAudio()
++{
++	fAudioLock.Lock();
++	BMediaTrack* track = fAudioTrack;
++	BMallocIO* swap = fAudioPending;
++	fAudioPending = fAudioWriting;
++	fAudioWriting = swap;
++	fAudioLock.Unlock();
++
++	size_t size = fAudioWriting->BufferLength();
++	if (track != NULL && size >= fAudioFrameSize && fAudioFrameSize > 0) {
++		track->WriteFrames(fAudioWriting->Buffer(), size / fAudioFrameSize);
++	}
++	fAudioWriting->SetSize(0);
++	fAudioWriting->Seek(0, SEEK_SET);
+ }
+ 
+ 
+@@ -396,8 +428,16 @@ VideoRecorder::_Thread()
+ 			}
+ 		}
+ 
+-		if (fQuit)
+-			break;
++		_WriteAudio();
++		if (fQuit) {
++			// the newest picture still (Stop() comes after the last one
++			// was added): the pictures last until the stop
++			fLock.Lock();
++			bool pending = fHasPending;
++			fLock.Unlock();
++			if (!pending)
++				break;
++		}
+ 	}
+ }
+ 
+diff --git a/src/apps/codycam/VideoRecorder.h b/src/apps/codycam/VideoRecorder.h
+index 2fd529ccae..511b24347e 100644
+--- a/src/apps/codycam/VideoRecorder.h
++++ b/src/apps/codycam/VideoRecorder.h
+@@ -6,6 +6,7 @@
+ #define VIDEO_RECORDER_H
+ 
+ 
++#include <DataIO.h>
+ #include <Locker.h>
+ #include <MediaDefs.h>
+ #include <OS.h>
+@@ -60,6 +61,7 @@ private:
+ 									const media_multi_audio_format& audio);
+ 
+ 	static	status_t			_ThreadEntry(void* data);
++			void				_WriteAudio();
+ 			void				_Thread();
+ 			void				_Cleanup();
+ 
+@@ -89,6 +91,11 @@ private:
+ 			BLocker				fAudioLock;
+ 			BMediaTrack*		fAudioTrack;
+ 				// under fAudioLock: the sound comes from another thread
++			BMallocIO*			fAudioPending;
++				// under fAudioLock: what came, for the thread to write (the
++				// sound's thread mustn't wait for the file: it would take
++				// longer than the sound's buffers last)
++			BMallocIO*			fAudioWriting;
+ 			size_t				fAudioFrameSize;
+ 			float				fAudioFrameRate;
+ 			bool				fAudioUnsigned;
+@@ -100,6 +107,7 @@ private:
+ 				// silence put in front (> 0) or sound left out (< 0)
+ 			bigtime_t			fLastAudioArrival;
+ 			bigtime_t			fLastPictureArrival;
++			bigtime_t			fLastAdded;
+ 			int32				fAudioLate;
+ 				// buffers that came more than two buffers' time apart
+ };

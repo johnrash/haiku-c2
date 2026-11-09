@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 15:39:18 -0500
+Subject: [PATCH 234/342] usb_webcam: a picture with bytes after its EOI goes
+ to the S905 too
+
+The C920 follows some pictures (3% at 1080p) with 31 bytes after their
+EOI; they were taken for cut short and skipped. The last EOI in the last
+4 KB is the end (FF D9 can't be in the entropy-coded data), and the
+decoder gets the picture up to it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../usb_webcam/addons/uvc/UVCCamDevice.cpp    | 52 +++++++------------
+ .../usb_webcam/addons/uvc/UVCCamDevice.h      |  2 +-
+ 2 files changed, 21 insertions(+), 33 deletions(-)
+
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+index 3ab57f45e4..aaf36ed251 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+@@ -1984,25 +1984,27 @@ UVCCamDevice::_HardwareDecoderEntry(void* data)
+ }
+ 
+ 
+-/*!	Whether \a data is a whole JPEG picture of the stream's size: from SOI to
+-	EOI. A picture cut short (its end lost with an isochronous packet) would
+-	make the S905's decoder decode the next one into it, and lose that.
++/*!	The length of the JPEG picture of the stream's size in \a data, from SOI
++	to EOI, or 0 if it isn't whole. A picture cut short (its end lost with an
++	isochronous packet) would make the S905's decoder decode the next one
++	into it, and lose that. The C920 follows some pictures with 31 bytes
++	after their EOI; FF D9 can't be in the entropy-coded data, so the last
++	one in the last 4 KB is the end.
+ */
+-bool
+-UVCCamDevice::_IsWholePicture(const uint8* data, size_t length) const
++size_t
++UVCCamDevice::_PictureLength(const uint8* data, size_t length) const
+ {
+ 	if (length < 4 || data[0] != 0xff || data[1] != 0xd8)
+-		return false;
+-	// the end, perhaps followed by padding
+-	bool ended = false;
+-	for (size_t i = length - 2; i + 32 >= length && i > 2; i--) {
++		return 0;
++	size_t end = 0;
++	for (size_t i = length - 2; i + 4096 >= length && i > 2; i--) {
+ 		if (data[i] == 0xff && data[i + 1] == 0xd9) {
+-			ended = true;
++			end = i + 2;
+ 			break;
+ 		}
+ 	}
+-	if (!ended)
+-		return false;
++	if (end == 0)
++		return 0;
+ 
+ 	size_t position = 2;
+ 	while (position + 9 < length && data[position] == 0xff) {
+@@ -2011,13 +2013,13 @@ UVCCamDevice::_IsWholePicture(const uint8* data, size_t length) const
+ 		if (marker == 0xc0 || marker == 0xc1) {
+ 			int32 height = (data[position + 5] << 8) | data[position + 6];
+ 			int32 width = (data[position + 7] << 8) | data[position + 8];
+-			return width == fStreamWidth && height == fStreamHeight;
++			return width == fStreamWidth && height == fStreamHeight ? end : 0;
+ 		}
+ 		if (marker == 0xda)
+ 			break;
+ 		position += 2 + segment;
+ 	}
+-	return false;
++	return 0;
+ }
+ 
+ 
+@@ -2058,8 +2060,8 @@ UVCCamDevice::_HardwareDecoderThread()
+ 		if (frame != NULL) {
+ 			taken++;
+ 			const uint8* data = (const uint8*)frame->Buffer();
+-			size_t length = frame->BufferLength();
+-			if (_IsWholePicture(data, length)) {
++			size_t length = _PictureLength(data, frame->BufferLength());
++			if (length > 0) {
+ 				meson_vdec_write write = {};
+ 				write.data = data;
+ 				write.size = length;
+@@ -2067,22 +2069,8 @@ UVCCamDevice::_HardwareDecoderThread()
+ 					sizeof(write)) == 0;
+ 				if (!written)
+ 					notWritten++;
+-			} else {
+-				if (cutShort++ < 3) {
+-					// where its end is, if anywhere (FF D9 can't be in the
+-					// entropy-coded data)
+-					size_t end = 0;
+-					for (size_t k = length - 2; k > 2 && end == 0; k--) {
+-						if (data[k] == 0xff && data[k + 1] == 0xd9)
+-							end = k;
+-					}
+-					debug_printf("usb_webcam: picture skipped: %zu bytes, "
+-						"starts %02x%02x, ends %02x%02x%02x%02x, EOI at %zu\n",
+-						length, data[0], data[1], data[length - 4],
+-						data[length - 3], data[length - 2], data[length - 1],
+-						end);
+-				}
+-			}
++			} else
++				cutShort++;
+ 			delete frame;
+ 		}
+ 
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+index 8e6dc05d91..3e5696ba0d 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+@@ -69,7 +69,7 @@ private:
+ 			void				_StopHardwareDecoder();
+ 			status_t			_HardwareDecoderThread();
+ 	static	status_t			_HardwareDecoderEntry(void* data);
+-			bool				_IsWholePicture(const uint8* data,
++			size_t				_PictureLength(const uint8* data,
+ 									size_t length) const;
+ 			status_t			_FillFromDecoder(BBuffer* buffer,
+ 									bigtime_t* stamp);

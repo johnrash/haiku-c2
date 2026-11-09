@@ -1,0 +1,979 @@
+--- a/src/gallium/meson.build
++++ b/src/gallium/meson.build
+@@ -218,6 +218,9 @@
+ if with_platform_haiku
+   subdir('frontends/hgl')
+   subdir('targets/haiku-softpipe')
++  if with_gallium_lima
++    subdir('targets/haiku-lima')
++  endif
+ endif
+ if with_gallium_st_nine
+   subdir('frontends/nine')
+--- a/src/gallium/targets/haiku-lima/meson.build
++++ b/src/gallium/targets/haiku-lima/meson.build
+@@ -0,0 +1,40 @@
++# Copyright 2026, haiku-odroid-c2 port authors.
++# Distributed under the terms of the MIT License.
++
++# "Lima Pipe": the BGLRenderer add-on for the Mali-450 (Haiku's meson_mali),
++# with GalliumContext from haiku-softpipe; linked like libswpipe, with lima
++# and the libdrm stand-in in place of the software drivers.
++liblimapipe = shared_library(
++  'limapipe',
++  files('LimaRenderer.cpp', '../haiku-softpipe/GalliumContext.cpp'),
++  include_directories : [
++    inc_include, inc_src, inc_mapi, inc_mesa, inc_gallium, inc_gallium_aux, inc_util, inc_haikugl, inc_gallium_drivers, inc_gallium_winsys,
++    include_directories('../../frontends/hgl', '../haiku-softpipe'),
++    include_directories('/boot/system/develop/headers/private')
++  ],
++  gnu_symbol_visibility : 'hidden',
++  link_args : [ld_args_bsymbolic, ld_args_gc_sections],
++  link_with : [
++    libglapi, libsthgl, libcompiler,
++    libmesa, libglsl, libgallium, libgl
++  ],
++  dependencies : [
++    driver_lima, dep_libdrm, cpp.find_library('be'),
++    cpp.find_library('translation'), cpp.find_library('network'), dep_unwind,
++    idep_mesautil, idep_nir,
++  ],
++  install : true,
++)
++
++# the first hardware test (docs/m43-mesa-lima-haiku.md §4, stage 1)
++limatest = executable(
++  'limatest',
++  files('limatest.c'),
++  include_directories : [
++    inc_include, inc_src, inc_gallium, inc_gallium_aux, inc_gallium_winsys,
++  ],
++  link_args : [ld_args_gc_sections],
++  link_with : [libgallium],
++  dependencies : [driver_lima, dep_libdrm, idep_mesautil, idep_nir],
++  install : false,
++)
+--- a/src/gallium/targets/haiku-lima/LimaRenderer.h
++++ b/src/gallium/targets/haiku-lima/LimaRenderer.h
+@@ -0,0 +1,74 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * Based on haiku-softpipe/SoftwareRenderer.h,
++ * Copyright 2006-2012, Haiku, Inc. All rights reserved.
++ */
++#ifndef LIMARENDERER_H
++#define LIMARENDERER_H
++
++
++#include <kernel/image.h>
++#include <Locker.h>
++
++#include "GLRenderer.h"
++#include "GalliumContext.h"
++
++
++struct pipe_context;
++struct pipe_resource;
++
++
++/*!	"Lima Pipe": Mesa's lima driver on the Mali-450 (meson_mali). It works
++	as Software Pipe does, but the GPU renders into buffers of its own: each
++	frame presented is read back into a BBitmap, which is shown as Software
++	Pipe shows its own (docs/m43-mesa-lima-haiku.md §3.3, §3.4).
++*/
++class LimaRenderer : public BGLRenderer, public HGLWinsysContext {
++public:
++								LimaRenderer(BGLView *view,
++									ulong bgl_options);
++	virtual						~LimaRenderer();
++
++			status_t			InitCheck() const;
++
++			void				LockGL();
++			void				UnlockGL();
++
++			void				Display(BBitmap* bitmap, BRect* updateRect);
++
++			void				SwapBuffers(bool vsync = false);
++			void				Draw(BRect updateRect);
++			status_t			CopyPixelsOut(BPoint source, BBitmap *dest);
++			status_t			CopyPixelsIn(BBitmap *source, BPoint dest);
++			void				FrameResized(float width, float height);
++
++			void				EnableDirectMode(bool enabled);
++			void				DirectConnected(direct_buffer_info *info);
++
++			// the screen's flush_frontbuffer: a new frame from the GL
++			// thread, through its context; the last one again otherwise
++			void				Present(struct pipe_context* context,
++									struct pipe_resource* resource);
++			void				ShowLastFrame();
++
++private:
++			GalliumContext*		fContextObj;
++			context_id			fContextID;
++
++			bool				fDirectModeEnabled;
++			direct_buffer_info*	fInfo;
++			BLocker				fInfoLocker;
++			ulong				fOptions;
++			GLuint				fWidth;
++			GLuint				fHeight;
++			color_space			fColorSpace;
++
++			BBitmap*			fBitmap;
++				// the last frame; made and filled by the GL thread
++			BLocker				fBitmapLocker;
++				// against the window thread, which shows it again
++};
++
++#endif	// LIMARENDERER_H
+--- a/src/gallium/targets/haiku-lima/LimaRenderer.cpp
++++ b/src/gallium/targets/haiku-lima/LimaRenderer.cpp
+@@ -0,0 +1,516 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * Based on haiku-softpipe/SoftwareRenderer.cpp,
++ * Copyright 2006-2012, Haiku, Inc. All rights reserved.
++ * Authors: Jérôme Duval, Philippe Houdoin, Artur Wyszynski,
++ * Alexander von Gluck IV.
++ */
++
++
++#include "LimaRenderer.h"
++
++#include <Autolock.h>
++#include <Bitmap.h>
++#include <interface/DirectWindowPrivate.h>
++#include <interface/ColorConversion.h>
++#include <GraphicsDefs.h>
++#include <Screen.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <new>
++
++#include "pipe/p_context.h"
++#include "pipe/p_defines.h"
++#include "pipe/p_screen.h"
++#include "pipe/p_state.h"
++#include "util/debug.h"
++
++extern "C" {
++#include "lima/drm/lima_drm_public.h"
++}
++
++
++#ifdef DEBUG
++#	define TRACE(x...) printf("LimaRenderer: " x)
++#	define CALLED() TRACE("CALLED: %s\n", __PRETTY_FUNCTION__)
++#else
++#	define TRACE(x...)
++#	define CALLED()
++#endif
++#define ERROR(x...)	printf("LimaRenderer: " x)
++
++
++// meson_mali (haiku/headers/private/drivers/meson_mali.h); LIMA_DEVICE
++// names another one
++static const char* kDevice = "/dev/misc/mali/0";
++
++
++// GLRendererRoster tries this add-on before Software Pipe (which has none,
++// so 0); without the device it declines, and Software Pipe takes over.
++extern "C" {
++_EXPORT int32 gl_renderer_priority = 10;
++}
++
++
++static struct pipe_resource* (*sLimaResourceCreate)(struct pipe_screen*,
++	const struct pipe_resource*);
++
++
++/*!	The colour buffers the frontend makes are display targets: those are
++	made linear, so that the CPU reads them back as they are (lima tiles
++	everything else, and reading a tiled buffer means detiling a copy).
++*/
++static struct pipe_resource*
++haiku_lima_resource_create(struct pipe_screen* screen,
++	const struct pipe_resource* templat)
++{
++	if ((templat->bind & PIPE_BIND_DISPLAY_TARGET) == 0)
++		return sLimaResourceCreate(screen, templat);
++
++	struct pipe_resource linear = *templat;
++	linear.bind |= PIPE_BIND_LINEAR;
++	return sLimaResourceCreate(screen, &linear);
++}
++
++
++/*!	The screen's flush_frontbuffer. \a drawable is the HGLWinsysContext the
++	renderer gave GalliumContext::CreateContext(). With a context (the
++	frontend and SwapBuffers(), in the GL thread) a new frame is read back
++	and shown; without one, the last frame is shown again.
++*/
++static void
++haiku_lima_flush_frontbuffer(struct pipe_screen* screen,
++	struct pipe_context* context, struct pipe_resource* resource,
++	unsigned level, unsigned layer, void* drawable, struct pipe_box* box)
++{
++	if (drawable == NULL)
++		return;
++	LimaRenderer* renderer
++		= static_cast<LimaRenderer*>((HGLWinsysContext*)drawable);
++	if (context != NULL)
++		renderer->Present(context, resource);
++	else
++		renderer->ShowLastFrame();
++}
++
++
++extern "C" struct pipe_screen*
++hgl_target_create_screen(void)
++{
++	const char* path = getenv("LIMA_DEVICE");
++	if (path == NULL || path[0] == '\0')
++		path = kDevice;
++	int fd = open(path, O_RDWR | O_CLOEXEC);
++	if (fd < 0) {
++		ERROR("%s: %s: %s\n", __func__, path, strerror(errno));
++		return NULL;
++	}
++
++	// lima keeps a duplicate of its own
++	struct pipe_screen* screen = lima_drm_screen_create(fd);
++	close(fd);
++	if (screen == NULL) {
++		ERROR("%s: no lima screen on %s\n", __func__, path);
++		return NULL;
++	}
++
++	if (screen->resource_create != haiku_lima_resource_create) {
++		sLimaResourceCreate = screen->resource_create;
++		screen->resource_create = haiku_lima_resource_create;
++	}
++	screen->flush_frontbuffer = haiku_lima_flush_frontbuffer;
++	return screen;
++}
++
++
++extern "C" _EXPORT BGLRenderer*
++instantiate_gl_renderer(BGLView *view, ulong opts)
++{
++	// Mesa's switch to software rendering: Software Pipe takes over
++	if (env_var_as_boolean("LIBGL_ALWAYS_SOFTWARE", false))
++		return NULL;
++
++	LimaRenderer* renderer = new(std::nothrow) LimaRenderer(view, opts);
++	if (renderer != NULL && renderer->InitCheck() != B_OK) {
++		delete renderer;
++		renderer = NULL;
++	}
++	return renderer;
++}
++
++
++struct RasBuffer
++{
++	int32 width, height, stride;
++	int32 orgX, orgY;
++	uint8 *colors;
++	color_space pixel_format;
++	int32 pixel_size;
++
++	RasBuffer(int32 width, int32 height, int32 stride, int32 orgX, int32 orgY, void *colors):
++		width(width), height(height), stride(stride), orgX(orgX), orgY(orgY), colors((uint8*)colors)
++	{}
++
++	RasBuffer(BBitmap *bmp)
++	{
++		width  = bmp->Bounds().IntegerWidth()  + 1;
++		height = bmp->Bounds().IntegerHeight() + 1;
++		stride = bmp->BytesPerRow();
++		orgX   = 0;
++		orgY   = 0;
++		pixel_format = bmp->ColorSpace();
++		pixel_size = stride / width;
++		colors = (uint8*)bmp->Bits();
++	}
++
++	RasBuffer(direct_buffer_info *info)
++	{
++		width  = 0x7fffffff;
++		height = 0x7fffffff;
++		stride = info->bytes_per_row;
++		orgX   = 0;
++		orgY   = 0;
++		pixel_format = info->pixel_format;
++		pixel_size = info->bits_per_pixel / 8;
++		colors = (uint8*)info->bits;
++	}
++
++	void ClipSize(int32 x, int32 y, int32 w, int32 h)
++	{
++		if (x < 0) {w += x; x = 0;}
++		if (y < 0) {h += y; y = 0;}
++		if (x + w > width) {w = width  - x;}
++		if (y + h > height) {h = height - y;}
++		if ((w > 0) && (h > 0)) {
++			colors += (y * stride) + (x * pixel_size);
++			width  = w;
++			height = h;
++		} else {
++			width = 0; height = 0; colors = NULL;
++		}
++		if (x + orgX > 0) {orgX += x;} else {orgX = 0;}
++		if (y + orgY > 0) {orgY += y;} else {orgY = 0;}
++	}
++
++	void ClipRect(int32 l, int32 t, int32 r, int32 b)
++	{
++		ClipSize(l, t, r - l, b - t);
++	}
++
++	void Shift(int32 dx, int32 dy)
++	{
++		orgX += dx;
++		orgY += dy;
++	}
++
++	void Blit(RasBuffer src)
++	{
++		RasBuffer dst = *this;
++		int32 x, y;
++		x = src.orgX - orgX;
++		y = src.orgY - orgY;
++		dst.ClipSize(x, y, src.width, src.height);
++		src.ClipSize(-x, -y, width, height);
++		for (; dst.height > 0; dst.height--) {
++			if (src.pixel_format == dst.pixel_format) {
++				memcpy(dst.colors, src.colors, src.width * src.pixel_size);
++			} else {
++				BPrivate::ConvertBits(src.colors, dst.colors, src.stride, dst.stride,
++					src.stride, dst.stride, src.pixel_format, dst.pixel_format, src.width, 1);
++			}
++			dst.colors += dst.stride;
++			src.colors += src.stride;
++		}
++	}
++};
++
++
++LimaRenderer::LimaRenderer(BGLView *view, ulong options)
++	:
++	BGLRenderer(view, options),
++	fContextObj(NULL),
++	fContextID(-1),
++	fDirectModeEnabled(false),
++	fInfo(NULL),
++	fInfoLocker("info locker"),
++	fOptions(options),
++	fWidth(0),
++	fHeight(0),
++	fColorSpace(B_NO_COLOR_SPACE),
++	fBitmap(NULL),
++	fBitmapLocker("lima frame locker")
++{
++	CALLED();
++
++	// no screen (no device): InitCheck() fails
++	fContextObj = new GalliumContext(options);
++	if (fContextObj->InitCheck() != B_OK)
++		return;
++
++	BRect b = view->Bounds();
++	fColorSpace = BScreen(view->Window()).ColorSpace();
++
++	fWidth = (GLint)b.IntegerWidth();
++	fHeight = (GLint)b.IntegerHeight();
++
++	fContextID = fContextObj->CreateContext(this);
++	if (fContextID < 0) {
++		ERROR("%s: There was an error creating the context!\n", __func__);
++		return;
++	}
++
++	if (!fContextObj->GetCurrentContext())
++		LockGL();
++}
++
++
++LimaRenderer::~LimaRenderer()
++{
++	CALLED();
++
++	delete fContextObj;
++	delete fBitmap;
++	free(fInfo);
++}
++
++
++status_t
++LimaRenderer::InitCheck() const
++{
++	if (fContextObj == NULL || fContextObj->InitCheck() != B_OK)
++		return B_NO_INIT;
++	return fContextID >= 0 ? B_OK : B_ERROR;
++}
++
++
++void
++LimaRenderer::LockGL()
++{
++//	CALLED();
++	BGLRenderer::LockGL();
++
++	color_space cs = BScreen(GLView()->Window()).ColorSpace();
++
++	{
++		BAutolock lock(fInfoLocker);
++		if (fDirectModeEnabled && fInfo != NULL) {
++			fWidth = fInfo->window_bounds.right - fInfo->window_bounds.left;
++			fHeight = fInfo->window_bounds.bottom - fInfo->window_bounds.top;
++		}
++
++		fContextObj->Validate(fWidth, fHeight);
++		fColorSpace = cs;
++	}
++
++	// do not hold fInfoLocker here to avoid deadlock
++	fContextObj->SetCurrentContext(true, fContextID);
++}
++
++
++void
++LimaRenderer::UnlockGL()
++{
++//	CALLED();
++	if ((fOptions & BGL_DOUBLE) == 0) {
++		SwapBuffers();
++	}
++	fContextObj->SetCurrentContext(false, fContextID);
++	BGLRenderer::UnlockGL();
++}
++
++
++void
++LimaRenderer::Display(BBitmap *bitmap, BRect *updateRect)
++{
++//	CALLED();
++
++	if (!fDirectModeEnabled) {
++		// TODO: avoid timeout
++		if (GLView()->LockLooperWithTimeout(1000) == B_OK) {
++			GLView()->DrawBitmap(bitmap, B_ORIGIN);
++			GLView()->UnlockLooper();
++		}
++	} else {
++		BAutolock lock(fInfoLocker);
++		if (fInfo != NULL) {
++			RasBuffer srcBuf(bitmap);
++			RasBuffer dstBuf(fInfo);
++			for (uint32 i = 0; i < fInfo->clip_list_count; i++) {
++				clipping_rect *clip = &fInfo->clip_list[i];
++				RasBuffer dstClip = dstBuf;
++				dstClip.ClipRect(clip->left, clip->top, clip->right + 1, clip->bottom + 1);
++				dstClip.Shift(-fInfo->window_bounds.left, -fInfo->window_bounds.top);
++				dstClip.Blit(srcBuf);
++			}
++		}
++	}
++}
++
++
++/*!	Reads the frame in \a resource back into fBitmap and shows it. In the
++	GL thread, with the GL context locked: texture_map() flushes the jobs
++	that draw into the buffer and waits for them; a linear buffer is mapped
++	as it is.
++*/
++void
++LimaRenderer::Present(struct pipe_context* context,
++	struct pipe_resource* resource)
++{
++	color_space colorSpace;
++	uint32 bytesPerPixel;
++	switch (resource->format) {
++		// B_RGB32 has the byte order of BGRA8888 and BGRX8888, B_RGB16
++		// that of B5G6R5 (BGL_INDEX)
++		case PIPE_FORMAT_B8G8R8A8_UNORM:
++		case PIPE_FORMAT_B8G8R8X8_UNORM:
++			colorSpace = B_RGB32;
++			bytesPerPixel = 4;
++			break;
++		case PIPE_FORMAT_B5G6R5_UNORM:
++			colorSpace = B_RGB16;
++			bytesPerPixel = 2;
++			break;
++		default:
++			ERROR("%s: can't show format %d\n", __func__, resource->format);
++			return;
++	}
++	uint32 width = resource->width0;
++	uint32 height = resource->height0;
++
++	struct pipe_box box;
++	memset(&box, 0, sizeof(box));
++	box.width = width;
++	box.height = height;
++	box.depth = 1;
++	struct pipe_transfer* transfer;
++	const uint8* source = (const uint8*)context->texture_map(context,
++		resource, 0, PIPE_MAP_READ, &box, &transfer);
++	if (source == NULL) {
++		ERROR("%s: can't read the frame back\n", __func__);
++		return;
++	}
++
++	{
++		BAutolock lock(fBitmapLocker);
++		if (fBitmap == NULL || fBitmap->ColorSpace() != colorSpace
++			|| fBitmap->Bounds().IntegerWidth() + 1 != (int32)width
++			|| fBitmap->Bounds().IntegerHeight() + 1 != (int32)height) {
++			delete fBitmap;
++			fBitmap = new(std::nothrow) BBitmap(
++				BRect(0, 0, width - 1, height - 1), colorSpace);
++			if (fBitmap != NULL && fBitmap->InitCheck() != B_OK) {
++				delete fBitmap;
++				fBitmap = NULL;
++			}
++		}
++		if (fBitmap != NULL) {
++			uint8* target = (uint8*)fBitmap->Bits();
++			int32 targetStride = fBitmap->BytesPerRow();
++			size_t rowBytes = width * bytesPerPixel;
++			for (uint32 y = 0; y < height; y++) {
++				memcpy(target + y * targetStride,
++					source + y * transfer->stride, rowBytes);
++			}
++		}
++	}
++	context->texture_unmap(context, transfer);
++
++	// Only this thread changes fBitmap; not holding fBitmapLocker here
++	// keeps Display() (which locks the window) clear of a window thread
++	// waiting for it in ShowLastFrame().
++	if (fBitmap != NULL)
++		Display(fBitmap, NULL);
++}
++
++
++/*!	Shows the last frame again, without touching the GPU (the window
++	thread, when the view needs redrawing).
++*/
++void
++LimaRenderer::ShowLastFrame()
++{
++	BAutolock lock(fBitmapLocker);
++	if (fBitmap != NULL)
++		Display(fBitmap, NULL);
++}
++
++
++void
++LimaRenderer::SwapBuffers(bool vsync)
++{
++	BScreen screen(GLView()->Window());
++	fContextObj->SwapBuffers(fContextID);
++	fContextObj->Validate(fWidth, fHeight);
++	if (vsync)
++		screen.WaitForRetrace();
++}
++
++
++void
++LimaRenderer::Draw(BRect updateRect)
++{
++//	CALLED();
++	ShowLastFrame();
++}
++
++
++status_t
++LimaRenderer::CopyPixelsOut(BPoint location, BBitmap *bitmap)
++{
++	CALLED();
++
++	// TODO: implement
++	return B_ERROR;
++}
++
++
++status_t
++LimaRenderer::CopyPixelsIn(BBitmap *bitmap, BPoint location)
++{
++	CALLED();
++
++	// TODO: implement
++	return B_ERROR;
++}
++
++
++void
++LimaRenderer::EnableDirectMode(bool enabled)
++{
++	fDirectModeEnabled = enabled;
++}
++
++
++void
++LimaRenderer::DirectConnected(direct_buffer_info *info)
++{
++//	CALLED();
++	BAutolock lock(fInfoLocker);
++	if (info) {
++		if (!fInfo) {
++			fInfo = (direct_buffer_info *)calloc(1,
++				DIRECT_BUFFER_INFO_AREA_SIZE);
++		}
++		memcpy(fInfo, info, DIRECT_BUFFER_INFO_AREA_SIZE);
++	} else if (fInfo) {
++		free(fInfo);
++		fInfo = NULL;
++	}
++}
++
++
++void
++LimaRenderer::FrameResized(float width, float height)
++{
++	TRACE("%s: %f x %f\n", __func__, width, height);
++
++	BAutolock lock(fInfoLocker);
++	fWidth = (GLuint)width;
++	fHeight = (GLuint)height;
++}
+--- a/src/gallium/targets/haiku-lima/limatest.c
++++ b/src/gallium/targets/haiku-lima/limatest.c
+@@ -0,0 +1,325 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++/*
++ * The first hardware test of Mesa's lima driver on Haiku's meson_mali
++ * (docs/m43-mesa-lima-haiku.md §4, stage 1): a 64x64 linear render target
++ * is cleared red, then green, and read back and checked pixel by pixel
++ * after each; then rounds of clearing a 1920x1080 one and reading it back
++ * are timed.
++ *
++ * Usage: limatest [rounds]	(100 by default)
++ * Exit status 0 only if every pixel matched; 1 if one didn't; 2 if the
++ * test couldn't run. LIMA_DEVICE names another device than
++ * /dev/misc/mali/0. With LIMA_HAIKU_NOOP=1 (the libdrm stand-in's no-op
++ * back end) everything runs, but reads back zeros.
++ */
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++
++#include <xf86drm.h>
++#include "drm-uapi/lima_drm.h"
++
++#include "pipe/p_context.h"
++#include "pipe/p_defines.h"
++#include "pipe/p_screen.h"
++#include "pipe/p_state.h"
++#include "util/u_inlines.h"
++
++#include "lima/drm/lima_drm_public.h"
++
++
++#define DEVICE "/dev/misc/mali/0"
++
++/* as a little-endian uint32: 0xAARRGGBB */
++#define FORMAT PIPE_FORMAT_B8G8R8A8_UNORM
++
++struct target {
++   struct pipe_resource *resource;
++   struct pipe_surface *surface;
++   unsigned width;
++   unsigned height;
++};
++
++
++static double
++now_ms(void)
++{
++   struct timespec time;
++   clock_gettime(CLOCK_MONOTONIC, &time);
++   return time.tv_sec * 1000.0 + time.tv_nsec / 1000000.0;
++}
++
++
++static bool
++target_create(struct pipe_screen *screen, struct pipe_context *context,
++              unsigned width, unsigned height, struct target *target)
++{
++   struct pipe_resource templat;
++   memset(&templat, 0, sizeof(templat));
++   templat.target = PIPE_TEXTURE_2D;
++   templat.format = FORMAT;
++   templat.width0 = width;
++   templat.height0 = height;
++   templat.depth0 = 1;
++   templat.array_size = 1;
++   templat.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_LINEAR;
++   target->resource = screen->resource_create(screen, &templat);
++   if (target->resource == NULL) {
++      fprintf(stderr, "limatest: no %ux%u render target\n", width, height);
++      return false;
++   }
++
++   struct pipe_surface surface;
++   memset(&surface, 0, sizeof(surface));
++   surface.format = FORMAT;
++   target->surface = context->create_surface(context, target->resource,
++                                             &surface);
++   if (target->surface == NULL) {
++      fprintf(stderr, "limatest: no %ux%u surface\n", width, height);
++      pipe_resource_reference(&target->resource, NULL);
++      return false;
++   }
++
++   struct pipe_framebuffer_state framebuffer;
++   memset(&framebuffer, 0, sizeof(framebuffer));
++   framebuffer.width = width;
++   framebuffer.height = height;
++   framebuffer.nr_cbufs = 1;
++   framebuffer.cbufs[0] = target->surface;
++   context->set_framebuffer_state(context, &framebuffer);
++
++   target->width = width;
++   target->height = height;
++   return true;
++}
++
++
++static void
++target_destroy(struct pipe_context *context, struct target *target)
++{
++   struct pipe_framebuffer_state framebuffer;
++   memset(&framebuffer, 0, sizeof(framebuffer));
++   context->set_framebuffer_state(context, &framebuffer);
++   pipe_surface_reference(&target->surface, NULL);
++   pipe_resource_reference(&target->resource, NULL);
++}
++
++
++static void
++clear(struct pipe_context *context, uint32_t color)
++{
++   union pipe_color_union value;
++   value.f[0] = ((color >> 16) & 0xff) / 255.0f;
++   value.f[1] = ((color >> 8) & 0xff) / 255.0f;
++   value.f[2] = (color & 0xff) / 255.0f;
++   value.f[3] = (color >> 24) / 255.0f;
++   context->clear(context, PIPE_CLEAR_COLOR0, NULL, &value, 0.0, 0);
++}
++
++
++static void *
++map(struct pipe_context *context, struct target *target,
++    struct pipe_transfer **transfer)
++{
++   struct pipe_box box;
++   memset(&box, 0, sizeof(box));
++   box.width = target->width;
++   box.height = target->height;
++   box.depth = 1;
++   return context->texture_map(context, target->resource, 0, PIPE_MAP_READ,
++                               &box, transfer);
++}
++
++
++/* The pixels that aren't \a expected; the first is reported. */
++static unsigned
++check(const uint8_t *pixels, unsigned stride, unsigned width,
++      unsigned height, uint32_t expected, const char *what)
++{
++   unsigned wrong = 0;
++   for (unsigned y = 0; y < height; y++) {
++      for (unsigned x = 0; x < width; x++) {
++         uint32_t pixel;
++         memcpy(&pixel, pixels + y * stride + x * 4, 4);
++         if (pixel == expected)
++            continue;
++         if (wrong == 0) {
++            printf("%s: pixel (%u, %u) is %08x, not %08x\n", what, x, y,
++                   pixel, expected);
++         }
++         wrong++;
++      }
++   }
++   return wrong;
++}
++
++
++int
++main(int argc, char **argv)
++{
++   static const uint32_t colors[2] = { 0xffff0000, 0xff00ff00 };
++   static const char *names[2] = { "red", "green" };
++
++   int rounds = argc > 1 ? atoi(argv[1]) : 100;
++   if (rounds < 1)
++      rounds = 1;
++   if (getenv("LIMA_HAIKU_NOOP") != NULL)
++      printf("LIMA_HAIKU_NOOP: no GPU, the pixels read back are zeros\n");
++
++   const char *path = getenv("LIMA_DEVICE");
++   if (path == NULL || path[0] == '\0')
++      path = DEVICE;
++   int fd = open(path, O_RDWR | O_CLOEXEC);
++   if (fd < 0) {
++      fprintf(stderr, "limatest: %s: %s\n", path, strerror(errno));
++      return 2;
++   }
++
++   /* what the driver says, through the libdrm stand-in alone */
++   struct drm_lima_get_param param;
++   memset(&param, 0, sizeof(param));
++   param.param = DRM_LIMA_PARAM_GPU_ID;
++   if (drmIoctl(fd, DRM_IOCTL_LIMA_GET_PARAM, &param) != 0) {
++      fprintf(stderr, "limatest: GET_PARAM GPU_ID: %s\n", strerror(errno));
++      return 2;
++   }
++   printf("GPU_ID %llu%s\n", (unsigned long long)param.value,
++          param.value == DRM_LIMA_PARAM_GPU_ID_MALI450 ? " (Mali-450)" : "");
++   memset(&param, 0, sizeof(param));
++   param.param = DRM_LIMA_PARAM_NUM_PP;
++   if (drmIoctl(fd, DRM_IOCTL_LIMA_GET_PARAM, &param) != 0) {
++      fprintf(stderr, "limatest: GET_PARAM NUM_PP: %s\n", strerror(errno));
++      return 2;
++   }
++   printf("NUM_PP %llu\n", (unsigned long long)param.value);
++
++   struct pipe_screen *screen = lima_drm_screen_create(fd);
++   close(fd);
++      /* the screen has a duplicate of its own */
++   if (screen == NULL) {
++      fprintf(stderr, "limatest: no lima screen on %s\n", path);
++      return 2;
++   }
++   printf("screen: %s, vendor %s\n", screen->get_name(screen),
++          screen->get_vendor(screen));
++
++   struct pipe_context *context = screen->context_create(screen, NULL, 0);
++   if (context == NULL) {
++      fprintf(stderr, "limatest: no context\n");
++      screen->destroy(screen);
++      return 2;
++   }
++
++   bool passed = true;
++   int status = 0;
++   struct target target;
++   struct pipe_transfer *transfer;
++
++   /* 64x64: red, then green, each checked */
++   if (!target_create(screen, context, 64, 64, &target)) {
++      status = 2;
++      goto out;
++   }
++   for (int i = 0; i < 2; i++) {
++      clear(context, colors[i]);
++      struct pipe_fence_handle *fence = NULL;
++      context->flush(context, &fence, 0);
++      if (fence != NULL) {
++         if (!screen->fence_finish(screen, context, fence,
++                                   PIPE_TIMEOUT_INFINITE)) {
++            printf("64x64 %s: the fence wait failed\n", names[i]);
++         }
++         screen->fence_reference(screen, &fence, NULL);
++      } else
++         printf("64x64 %s: no fence\n", names[i]);
++
++      const uint8_t *pixels = map(context, &target, &transfer);
++      if (pixels == NULL) {
++         fprintf(stderr, "limatest: can't map the 64x64 target\n");
++         target_destroy(context, &target);
++         status = 2;
++         goto out;
++      }
++      char what[32];
++      snprintf(what, sizeof(what), "64x64 %s", names[i]);
++      unsigned wrong = check(pixels, transfer->stride, 64, 64, colors[i],
++                             what);
++      context->texture_unmap(context, transfer);
++      printf("%s: %u of %u pixels wrong\n", what, wrong, 64 * 64);
++      if (wrong != 0)
++         passed = false;
++   }
++   target_destroy(context, &target);
++
++   /* 1920x1080: clear, flush, wait and copy out, as a presented frame is */
++   const unsigned width = 1920, height = 1080;
++   if (!target_create(screen, context, width, height, &target)) {
++      status = 2;
++      goto out;
++   }
++   uint8_t *copy = malloc(width * height * 4);
++   if (copy == NULL) {
++      target_destroy(context, &target);
++      status = 2;
++      goto out;
++   }
++   double waited = 0, copied = 0;
++   double start = now_ms();
++   for (int round = 0; round < rounds; round++) {
++      clear(context, colors[round & 1]);
++      context->flush(context, NULL, 0);
++
++      double mapStart = now_ms();
++      const uint8_t *pixels = map(context, &target, &transfer);
++      double copyStart = now_ms();
++      if (pixels == NULL) {
++         fprintf(stderr, "limatest: can't map the %ux%u target\n", width,
++                 height);
++         free(copy);
++         target_destroy(context, &target);
++         status = 2;
++         goto out;
++      }
++      for (unsigned y = 0; y < height; y++) {
++         memcpy(copy + y * width * 4, pixels + y * transfer->stride,
++                width * 4);
++      }
++      context->texture_unmap(context, transfer);
++      waited += copyStart - mapStart;
++      copied += now_ms() - copyStart;
++   }
++   double total = now_ms() - start;
++   unsigned wrong = check(copy, width * 4, width, height,
++                          colors[(rounds - 1) & 1], "1920x1080");
++   printf("1920x1080: %u of %u pixels of the last frame wrong\n", wrong,
++          width * height);
++   if (wrong != 0)
++      passed = false;
++   printf("1920x1080: %d rounds, %.2f ms per clear and read back "
++          "(%.2f ms waiting in texture_map, %.2f ms copying: %.0f MB/s)\n",
++          rounds, total / rounds, waited / rounds, copied / rounds,
++          copied > 0 ? (double)width * height * 4 * rounds / 1000.0
++             / copied : 0.0);
++   free(copy);
++   target_destroy(context, &target);
++
++out:
++   context->destroy(context);
++   screen->destroy(screen);
++   if (status == 0 && !passed)
++      status = 1;
++   printf("limatest: %s\n", status == 0 ? "passed"
++          : status == 1 ? "FAILED" : "couldn't run");
++   return status;
++}

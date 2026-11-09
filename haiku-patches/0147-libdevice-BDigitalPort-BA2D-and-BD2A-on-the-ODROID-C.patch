@@ -1,0 +1,494 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 23:21:29 -0400
+Subject: [PATCH 147/342] libdevice: BDigitalPort, BA2D and BD2A on the
+ ODROID-C2
+
+The BeBox GeekPort classes were stubs. On the ODROID-C2's header they
+now work as the Be Book describes: "DigitalA" and "DigitalB" are 8-bit
+ports on 16 free GPIO pins (through meson_gpio); "A2D1" and "A2D2" read
+the two analog inputs in millivolts, as the BeBox's one step a
+millivolt (through meson_saradc); "D2A1" and "D2A2" are PWM outputs on
+pins 11 and 19, value/255, which keep their output when closed. 3.3 V
+pins, 1.8 V analog inputs. Elsewhere Open() fails, as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kits/device/A2D.cpp         |  59 ++++++++++++--
+ src/kits/device/D2A.cpp         |  88 +++++++++++++++++++--
+ src/kits/device/DigitalPort.cpp | 135 +++++++++++++++++++++++++++-----
+ src/kits/device/Jamfile         |   2 +-
+ 4 files changed, 253 insertions(+), 31 deletions(-)
+
+diff --git a/src/kits/device/A2D.cpp b/src/kits/device/A2D.cpp
+index ec1e4a6c1c..5d6de7e2e6 100644
+--- a/src/kits/device/A2D.cpp
++++ b/src/kits/device/A2D.cpp
+@@ -1,24 +1,65 @@
+-/* 
++/*
+  * Copyright 2002, Marcus Overhagen. All rights reserved.
++ * Copyright 2026, haiku-odroid-c2 port authors.
+  * Distributed under the terms of the MIT License.
++ *
++ * The BeBox GeekPort's A/D channels on the ODROID-C2 (through
++ * meson_saradc): "A2D1" is the SoC's ADC input 0 on header pin 40, "A2D2"
++ * input 1 on pin 37. A value is in millivolts, as the BeBox's (one step a
++ * millivolt), but the inputs take 0 to 1.8 V only (the BeBox: 4.096 V),
++ * in steps of about 1.76 mV. Elsewhere Open() fails, as it always did.
+  */
+ 
++
+ #include <A2D.h>
+ 
++#include <fcntl.h>
++#include <stdio.h>
++#include <strings.h>
++#include <unistd.h>
++
++#include <meson_saradc.h>
++
++
++namespace {
++
++const char* const kChannels[] = { "A2D1", "A2D2" };
++
++}	// namespace
++
+ 
+ BA2D::BA2D()
++	:
++	fFd(-1)
+ {
+ }
+ 
+ 
+ BA2D::~BA2D()
+ {
++	Close();
+ }
+ 
+ 
++/*!	Opens "A2D1" or "A2D2". Returns a positive number, or B_ERROR. */
+ status_t
+ BA2D::Open(const char* portName)
+ {
++	Close();
++	if (portName == NULL)
++		return B_ERROR;
++	for (size_t i = 0; i < B_COUNT_OF(kChannels); i++) {
++		if (strcasecmp(portName, kChannels[i]) != 0)
++			continue;
++		char path[64];
++		snprintf(path, sizeof(path), "%s/%" B_PRIuSIZE,
++			MESON_SARADC_DEVICE_DIRECTORY, i);
++		int fd = open(path, O_RDONLY | O_CLOEXEC);
++		if (fd < 0)
++			return B_ERROR;
++		fFd = fd;
++		return fFd;
++	}
+ 	return B_ERROR;
+ }
+ 
+@@ -26,20 +67,30 @@ BA2D::Open(const char* portName)
+ void
+ BA2D::Close()
+ {
++	if (fFd >= 0)
++		close(fFd);
++	fFd = -1;
+ }
+ 
+ 
+ bool
+ BA2D::IsOpen()
+ {
+-	return false;
++	return fFd >= 0;
+ }
+ 
+ 
++/*!	A sample of the channel, in millivolts. Returns its size (2). */
+ ssize_t
+ BA2D::Read(ushort* buf)
+ {
+-	return 0;
++	meson_saradc_sample sample;
++	if (fFd < 0 || buf == NULL
++		|| ioctl(fFd, MESON_SARADC_READ, &sample, sizeof(sample)) != 0) {
++		return B_ERROR;
++	}
++	*buf = (ushort)sample.millivolts;
++	return sizeof(*buf);
+ }
+ 
+ 
+@@ -59,5 +110,3 @@ void
+ BA2D::_ReservedA2D3()
+ {
+ }
+-
+-
+diff --git a/src/kits/device/D2A.cpp b/src/kits/device/D2A.cpp
+index 08e6efaae8..c81649c0b5 100644
+--- a/src/kits/device/D2A.cpp
++++ b/src/kits/device/D2A.cpp
+@@ -1,51 +1,129 @@
+-/* 
++/*
+  * Copyright 2002, Marcus Overhagen. All rights reserved.
++ * Copyright 2026, haiku-odroid-c2 port authors.
+  * Distributed under the terms of the MIT License.
++ *
++ * The BeBox GeekPort's D/A channels on the ODROID-C2, which has no D/A
++ * converter: "D2A1" and "D2A2" are PWM outputs on header pins 11 and 19
++ * (through meson_gpio), at about 94 kHz with a duty cycle of value/255,
++ * 3.3 V high. (Pin 33's PWM shares its controller with the core voltage
++ * regulator's, which is left alone.) A resistor and a capacitor make that
++ * a voltage of 0 to 3.3 V. As on the BeBox, a channel keeps its output when it is
++ * closed, and Read() gives the value last written, by anyone. Elsewhere
++ * Open() fails, as it always did.
+  */
+ 
++
+ #include <D2A.h>
+ 
++#include <fcntl.h>
++#include <strings.h>
++#include <unistd.h>
++
++#include <meson_gpio.h>
++
++
++namespace {
++
++struct d2a_channel {
++	const char*	name;
++	uint8		pin;
++};
++
++const d2a_channel kChannels[] = {
++	{ "D2A1", 11 },
++	{ "D2A2", 19 },
++};
++
++}	// namespace
++
++
+ BD2A::BD2A()
++	:
++	fFd(-1)
+ {
+ }
+ 
+ 
+ BD2A::~BD2A()
+ {
++	Close();
+ }
+ 
+ 
++/*!	Opens "D2A1" or "D2A2", leaving the output as it is. Returns a positive
++	number, or B_ERROR (also when the channel is in use).
++*/
+ status_t
+ BD2A::Open(const char* portName)
+ {
++	Close();
++	if (portName == NULL)
++		return B_ERROR;
++	for (size_t i = 0; i < B_COUNT_OF(kChannels); i++) {
++		if (strcasecmp(portName, kChannels[i].name) != 0)
++			continue;
++		int fd = open(MESON_GPIO_DEVICE, O_RDWR | O_CLOEXEC);
++		if (fd < 0)
++			return B_ERROR;
++		meson_gpio_pins pins;
++		pins.count = 1;
++		pins.pins[0] = kChannels[i].pin;
++		if (ioctl(fd, MESON_GPIO_CLAIM, &pins, sizeof(pins)) != 0) {
++			close(fd);
++			return B_ERROR;
++		}
++		fFd = fd;
++		return fFd;
++	}
+ 	return B_ERROR;
+ }
+ 
+ 
++/*!	Closes the channel; its output stays. */
+ void
+ BD2A::Close()
+ {
++	if (fFd >= 0)
++		close(fFd);
++	fFd = -1;
+ }
+ 
+ 
+ bool
+ BD2A::IsOpen()
+ {
+-	return false;
++	return fFd >= 0;
+ }
+ 
+ 
++/*!	The value last written to the channel. Returns 1. */
+ ssize_t
+ BD2A::Read(uint8* buf)
+ {
+-	return 0;
++	meson_gpio_pwm pwm;
++	pwm.bit = 0;
++	if (fFd < 0 || buf == NULL
++		|| ioctl(fFd, MESON_GPIO_GET_PWM, &pwm, sizeof(pwm)) != 0) {
++		return B_ERROR;
++	}
++	*buf = (uint8)pwm.duty;
++	return 1;
+ }
+ 
+ 
++/*!	The channel's output, until the next Write(): a duty cycle of
++	value/255. Returns 1.
++*/
+ ssize_t
+ BD2A::Write(uint8 value)
+ {
+-	return 0;
++	meson_gpio_pwm pwm;
++	pwm.bit = 0;
++	pwm.duty = value;
++	if (fFd < 0 || ioctl(fFd, MESON_GPIO_SET_PWM, &pwm, sizeof(pwm)) != 0)
++		return B_ERROR;
++	return 1;
+ }
+ 
+ 
+@@ -65,5 +143,3 @@ void
+ BD2A::_ReservedD2A3()
+ {
+ }
+-
+-
+diff --git a/src/kits/device/DigitalPort.cpp b/src/kits/device/DigitalPort.cpp
+index 5c540eb7ec..75438f5a7d 100644
+--- a/src/kits/device/DigitalPort.cpp
++++ b/src/kits/device/DigitalPort.cpp
+@@ -1,79 +1,178 @@
+-/* 
++/*
+  * Copyright 2002, Marcus Overhagen. All rights reserved.
++ * Copyright 2026, haiku-odroid-c2 port authors.
+  * Distributed under the terms of the MIT License.
++ *
++ * The BeBox GeekPort's two 8-bit digital ports, "DigitalA" and "DigitalB",
++ * on the ODROID-C2's 40-pin header (through meson_gpio): bits 0 to 7 on
++ * header pins 7, 12, 13, 15, 16, 18, 21, 22 (DigitalA) and 23, 24, 26, 29,
++ * 31, 32, 35, 36 (DigitalB). The pins are 3.3 V, not the BeBox's 5 V.
++ * Elsewhere Open() fails, as it always did.
+  */
+ 
++
+ #include <DigitalPort.h>
+ 
++#include <fcntl.h>
++#include <string.h>
++#include <strings.h>
++#include <unistd.h>
++
++#include <meson_gpio.h>
++
++
++namespace {
++
++struct digital_port {
++	const char*	name;
++	uint8		pins[8];
++};
++
++const digital_port kPorts[] = {
++	{ "DigitalA", { 7, 12, 13, 15, 16, 18, 21, 22 } },
++	{ "DigitalB", { 23, 24, 26, 29, 31, 32, 35, 36 } },
++};
++
++}	// namespace
++
++
+ BDigitalPort::BDigitalPort()
++	:
++	fFd(-1),
++	fIsInput(true)
+ {
+ }
+ 
+ 
+ BDigitalPort::~BDigitalPort()
+ {
++	Close();
+ }
+ 
+ 
++/*!	Opens "DigitalA" or "DigitalB" as an input port. Returns a positive
++	number, or B_ERROR (also when the port is in use).
++*/
+ status_t
+-BDigitalPort::Open(const char *portName)
++BDigitalPort::Open(const char* portName)
+ {
+-	return B_ERROR;
++	Close();
++	if (portName == NULL)
++		return B_ERROR;
++
++	const digital_port* port = NULL;
++	for (size_t i = 0; i < B_COUNT_OF(kPorts); i++) {
++		if (strcasecmp(portName, kPorts[i].name) == 0)
++			port = &kPorts[i];
++	}
++	if (port == NULL)
++		return B_ERROR;
++
++	int fd = open(MESON_GPIO_DEVICE, O_RDWR | O_CLOEXEC);
++	if (fd < 0)
++		return B_ERROR;
++	meson_gpio_pins pins;
++	pins.count = B_COUNT_OF(port->pins);
++	memcpy(pins.pins, port->pins, sizeof(port->pins));
++	uint32 outputs = 0;
++	if (ioctl(fd, MESON_GPIO_CLAIM, &pins, sizeof(pins)) != 0
++		|| ioctl(fd, MESON_GPIO_SET_OUTPUTS, &outputs, sizeof(outputs))
++			!= 0) {
++		close(fd);
++		return B_ERROR;
++	}
++	fFd = fd;
++	fIsInput = true;
++	return fFd;
+ }
+ 
+ 
++/*!	Closes the port; it becomes an input. */
+ void
+-BDigitalPort::Close(void)
++BDigitalPort::Close()
+ {
++	if (fFd >= 0)
++		close(fFd);
++	fFd = -1;
++	fIsInput = true;
+ }
+ 
+ 
+ bool
+-BDigitalPort::IsOpen(void)
++BDigitalPort::IsOpen()
+ {
+-	return false;
++	return fFd >= 0;
+ }
+ 
+ 
++/*!	The levels on the port's pins, inputs or outputs. Returns 1. */
+ ssize_t
+-BDigitalPort::Read(uint8 *buf)
++BDigitalPort::Read(uint8* buf)
+ {
+-	return 0;
++	uint32 levels;
++	if (fFd < 0 || buf == NULL
++		|| ioctl(fFd, MESON_GPIO_READ, &levels, sizeof(levels)) != 0) {
++		return B_ERROR;
++	}
++	*buf = (uint8)levels;
++	return 1;
+ }
+ 
+ 
++/*!	Drives \a value on an output port, until the next Write(). Returns 1;
++	B_ERROR for an input port.
++*/
+ ssize_t
+ BDigitalPort::Write(uint8 value)
+ {
+-	return 0;
++	uint32 levels = value;
++	if (fFd < 0 || fIsInput
++		|| ioctl(fFd, MESON_GPIO_WRITE, &levels, sizeof(levels)) != 0) {
++		return B_ERROR;
++	}
++	return 1;
+ }
+ 
+ 
+ status_t
+-BDigitalPort::SetAsOutput(void)
++BDigitalPort::SetAsOutput()
+ {
+-	return B_ERROR;
++	uint32 outputs = 0xff;
++	if (fFd < 0
++		|| ioctl(fFd, MESON_GPIO_SET_OUTPUTS, &outputs, sizeof(outputs))
++			!= 0) {
++		return B_ERROR;
++	}
++	fIsInput = false;
++	return B_OK;
+ }
+ 
+ 
+ bool
+-BDigitalPort::IsOutput(void)
++BDigitalPort::IsOutput()
+ {
+-	return false;
++	return fFd >= 0 && !fIsInput;
+ }
+ 
+ 
+ status_t
+-BDigitalPort::SetAsInput(void)
++BDigitalPort::SetAsInput()
+ {
+-	return B_ERROR;
++	uint32 outputs = 0;
++	if (fFd < 0
++		|| ioctl(fFd, MESON_GPIO_SET_OUTPUTS, &outputs, sizeof(outputs))
++			!= 0) {
++		return B_ERROR;
++	}
++	fIsInput = true;
++	return B_OK;
+ }
+ 
+ 
+ bool
+-BDigitalPort::IsInput(void)
++BDigitalPort::IsInput()
+ {
+-	return false;
++	return fFd >= 0 && fIsInput;
+ }
+ 
+ 
+@@ -93,5 +192,3 @@ void
+ BDigitalPort::_ReservedDigitalPort3()
+ {
+ }
+-
+-
+diff --git a/src/kits/device/Jamfile b/src/kits/device/Jamfile
+index bae5eff090..9aeb2752c9 100644
+--- a/src/kits/device/Jamfile
++++ b/src/kits/device/Jamfile
+@@ -1,6 +1,6 @@
+ SubDir HAIKU_TOP src kits device ;
+ 
+-UsePrivateHeaders device ;
++UsePrivateHeaders device drivers ;
+ 
+ # for usb_raw.h that defines the ioctl protocol used by the USB classes
+ UseHeaders [ FDirName $(HAIKU_TOP) src add-ons kernel drivers bus usb ] : true ;

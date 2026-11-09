@@ -1,0 +1,587 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 15:30:44 -0500
+Subject: [PATCH 231/342] usb_webcam: MJPEG decoded by the S905's decoder
+
+When meson_vdec and linux-firmware's gxl_mjpeg.bin (meson_vdec_firmware)
+can be had, one thread gives each whole picture to the decoder and,
+while it decodes that, turns the frame of the one before into B_RGB32
+with NEON (i420_neon.c, JPEG's full range BT.601 as libjpeg-turbo):
+21 + 12 ms a 1920x1080 frame, overlapped. A picture cut short isn't
+given to it, as it would decode the next one into it. The decoder does
+one session at a time (a video player's, say), and without it or the
+firmware libjpeg-turbo decodes as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../media/media-add-ons/usb_webcam/Jamfile    |   2 +-
+ .../usb_webcam/addons/uvc/UVCCamDevice.cpp    | 282 +++++++++++++++++-
+ .../usb_webcam/addons/uvc/UVCCamDevice.h      |  14 +
+ .../usb_webcam/addons/uvc/i420_neon.c         | 130 ++++++++
+ .../usb_webcam/addons/uvc/i420_neon.h         |  31 ++
+ 5 files changed, 444 insertions(+), 15 deletions(-)
+ create mode 100644 src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/i420_neon.c
+ create mode 100644 src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/i420_neon.h
+
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/Jamfile b/src/add-ons/media/media-add-ons/usb_webcam/Jamfile
+index 8b8be8ec34..ce08ebe979 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/Jamfile
++++ b/src/add-ons/media/media-add-ons/usb_webcam/Jamfile
+@@ -89,7 +89,7 @@ for architectureObject in [ MultiArchSubDirSetup ] {
+ 		# YUY2 to B_RGB32 with NEON
+ 		local neonSources ;
+ 		if $(TARGET_ARCH) = arm64 {
+-			neonSources = yuy2_neon.c ;
++			neonSources = yuy2_neon.c i420_neon.c ;
+ 		}
+ 
+ 		# MJPEG, for the frame sizes a UVC camera sends faster that way
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+index 69f4c78fe4..fd0171ac2c 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+@@ -9,15 +9,20 @@
+ #include "UVCCamDevice.h"
+ #include "UVCDeframer.h"
+ 
++#include <errno.h>
++#include <fcntl.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <unistd.h>
+ #include <Directory.h>
+ #include <File.h>
+ #include <FindDirectory.h>
+ #include <ParameterWeb.h>
+ #include <Path.h>
++#include <PathFinder.h>
+ #include <String.h>
++#include <StringList.h>
+ #include <media/Buffer.h>
+ 
+ #ifdef HAVE_TURBOJPEG
+@@ -26,6 +31,12 @@
+ #ifdef __aarch64__
+ #	include "yuy2_neon.h"
+ #endif
++#if defined(HAVE_TURBOJPEG) && defined(__aarch64__)
++#	define HARDWARE_MJPEG
++#	include <meson_vdec.h>
++#	include "i420_neon.h"
++static const char* kMjpegFirmwarePath = "firmware/meson/vdec/gxl_mjpeg.bin";
++#endif
+ 
+ 
+ usb_webcam_support_descriptor kSupportedDevices[] = {
+@@ -102,6 +113,9 @@ UVCCamDevice::UVCCamDevice(CamDeviceAddon& _addon, BUSBDevice* _device)
+ 	fReadyStamp(0),
+ 	fReadyPending(false),
+ 	fDecoding(false),
++	fHardwareDecoder(-1),
++	fHardwareFrames(-1),
++	fHardwareFramesBase(NULL),
+ 	fCameraTerminalID(0),
+ 	fCameraControls(0),
+ 	fConstantFrameRate(0)
+@@ -1740,6 +1754,17 @@ UVCCamDevice::_StartDecoders()
+ 	fNewestDecoded = 0;
+ 	fReadyPending = false;
+ 	fDecoding = true;
++#ifdef HARDWARE_MJPEG
++	if (_StartHardwareDecoder() == B_OK) {
++		fDecoders[0] = spawn_thread(_HardwareDecoderEntry,
++			"UVC MJPEG decoder (S905)", B_DISPLAY_PRIORITY, this);
++		if (fDecoders[0] >= 0) {
++			resume_thread(fDecoders[0]);
++			return B_OK;
++		}
++		_StopHardwareDecoder();
++	}
++#endif
+ 	for (int32 i = 0; i < kDecoderCount; i++) {
+ 		fDecoderStarts[i].device = this;
+ 		fDecoderStarts[i].index = i;
+@@ -1770,6 +1795,7 @@ UVCCamDevice::_StopDecoders()
+ 		delete_sem(fDecodedSem);
+ 		fDecodedSem = -1;
+ 	}
++	_StopHardwareDecoder();
+ 	for (int32 i = 0; i < kDecoderCount; i++) {
+ 		free(fDecodeBuffers[i]);
+ 		fDecodeBuffers[i] = NULL;
+@@ -1833,20 +1859,7 @@ UVCCamDevice::_DecoderThread(int32 index)
+ 		if (!good)
+ 			continue;
+ 
+-		fDecodeLock.Lock();
+-		bool wake = false;
+-		if (sequence > fNewestDecoded) {
+-			fNewestDecoded = sequence;
+-			uint8* swap = fReadyBuffer;
+-			fReadyBuffer = fDecodeBuffers[index];
+-			fDecodeBuffers[index] = swap;
+-			fReadyStamp = stamp;
+-			wake = !fReadyPending;
+-			fReadyPending = true;
+-		}
+-		fDecodeLock.Unlock();
+-		if (wake)
+-			release_sem(fDecodedSem);
++		_PublishDecoded(index, sequence, stamp);
+ 	}
+ 
+ 	tj3Destroy(handle);
+@@ -1857,6 +1870,247 @@ UVCCamDevice::_DecoderThread(int32 index)
+ }
+ 
+ 
++/*!	Decoder \a index's buffer becomes the ready one, unless a newer frame
++	got there first.
++*/
++void
++UVCCamDevice::_PublishDecoded(int32 index, int32 sequence, bigtime_t stamp)
++{
++	fDecodeLock.Lock();
++	bool wake = false;
++	if (sequence > fNewestDecoded) {
++		fNewestDecoded = sequence;
++		uint8* swap = fReadyBuffer;
++		fReadyBuffer = fDecodeBuffers[index];
++		fDecodeBuffers[index] = swap;
++		fReadyStamp = stamp;
++		wake = !fReadyPending;
++		fReadyPending = true;
++	}
++	fDecodeLock.Unlock();
++	if (wake)
++		release_sem(fDecodedSem);
++}
++
++
++/*!	The S905's decoder for the MJPEG frames (meson_vdec, with
++	linux-firmware's gxl_mjpeg.bin from the meson_vdec_firmware package),
++	if it can be had: it does one session at a time (a video player may
++	have it), and the firmware may not be installed. libjpeg-turbo decodes
++	them then.
++*/
++status_t
++UVCCamDevice::_StartHardwareDecoder()
++{
++#ifdef HARDWARE_MJPEG
++	BStringList paths;
++	if (BPathFinder::FindPaths(B_FIND_PATH_DATA_DIRECTORY,
++			kMjpegFirmwarePath, B_FIND_PATH_EXISTING_ONLY, paths) != B_OK
++		|| paths.IsEmpty()) {
++		return B_ENTRY_NOT_FOUND;
++	}
++	BFile file(paths.StringAt(0), B_READ_ONLY);
++	off_t size;
++	if (file.InitCheck() != B_OK || file.GetSize(&size) != B_OK || size <= 0
++		|| size > 64 * 1024) {
++		return B_BAD_DATA;
++	}
++	uint8* firmware = (uint8*)malloc(size);
++	if (firmware == NULL)
++		return B_NO_MEMORY;
++	if (file.Read(firmware, size) != size) {
++		free(firmware);
++		return B_IO_ERROR;
++	}
++
++	int device = open(MESON_VDEC_DEVICE, O_RDWR);
++	if (device < 0) {
++		free(firmware);
++		return errno;
++	}
++	meson_vdec_start start = {};
++	start.codec = MESON_VDEC_MJPEG;
++	start.firmware = firmware;
++	start.firmware_size = size;
++	start.width = fStreamWidth;
++	start.height = fStreamHeight;
++	status_t status = ioctl(device, MESON_VDEC_START, &start, sizeof(start))
++		== 0 ? B_OK : errno;
++	free(firmware);
++	if (status == B_OK) {
++		fHardwareFrames = clone_area("UVC MJPEG frames",
++			(void**)&fHardwareFramesBase, B_ANY_ADDRESS, B_READ_AREA,
++			start.frames);
++		if (fHardwareFrames < 0)
++			status = fHardwareFrames;
++	}
++	if (status != B_OK) {
++		// closing ends the session
++		close(device);
++		fHardwareFrames = -1;
++		return status;
++	}
++	fHardwareDecoder = device;
++	printf("UVCCamDevice: %" B_PRId32 "x%" B_PRId32 " MJPEG decoded by the "
++		"S905's decoder\n", fStreamWidth, fStreamHeight);
++	return B_OK;
++#else
++	return B_NOT_SUPPORTED;
++#endif
++}
++
++
++void
++UVCCamDevice::_StopHardwareDecoder()
++{
++#ifdef HARDWARE_MJPEG
++	if (fHardwareDecoder < 0)
++		return;
++	ioctl(fHardwareDecoder, MESON_VDEC_STOP, NULL, 0);
++	if (fHardwareFrames >= 0)
++		delete_area(fHardwareFrames);
++	fHardwareFrames = -1;
++	fHardwareFramesBase = NULL;
++	close(fHardwareDecoder);
++	fHardwareDecoder = -1;
++#endif
++}
++
++
++/*static*/ status_t
++UVCCamDevice::_HardwareDecoderEntry(void* data)
++{
++	return ((UVCCamDevice*)data)->_HardwareDecoderThread();
++}
++
++
++/*!	Whether \a data is a whole JPEG picture of the stream's size: from SOI to
++	EOI. A picture cut short (its end lost with an isochronous packet) would
++	make the S905's decoder decode the next one into it, and lose that.
++*/
++bool
++UVCCamDevice::_IsWholePicture(const uint8* data, size_t length) const
++{
++	if (length < 4 || data[0] != 0xff || data[1] != 0xd8)
++		return false;
++	// the end, perhaps followed by padding
++	bool ended = false;
++	for (size_t i = length - 2; i + 32 >= length && i > 2; i--) {
++		if (data[i] == 0xff && data[i + 1] == 0xd9) {
++			ended = true;
++			break;
++		}
++	}
++	if (!ended)
++		return false;
++
++	size_t position = 2;
++	while (position + 9 < length && data[position] == 0xff) {
++		uint8 marker = data[position + 1];
++		size_t segment = (data[position + 2] << 8) | data[position + 3];
++		if (marker == 0xc0 || marker == 0xc1) {
++			int32 height = (data[position + 5] << 8) | data[position + 6];
++			int32 width = (data[position + 7] << 8) | data[position + 8];
++			return width == fStreamWidth && height == fStreamHeight;
++		}
++		if (marker == 0xda)
++			break;
++		position += 2 + segment;
++	}
++	return false;
++}
++
++
++/*!	The decoder thread with the S905's decoder: each whole picture goes to
++	it, and while it decodes one, the frame of the one before becomes
++	B_RGB32 (NEON) in the first decoder buffer: about 21 and 10 ms a
++	1920x1080 frame, which keeps up with 30 frames a second without a core
++	(libjpeg-turbo took two).
++*/
++status_t
++UVCCamDevice::_HardwareDecoderThread()
++{
++#ifdef HARDWARE_MJPEG
++	meson_vdec_frame previous;
++	bool havePrevious = false;
++	int32 previousSequence = 0;
++	bigtime_t previousStamp = 0;
++	while (fDecoding) {
++		CamFrame* frame = NULL;
++		bigtime_t stamp = 0;
++		int32 sequence = 0;
++		if (fDeframer->WaitFrame(100000) == B_OK) {
++			fDecodeLock.Lock();
++			if (fDeframer->GetFrame(&frame, &stamp) != B_OK)
++				frame = NULL;
++			sequence = ++fFramesTaken;
++			fDecodeLock.Unlock();
++		}
++
++		bool written = false;
++		if (frame != NULL) {
++			const uint8* data = (const uint8*)frame->Buffer();
++			size_t length = frame->BufferLength();
++			if (_IsWholePicture(data, length)) {
++				meson_vdec_write write = {};
++				write.data = data;
++				write.size = length;
++				written = ioctl(fHardwareDecoder, MESON_VDEC_WRITE, &write,
++					sizeof(write)) == 0;
++			}
++			delete frame;
++		}
++
++		// the frame before, while the decoder decodes this one
++		if (havePrevious) {
++			const uint8* base = fHardwareFramesBase + previous.offset;
++			i420_to_rgb32_neon(fDecodeBuffers[0], fStreamWidth * 4, base,
++				previous.bytes_per_row, base + previous.chroma_offset,
++				base + previous.cr_offset, previous.bytes_per_row / 2,
++				fStreamWidth, fStreamHeight);
++			uint32 index = previous.index;
++			ioctl(fHardwareDecoder, MESON_VDEC_RECYCLE_FRAME, &index,
++				sizeof(index));
++			havePrevious = false;
++			_PublishDecoded(0, previousSequence, previousStamp);
++		}
++		if (!written)
++			continue;
++
++		// its frame, and any that came late before it (the newest counts)
++		meson_vdec_frame decoded = {};
++		decoded.timeout = 200000;
++		while (ioctl(fHardwareDecoder, MESON_VDEC_GET_FRAME, &decoded,
++				sizeof(decoded)) == 0) {
++			if ((decoded.flags & (MESON_VDEC_FRAME_END_OF_STREAM
++					| MESON_VDEC_FRAME_GIVE_BACK)) != 0
++				|| decoded.cr_offset == 0) {
++				break;
++			}
++			if (havePrevious) {
++				uint32 index = previous.index;
++				ioctl(fHardwareDecoder, MESON_VDEC_RECYCLE_FRAME, &index,
++					sizeof(index));
++			}
++			previous = decoded;
++			havePrevious = true;
++			previousSequence = sequence;
++			previousStamp = stamp;
++			decoded.timeout = 0;
++		}
++	}
++	if (havePrevious) {
++		uint32 index = previous.index;
++		ioctl(fHardwareDecoder, MESON_VDEC_RECYCLE_FRAME, &index,
++			sizeof(index));
++	}
++	return B_OK;
++#else
++	return B_NOT_SUPPORTED;
++#endif
++}
++
++
+ /*!	The payload transfers, several queued together so that the stream has
+ 	no gaps (BUSBEndpoint::QueueIsochronous()): a transfer of kPackets
+ 	microframes each, a packet per microframe, each going to the deframer
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+index 8aa20fcab0..8e6dc05d91 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+@@ -63,6 +63,14 @@ private:
+ 			void				_StopDecoders();
+ 			status_t			_DecoderThread(int32 index);
+ 	static	status_t			_DecoderEntry(void* data);
++			void				_PublishDecoded(int32 index, int32 sequence,
++									bigtime_t stamp);
++			status_t			_StartHardwareDecoder();
++			void				_StopHardwareDecoder();
++			status_t			_HardwareDecoderThread();
++	static	status_t			_HardwareDecoderEntry(void* data);
++			bool				_IsWholePicture(const uint8* data,
++									size_t length) const;
+ 			status_t			_FillFromDecoder(BBuffer* buffer,
+ 									bigtime_t* stamp);
+ 			status_t			_SetParameter(int32 id, bigtime_t when,
+@@ -147,6 +155,12 @@ private:
+ 			bool				fReadyPending;
+ 			volatile bool		fDecoding;
+ 
++			// MJPEG with the S905's decoder (meson_vdec) when it can be had:
++			// one thread then, into the first decoder buffer
++			int					fHardwareDecoder;
++			area_id				fHardwareFrames;
++			const uint8*		fHardwareFramesBase;
++
+ 			float				fBrightness;
+ 			float				fContrast;
+ 			float				fHue;
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/i420_neon.c b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/i420_neon.c
+new file mode 100644
+index 0000000000..59f3119d51
+--- /dev/null
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/i420_neon.c
+@@ -0,0 +1,130 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "i420_neon.h"
++
++// The build includes GCC's headers like its own, with -Werror.
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wsign-compare"
++#pragma GCC diagnostic ignored "-Wmissing-braces"
++#include <arm_neon.h>
++#pragma GCC diagnostic pop
++
++
++// JPEG's YCbCr (BT.601, full range), in 8.8 fixed point
++#define RED_CR		359		// 1.402
++#define GREEN_CB	-88		// -0.344136
++#define GREEN_CR	-183	// -0.714136
++#define BLUE_CB		454		// 1.772
++
++
++static inline uint8_t
++clamp(int32_t value)
++{
++	return value < 0 ? 0 : value > 255 ? 255 : (uint8_t)value;
++}
++
++
++static void
++convert_pixel(uint8_t* out, int32_t y, int32_t red, int32_t green,
++	int32_t blue)
++{
++	y <<= 8;
++	out[0] = clamp((y + blue) >> 8);
++	out[1] = clamp((y + green) >> 8);
++	out[2] = clamp((y + red) >> 8);
++	out[3] = 255;
++}
++
++
++/*!	A row pair (or the last row) of planar 4:2:0 YCbCr to B_RGB32 (B G R A
++	in memory), 16 pixels at a time.
++*/
++static void
++convert_rows(uint8_t* out0, uint8_t* out1, const uint8_t* luma0,
++	const uint8_t* luma1, const uint8_t* cb, const uint8_t* cr,
++	uint32_t width)
++{
++	const int16x8_t kChromaBias = vdupq_n_s16(128);
++	const int32x4_t kRound = vdupq_n_s32(128);
++	uint32_t x = 0;
++	for (; x + 16 <= width; x += 16) {
++		int16x8_t u = vsubq_s16(vreinterpretq_s16_u16(
++			vmovl_u8(vld1_u8(cb + x / 2))), kChromaBias);
++		int16x8_t v = vsubq_s16(vreinterpretq_s16_u16(
++			vmovl_u8(vld1_u8(cr + x / 2))), kChromaBias);
++		int32x4_t redLow = vmlal_n_s16(kRound, vget_low_s16(v), RED_CR);
++		int32x4_t redHigh = vmlal_n_s16(kRound, vget_high_s16(v), RED_CR);
++		int32x4_t greenLow = vmlal_n_s16(vmlal_n_s16(kRound,
++			vget_low_s16(u), GREEN_CB), vget_low_s16(v), GREEN_CR);
++		int32x4_t greenHigh = vmlal_n_s16(vmlal_n_s16(kRound,
++			vget_high_s16(u), GREEN_CB), vget_high_s16(v), GREEN_CR);
++		int32x4_t blueLow = vmlal_n_s16(kRound, vget_low_s16(u), BLUE_CB);
++		int32x4_t blueHigh = vmlal_n_s16(kRound, vget_high_s16(u), BLUE_CB);
++
++		for (int row = 0; row < 2; row++) {
++			const uint8_t* luma = row == 0 ? luma0 : luma1;
++			uint8_t* out = row == 0 ? out0 : out1;
++			if (luma == NULL)
++				break;
++			// even and odd pixels, which share a chroma sample
++			uint8x8x2_t pixels = vld2_u8(luma + x);
++			uint8x8_t red[2], green[2], blue[2];
++			for (int k = 0; k < 2; k++) {
++				int16x8_t y = vreinterpretq_s16_u16(vmovl_u8(pixels.val[k]));
++				int32x4_t yLow = vshll_n_s16(vget_low_s16(y), 8);
++				int32x4_t yHigh = vshll_n_s16(vget_high_s16(y), 8);
++				red[k] = vqmovun_s16(vcombine_s16(
++					vshrn_n_s32(vaddq_s32(yLow, redLow), 8),
++					vshrn_n_s32(vaddq_s32(yHigh, redHigh), 8)));
++				green[k] = vqmovun_s16(vcombine_s16(
++					vshrn_n_s32(vaddq_s32(yLow, greenLow), 8),
++					vshrn_n_s32(vaddq_s32(yHigh, greenHigh), 8)));
++				blue[k] = vqmovun_s16(vcombine_s16(
++					vshrn_n_s32(vaddq_s32(yLow, blueLow), 8),
++					vshrn_n_s32(vaddq_s32(yHigh, blueHigh), 8)));
++			}
++			uint8x8x2_t r = vzip_u8(red[0], red[1]);
++			uint8x8x2_t g = vzip_u8(green[0], green[1]);
++			uint8x8x2_t b = vzip_u8(blue[0], blue[1]);
++			uint8x16x4_t result;
++			result.val[0] = vcombine_u8(b.val[0], b.val[1]);
++			result.val[1] = vcombine_u8(g.val[0], g.val[1]);
++			result.val[2] = vcombine_u8(r.val[0], r.val[1]);
++			result.val[3] = vdupq_n_u8(255);
++			vst4q_u8(out + x * 4, result);
++		}
++	}
++
++	for (; x < width; x++) {
++		int32_t u = cb[x / 2] - 128;
++		int32_t v = cr[x / 2] - 128;
++		int32_t red = 128 + RED_CR * v;
++		int32_t green = 128 + GREEN_CB * u + GREEN_CR * v;
++		int32_t blue = 128 + BLUE_CB * u;
++		convert_pixel(out0 + x * 4, luma0[x], red, green, blue);
++		if (luma1 != NULL)
++			convert_pixel(out1 + x * 4, luma1[x], red, green, blue);
++	}
++}
++
++
++void
++i420_to_rgb32_neon(uint8_t* destination, size_t destinationBytesPerRow,
++	const uint8_t* luma, size_t lumaBytesPerRow, const uint8_t* cb,
++	const uint8_t* cr, size_t chromaBytesPerRow, uint32_t width,
++	uint32_t height)
++{
++	for (uint32_t y = 0; y < height; y += 2) {
++		bool pair = y + 1 < height;
++		convert_rows(destination + y * destinationBytesPerRow,
++			pair ? destination + (y + 1) * destinationBytesPerRow : NULL,
++			luma + y * lumaBytesPerRow,
++			pair ? luma + (y + 1) * lumaBytesPerRow : NULL,
++			cb + (y / 2) * chromaBytesPerRow, cr + (y / 2) * chromaBytesPerRow,
++			width);
++	}
++}
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/i420_neon.h b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/i420_neon.h
+new file mode 100644
+index 0000000000..6171dc4cb2
+--- /dev/null
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/i420_neon.h
+@@ -0,0 +1,31 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef I420_NEON_H
++#define I420_NEON_H
++
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*!	Planar 4:2:0 JPEG YCbCr (full range BT.601, as libjpeg-turbo converts
++	it) to B_RGB32, each chroma sample for 2x2 pixels.
++*/
++void i420_to_rgb32_neon(uint8_t* destination, size_t destinationBytesPerRow,
++	const uint8_t* luma, size_t lumaBytesPerRow, const uint8_t* cb,
++	const uint8_t* cr, size_t chromaBytesPerRow, uint32_t width,
++	uint32_t height);
++
++#ifdef __cplusplus
++}
++#endif
++
++
++#endif	// I420_NEON_H

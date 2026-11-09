@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 14:07:10 -0400
+Subject: [PATCH 030/342] arm64: Cortex-A53 errata 835769 and 843419
+ workarounds
+
+The cross compiler's defaults leave both workarounds off (gcc's -Q output
+says "enabled", but the link spec passes --fix-cortex-a53-843419 only for
+an explicit -mfix-cortex-a53-843419, and no NOPs were inserted for
+835769). The ODROID-C2's S905 has A53 r0p4 cores with both errata.
+
+843419 is not theoretical there: an ADRP at page offset 0xff8 in the
+bootstrap ICU's uhash_openSize, then a store, then a load based on the
+ADRP, loaded garbage resize ratios on the C2; the hash table then grew
+on every insert until malloc failed, and about 1 in 40 programs crashed
+in setlocale() once ICU had its data.
+
+-mfix-cortex-a53-835769 and -mfix-cortex-a53-843419 now go with the
+arm64 architecture flags (all compiles, and links through the compiler
+driver); the kernel and boot loader, linked with ld directly, and kernel
+add-ons get --fix-cortex-a53-843419.
+
+Tested on the ODROID-C2: after a clean build none of the 734 binaries
+has an 843419 sequence (scanner in the port's tools/a53-843419.py), and
+libroot, libbe and the kernel have no unprotected 835769 sequence; the
+desktop boots, 200 setlocale() runs with the full ICU data, no crash.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/jam/ArchitectureRules | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/build/jam/ArchitectureRules b/build/jam/ArchitectureRules
+index 329aa08fdc..9f28156133 100644
+--- a/build/jam/ArchitectureRules
++++ b/build/jam/ArchitectureRules
+@@ -38,7 +38,13 @@ rule ArchitectureSetup architecture
+ 	switch $(cpu) {
+ 		case ppc : archFlags += -mcpu=440fp ;
+ 		case arm : archFlags += -march=armv7-a -mfloat-abi=hard ;
+-		case arm64 : archFlags += -march=armv8-a+crc ;
++		case arm64 :
++			# Cortex-A53 errata 835769 (64-bit multiply-accumulate after a
++			# memory access) and 843419 (ADRP at the end of a page, then a
++			# load or store: wrong address), present in the A53s of e.g. the
++			# Amlogic S905. The cross compiler's defaults leave both off.
++			archFlags += -march=armv8-a+crc -mfix-cortex-a53-835769
++				-mfix-cortex-a53-843419 ;
+ 		case x86 : archFlags += -march=pentium ;
+ 		case riscv64 : archFlags += -march=rv64gc ;
+ 	}
+@@ -400,6 +406,11 @@ rule KernelArchitectureSetup architecture
+ 			HAIKU_KERNEL_ADDON_LINKFLAGS += -z max-page-size=0x1000 ;
+ 			HAIKU_KERNEL_PIC_CCFLAGS = -fpic ;
+ 			HAIKU_KERNEL_PIC_LINKFLAGS = -shared ;
++			# Cortex-A53 erratum 843419 (see above) for what is linked with
++			# ld directly or without the architecture flags
++			HAIKU_KERNEL_PIC_LINKFLAGS += --fix-cortex-a53-843419 ;
++			HAIKU_KERNEL_ADDON_LINKFLAGS += -Xlinker --fix-cortex-a53-843419 ;
++			HAIKU_BOOT_LDFLAGS += --fix-cortex-a53-843419 ;
+ 
+ 		case m68k :
+ 			# We don't want to have to handle emulating missing FPU opcodes for

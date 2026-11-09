@@ -1,0 +1,64 @@
+Error codes: compare and convert with FFmpeg's AVERROR() and AVUNERROR()
+instead of negating errno values. On Haiku errno values are negative and
+AVERROR(e) is e, so -EAGAIN never matched and decoding stopped with
+"Operation would block" after the first packet.
+
+Copyright 2026, haiku-odroid-c2 port authors. MIT License.
+
+--- a/av/bitstream.py	2026-10-20 23:29:42.081112600 -0400
++++ b/av/bitstream.py	2026-11-07 13:22:29.160180764 -0500
+@@ -95,7 +95,7 @@
+             with cython.nogil:
+                 res = lib.av_bsf_receive_packet(self.ptr, new_packet.ptr)
+ 
+-            if res == -EAGAIN or res == lib.AVERROR_EOF:
++            if res == lib.AVERROR(EAGAIN) or res == lib.AVERROR_EOF:
+                 return output
+ 
+             err_check(res)
+--- a/av/codec/context.py	2026-10-20 23:29:42.081794300 -0400
++++ b/av/codec/context.py	2026-11-07 13:22:29.160022220 -0500
+@@ -638,7 +638,7 @@
+         with cython.nogil:
+             res = lib.avcodec_receive_frame(self.ptr, frame.ptr)
+ 
+-        if res == -EAGAIN or res == lib.AVERROR_EOF:
++        if res == lib.AVERROR(EAGAIN) or res == lib.AVERROR_EOF:
+             return
+ 
+         err_check(res, "avcodec_receive_frame()")
+@@ -660,7 +660,7 @@
+         with cython.nogil:
+             res = lib.avcodec_receive_packet(self.ptr, packet.ptr)
+ 
+-        if res == -EAGAIN or res == lib.AVERROR_EOF:
++        if res == lib.AVERROR(EAGAIN) or res == lib.AVERROR_EOF:
+             return
+ 
+         err_check(res, "avcodec_receive_packet()")
+--- a/av/error.py	2026-10-20 23:29:42.083112700 -0400
++++ b/av/error.py	2026-11-07 13:25:55.922421396 -0500
+@@ -336,6 +336,10 @@
+         log = None
+ 
+     code: cython.int = -res
++    if lib.AVUNERROR(res) in errno.errorcode:
++        # an errno value: on Haiku these are negative and AVUNERROR(e) is e;
++        # FFmpeg's own codes (AVERROR_EOF, ...) stay -res
++        code = lib.AVUNERROR(res)
+     error_buffer: cython.p_char = cython.cast(
+         cython.p_char, malloc(lib.AV_ERROR_MAX_STRING_SIZE * cython.sizeof(char))
+     )
+--- a/include/avutil.pxd	2026-10-20 23:29:42.090112700 -0400
++++ b/include/avutil.pxd	2026-11-07 13:22:29.159745093 -0500
+@@ -156,6 +156,10 @@
+     cdef int AVERROR_DEMUXER_NOT_FOUND
+     cdef int AVERROR_ENCODER_NOT_FOUND
+     cdef int AVERROR_EOF
++    # FFmpeg's own mapping between errno values and its error codes: on
++    # Haiku, errno values are negative already and AVERROR(e) is e
++    cdef int AVERROR(int e)
++    cdef int AVUNERROR(int e)
+     cdef int AVERROR_EXIT
+     cdef int AVERROR_EXTERNAL
+     cdef int AVERROR_FILTER_NOT_FOUND

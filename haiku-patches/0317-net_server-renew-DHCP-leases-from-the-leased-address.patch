@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 6 Nov 2026 00:07:26 -0500
+Subject: [PATCH 317/342] net_server: renew DHCP leases from the leased address
+
+Since +320 the DHCP socket is bound to its device in every state, and a
+socket bound to a device takes the device's direct route, which fills in no
+source address: from the wildcard address, renewals went out from 0.0.0.0.
+Linux drops a unicast datagram from there as a martian, and so, it seems,
+does the wireless bridge a C2 was behind, which looked like a bridge that
+ignores renewals. Renewing now uses a socket bound to the leased address,
+as RFC 2131 4.4.5 asks; the other states keep the wildcard socket, which
+gets the broadcasts. If the address is gone, renewing falls back to the
+wildcard socket.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/servers/net/DHCPClient.cpp | 83 ++++++++++++++++++++++++++--------
+ src/servers/net/DHCPClient.h   |  1 +
+ 2 files changed, 64 insertions(+), 20 deletions(-)
+
+diff --git a/src/servers/net/DHCPClient.cpp b/src/servers/net/DHCPClient.cpp
+index 04bc58773c..78ad94ce56 100644
+--- a/src/servers/net/DHCPClient.cpp
++++ b/src/servers/net/DHCPClient.cpp
+@@ -608,38 +608,32 @@ DHCPClient::_Negotiate()
+ 	else
+ 		fHostName.Truncate(0);
+ 
+-	int socket = ::socket(AF_INET, SOCK_DGRAM, 0);
++	bool leased = state == RENEWING;
++	int socket = _OpenSocket(leased);
+ 	if (socket < 0)
+ 		return errno;
+ 
+-	// Enable reusing the port. This is needed in case there is more
+-	// than 1 interface that needs to be configured. Note that the only reason
+-	// this works is because there is code below to bind to a specific
+-	// interface.
+-	int option = 1;
+-	setsockopt(socket, SOL_SOCKET, SO_REUSEPORT, &option, sizeof(option));
+-
+-	BNetworkAddress local;
+-	local.SetToWildcard(AF_INET, DHCP_CLIENT_PORT);
+-
+-	option = 1;
+-	setsockopt(socket, SOL_SOCKET, SO_BROADCAST, &option, sizeof(option));
+-
+-	if (bind(socket, local, local.Length()) < 0) {
+-		close(socket);
+-		return errno;
+-	}
+-
+ 	bigtime_t previousLeaseTime = fLeaseTime;
+ 
+ 	status_t status = B_OK;
+ 	while (state != BOUND && fNegotiateThread != -1) {
++		if ((state == RENEWING) != leased) {
++			close(socket);
++			leased = state == RENEWING;
++			socket = _OpenSocket(leased);
++			if (socket < 0) {
++				status = errno;
++				break;
++			}
++		}
++
+ 		status = _StateTransition(socket, state);
+ 		if (status != B_OK && (state == SELECTING || state == REBOOTING))
+ 			break;
+ 	}
+ 
+-	close(socket);
++	if (socket >= 0)
++		close(socket);
+ 
+ 	if (fLeaseTime == 0)
+ 		fLeaseTime = previousLeaseTime;
+@@ -765,6 +759,55 @@ DHCPClient::_GotMessage(dhcp_state& state, dhcp_message* message)
+ }
+ 
+ 
++/*!	The socket for a state: renewing goes to the server from the leased
++	address, as RFC 2131 4.4.5 wants. Bound to the device (see
++	_StateTransition()), a socket on the wildcard address sends from 0.0.0.0,
++	and a server or bridge drops a renewal from there. Every other state uses
++	the wildcard address, which also gets the broadcasts.
++*/
++int
++DHCPClient::_OpenSocket(bool leasedAddress)
++{
++	int socket = ::socket(AF_INET, SOCK_DGRAM, 0);
++	if (socket < 0)
++		return -1;
++
++	// Enable reusing the port. This is needed in case there is more
++	// than 1 interface that needs to be configured. Note that the only reason
++	// this works is because there is code below to bind to a specific
++	// interface.
++	int option = 1;
++	setsockopt(socket, SOL_SOCKET, SO_REUSEPORT, &option, sizeof(option));
++
++	option = 1;
++	setsockopt(socket, SOL_SOCKET, SO_BROADCAST, &option, sizeof(option));
++
++	BNetworkAddress local;
++	if (leasedAddress) {
++		local.SetTo(fAssignedAddress, DHCP_CLIENT_PORT);
++		if (bind(socket, local, local.Length()) == 0)
++			return socket;
++
++		// The address isn't configured any more: renew from the wildcard
++		// address, as before
++		syslog(LOG_DEBUG, "%s: can't send from %s: %s\n", Device(),
++			_AddressToString(fAssignedAddress).String(), strerror(errno));
++		close(socket);
++		return _OpenSocket(false);
++	}
++
++	local.SetToWildcard(AF_INET, DHCP_CLIENT_PORT);
++	if (bind(socket, local, local.Length()) < 0) {
++		status_t error = errno;
++		close(socket);
++		errno = error;
++		return -1;
++	}
++
++	return socket;
++}
++
++
+ status_t
+ DHCPClient::_StateTransition(int socket, dhcp_state& state)
+ {
+diff --git a/src/servers/net/DHCPClient.h b/src/servers/net/DHCPClient.h
+index b666bf9310..47b60698c1 100644
+--- a/src/servers/net/DHCPClient.h
++++ b/src/servers/net/DHCPClient.h
+@@ -49,6 +49,7 @@ private:
+ 			status_t			_Negotiate();
+ 			status_t			_GotMessage(dhcp_state& state,
+ 									dhcp_message* message);
++			int					_OpenSocket(bool leasedAddress);
+ 			status_t			_StateTransition(int socket, dhcp_state& state);
+ 			void				_ParseOptions(dhcp_message& message,
+ 									BMessage& address,

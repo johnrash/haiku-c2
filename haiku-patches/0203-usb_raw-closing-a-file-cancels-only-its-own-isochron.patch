@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 07:16:13 -0500
+Subject: [PATCH 203/342] usb_raw: closing a file cancels only its own
+ isochronous requests (M45)
+
+The file cookie was the device itself, shared by everyone who opened
+it, and its queued isochronous requests were the device's: any program
+closing the device (listusb, or any BUSBRoster looking at devices)
+canceled and reaped the requests another one had queued. The C920's
+stream restarted, losing frames, at every listusb.
+
+open() now returns a handle of its own; a request remembers the handle
+that queued it, only that one can wait for it, and closing the handle
+cancels only its requests.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/drivers/bus/usb/usb_raw.cpp        | 44 ++++++++++++++-----
+ 1 file changed, 33 insertions(+), 11 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp b/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp
+index 2c56a4aaa2..08baebb1f9 100644
+--- a/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp
++++ b/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp
+@@ -37,6 +37,7 @@
+ // leaves gaps), each waited for with B_USB_RAW_COMMAND_WAIT_ISOCHRONOUS.
+ typedef struct raw_request {
+ 	struct raw_request	*next;
++	void				*owner;		// the raw_handle that queued it
+ 	uint32				id;
+ 	usb_pipe			pipe;
+ 	sem_id				done;
+@@ -68,7 +69,13 @@ typedef struct {
+ 	uint32				next_request;
+ } raw_device;
+ 
+-static void usb_raw_cancel_requests(raw_device *device);
++// what an open() returns: the device is shared by all who opened it, its
++// queued isochronous requests belong to the one that queued them
++typedef struct {
++	raw_device			*device;
++} raw_handle;
++
++static void usb_raw_cancel_requests(raw_device *device, void *owner);
+ static void usb_raw_cancel_interface(
+ 	const usb_configuration_info *configurationInfo, int32 interfaceIndex);
+ 
+@@ -230,8 +237,14 @@ usb_raw_open(const char *name, uint32 flags, void **cookie)
+ 	raw_device *element = gDeviceList;
+ 	while (element) {
+ 		if (strcmp(name, element->name) == 0) {
++			raw_handle *handle = (raw_handle *)malloc(sizeof(raw_handle));
++			if (handle == NULL) {
++				mutex_unlock(&gDeviceListLock);
++				return B_NO_MEMORY;
++			}
++			handle->device = element;
+ 			element->reference_count++;
+-			*cookie = element;
++			*cookie = handle;
+ 			mutex_unlock(&gDeviceListLock);
+ 			return B_OK;
+ 		}
+@@ -256,10 +269,13 @@ static status_t
+ usb_raw_free(void *cookie)
+ {
+ 	TRACE((DRIVER_NAME": free()\n"));
+-	usb_raw_cancel_requests((raw_device *)cookie);
++	raw_handle *handle = (raw_handle *)cookie;
++	raw_device *device = handle->device;
++	// only this file's requests: another program may stream on the device
++	usb_raw_cancel_requests(device, handle);
++	free(handle);
+ 	mutex_lock(&gDeviceListLock);
+ 
+-	raw_device *device = (raw_device *)cookie;
+ 	device->reference_count--;
+ 	if (device->device == 0) {
+ 		mutex_lock(&device->lock);
+@@ -313,17 +329,20 @@ usb_raw_free_request(raw_request *request)
+ }
+ 
+ 
+-/*!	Waits for the device's queued isochronous transfers, canceling them
+-	first: the file is closed.
++/*!	Waits for the isochronous transfers \a owner queued and nobody waited
++	for, canceling them first: its file is closed.
+ */
+ static void
+-usb_raw_cancel_requests(raw_device *device)
++usb_raw_cancel_requests(raw_device *device, void *owner)
+ {
+ 	while (true) {
+ 		mutex_lock(&device->lock);
+-		raw_request *request = device->requests;
++		raw_request **link = &device->requests;
++		while (*link != NULL && (*link)->owner != owner)
++			link = &(*link)->next;
++		raw_request *request = *link;
+ 		if (request != NULL) {
+-			device->requests = request->next;
++			*link = request->next;
+ 			device->request_count--;
+ 		}
+ 		mutex_unlock(&device->lock);
+@@ -398,8 +417,9 @@ usb_raw_callback(void *cookie, status_t status, void *data, size_t actualLength)
+ static status_t
+ usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
+ {
++	raw_handle *handle = (raw_handle *)cookie;
+ 	TRACE((DRIVER_NAME": ioctl\n"));
+-	raw_device *device = (raw_device *)cookie;
++	raw_device *device = handle->device;
+ 	if (device->device == 0)
+ 		return B_DEV_NOT_READY;
+ 
+@@ -966,6 +986,7 @@ usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
+ 				break;
+ 			}
+ 			request->id = device->next_request++;
++			request->owner = handle;
+ 			if (gUSBModule->queue_isochronous(request->pipe,
+ 					command.async_isochronous.data,
+ 					command.async_isochronous.length, request->descriptors,
+@@ -993,7 +1014,8 @@ usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
+ 			mutex_lock(&device->lock);
+ 			raw_request **link = &device->requests;
+ 			while (*link != NULL
+-				&& (*link)->id != command.async_isochronous.request) {
++				&& ((*link)->id != command.async_isochronous.request
++					|| (*link)->owner != handle)) {
+ 				link = &(*link)->next;
+ 			}
+ 			raw_request *request = *link;

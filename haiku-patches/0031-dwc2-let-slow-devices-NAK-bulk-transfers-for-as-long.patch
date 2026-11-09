@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 14:46:19 -0400
+Subject: [PATCH 031/342] dwc2: let slow devices NAK bulk transfers for as long
+ as they need
+
+A host channel that had not halted within 2 s was halted and the
+transfer failed with "no response". In DMA mode the core retries NAKed
+bulk and control transactions by itself, so a device that NAKs for more
+than 2 s lost its transfer, mid-way, with the data toggle out of step;
+the mass storage reset that followed failed the same way. A Verbatim
+STORE N GO stick takes up to 16 s to accept writes while it programs
+its flash: BFS's first write after mounting failed and the volume could
+not be unmounted again.
+
+Bulk transfers now run until they complete or are canceled (usb_disk
+cancels after 10 s), control transfers get the 5 s USB 2.0 limit, and
+interrupt transfers, which halt on a NAK, keep 2 s. A cancel no longer
+logs "no response".
+
+Tested on the ODROID-C2 with that stick: 8 x 32 MB raw writes (the
+first took 16 s) read back identical; hot-plugged volume unmounted;
+mkfs, copies, unmount, remount and verify; no USB errors.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/busses/usb/dwc2.cpp | 39 +++++++++++++++++++++-----
+ 1 file changed, 32 insertions(+), 7 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.cpp b/src/add-ons/kernel/busses/usb/dwc2.cpp
+index a37ede7fe8..f9eaf38422 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2.cpp
+@@ -1081,11 +1081,34 @@ DWC2::_RunChannel(dwc2_lane* lane, uint32 character, uint32 split,
+ 	asm volatile("dsb sy" : : : "memory");
+ 	_Write(HC_CHAR(lane->channel), character | HCCHAR_CHENA);
+ 
+-	entry.Wait(B_RELATIVE_TIMEOUT, 2000000);
+-	uint32 status = atomic_get(&lane->status);
+-	if ((status & HCINT_CHHLTD) == 0) {
+-		_HaltChannel(lane);
+-		return B_DEV_TIMEOUT;
++	// In DMA mode the core retries NAKed bulk and control transactions by
++	// itself; the channel halts when the transfer is done or fails. A bulk
++	// transfer may be NAKed for seconds (a USB stick writing its flash), so
++	// it runs until it is canceled: the class driver has its own timeout.
++	// Control transfers get the 5 s USB 2.0 limit, the others (interrupt
++	// transfers halt on a NAK) 2 s.
++	uint32 type = (character >> HCCHAR_EPTYPE_SHIFT) & 3;
++	bigtime_t limit = type == EPTYPE_BULK ? 0
++		: type == EPTYPE_CONTROL ? 5000000 : 2000000;
++	bigtime_t start = system_time();
++	uint32 status;
++	while (true) {
++		entry.Wait(B_RELATIVE_TIMEOUT, 100000);
++		status = atomic_get(&lane->status);
++		if ((status & HCINT_CHHLTD) != 0)
++			break;
++		// set by CancelQueuedTransfers() for the transfer this lane runs
++		bool canceled = lane->current != NULL
++			&& *(volatile bool*)&lane->current->canceled;
++		if (canceled || (limit != 0 && system_time() - start >= limit)) {
++			_HaltChannel(lane);
++			return canceled ? B_CANCELED : B_DEV_TIMEOUT;
++		}
++		lane->halted.Add(&entry);
++		// it may have halted before the entry was added again
++		status = atomic_get(&lane->status);
++		if ((status & HCINT_CHHLTD) != 0)
++			break;
+ 	}
+ 
+ 	if (in)
+@@ -1138,8 +1161,10 @@ DWC2::_Transaction(dwc2_lane* lane, Pipe* pipe, uint32 pid, bool in,
+ 	status_t result = _RunChannel(lane, _ChannelCharacteristics(pipe, in, false), 0,
+ 		size, packets, pid, offset, in, &status, &transferSize);
+ 	if (result != B_OK) {
+-		ERROR("device %d endpoint %d: no response\n", pipe->DeviceAddress(),
+-			pipe->EndpointAddress() & 0xf);
++		if (result == B_DEV_TIMEOUT) {
++			ERROR("device %d endpoint %d: no response\n", pipe->DeviceAddress(),
++				pipe->EndpointAddress() & 0xf);
++		}
+ 		return result;
+ 	}
+ 

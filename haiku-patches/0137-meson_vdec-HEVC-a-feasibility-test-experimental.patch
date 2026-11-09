@@ -1,0 +1,2067 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 20:35:43 -0400
+Subject: [PATCH 137/342] meson_vdec: HEVC, a feasibility test (experimental)
+
+The S905's HEVC block, with linux-firmware's gxl_hevc.bin
+(MESON_VDEC_HEVC) or the vendor kernel's microcode
+(MESON_VDEC_HEVC_VENDOR): power, clock, firmware, the stream parser
+feeding the block's stream buffer, the codec start; the firmware parses
+each slice header and the host programs an intra slice's decoding to NV12
+(64 KB aligned planes: the GXBB's reference table keeps address bits 31:16
+only). Intra pictures of 8-bit streams only; the others are skipped. The
+mailbox interrupt stays masked, the waits poll. On the ODROID-C2, 320x240
+and 1920x1080 intra streams match FFmpeg bit for bit, with either
+firmware. Facts: the port's docs/m26-vdec-hevc-facts.md and
+docs/m26-vdec-hevc-vendor-facts.md.
+
+The class, its registers and constants move to meson_vdec_private.h for
+the second source file. The parser submit's trace reads the level of the
+block in use: reading VDEC_1's registers while it is powered down (an HEVC
+session) hangs the bus.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/drivers/meson_vdec.h          |   5 +
+ .../kernel/drivers/video/meson_vdec/Jamfile   |   1 +
+ .../drivers/video/meson_vdec/meson_vdec.cpp   | 493 ++--------
+ .../video/meson_vdec/meson_vdec_hevc.cpp      | 903 ++++++++++++++++++
+ .../video/meson_vdec/meson_vdec_private.h     | 477 +++++++++
+ 5 files changed, 1459 insertions(+), 420 deletions(-)
+ create mode 100644 src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp
+ create mode 100644 src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
+
+diff --git a/headers/private/drivers/meson_vdec.h b/headers/private/drivers/meson_vdec.h
+index 4131c2d469..7e94392ccd 100644
+--- a/headers/private/drivers/meson_vdec.h
++++ b/headers/private/drivers/meson_vdec.h
+@@ -40,6 +40,11 @@ enum {
+ enum {
+ 	MESON_VDEC_MPEG12 = 1,
+ 	MESON_VDEC_H264 = 2,
++	MESON_VDEC_HEVC = 3,
++		// experimental: intra pictures of 8-bit streams, linux-firmware's
++		// gxl_hevc.bin
++	MESON_VDEC_HEVC_VENDOR = 4,
++		// the same with the vendor kernel's microcode
+ };
+ 
+ struct meson_vdec_start {
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/Jamfile b/src/add-ons/kernel/drivers/video/meson_vdec/Jamfile
+index 668b307144..0ebd8768b0 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/Jamfile
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/Jamfile
+@@ -6,5 +6,6 @@ UsePrivateHeaders drivers ;
+ if $(TARGET_ARCH) = arm64 {
+ 	KernelAddon meson_vdec :
+ 		meson_vdec.cpp
++		meson_vdec_hevc.cpp
+ 	;
+ }
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+index 8ad01b1dc2..5e7b4a8925 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+@@ -22,423 +22,13 @@
+  */
+ 
+ 
+-#include <new>
+-#include <stdio.h>
+-#include <string.h>
+-
+-#include <AutoDeleter.h>
+-#include <AutoDeleterDrivers.h>
+-#include <bus/FDT.h>
+-#include <device_manager.h>
+-#include <debug.h>
+-#include <kernel.h>
+-#include <arch/int.h>
+-#include <lock.h>
+-#include <util/AutoLock.h>
+-#include <vm/vm.h>
+-
+-#include <meson_canvas.h>
+-#include <meson_vdec.h>
+-
+-
+-#define DRIVER_MODULE_NAME	"drivers/video/meson_vdec/driver_v1"
+-#define DEVICE_MODULE_NAME	"drivers/video/meson_vdec/device_v1"
+-
+-#define INFO(x...)			dprintf("meson_vdec: " x)
+-
+-
+-// blocks besides the DOS and the parser, which come from the device tree
+-static const phys_addr_t kAoBase = 0xc8100000;
+-static const phys_addr_t kHhiBase = 0xc883c000;
+-static const phys_addr_t kResetBase = 0xc1104000;
+-
+-// AO (byte offsets)
+-enum {
+-	AO_RTI_GEN_PWR_SLEEP0		= 0xe8,
+-	AO_RTI_GEN_PWR_ISO0			= 0xec,
+-};
+-#define AO_SLEEP_VDEC1				(3 << 2)
+-#define AO_ISO_VDEC1				(3 << 6)
+-
+-// HHI (byte offsets)
+-enum {
+-	HHI_GCLK_MPEG0				= 0x140,
+-	HHI_GCLK_MPEG1				= 0x144,
+-	HHI_VDEC_CLK_CNTL			= 0x1e0,
+-};
+-#define GCLK_MPEG0_DOS				(1 << 1)
+-#define GCLK_MPEG1_DOS_PARSER		(1 << 25)
+-#define VDEC_CLK_DIVIDER_MASK		0x7f
+-#define VDEC_CLK_SOURCE_SHIFT		9
+-#define VDEC_CLK_SOURCE_MASK		(3 << VDEC_CLK_SOURCE_SHIFT)
+-#define VDEC_CLK_SOURCE_FCLK_DIV3	1			// 666.67 MHz
+-#define VDEC_CLK_GATE				(1 << 8)
+-
+-// reset controller (byte offsets)
+-enum {
+-	RESET1						= 0x408,
+-};
+-#define RESET1_PARSER				(1 << 8)	// a pulse
+-
+-// the decoder's canvases (meson_canvas.h): 2 a frame (Y, CbCr)
+-static const uint32 kFirstCanvas = 0x80;
+-
+-// DOS (byte offsets)
+-enum {
+-	ASSIST_MBOX1_CLR_REG		= 0x01d4,
+-	ASSIST_MBOX1_MASK			= 0x01d8,
+-	MPSR						= 0x0c04,
+-	CPSR						= 0x0c84,
+-	IMEM_DMA_CTRL				= 0x0d00,
+-	IMEM_DMA_ADR				= 0x0d04,
+-	IMEM_DMA_COUNT				= 0x0d08,
+-	PSCALE_CTRL					= 0x2444,
+-	GCLK_EN						= 0x260c,
+-	MDEC_PIC_DC_CTRL			= 0x2638,
+-	ANC0_CANVAS_ADDR			= 0x2640,	// H.264: to 23, the frames
+-	MDEC_PIC_DC_THRESH			= 0x26e0,
+-	AV_SCRATCH_0				= 0x2700,	// to _7: the frames' canvases
+-											// H.264: the command
+-	AV_SCRATCH_1				= 0x2704,	// H.264: to _6, frame reports
+-	AV_SCRATCH_2				= 0x2708,
+-	AV_SCRATCH_3				= 0x270c,
+-	AV_SCRATCH_4				= 0x2710,	// later: sequence info
+-	AV_SCRATCH_5				= 0x2714,	// later: picture info
+-	AV_SCRATCH_6				= 0x2718,	// later: the width
+-	AV_SCRATCH_7				= 0x271c,	// later: the height
+-	AV_SCRATCH_8				= 0x2720,	// frame handed back
+-	AV_SCRATCH_9				= 0x2724,	// frame decoded
+-	AV_SCRATCH_A				= 0x2728,	// (width << 16) | height
+-	AV_SCRATCH_B				= 0x272c,	// workspace + 5 KB
+-	AV_SCRATCH_C				= 0x2730,	// error count
+-	AV_SCRATCH_D				= 0x2734,	// the frame's stream offset
+-	AV_SCRATCH_E				= 0x2738,	// waiting for a frame?
+-	AV_SCRATCH_F				= 0x273c,	// 1: fatal error
+-	AV_SCRATCH_G				= 0x2740,	// H.264: the extension
+-	AV_SCRATCH_I				= 0x2748,	// H.264: the SEI buffer
+-	AV_SCRATCH_J				= 0x274c,	// H.264: SEI data
+-	MPEG1_2_REG					= 0x3004,
+-	PIC_HEAD_INFO				= 0x300c,
+-	POWER_CTL_VLD				= 0x3020,
+-	M4_CONTROL_REG				= 0x30a4,
+-	VLD_MEM_VIFIFO_START_PTR	= 0x3100,
+-	VLD_MEM_VIFIFO_CURR_PTR		= 0x3104,
+-	VLD_MEM_VIFIFO_END_PTR		= 0x3108,
+-	VLD_MEM_VIFIFO_CONTROL		= 0x3110,
+-	VLD_MEM_VIFIFO_WP			= 0x3114,
+-	VLD_MEM_VIFIFO_RP			= 0x3118,
+-	VLD_MEM_VIFIFO_LEVEL		= 0x311c,
+-	VLD_MEM_VIFIFO_BUF_CNTL		= 0x3120,
+-	VLD_MEM_VIFIFO_WRAP_COUNT	= 0x3144,
+-	DOS_SW_RESET0				= 0xfc00,
+-	DOS_GCLK_EN0				= 0xfc04,
+-	DOS_GEN_CTRL0				= 0xfc08,
+-	DOS_MEM_PD_VDEC				= 0xfcc0,
+-	DOS_VDEC_MCRCC_STALL_CTRL	= 0xfd00,
+-};
+-#define IMEM_DMA_BUSY				(1 << 15)
+-#define MDEC_PIC_DC_NV12			(1 << 17)
+-#define MDEC_PIC_DC_BIT31			(1u << 31)
+-#define VIFIFO_CONTROL_INIT			(1 << 0)
+-#define VIFIFO_CONTROL_RUN			0x00110406
+-	// FIFO count 0x11, fill on level, empty and fill enable
+-#define VIFIFO_BUF_CNTL_INIT		(1 << 0)
+-#define VIFIFO_BUF_CNTL_MANUAL		(1 << 1)
+-#define BUFFEROUT_SKIP				0x00fe0000
+-#define PIC_INFO_PROGRESSIVE		(1 << 15)
+-
+-// ESPARSER (byte offsets from its base)
+-enum {
+-	PARSER_CONTROL				= 0x00,
+-	PARSER_FETCH_ADDR			= 0x04,
+-	PARSER_FETCH_CMD			= 0x08,
+-	PARSER_CONFIG				= 0x14,
+-	PFIFO_WR_PTR				= 0x18,
+-	PFIFO_RD_PTR				= 0x1c,
+-	PARSER_SEARCH_PATTERN		= 0x24,
+-	PARSER_SEARCH_MASK			= 0x28,
+-	PARSER_INT_ENABLE			= 0x2c,
+-	PARSER_INT_STATUS			= 0x30,
+-	PARSER_ES_CONTROL			= 0x5c,
+-	PARSER_VIDEO_START_PTR		= 0x80,
+-	PARSER_VIDEO_END_PTR		= 0x84,
+-	PARSER_VIDEO_WP				= 0x88,
+-	PARSER_VIDEO_HOLE			= 0x90,
+-};
+-#define PARSER_START_SEARCH			0x03
+-#define PARSER_START_WRITE_SEARCH	0x23	// with the pack size at bit 8
+-#define PARSER_FETCH_ENDIAN_64		(7 << 27)
+-#define PARSER_INT_START_CODE		(1 << 0)
+-#define PARSER_INT_HOST_START_CODE	(1 << 8)
+-
+-static const uint32 kFirmwareSize = 16 * 1024;
+-	// what the IMEM DMA loads; the H.264 file has an extension after it
+-static const size_t kVififoSize = 8 * 1024 * 1024;
+-static const size_t kWorkspaceSize = 128 * 1024;
+-static const uint32 kWorkspaceOffset = 0x1400;
+-	// the firmware takes the address 5 KB in
+-static const size_t kInputSize = 256 * 1024;
+-	// one parser fetch; plus the padding and the marker
+-static const uint32 kMinimumFetch = 4096;
+-static const uint32 kMarkerSize = 512;
+-static const size_t kVififoMargin = 6 * 1024;
+-	// the parser's own FIFO
+-static const uint32 kFrameCount = 8;
+-	// MPEG-1/2's
+-static const uint32 kMaxFrames = 24;
+-	// H.264's at most (and the queue's)
+-static const uint32 kMaxWidth = 1920;
+-static const uint32 kMaxHeight = 1088;
+-static const bigtime_t kPollInterval = 2000;
+-
+-// H.264
+-static const uint32 kH264ExtensionSize = 20 * 1024;
+-static const size_t kH264WorkspaceSize = 0x1ee000;
+-static const uint32 kH264WorkspaceBias = 0x01000000;
+-	// the firmware adds it to the workspace address it is given
+-static const size_t kH264SeiSize = 8 * 1024;
+-static const uint32 kH264MaxReportFrames = 6;
+-static const uint32 kMotionVectorBytes = 96;	// per macroblock and reference
+-
+-enum {
+-	H264_COMMAND_SEQUENCE		= 1,	// geometry known, wants frames
+-	H264_COMMAND_FRAMES			= 2,	// frames decoded
+-	H264_COMMAND_FATAL			= 6,
+-	H264_COMMAND_BAD_WIDTH		= 7,
+-	H264_COMMAND_BAD_HEIGHT		= 8,
+-};
+-#define H264_STATUS_INDEX_MASK		0x1f
+-#define H264_STATUS_ERROR			(1 << 9)
+-#define H264_SEI_READY				(1 << 15)
+-
+-/*!	The end of an H.264 stream: a 16x16 IDR picture (SPS, PPS, slice;
+-	encoded with x264). Before decoding an IDR picture, the firmware puts
+-	out all it holds; the picture itself changes the size, which stops the
+-	firmware until it gets frames for it, and it doesn't.
+-*/
+-static const uint8 kH264EndOfStream[] = {
+-	0x00, 0x00, 0x00, 0x01, 0x67, 0x4d, 0x40, 0x0a, 0xda, 0x7b, 0x01, 0x10,
+-	0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x06, 0x40, 0xf1, 0x22, 0x6a,
+-	0x00, 0x00, 0x00, 0x01, 0x68, 0xef, 0x0f, 0x2c, 0x80, 0x00, 0x00, 0x01,
+-	0x65, 0x88, 0x84, 0x1f, 0xff, 0xfe, 0xf4, 0xa3, 0xf8, 0x14, 0xd2, 0x6c,
+-	0x4d
+-};
++#include "meson_vdec_private.h"
+ 
+ 
+ device_manager_info* gDeviceManager;
+ meson_canvas_module_info* gCanvas;
+ 
+ 
+-/*!	Writes back and invalidates the cache lines of a physical range through
+-	the kernel's cached map of all memory: before the device reads what the
+-	CPU wrote, and before the CPU reads what the device wrote.
+-*/
+-static void
+-flush_cache_range(phys_addr_t physical, size_t size)
+-{
+-	uint64 ctr;
+-	asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
+-	const addr_t lineSize = 4 << ((ctr >> 16) & 0xf);
+-	addr_t start = (KERNEL_PMAP_BASE + physical) & ~(lineSize - 1);
+-	for (addr_t line = start; line < KERNEL_PMAP_BASE + physical + size;
+-			line += lineSize) {
+-		asm volatile("dc civac, %0" : : "r"(line) : "memory");
+-	}
+-	asm volatile("dsb sy" : : : "memory");
+-}
+-
+-
+-static inline uint32
+-align_up(uint32 value, uint32 alignment)
+-{
+-	return (value + alignment - 1) & ~(alignment - 1);
+-}
+-
+-
+-struct dma_buffer {
+-	area_id			area;
+-	uint8*			address;
+-	phys_addr_t		physical;
+-	size_t			size;
+-
+-	dma_buffer() : area(-1), address(NULL), physical(0), size(0) {}
+-};
+-
+-
+-class MesonVdec {
+-public:
+-								MesonVdec(device_node* node);
+-								~MesonVdec();
+-
+-			status_t			Init(phys_addr_t dos, phys_addr_t parser,
+-									int32 vdecIrq, int32 parserIrq,
+-									bool edgeTriggered);
+-			device_node*		Node() const { return fNode; }
+-
+-			status_t			Open();
+-			void				Close();
+-			status_t			Control(uint32 op, void* buffer,
+-									size_t length);
+-			void				Dump();
+-
+-private:
+-	static	int32				_VdecInterrupt(void* data);
+-	static	int32				_ParserInterrupt(void* data);
+-			bool				_CheckDecoder();
+-			bool				_CheckMpeg12();
+-			bool				_CheckH264();
+-			bool				_CheckParser();
+-			void				_QueueFrame(uint32 index, uint32 info,
+-									uint32 offset);
+-			void				_HandBack();
+-			bool				_FirmwareDone();
+-
+-			status_t			_Start(meson_vdec_start& start,
+-									const void* userFirmware);
+-			status_t			_StartSession(meson_vdec_start& start,
+-									const void* userFirmware);
+-			void				_WarmUp(const meson_vdec_start& start,
+-									const void* userFirmware);
+-			void				_Stop(bool keepBuffers = false);
+-			void				_FreeBuffers();
+-			status_t			_KeepBuffer(const char* name, size_t size,
+-									dma_buffer& buffer, bool userReadable,
+-									bool clear);
+-			status_t			_Write(const uint8* userData, size_t size,
+-									uint32* _offset);
+-			status_t			_Submit(size_t payload, bool marker);
+-			status_t			_EndOfStream();
+-			status_t			_GetFrame(meson_vdec_frame& frame);
+-			status_t			_Recycle(uint32 index);
+-
+-			void				_PowerUp();
+-			void				_PowerDown();
+-			void				_SetupVififo();
+-			status_t			_LoadFirmware(const void* userFirmware);
+-			void				_StartCodec();
+-			status_t			_StartH264(const void* userFirmware);
+-	static	status_t			_SetupThread(void* data);
+-			status_t			_SetupH264Frames(const uint32* info);
+-			void				_FreeH264Frames();
+-			void				_InitParser();
+-			void				_WriteCanvas(uint32 index,
+-									phys_addr_t address, uint32 bytesPerRow,
+-									uint32 height);
+-
+-			status_t			_AllocateBuffer(const char* name, size_t size,
+-									dma_buffer& buffer, bool userReadable);
+-			void				_FreeBuffer(dma_buffer& buffer);
+-
+-			uint32				_Dos(uint32 offset)
+-									{ return fDos[offset / 4]; }
+-			void				_SetDos(uint32 offset, uint32 value)
+-									{ fDos[offset / 4] = value; }
+-			uint32				_Parser(uint32 offset)
+-									{ return fParser[offset / 4]; }
+-			void				_SetParser(uint32 offset, uint32 value)
+-									{ fParser[offset / 4] = value; }
+-
+-private:
+-			device_node*		fNode;
+-			area_id				fDosArea;
+-			area_id				fParserArea;
+-			area_id				fAoArea;
+-			area_id				fHhiArea;
+-			area_id				fResetArea;
+-			volatile uint32*	fDos;
+-			volatile uint32*	fParser;
+-			volatile uint32*	fAo;
+-			volatile uint32*	fHhi;
+-			volatile uint32*	fReset;
+-			int32				fVdecIrq;
+-			int32				fParserIrq;
+-
+-			mutex				fLock;
+-				// one session, its calls one at a time (but GET_FRAME)
+-			spinlock			fStateLock;
+-				// the frame queue, the interrupt handlers
+-			bool				fOpen;
+-			bool				fRunning;
+-			bool				fEndOfStream;
+-			bool				fWarmedUp;
+-
+-			dma_buffer			fFirmware;
+-			dma_buffer			fVififo;
+-			dma_buffer			fWorkspace;
+-			dma_buffer			fInput;
+-			dma_buffer			fFrames;
+-			uint32				fCodec;
+-			uint32				fWidth;
+-			uint32				fHeight;
+-			uint32				fBytesPerRow;
+-			uint32				fLumaSize;
+-			size_t				fFrameSize;
+-			uint32				fFrameCount;
+-			uint32				fStreamBytes;
+-				// written to the VIFIFO this session: the offsets the
+-				// H.264 firmware gives its frames count from its start
+-			uint32				fEndOffset;
+-
+-			// H.264: the extension of the firmware, the firmware's own
+-			// memory, and the frames (one area each) and their motion
+-			// vectors, which the firmware asks for
+-			dma_buffer			fExtension;
+-			dma_buffer			fSei;
+-			dma_buffer			fMotionVectors;
+-			dma_buffer			fFrameBuffers[kMaxFrames];
+-			uint32				fFrameBuffersAllocated;
+-			thread_id			fSetupThread;
+-			sem_id				fSetupSem;
+-			bool				fSetupPending;
+-				// its command 1 waits for the setup thread
+-			bool				fEndReached;
+-				// the command 1 is the end of the stream's picture's: the
+-				// firmware put out all frames before and stopped
+-			uint32				fSetupInfo[4];
+-				// AV_SCRATCH_1, 2, 3 and 6 of the command
+-			uint32				fLastSetupInfo;
+-			uint32				fDecodeErrors;
+-			uint32				fBadPictures;
+-
+-			sem_id				fFrameSem;
+-			sem_id				fParserSem;
+-			uint32				fQueue[kMaxFrames];
+-			uint32				fQueueInfo[kMaxFrames];
+-			uint32				fQueueOffset[kMaxFrames];
+-			uint32				fQueueHead;
+-			uint32				fQueueCount;
+-			uint32				fHeld;
+-				// bit per frame: with the caller
+-			uint32				fBack[kMaxFrames];
+-			uint32				fBackHead;
+-			uint32				fBackCount;
+-				// H.264: frames given back, for the firmware's two places
+-			bigtime_t			fLastReport;
+-			bool				fFatal;
+-
+-			// the last events, for finding what the firmware does
+-			struct trace_entry {
+-				bigtime_t		time;
+-				char			what;	// 'R'eport, 'B'ack, 'S'ubmit, 'E'nd
+-				uint32			a, b, c, d;
+-			};
+-	static	const uint32		kTraceSize = 64;
+-			trace_entry			fTrace[kTraceSize];
+-			uint32				fTraceCount;
+-			void				_Trace(char what, uint32 a, uint32 b = 0,
+-									uint32 c = 0, uint32 d = 0);
+-			void				_DumpTrace(bool debugger);
+-
+-			// counters, for the KDL command
+-			uint32				fVdecInterrupts;
+-			uint32				fParserInterrupts;
+-			uint32				fFramesDecoded;
+-			uint32				fFramesSkipped;
+-			uint32				fSubmitted;
+-			uint32				fParserTimeouts;
+-};
+-
+-
+ static MesonVdec* sDevice;
+ 
+ 
+@@ -476,6 +66,22 @@ MesonVdec::MesonVdec(device_node* node)
+ 	fSetupPending(false),
+ 	fEndReached(false),
+ 	fLastSetupInfo(0),
++	fHevcVendor(false),
++	fHevcPicture(-1),
++	fHevcPictureOffset(0),
++	fHevcCodedWidth(0),
++	fHevcCodedHeight(0),
++	fHevcLog2Ctb(0),
++	fHevcCtbColumns(0),
++	fHevcCtbRows(0),
++	fHevcMvUnit(0),
++	fHevcMvOffset(0),
++	fHevcEnded(false),
++	fHevcLastStatus(0),
++	fHevcLastChange(0),
++	fHevcReports(0),
++	fHevcSlices(0),
++	fHevcSkipped(0),
+ 	fDecodeErrors(0),
+ 	fBadPictures(0),
+ 	fFrameSem(-1),
+@@ -634,7 +240,7 @@ MesonVdec::_DumpTrace(bool debugger)
+ bool
+ MesonVdec::_CheckDecoder()
+ {
+-	if (!fRunning)
++	if (!fRunning || _IsHevc())
+ 		return false;
+ 	_SetDos(ASSIST_MBOX1_CLR_REG, 1);
+ 	return fCodec == MESON_VDEC_H264 ? _CheckH264() : _CheckMpeg12();
+@@ -1141,6 +747,8 @@ MesonVdec::_WarmUp(const meson_vdec_start& start, const void* userFirmware)
+ status_t
+ MesonVdec::_StartSession(meson_vdec_start& start, const void* userFirmware)
+ {
++	if (start.codec == MESON_VDEC_HEVC || start.codec == MESON_VDEC_HEVC_VENDOR)
++		return _StartHevc(start, userFirmware);
+ 	bool h264 = start.codec == MESON_VDEC_H264;
+ 	if (start.codec != MESON_VDEC_MPEG12 && !h264)
+ 		return B_BAD_VALUE;
+@@ -1453,8 +1061,12 @@ MesonVdec::_Stop(bool keepBuffers)
+ 	if (fRunning) {
+ 		// the firmware stops; what it still writes, it writes into buffers
+ 		// that stay until it is powered down
+-		_SetDos(MPSR, 0);
+-		_SetDos(CPSR, 0);
++		if (_IsHevc())
++			_StopHevcProcessor();
++		else {
++			_SetDos(MPSR, 0);
++			_SetDos(CPSR, 0);
++		}
+ 		snooze(5000);
+ 		InterruptsSpinLocker locker(fStateLock);
+ 		fRunning = false;
+@@ -1464,7 +1076,15 @@ MesonVdec::_Stop(bool keepBuffers)
+ 			wait_for_thread(fSetupThread, NULL);
+ 			fSetupThread = -1;
+ 		}
+-		_PowerDown();
++		if (_IsHevc()) {
++			INFO("HEVC session ended: %" B_PRIu32 " reports, %" B_PRIu32
++				" slices decoded, %" B_PRIu32 " skipped, %" B_PRIu32
++				" frames, %" B_PRIu32 " damaged\n", fHevcReports, fHevcSlices,
++				fHevcSkipped, fFramesDecoded, fBadPictures);
++			_DumpTrace(false);
++			_PowerDownHevc();
++		} else
++			_PowerDown();
+ 		if (fFatal || fDecodeErrors > 0 || fBadPictures > 0) {
+ 			INFO("session ended%s: %" B_PRIu32 " frames decoded in all, %"
+ 				B_PRIu32 " decode errors, %" B_PRIu32 " damaged pictures\n",
+@@ -1483,6 +1103,7 @@ void
+ MesonVdec::_FreeBuffers()
+ {
+ 	_FreeBuffer(fExtension);
++	_FreeBuffer(fAux);
+ 	_FreeBuffer(fSei);
+ 	_FreeBuffer(fMotionVectors);
+ 	_FreeH264Frames();
+@@ -1530,7 +1151,9 @@ MesonVdec::_Submit(size_t payload, bool marker)
+ 	fSubmitted++;
+ 	fStreamBytes += length;
+ 	_Trace(marker ? 'S' : 'E', payload, _Parser(PARSER_VIDEO_WP),
+-		_Dos(VLD_MEM_VIFIFO_LEVEL));
++		_StreamLevel());
++		// (not VDEC_1's registers in an HEVC session: VDEC_1 is powered
++		// down then, and reading its registers hangs the bus)
+ 
+ 	bigtime_t timeout = system_time() + (marker ? 1000000 : 200000);
+ 	while (true) {
+@@ -1554,7 +1177,7 @@ MesonVdec::_Submit(size_t payload, bool marker)
+ 		INFO("parser timeout: control %#" B_PRIx32 ", status %#" B_PRIx32
+ 			", video WP %#" B_PRIx32 ", VIFIFO level %" B_PRIu32 "\n",
+ 			_Parser(PARSER_CONTROL), _Parser(PARSER_INT_STATUS),
+-			_Parser(PARSER_VIDEO_WP), _Dos(VLD_MEM_VIFIFO_LEVEL));
++			_Parser(PARSER_VIDEO_WP), _StreamLevel());
+ 	}
+ 	return marker ? B_TIMED_OUT : B_OK;
+ }
+@@ -1580,7 +1203,7 @@ MesonVdec::_Write(const uint8* userData, size_t size, uint32* _offset)
+ 		// take frames meanwhile
+ 		bigtime_t timeout = system_time() + 5000000;
+ 		while (true) {
+-			size_t used = _Dos(VLD_MEM_VIFIFO_LEVEL)
++			size_t used = _StreamLevel()
+ 				+ _Parser(PARSER_VIDEO_HOLE) + kVififoMargin;
+ 			if (used < fVififo.size && fVififo.size - used >= piece)
+ 				break;
+@@ -1616,6 +1239,8 @@ MesonVdec::_EndOfStream()
+ {
+ 	if (!fRunning)
+ 		return B_NOT_ALLOWED;
++	if (_IsHevc())
++		return _EndOfStreamHevc();
+ 	if (fCodec == MESON_VDEC_H264) {
+ 		// a 16x16 IDR picture and the parser's marker in 4 KB: what the
+ 		// firmware reports of it (at or after fEndOffset) is dropped
+@@ -1663,7 +1288,8 @@ MesonVdec::_GetFrame(meson_vdec_frame& frame)
+ 	// H.264, the firmware asking for frames for the end's own picture is
+ 	// (it has put out all before). The pause is a long one for H.264 then,
+ 	// in case it doesn't ask.
+-	const bigtime_t endPause = fCodec == MESON_VDEC_H264 ? 2000000 : 300000;
++	const bigtime_t endPause = fCodec == MESON_VDEC_H264 || _IsHevc()
++		? 2000000 : 300000;
+ 	bigtime_t start = system_time();
+ 	bool endOfStream = fEndOfStream;
+ 	bigtime_t timeout = start
+@@ -1673,6 +1299,24 @@ MesonVdec::_GetFrame(meson_vdec_frame& frame)
+ 			endOfStream = true;
+ 			timeout = min_c(timeout, system_time() + endPause);
+ 		}
++		if (_IsHevc()) {
++			_PollHevc();
++			InterruptsSpinLocker locker(fStateLock);
++			bool ended = fHevcEnded && fQueueCount == 0;
++			bool queued = fQueueCount > 0;
++			locker.Unlock();
++			if (ended && frame.timeout > 0) {
++				memset(&frame, 0, sizeof(frame));
++				frame.flags = MESON_VDEC_FRAME_END_OF_STREAM;
++				return B_OK;
++			}
++			if (fFatal || queued) {
++				if (acquire_sem_etc(fFrameSem, 1, B_RELATIVE_TIMEOUT, 0)
++						== B_OK || fFatal) {
++					break;
++				}
++			}
++		}
+ 		if (fCodec == MESON_VDEC_H264 && fEndOfStream && frame.timeout > 0) {
+ 			InterruptsSpinLocker locker(fStateLock);
+ 			_CheckDecoder();
+@@ -1728,7 +1372,7 @@ MesonVdec::_GetFrame(meson_vdec_frame& frame)
+ 	frame.stream_offset = offset;
+ 	locker.Unlock();
+ 
+-	if (fCodec == MESON_VDEC_H264) {
++	if (fCodec == MESON_VDEC_H264 || _IsHevc()) {
+ 		flush_cache_range(fFrameBuffers[index].physical, fFrameSize);
+ 		frame.frames = fFrameBuffers[index].area;
+ 		frame.offset = 0;
+@@ -1756,6 +1400,11 @@ MesonVdec::_Recycle(uint32 index)
+ 	InterruptsSpinLocker locker(fStateLock);
+ 	if (index >= fFrameCount || (fHeld & (1 << index)) == 0)
+ 		return B_BAD_VALUE;
++	if (_IsHevc()) {
++		// the driver itself picks the frames for new pictures
++		fHeld &= ~(1 << index);
++		return B_OK;
++	}
+ 	if (fCodec == MESON_VDEC_H264) {
+ 		fHeld &= ~(1 << index);
+ 		if (fBackCount < kMaxFrames) {
+@@ -1905,6 +1554,10 @@ MesonVdec::Dump()
+ 		fVdecInterrupts, fParserInterrupts, fSubmitted, fParserTimeouts);
+ 	if (!fRunning)
+ 		return;
++	if (_IsHevc()) {
++		_DumpHevc();
++		return;
++	}
+ 	kprintf("  scratch 0-3 %#" B_PRIx32 " %#" B_PRIx32 " %#" B_PRIx32 " %#"
+ 		B_PRIx32 ", J %#" B_PRIx32 "\n", _Dos(AV_SCRATCH_0),
+ 		_Dos(AV_SCRATCH_1), _Dos(AV_SCRATCH_1 + 4), _Dos(AV_SCRATCH_1 + 8),
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp
+new file mode 100644
+index 0000000000..59fad85b87
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp
+@@ -0,0 +1,903 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * meson_vdec's HEVC block (experimental, PLAN.md M26 stage 3): a
++ * feasibility test of the S905's HEVC decoder with linux-firmware's
++ * gxl_hevc.bin (MESON_VDEC_HEVC) or the vendor kernel's microcode
++ * (MESON_VDEC_HEVC_VENDOR). It decodes intra pictures of 8-bit streams to
++ * NV12 and skips the others. The register facts are in the port's
++ * docs/m26-vdec-hevc-facts.md and docs/m26-vdec-hevc-vendor-facts.md.
++ *
++ * Unlike VDEC_1's firmware, the HEVC firmware only parses: it reports each
++ * slice segment header (status 8) with the parameters it parsed (the RPM),
++ * and the host programs the picture's buffers and the slice's decoding and
++ * tells it to go on. The mailbox interrupt stays masked; the waits poll the
++ * status register.
++ */
++
++
++#include "meson_vdec_private.h"
++
++
++// HEVC block registers (DOS byte offsets)
++enum {
++	HEVC_ASSIST_MBOX1_CLR_REG	= 0xc1d4,
++	HEVC_ASSIST_MBOX1_MASK		= 0xc1d8,
++	HEVC_ASSIST_SCRATCH_0		= 0xc300,	// to _N, 4 bytes apart
++	HEVC_PARSER_VERSION			= 0xc400,
++	HEVC_STREAM_CONTROL			= 0xc404,
++	HEVC_STREAM_START_ADDR		= 0xc408,
++	HEVC_STREAM_END_ADDR		= 0xc40c,
++	HEVC_STREAM_WR_PTR			= 0xc410,
++	HEVC_STREAM_RD_PTR			= 0xc414,
++	HEVC_STREAM_LEVEL			= 0xc418,
++	HEVC_STREAM_FIFO_CTL		= 0xc41c,
++	HEVC_SHIFT_CONTROL			= 0xc420,
++	HEVC_SHIFT_STARTCODE		= 0xc424,
++	HEVC_SHIFT_EMULATECODE		= 0xc428,
++	HEVC_SHIFT_STATUS			= 0xc42c,
++	HEVC_SHIFT_BYTE_COUNT		= 0xc434,
++	HEVC_CABAC_CONTROL			= 0xc440,
++	HEVC_PARSER_CMD_WRITE		= 0xc448,
++	HEVC_PARSER_CORE_CONTROL	= 0xc44c,
++	HEVC_PARSER_INT_CONTROL		= 0xc480,
++	HEVC_PARSER_IF_CONTROL		= 0xc488,
++	HEVC_PARSER_LCU_START		= 0xc490,
++	HEVC_PARSER_CMD_SKIP_0		= 0xc4a0,
++	HEVC_PARSER_CMD_SKIP_1		= 0xc4a4,
++	HEVC_PARSER_CMD_SKIP_2		= 0xc4a8,
++	HEVC_MPRED_CTRL0			= 0xc804,
++	HEVC_MPRED_CTRL1			= 0xc808,
++	HEVC_MPRED_PIC_SIZE			= 0xc814,
++	HEVC_MPRED_PIC_SIZE_LCU		= 0xc818,
++	HEVC_MPRED_TILE_START		= 0xc81c,
++	HEVC_MPRED_TILE_SIZE_LCU	= 0xc820,
++	HEVC_MPRED_REF_NUM			= 0xc824,
++	HEVC_MPRED_REF_EN_L0		= 0xc830,
++	HEVC_MPRED_REF_EN_L1		= 0xc834,
++	HEVC_MPRED_ABV_START_ADDR	= 0xc848,
++	HEVC_MPRED_MV_WR_START_ADDR	= 0xc84c,
++	HEVC_MPRED_MV_RD_START_ADDR	= 0xc850,
++	HEVC_MPRED_MV_WPTR			= 0xc854,
++	HEVC_MPRED_MV_RPTR			= 0xc858,
++	HEVC_MPRED_MV_WR_ROW_JUMP	= 0xc85c,
++	HEVC_MPRED_MV_RD_ROW_JUMP	= 0xc860,
++	HEVC_MPRED_CURR_LCU			= 0xc864,
++	HEVC_MPRED_L0_REF00_POC		= 0xc880,
++	HEVC_MPRED_L1_REF00_POC		= 0xc8c0,
++	HEVC_MPRED_CUR_POC			= 0xc980,
++	HEVC_MPRED_COL_POC			= 0xc984,
++	HEVC_MPRED_MV_RD_END_ADDR	= 0xc988,
++	HEVC_MPSR					= 0xcc04,
++	HEVC_MCPU_INTR_REQ			= 0xcc14,
++	HEVC_CPSR					= 0xcc84,
++	HEVC_IMEM_DMA_CTRL			= 0xcd00,
++	HEVC_IMEM_DMA_ADR			= 0xcd04,
++	HEVC_IMEM_DMA_COUNT			= 0xcd08,
++	HEVC_LMEM_DMA_CTRL			= 0xcd40,
++	HEVCD_IPP_TOP_CNTL			= 0xd000,
++	HEVCD_IPP_LINEBUFF_BASE		= 0xd024,
++	HEVCD_IPP_AXIIF_CONFIG		= 0xd02c,
++	HEVCD_MPP_ANC2AXI_TBL_CONF_ADDR = 0xd180,
++	HEVCD_MPP_ANC2AXI_TBL_CMD_ADDR = 0xd184,
++	HEVCD_MPP_ANC_CANVAS_ACCCONFIG_ADDR = 0xd300,
++	HEVCD_MPP_ANC_CANVAS_DATA_ADDR = 0xd304,
++	HEVCD_MPP_DECOMP_CTL1		= 0xd308,
++	HEVCD_MCRCC_CTL1			= 0xd3c0,
++	HEVC_DBLK_CFG1				= 0xd404,
++	HEVC_DBLK_CFG2				= 0xd408,
++	HEVC_DBLK_CFG4				= 0xd410,
++	HEVC_DBLK_CFG5				= 0xd414,
++	HEVC_DBLK_CFG9				= 0xd424,
++	HEVC_SAO_CTRL0				= 0xd804,
++	HEVC_SAO_CTRL1				= 0xd808,
++	HEVC_SAO_PIC_SIZE			= 0xd814,
++	HEVC_SAO_PIC_SIZE_LCU		= 0xd818,
++	HEVC_SAO_Y_START_ADDR		= 0xd82c,
++	HEVC_SAO_Y_LENGTH			= 0xd830,
++	HEVC_SAO_C_START_ADDR		= 0xd834,
++	HEVC_SAO_C_LENGTH			= 0xd838,
++	HEVC_SAO_Y_WPTR				= 0xd83c,
++	HEVC_SAO_C_WPTR				= 0xd840,
++	HEVC_SAO_CTRL5				= 0xd88c,
++	HEVC_IQIT_SCALELUT_WR_ADDR	= 0xdc08,
++	HEVC_IQIT_SCALELUT_DATA		= 0xdc10,
++	HEVC_PSCALE_CTRL			= 0xe444,
++	DOS_MEM_PD_HEVC				= 0xfccc,
++	DOS_SW_RESET3				= 0xfcd0,
++	DOS_GCLK_EN3				= 0xfcd4,
++};
++
++// the scratch registers as the firmware uses them
++#define HEVC_SCRATCH(x)				(HEVC_ASSIST_SCRATCH_0 + 4 * (x))
++enum {
++	HEVC_DEC_STATUS_REG			= HEVC_SCRATCH(0),
++	HEVC_RPM_BUFFER				= HEVC_SCRATCH(1),
++	HEVC_SHORT_TERM_RPS			= HEVC_SCRATCH(2),
++	HEVC_VPS_BUFFER				= HEVC_SCRATCH(3),
++	HEVC_SPS_BUFFER				= HEVC_SCRATCH(4),
++	HEVC_PPS_BUFFER				= HEVC_SCRATCH(5),
++	HEVC_SAO_UP					= HEVC_SCRATCH(6),
++	HEVC_STREAM_SWAP_BUFFER		= HEVC_SCRATCH(7),
++	HEVC_STREAM_SWAP_BUFFER2	= HEVC_SCRATCH(8),
++	HEVC_SAO_MEM_UNIT			= HEVC_SCRATCH(9),
++	HEVC_SAO_ABV				= HEVC_SCRATCH(10),
++	HEVC_SAO_VB_SIZE			= HEVC_SCRATCH(11),
++	HEVC_SAO_VB					= HEVC_SCRATCH(12),
++	HEVC_SCALELUT				= HEVC_SCRATCH(13),
++	HEVC_WAIT_FLAG				= HEVC_SCRATCH(14),
++	HEVC_LMEM_DUMP_ADR			= HEVC_SCRATCH(15),
++	HEVC_DECODE_MODE2			= HEVC_SCRATCH(17),	// gxl_hevc.bin
++	HEVC_NAL_SEARCH_CTL			= HEVC_SCRATCH(18),
++	HEVC_DECODE_MODE			= HEVC_SCRATCH(19),	// gxl; vendor: NAL type
++	HEVC_DECODE_STOP_POS		= HEVC_SCRATCH(20),
++	HEVC_AUX_ADR				= HEVC_SCRATCH(21),	// gxl; vendor: swap test
++	HEVC_AUX_DATA_SIZE			= HEVC_SCRATCH(22),
++	HEVC_DECODE_SIZE			= HEVC_SCRATCH(23),	// vendor: picture count
++};
++
++enum {
++	HEVC_STATUS_DECODE_SLICE	= 0x05,		// host: decode the slice
++	HEVC_STATUS_SLICE_HEADER	= 0x08,		// a slice header was parsed
++	HEVC_STATUS_NAL_FOUND		= 0x09,		// (with an end of stream NAL)
++	HEVC_STATUS_PICTURE_DONE	= 0x0a,
++	HEVC_STATUS_PICTURE_ERROR	= 0x0b,
++	HEVC_STATUS_DECODE_EMPTY	= 0x20,
++	HEVC_STATUS_SEARCH_EMPTY	= 0x22,
++	HEVC_STATUS_DONE			= 0xff,		// host: go on (skip)
++};
++
++// the parsed parameters (RPM), as gxl_hevc.bin numbers them; the vendor
++// microcode has 8 tile entries less: its fields from misc_flag0 on are 8
++// lower
++enum {
++	RPM_SLICE_TYPE				= 18,	// 0 B, 1 P, 2 I
++	RPM_TMVP					= 19,
++	RPM_DEPENDENT_SLICE			= 20,
++	RPM_SLICE_ADDRESS			= 21,
++	RPM_WIDTH					= 23,
++	RPM_HEIGHT					= 24,
++	RPM_LOG2_MIN_CB				= 25,	// - 3
++	RPM_LOG2_DIFF_CB			= 26,
++	RPM_POC_LSB					= 28,
++	RPM_COL_FROM_L0				= 29,
++	RPM_PARALLEL_MERGE			= 31,
++	RPM_FIVE_MINUS_MERGE		= 32,
++	RPM_REORDER					= 33,
++	RPM_TILES					= 35,
++	RPM_MISC_FLAG0				= 54,
++	RPM_PPS_BETA				= 55,
++	RPM_PPS_TC					= 56,
++	RPM_SLICE_BETA				= 57,
++	RPM_SLICE_TC				= 58,
++	RPM_PPS_CB_QP				= 59,
++	RPM_PPS_CR_QP				= 60,
++	RPM_FIRST_SLICE				= 61,
++	RPM_TEMPORAL_ID				= 62,
++	RPM_NAL_TYPE				= 63,
++	RPM_BIT_DEPTH				= 68,
++	RPM_CONFORMANCE				= 104,
++	RPM_CONF_LEFT				= 105,
++	RPM_CONF_RIGHT				= 106,
++	RPM_CONF_TOP				= 107,
++	RPM_CONF_BOTTOM				= 108,
++	RPM_CHROMA_FORMAT			= 109,
++};
++#define MISC_PCM_LOOP_FILTER_DISABLED	(1 << 0)
++#define MISC_PCM_ENABLED				(1 << 1)
++#define MISC_PPS_ACROSS_SLICES			(1 << 3)
++#define MISC_DEBLOCK_OVERRIDE_ENABLED	(1 << 4)
++#define MISC_PPS_DEBLOCK_DISABLED		(1 << 5)
++#define MISC_DEBLOCK_OVERRIDE			(1 << 6)
++#define MISC_SLICE_DEBLOCK_DISABLED		(1 << 7)
++#define MISC_SAO_LUMA					(1 << 8)
++#define MISC_SAO_CHROMA					(1 << 9)
++#define MISC_SLICE_ACROSS_SLICES		(1 << 10)
++
++// the workspace (gxl_hevc.bin's layout without the per-picture MV storage)
++static const uint32 kWorkIpp = 0x000000;
++static const uint32 kWorkSaoAbove = 0x004000;
++static const uint32 kWorkSaoVb = 0x034000;
++static const uint32 kWorkShortTermRps = 0x064000;
++static const uint32 kWorkVps = 0x064800;
++static const uint32 kWorkSps = 0x065000;
++static const uint32 kWorkPps = 0x065800;
++static const uint32 kWorkSaoUp = 0x067800;
++static const uint32 kWorkSwap = 0x06a000;
++static const uint32 kWorkSwap2 = 0x06a800;
++static const uint32 kWorkScaleLut = 0x06b000;
++static const uint32 kWorkDeblockParameters = 0x073000;
++static const uint32 kWorkDeblockData = 0x093000;
++static const uint32 kWorkMpredAbove = 0x198000;
++static const uint32 kWorkRpm = 0x1a0000;
++static const uint32 kWorkLmem = 0x1a0100;
++static const size_t kHevcWorkspaceSize = 0x1b0000;
++static const size_t kHevcAuxSize = 16 * 1024;
++static const uint32 kHevcFrames = 6;
++	// intra pictures only, for now
++static const uint32 kHevcTableSlots = 48;
++	// the reference address table: 24 pictures of two planes
++
++static const uint16 kParserCommands[] = {
++	0x0401, 0x8401, 0x0800, 0x0402, 0x9002, 0x1423, 0x8cc3, 0x1423,
++	0x8804, 0x9825, 0x0800, 0x04fe, 0x8406, 0x8411, 0x1800, 0x8408,
++	0x8409, 0x8c2a, 0x9c2b, 0x1c00, 0x840f, 0x8407, 0x8000, 0x8408,
++	0x2000, 0xa800, 0x8410, 0x04de, 0x840c, 0x840d, 0xac00, 0xa000,
++	0x08c0, 0x08e0, 0xa40e, 0xfc00, 0x7c00
++};
++
++// the end of the stream: an end of sequence NAL unit
++static const uint8 kHevcEndOfStream[] = { 0x00, 0x00, 0x00, 0x01, 0x48, 0x01 };
++
++
++//	#pragma mark - power, firmware, start
++
++
++void
++MesonVdec::_PowerUpHevc()
++{
++	fHhi[HHI_GCLK_MPEG1 / 4] |= GCLK_MPEG1_DOS_PARSER;
++	fHhi[HHI_GCLK_MPEG0 / 4] |= GCLK_MPEG0_DOS;
++
++	// HHI_VDEC2_CLK_CNTL's upper half: fclk/3, 666.7 MHz
++	uint32 clock = fHhi[HHI_VDEC2_CLK_CNTL / 4] & ~(0x7fu << 16)
++		& ~(3u << 25) & ~(1u << 24);
++	fHhi[HHI_VDEC2_CLK_CNTL / 4] = clock | (1u << 25);
++	fHhi[HHI_VDEC2_CLK_CNTL / 4] |= 1u << 24;
++
++	fAo[AO_RTI_GEN_PWR_SLEEP0 / 4] &= ~AO_SLEEP_HEVC;
++	spin(20);
++	_SetDos(DOS_SW_RESET3, 0xffffffff);
++	spin(10);
++	_SetDos(DOS_SW_RESET3, 0);
++	_SetDos(DOS_GCLK_EN3, 0xffffffff);
++	_SetDos(DOS_MEM_PD_HEVC, 0);
++	fAo[AO_RTI_GEN_PWR_ISO0 / 4] &= ~AO_ISO_HEVC;
++	_SetDos(DOS_SW_RESET3, 0xffffffff);
++	spin(10);
++	_SetDos(DOS_SW_RESET3, 0);
++	_SetDos(DOS_SW_RESET3, 0x000ed918);
++	spin(10);
++	_SetDos(DOS_SW_RESET3, 0);
++}
++
++
++void
++MesonVdec::_StopHevcProcessor()
++{
++	_SetDos(HEVC_ASSIST_MBOX1_MASK, 0);
++	_SetDos(HEVC_MPSR, 0);
++	_SetDos(HEVC_CPSR, 0);
++	// what the processor's DMA still does
++	for (int32 i = 0; i < 1000; i++) {
++		if ((_Dos(HEVC_IMEM_DMA_CTRL) & (1 << 15)) == 0
++			&& (_Dos(HEVC_LMEM_DMA_CTRL) & (1 << 15)) == 0) {
++			break;
++		}
++		spin(10);
++	}
++	_SetDos(HEVC_STREAM_CONTROL, 0);
++	_SetDos(DOS_SW_RESET3, 0x000ed918);
++	spin(10);
++	_SetDos(DOS_SW_RESET3, 0);
++}
++
++
++void
++MesonVdec::_PowerDownHevc()
++{
++	fAo[AO_RTI_GEN_PWR_ISO0 / 4] |= AO_ISO_HEVC;
++	_SetDos(DOS_MEM_PD_HEVC, 0xffffffff);
++	fAo[AO_RTI_GEN_PWR_SLEEP0 / 4] |= AO_SLEEP_HEVC;
++	fHhi[HHI_VDEC2_CLK_CNTL / 4] &= ~(1u << 24);
++	_SetDos(DOS_GEN_CTRL0, 0);
++	fHhi[HHI_GCLK_MPEG0 / 4] &= ~GCLK_MPEG0_DOS;
++	fHhi[HHI_GCLK_MPEG1 / 4] &= ~GCLK_MPEG1_DOS_PARSER;
++}
++
++
++/*!	The codec start: the workspace, the shifter and parser, the scratch
++	registers the firmware reads at its start (it moves some of them: they
++	are written once).
++*/
++void
++MesonVdec::_StartHevcCodec()
++{
++	phys_addr_t work = fWorkspace.physical;
++	_SetDos(HEVCD_IPP_LINEBUFF_BASE, work + kWorkIpp);
++	_SetDos(HEVC_RPM_BUFFER, work + kWorkRpm);
++	_SetDos(HEVC_SHORT_TERM_RPS, work + kWorkShortTermRps);
++	_SetDos(HEVC_VPS_BUFFER, work + kWorkVps);
++	_SetDos(HEVC_SPS_BUFFER, work + kWorkSps);
++	_SetDos(HEVC_PPS_BUFFER, work + kWorkPps);
++	_SetDos(HEVC_SAO_UP, work + kWorkSaoUp);
++	_SetDos(HEVC_STREAM_SWAP_BUFFER, work + kWorkSwap);
++	_SetDos(HEVC_STREAM_SWAP_BUFFER2, work + kWorkSwap2);
++	_SetDos(HEVC_SCALELUT, work + kWorkScaleLut);
++	_SetDos(HEVC_DBLK_CFG4, work + kWorkDeblockParameters);
++	_SetDos(HEVC_DBLK_CFG5, work + kWorkDeblockData);
++	_SetDos(HEVC_LMEM_DUMP_ADR, work + kWorkLmem);
++
++	_SetDos(HEVC_STREAM_CONTROL, _Dos(HEVC_STREAM_CONTROL) | 1);
++	_SetDos(HEVC_PARSER_INT_CONTROL,
++		(_Dos(HEVC_PARSER_INT_CONTROL) & 0x03fffff7) | 0x69400091);
++	_SetDos(HEVC_SHIFT_STATUS, _Dos(HEVC_SHIFT_STATUS) | 3);
++	_SetDos(HEVC_SHIFT_CONTROL, 0xe5);
++	_SetDos(HEVC_CABAC_CONTROL, 1);
++	_SetDos(HEVC_PARSER_CORE_CONTROL, 1);
++	_SetDos(HEVC_DEC_STATUS_REG, 0);
++	_SetDos(HEVC_IQIT_SCALELUT_WR_ADDR, 0);
++	for (int32 i = 0; i < 1024; i++)
++		_SetDos(HEVC_IQIT_SCALELUT_DATA, 0);
++	_SetDos(HEVC_DECODE_SIZE, fHevcVendor ? 0xffffffff : 0);
++	_SetDos(HEVC_PARSER_CMD_WRITE, 1 << 16);
++	for (size_t i = 0; i < B_COUNT_OF(kParserCommands); i++)
++		_SetDos(HEVC_PARSER_CMD_WRITE, kParserCommands[i]);
++	_SetDos(HEVC_PARSER_CMD_SKIP_0, 0x0000090b);
++	_SetDos(HEVC_PARSER_CMD_SKIP_1, 0x1b14140f);
++	_SetDos(HEVC_PARSER_CMD_SKIP_2, 0x001b1910);
++	_SetDos(HEVC_PARSER_IF_CONTROL, 0x25);
++	_SetDos(HEVCD_IPP_TOP_CNTL, 1);
++	_SetDos(HEVCD_IPP_TOP_CNTL, 2);
++	_SetDos(HEVC_WAIT_FLAG, 1);
++	_SetDos(HEVC_ASSIST_MBOX1_CLR_REG, 1);
++	_SetDos(HEVC_ASSIST_MBOX1_MASK, 0);
++		// the waits poll the status
++	_SetDos(HEVC_PSCALE_CTRL, 0);
++	_SetDos(HEVC_NAL_SEARCH_CTL, fHevcVendor ? 0x8 : 0xc);
++	_SetDos(HEVC_DECODE_STOP_POS, 0);
++	if (fHevcVendor) {
++		_SetDos(HEVC_AUX_ADR, 0);
++		_SetDos(HEVC_AUX_DATA_SIZE, 0);
++	} else {
++		_SetDos(HEVC_DECODE_MODE, 0);
++		_SetDos(HEVC_DECODE_MODE2, 0);
++		_SetDos(HEVC_AUX_ADR, fAux.physical);
++		_SetDos(HEVC_AUX_DATA_SIZE, (kHevcAuxSize / 16) << 16);
++	}
++}
++
++
++/*!	The stream parser as for VDEC_1, its output going to the HEVC block's
++	stream buffer (the VIFIFO's memory) instead.
++*/
++void
++MesonVdec::_InitHevcParser()
++{
++	fReset[RESET1 / 4] = RESET1_PARSER;
++	_SetParser(PARSER_CONFIG, 0x000a1010);
++	_SetParser(PFIFO_RD_PTR, 0);
++	_SetParser(PFIFO_WR_PTR, 0);
++	_SetParser(PARSER_SEARCH_PATTERN, 0x00000100);
++	_SetParser(PARSER_SEARCH_MASK, 0xffffff00);
++	_SetParser(PARSER_CONFIG, 0x000a1810);
++	_SetParser(PARSER_CONTROL, PARSER_START_SEARCH);
++	_SetParser(PARSER_VIDEO_START_PTR, fVififo.physical);
++	_SetParser(PARSER_VIDEO_END_PTR, fVififo.physical + fVififo.size - 8);
++	_SetParser(PARSER_ES_CONTROL, _Parser(PARSER_ES_CONTROL) & ~1u);
++	_SetDos(DOS_GEN_CTRL0, 3 << 1);
++	_SetDos(HEVC_STREAM_CONTROL, _Dos(HEVC_STREAM_CONTROL) | (1 << 3));
++	_SetDos(HEVC_STREAM_CONTROL, _Dos(HEVC_STREAM_CONTROL) | 1);
++	_SetDos(HEVC_STREAM_FIFO_CTL, _Dos(HEVC_STREAM_FIFO_CTL) | (1u << 29));
++	_SetParser(PARSER_INT_STATUS, 0xffff);
++	_SetParser(PARSER_INT_ENABLE, PARSER_INT_HOST_START_CODE);
++}
++
++
++status_t
++MesonVdec::_StartHevc(meson_vdec_start& start, const void* userFirmware)
++{
++	if (start.firmware_size != kFirmwareSize || !IS_USER_ADDRESS(userFirmware))
++		return B_BAD_VALUE;
++
++	fCodec = start.codec;
++	fHevcVendor = start.codec == MESON_VDEC_HEVC_VENDOR;
++	fWidth = fHeight = 0;
++	status_t status;
++	if ((status = _KeepBuffer("meson_vdec firmware", kFirmwareSize,
++			fFirmware, false, false)) != B_OK
++		|| (status = _KeepBuffer("meson_vdec vififo", kVififoSize,
++			fVififo, false, false)) != B_OK
++		|| (status = _KeepBuffer("meson_vdec workspace", kHevcWorkspaceSize,
++			fWorkspace, false, true)) != B_OK
++		|| (status = _KeepBuffer("meson_vdec input",
++			kInputSize + kMinimumFetch + kMarkerSize, fInput, false, false))
++				!= B_OK
++		|| (status = _KeepBuffer("meson_vdec aux", kHevcAuxSize, fAux, false,
++			true)) != B_OK) {
++		INFO("no memory for an HEVC session: %s\n", strerror(status));
++		_Stop();
++		return status;
++	}
++	if (user_memcpy(fFirmware.address, userFirmware, kFirmwareSize) != B_OK) {
++		_Stop();
++		return B_BAD_ADDRESS;
++	}
++	flush_cache_range(fFirmware.physical, kFirmwareSize);
++
++	{
++		InterruptsSpinLocker locker(fStateLock);
++		fQueueHead = 0;
++		fQueueCount = 0;
++		fHeld = 0;
++		fFatal = false;
++		fLastReport = 0;
++		fEndOfStream = false;
++		fStreamBytes = 0;
++		fEndOffset = 0;
++		fFrameCount = 0;
++		fDecodeErrors = 0;
++		fBadPictures = 0;
++	}
++	fHevcPicture = -1;
++	fHevcEnded = false;
++	fHevcLastStatus = 0;
++	fHevcLastChange = system_time();
++	fHevcSlices = 0;
++	fHevcSkipped = 0;
++	fHevcReports = 0;
++	int32 count;
++	if (get_sem_count(fFrameSem, &count) == B_OK && count > 0)
++		acquire_sem_etc(fFrameSem, count, 0, 0);
++	if (get_sem_count(fParserSem, &count) == B_OK && count > 0)
++		acquire_sem_etc(fParserSem, count, 0, 0);
++
++	_PowerUpHevc();
++	uint32 version = _Dos(HEVC_PARSER_VERSION);
++	uint32 startCode = _Dos(HEVC_SHIFT_STARTCODE);
++	uint32 emulateCode = _Dos(HEVC_SHIFT_EMULATECODE);
++	INFO("HEVC block: parser version %#" B_PRIx32 ", start code %#" B_PRIx32
++		", emulation code %#" B_PRIx32 " (%s firmware)\n", version, startCode,
++		emulateCode, fHevcVendor ? "vendor" : "linux-firmware");
++
++	// the stream buffer
++	_SetDos(HEVC_STREAM_CONTROL, _Dos(HEVC_STREAM_CONTROL) & ~1u);
++	_SetDos(HEVC_STREAM_START_ADDR, fVififo.physical);
++	_SetDos(HEVC_STREAM_END_ADDR, fVififo.physical + fVififo.size);
++	_SetDos(HEVC_STREAM_RD_PTR, fVififo.physical);
++	_SetDos(HEVC_STREAM_WR_PTR, fVififo.physical);
++
++	// the firmware
++	_SetDos(HEVC_MPSR, 0);
++	_SetDos(HEVC_CPSR, 0);
++	_SetDos(HEVC_IMEM_DMA_ADR, fFirmware.physical);
++	_SetDos(HEVC_IMEM_DMA_COUNT, kFirmwareSize / 4);
++	_SetDos(HEVC_IMEM_DMA_CTRL, 0x00078000);
++	bigtime_t timeout = system_time() + 100000;
++	while ((_Dos(HEVC_IMEM_DMA_CTRL) & (1 << 15)) != 0) {
++		if (system_time() > timeout) {
++			INFO("HEVC firmware DMA does not finish\n");
++			_PowerDownHevc();
++			_Stop();
++			return B_TIMED_OUT;
++		}
++	}
++
++	_StartHevcCodec();
++	fRunning = true;
++	(void)_Dos(DOS_SW_RESET3);
++	_SetDos(DOS_SW_RESET3, (1 << 12) | (1 << 11));
++	_SetDos(DOS_SW_RESET3, 0);
++	(void)_Dos(DOS_SW_RESET3);
++	_SetDos(HEVC_MPSR, 1);
++	spin(20);
++	_InitHevcParser();
++
++	start.frame_count = 0;
++	start.frame_size = 0;
++	start.frames = -1;
++	INFO("HEVC session: byte count %" B_PRIu32 ", status %#" B_PRIx32 "\n",
++		_Dos(HEVC_SHIFT_BYTE_COUNT), _Dos(HEVC_DEC_STATUS_REG));
++	return B_OK;
++}
++
++
++//	#pragma mark - decoding
++
++
++/*!	A parameter of the last slice header, by gxl_hevc.bin's numbering. The
++	firmware stores each group of four 16-bit values in reverse order.
++*/
++uint32
++MesonVdec::_Rpm(uint32 index) const
++{
++	if (fHevcVendor && index >= RPM_MISC_FLAG0)
++		index -= 8;
++	return fRpm[(index & ~3u) + 3 - (index & 3)];
++}
++
++
++/*!	The frames, once the first slice header gives the picture's size: each
++	one area with the Y plane, the CbCr plane and the motion vectors, every
++	part 64 KB aligned (the GXBB's reference table keeps only address bits
++	31:16); and the reference table pointing at them.
++*/
++status_t
++MesonVdec::_SetupHevcFrames()
++{
++	uint32 width = _Rpm(RPM_WIDTH);
++	uint32 height = _Rpm(RPM_HEIGHT);
++	uint32 log2Ctb = _Rpm(RPM_LOG2_MIN_CB) + 3 + _Rpm(RPM_LOG2_DIFF_CB);
++	if (width < 16 || height < 16 || width > kMaxWidth || height > kMaxHeight
++		|| log2Ctb < 4 || log2Ctb > 6) {
++		INFO("HEVC stream of %" B_PRIu32 "x%" B_PRIu32 ", CTB %" B_PRIu32
++			": not decoded\n", width, height, 1u << log2Ctb);
++		return B_BAD_VALUE;
++	}
++	fHevcCodedWidth = width;
++	fHevcCodedHeight = height;
++	fHevcLog2Ctb = log2Ctb;
++	uint32 ctb = 1 << log2Ctb;
++	fHevcCtbColumns = (width + ctb - 1) / ctb;
++	fHevcCtbRows = (height + ctb - 1) / ctb;
++	fHevcMvUnit = log2Ctb == 6 ? 0x200 : log2Ctb == 5 ? 0x80 : 0x20;
++
++	uint32 bytesPerRow = align_up(width, 32);
++	uint32 lumaSize = align_up(bytesPerRow * align_up(height, 32), 64 * 1024);
++	uint32 chromaSize = align_up(lumaSize / 2, 64 * 1024);
++	uint32 mvSize = align_up(fHevcCtbColumns * fHevcCtbRows * fHevcMvUnit,
++		64 * 1024);
++	size_t frameSize = lumaSize + chromaSize + mvSize;
++
++	_FreeH264Frames();
++	for (uint32 i = 0; i < kHevcFrames; i++) {
++		char name[32];
++		snprintf(name, sizeof(name), "meson_vdec frame %" B_PRIu32, i);
++		status_t status = _AllocateBuffer(name, frameSize, fFrameBuffers[i],
++			true);
++		if (status != B_OK) {
++			_FreeH264Frames();
++			return status;
++		}
++	}
++	fFrameBuffersAllocated = kHevcFrames;
++	fFrameSize = frameSize;
++	fHevcMvOffset = lumaSize + chromaSize;
++
++	// the display size: the conformance window is in chroma samples
++	uint32 cropX = 0;
++	uint32 cropY = 0;
++	if (_Rpm(RPM_CONFORMANCE) != 0) {
++		cropX = 2 * (_Rpm(RPM_CONF_LEFT) + _Rpm(RPM_CONF_RIGHT));
++		cropY = 2 * (_Rpm(RPM_CONF_TOP) + _Rpm(RPM_CONF_BOTTOM));
++	}
++	{
++		InterruptsSpinLocker locker(fStateLock);
++		fFrameCount = kHevcFrames;
++		fWidth = width > cropX ? width - cropX : width;
++		fHeight = height > cropY ? height - cropY : height;
++		fBytesPerRow = bytesPerRow;
++		fLumaSize = lumaSize;
++	}
++
++	// the reference table: Y in slot 2k, CbCr in 2k + 1; the slots of
++	// pictures that don't exist show the first one
++	_SetDos(HEVCD_MPP_ANC2AXI_TBL_CONF_ADDR, 0);
++	for (uint32 slot = 0; slot < kHevcTableSlots; slot++) {
++		uint32 frame = slot / 2 < kHevcFrames ? slot / 2 : 0;
++		phys_addr_t address = fFrameBuffers[frame].physical
++			+ ((slot & 1) != 0 ? lumaSize : 0);
++		_SetDos(HEVCD_MPP_ANC2AXI_TBL_CMD_ADDR,
++			(uint32)address | (slot << 8) | 1);
++	}
++	_SetDos(HEVCD_MPP_ANC2AXI_TBL_CONF_ADDR, 1);
++	_SetDos(HEVCD_MPP_ANC_CANVAS_ACCCONFIG_ADDR, 1);
++	for (int32 i = 0; i < 32; i++)
++		_SetDos(HEVCD_MPP_ANC_CANVAS_DATA_ADDR, 0);
++	_SetDos(HEVCD_MPP_DECOMP_CTL1, 0x80000000);
++		// references as two NV12 planes, no compression
++
++	INFO("HEVC %" B_PRIu32 "x%" B_PRIu32 " (coded %" B_PRIu32 "x%" B_PRIu32
++		"), CTB %" B_PRIu32 ", %" B_PRIu32 "-bit: %" B_PRIu32 " frames of %"
++		B_PRIuSIZE " bytes\n", fWidth, fHeight, width, height, ctb,
++		(_Rpm(RPM_BIT_DEPTH) & 0xf) + 8, kHevcFrames, frameSize);
++	return B_OK;
++}
++
++
++/*!	The picture being decoded is complete: to the caller. */
++void
++MesonVdec::_FinishHevcPicture()
++{
++	if (fHevcPicture < 0)
++		return;
++	uint32 lcu = _Dos(HEVC_PARSER_LCU_START) & 0xffffff;
++	uint32 last = fHevcCtbColumns * fHevcCtbRows - 1;
++	_Trace('F', fHevcPicture, lcu, last);
++	if (lcu != last)
++		fBadPictures++;
++	InterruptsSpinLocker locker(fStateLock);
++	fLastReport = system_time();
++	_QueueFrame(fHevcPicture, lcu == last ? 0 : H264_STATUS_ERROR,
++		fHevcPictureOffset);
++	fHevcPicture = -1;
++}
++
++
++/*!	A free frame for a new picture: not with the caller, not waiting for
++	it. Intra pictures only so far: no references to keep.
++*/
++int32
++MesonVdec::_FreeHevcFrame()
++{
++	InterruptsSpinLocker locker(fStateLock);
++	uint32 busy = fHeld;
++	for (uint32 i = 0; i < fQueueCount; i++)
++		busy |= 1u << fQueue[(fQueueHead + i) % kMaxFrames];
++	for (uint32 i = 0; i < fFrameCount; i++) {
++		if ((busy & (1u << i)) == 0)
++			return i;
++	}
++	return -1;
++}
++
++
++/*!	Status 8: a slice segment header was parsed. Programs the slice's
++	decoding (intra slices) or skips it. Returns false if it must wait for
++	a free frame.
++*/
++bool
++MesonVdec::_HevcSlice()
++{
++	flush_cache_range(fWorkspace.physical + kWorkRpm, sizeof(fRpm));
++	memcpy(fRpm, fWorkspace.address + kWorkRpm, sizeof(fRpm));
++	uint32 sliceType = _Rpm(RPM_SLICE_TYPE);
++	uint32 address = _Rpm(RPM_SLICE_ADDRESS);
++	bool newPicture = address == 0;
++	uint32 nalType = _Rpm(RPM_NAL_TYPE);
++	fHevcReports++;
++	_Trace('H', sliceType | (nalType << 8) | (address << 16),
++		_Rpm(RPM_WIDTH) | (_Rpm(RPM_HEIGHT) << 16), _Rpm(RPM_POC_LSB),
++		_Dos(HEVC_SHIFT_BYTE_COUNT));
++	if (fHevcReports == 1) {
++		INFO("HEVC slice: type %" B_PRIu32 ", NAL %" B_PRIu32 ", address %"
++			B_PRIu32 ", %" B_PRIu32 "x%" B_PRIu32 ", CTB log2 %" B_PRIu32
++			"+3+%" B_PRIu32 ", POC lsb %" B_PRIu32 ", first %" B_PRIu32
++			", bit depth %#" B_PRIx32 ", chroma %" B_PRIu32 ", conformance %"
++			B_PRIu32 " (%" B_PRIu32 " %" B_PRIu32 " %" B_PRIu32 " %" B_PRIu32
++			"), byte count %" B_PRIu32 "\n", sliceType, nalType, address,
++			_Rpm(RPM_WIDTH), _Rpm(RPM_HEIGHT), _Rpm(RPM_LOG2_MIN_CB),
++			_Rpm(RPM_LOG2_DIFF_CB), _Rpm(RPM_POC_LSB), _Rpm(RPM_FIRST_SLICE),
++			_Rpm(RPM_BIT_DEPTH), _Rpm(RPM_CHROMA_FORMAT),
++			_Rpm(RPM_CONFORMANCE), _Rpm(RPM_CONF_LEFT), _Rpm(RPM_CONF_RIGHT),
++			_Rpm(RPM_CONF_TOP), _Rpm(RPM_CONF_BOTTOM),
++			_Dos(HEVC_SHIFT_BYTE_COUNT));
++	}
++
++	if (newPicture)
++		_FinishHevcPicture();
++
++	if (fFrameCount == 0 && newPicture && _SetupHevcFrames() != B_OK) {
++		fFatal = true;
++		release_sem_etc(fFrameSem, 1, 0);
++		return true;
++	}
++	bool decode = fFrameCount > 0 && sliceType == 2
++		&& _Rpm(RPM_BIT_DEPTH) == 0 && (newPicture || fHevcPicture >= 0);
++	if (decode && newPicture) {
++		int32 frame = _FreeHevcFrame();
++		if (frame < 0)
++			return false;
++		fHevcPicture = frame;
++		fHevcPictureOffset = _Dos(HEVC_SHIFT_BYTE_COUNT);
++	}
++	if (!decode) {
++		fHevcSkipped++;
++		_SetDos(HEVC_WAIT_FLAG, _Dos(HEVC_WAIT_FLAG) & ~2u);
++		_SetDos(HEVC_DEC_STATUS_REG, HEVC_STATUS_DONE);
++		_SetDos(HEVC_MCPU_INTR_REQ, 4);
++		return true;
++	}
++
++	uint32 width = fHevcCodedWidth;
++	uint32 height = fHevcCodedHeight;
++	uint32 log2Ctb = fHevcLog2Ctb;
++	uint32 ctbCount = fHevcCtbColumns * fHevcCtbRows;
++	phys_addr_t frame = fFrameBuffers[fHevcPicture].physical;
++	phys_addr_t luma = frame;
++	phys_addr_t chroma = frame + fLumaSize;
++	phys_addr_t mv = frame + fHevcMvOffset;
++	bool dependent = _Rpm(RPM_DEPENDENT_SLICE) != 0;
++
++	// no references: no reference lists, no reference cache
++	_SetDos(HEVCD_MCRCC_CTL1, 0);
++
++	// motion prediction, intra slices included (the MVs are written)
++	(void)_Dos(HEVC_MPRED_CURR_LCU);
++	_SetDos(HEVC_MPRED_MV_WR_START_ADDR, mv);
++	_SetDos(HEVC_MPRED_MV_RD_START_ADDR, mv);
++	if (newPicture) {
++		_SetDos(HEVC_MPRED_ABV_START_ADDR,
++			fWorkspace.physical + kWorkMpredAbove);
++		_SetDos(HEVC_MPRED_MV_WPTR, mv);
++		_SetDos(HEVC_MPRED_MV_RPTR, mv);
++	} else if (!dependent)
++		_SetDos(HEVC_MPRED_MV_RPTR, mv + address * fHevcMvUnit);
++	_SetDos(HEVC_MPRED_MV_RD_END_ADDR, mv + ctbCount * fHevcMvUnit);
++	_SetDos(HEVC_MPRED_MV_WR_ROW_JUMP, 0);
++	_SetDos(HEVC_MPRED_MV_RD_ROW_JUMP, 0);
++	_SetDos(HEVC_MPRED_TILE_START, 0);
++	_SetDos(HEVC_MPRED_TILE_SIZE_LCU,
++		fHevcCtbColumns | (fHevcCtbRows << 16));
++	_SetDos(HEVC_MPRED_PIC_SIZE, width | (height << 16));
++	_SetDos(HEVC_MPRED_PIC_SIZE_LCU,
++		(fHevcCtbColumns - 1) | ((fHevcCtbRows - 1) << 16));
++	_SetDos(HEVC_MPRED_REF_NUM, 0);
++	_SetDos(HEVC_MPRED_REF_EN_L0, 0);
++	_SetDos(HEVC_MPRED_REF_EN_L1, 0);
++	bool idr = nalType == 19 || nalType == 20;
++	_SetDos(HEVC_MPRED_CUR_POC, idr ? 0 : _Rpm(RPM_POC_LSB));
++	_SetDos(HEVC_MPRED_COL_POC, 0x80000000);
++	for (int32 i = 0; i < 16; i++) {
++		_SetDos(HEVC_MPRED_L0_REF00_POC + 4 * i, 0);
++		_SetDos(HEVC_MPRED_L1_REF00_POC + 4 * i, 0);
++	}
++	_SetDos(HEVC_MPRED_CTRL0, 2 | (newPicture ? (1 << 2) | (1 << 3) : 0)
++		| (dependent ? 1 << 4 : 0) | ((_Rpm(RPM_TMVP) & 1) << 5) | (1 << 6)
++		| ((_Rpm(RPM_COL_FROM_L0) & 1) << 7) | (1 << 9) | (1 << 10)
++		| (1 << 13) | (log2Ctb << 16) | (3 << 20)
++		| ((_Rpm(RPM_PARALLEL_MERGE) & 0xf) << 24));
++	_SetDos(HEVC_MPRED_CTRL1, ((5 - _Rpm(RPM_FIVE_MINUS_MERGE)) & 0xf)
++		| (2 << 4) | (3 << 8) | (5 << 12) | (36 << 16));
++
++	// SAO, deblocking and where the picture goes
++	uint32 misc = _Rpm(RPM_MISC_FLAG0);
++	_SetDos(HEVC_SAO_CTRL0, (_Dos(HEVC_SAO_CTRL0) & ~0xfu) | log2Ctb);
++	_SetDos(HEVC_SAO_PIC_SIZE, width | (height << 16));
++	_SetDos(HEVC_SAO_PIC_SIZE_LCU,
++		(fHevcCtbColumns - 1) | ((fHevcCtbRows - 1) << 16));
++	_SetDos(HEVC_SAO_Y_START_ADDR, luma);
++	_SetDos(HEVC_SAO_Y_WPTR, luma);
++	_SetDos(HEVC_SAO_C_START_ADDR, chroma);
++	_SetDos(HEVC_SAO_C_WPTR, chroma);
++	_SetDos(HEVC_SAO_Y_LENGTH, fLumaSize);
++	_SetDos(HEVC_SAO_C_LENGTH, fLumaSize / 2);
++	if (newPicture) {
++		_SetDos(HEVC_DBLK_CFG2, width | (height << 16));
++		uint32 cfg1 = ((_Rpm(RPM_PPS_CB_QP) & 0x1f) << 4)
++			| ((_Rpm(RPM_PPS_CR_QP) & 0x1f) << 9)
++			| (log2Ctb == 6 ? 0 : log2Ctb == 5 ? 1 : 2);
++		if ((misc & MISC_PCM_ENABLED) != 0
++			&& (misc & MISC_PCM_LOOP_FILTER_DISABLED) != 0) {
++			cfg1 |= 1 << 3;
++		}
++		_SetDos(HEVC_DBLK_CFG1, cfg1);
++	}
++	_SetDos(HEVC_SAO_CTRL1, (_Dos(HEVC_SAO_CTRL1) & ~0x3ff3u) | 0xff0 | 1);
++		// NV12 byte order; no compressed copy
++	_SetDos(HEVC_SAO_CTRL5, _Dos(HEVC_SAO_CTRL5) & ~(0xffu << 16));
++	_SetDos(HEVCD_IPP_AXIIF_CONFIG, (_Dos(HEVCD_IPP_AXIIF_CONFIG) & ~0x30u)
++		| 0xf);
++
++	bool slice = (misc & MISC_DEBLOCK_OVERRIDE_ENABLED) != 0
++		&& (misc & MISC_DEBLOCK_OVERRIDE) != 0;
++	bool deblockOff = slice ? (misc & MISC_SLICE_DEBLOCK_DISABLED) != 0
++		: (misc & MISC_PPS_DEBLOCK_DISABLED) != 0;
++	uint32 cfg9 = deblockOff ? 1 << 2 : 0;
++	if (!deblockOff) {
++		uint32 beta = _Rpm(slice ? RPM_SLICE_BETA : RPM_PPS_BETA);
++		uint32 tc = _Rpm(slice ? RPM_SLICE_TC : RPM_PPS_TC);
++		cfg9 |= ((beta & 0xf) << 3) | ((tc & 0xf) << 7);
++	}
++	bool across = (misc & MISC_PPS_ACROSS_SLICES) != 0;
++	if (across && ((misc & (MISC_SAO_LUMA | MISC_SAO_CHROMA)) != 0
++			|| !deblockOff)) {
++		across = (misc & MISC_SLICE_ACROSS_SLICES) != 0;
++	}
++	if (across)
++		cfg9 |= 1 << 1;
++	_SetDos(HEVC_DBLK_CFG9, cfg9);
++	_SetDos(HEVC_SAO_CTRL0, (_Dos(HEVC_SAO_CTRL0) & ~(3u << 8))
++		| (across ? 1 << 9 : 0));
++
++	uint32 saoUnit = (log2Ctb == 4 ? 9 : log2Ctb == 5 ? 14 : 24) << 4;
++	_SetDos(HEVC_SAO_MEM_UNIT, saoUnit);
++	_SetDos(HEVC_SAO_ABV, fWorkspace.physical + kWorkSaoAbove);
++	_SetDos(HEVC_SAO_VB_SIZE, (saoUnit + 0x20) * fHevcCtbRows);
++	_SetDos(HEVC_SAO_VB, fWorkspace.physical + kWorkSaoVb);
++
++	if (!fHevcVendor)
++		_SetDos(HEVC_DECODE_SIZE, 0);
++	fHevcSlices++;
++	asm volatile("dsb sy" : : : "memory");
++	_SetDos(HEVC_WAIT_FLAG, _Dos(HEVC_WAIT_FLAG) | 2);
++	_SetDos(HEVC_DEC_STATUS_REG, HEVC_STATUS_DECODE_SLICE);
++	_SetDos(HEVC_MCPU_INTR_REQ, 4);
++	return true;
++}
++
++
++/*!	Looks at the HEVC firmware's status and answers it. Called by the
++	waits, without fStateLock (it may allocate the frames).
++*/
++void
++MesonVdec::_PollHevc()
++{
++	if (!fRunning || fFatal || fHevcEnded)
++		return;
++	uint32 status = _Dos(HEVC_DEC_STATUS_REG) & 0xff;
++	bigtime_t now = system_time();
++	if (status != fHevcLastStatus) {
++		fHevcLastStatus = status;
++		fHevcLastChange = now;
++	}
++
++	switch (status) {
++		case HEVC_STATUS_SLICE_HEADER:
++			if (_HevcSlice())
++				fHevcLastStatus = 0;
++			return;
++
++		case HEVC_STATUS_NAL_FOUND:
++		case HEVC_STATUS_SEARCH_EMPTY:
++		case HEVC_STATUS_PICTURE_DONE:
++			// it looks for the next picture: the last one is complete; at
++			// the end of the stream, that was all
++			_Trace('E', status, _Dos(HEVC_DECODE_MODE),
++				_Dos(HEVC_SHIFT_BYTE_COUNT));
++			if (status == HEVC_STATUS_NAL_FOUND
++				|| (fEndOfStream && status == HEVC_STATUS_SEARCH_EMPTY)) {
++				_FinishHevcPicture();
++				if (fEndOfStream)
++					fHevcEnded = true;
++			}
++			if (status != HEVC_STATUS_SEARCH_EMPTY) {
++				_SetDos(HEVC_WAIT_FLAG, _Dos(HEVC_WAIT_FLAG) & ~2u);
++				_SetDos(HEVC_DEC_STATUS_REG, HEVC_STATUS_DONE);
++				_SetDos(HEVC_MCPU_INTR_REQ, 4);
++				fHevcLastStatus = 0;
++			}
++			return;
++
++		case HEVC_STATUS_PICTURE_ERROR:
++			fDecodeErrors++;
++			return;
++	}
++
++	// at the end of the stream, a quiet firmware that reached the last
++	// CTB has decoded all
++	if (fEndOfStream && now - fHevcLastChange > 100000) {
++		_Trace('Q', status, _Dos(HEVC_PARSER_LCU_START),
++			_Dos(HEVC_SHIFT_BYTE_COUNT));
++		_FinishHevcPicture();
++		fHevcEnded = true;
++	}
++}
++
++
++status_t
++MesonVdec::_EndOfStreamHevc()
++{
++	memset(fInput.address, 0, kMinimumFetch);
++	memcpy(fInput.address, kHevcEndOfStream, sizeof(kHevcEndOfStream));
++	{
++		InterruptsSpinLocker locker(fStateLock);
++		fEndOffset = fStreamBytes;
++		fEndOfStream = true;
++	}
++	fHevcLastChange = system_time();
++	return _Submit(kMinimumFetch, true);
++}
++
++
++void
++MesonVdec::_DumpHevc()
++{
++	kprintf("  HEVC: status %#" B_PRIx32 ", wait %#" B_PRIx32 ", byte count %"
++		B_PRIu32 ", LCU %#" B_PRIx32 ", stream level %" B_PRIu32 ", RD %#"
++		B_PRIx32 ", WR %#" B_PRIx32 ", MPSR %#" B_PRIx32 "; %" B_PRIu32
++		" reports, %" B_PRIu32 " slices decoded, %" B_PRIu32 " skipped\n",
++		_Dos(HEVC_DEC_STATUS_REG), _Dos(HEVC_WAIT_FLAG),
++		_Dos(HEVC_SHIFT_BYTE_COUNT), _Dos(HEVC_PARSER_LCU_START),
++		_Dos(HEVC_STREAM_LEVEL), _Dos(HEVC_STREAM_RD_PTR),
++		_Dos(HEVC_STREAM_WR_PTR), _Dos(HEVC_MPSR), fHevcReports, fHevcSlices,
++		fHevcSkipped);
++}
++
++
++uint32
++MesonVdec::_StreamLevel()
++{
++	return _IsHevc() ? _Dos(HEVC_STREAM_LEVEL) : _Dos(VLD_MEM_VIFIFO_LEVEL);
++}
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
+new file mode 100644
+index 0000000000..89977cbf8e
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
+@@ -0,0 +1,477 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * meson_vdec's registers, constants and its class, for its source files:
++ * meson_vdec.cpp (VDEC_1: MPEG-1/2 and H.264) and meson_vdec_hevc.cpp (the
++ * HEVC block, experimental).
++ */
++#ifndef MESON_VDEC_PRIVATE_H
++#define MESON_VDEC_PRIVATE_H
++
++
++#include <new>
++#include <stdio.h>
++#include <string.h>
++
++#include <AutoDeleter.h>
++#include <AutoDeleterDrivers.h>
++#include <bus/FDT.h>
++#include <device_manager.h>
++#include <debug.h>
++#include <kernel.h>
++#include <arch/int.h>
++#include <lock.h>
++#include <util/AutoLock.h>
++#include <vm/vm.h>
++
++#include <meson_canvas.h>
++#include <meson_vdec.h>
++
++
++#define DRIVER_MODULE_NAME	"drivers/video/meson_vdec/driver_v1"
++#define DEVICE_MODULE_NAME	"drivers/video/meson_vdec/device_v1"
++
++#define INFO(x...)			dprintf("meson_vdec: " x)
++
++
++// blocks besides the DOS and the parser, which come from the device tree
++static const phys_addr_t kAoBase = 0xc8100000;
++static const phys_addr_t kHhiBase = 0xc883c000;
++static const phys_addr_t kResetBase = 0xc1104000;
++
++// AO (byte offsets)
++enum {
++	AO_RTI_GEN_PWR_SLEEP0		= 0xe8,
++	AO_RTI_GEN_PWR_ISO0			= 0xec,
++};
++#define AO_SLEEP_VDEC1				(3 << 2)
++#define AO_ISO_VDEC1				(3 << 6)
++#define AO_SLEEP_HEVC				(3 << 6)
++#define AO_ISO_HEVC					(3 << 10)
++
++// HHI (byte offsets)
++enum {
++	HHI_GCLK_MPEG0				= 0x140,
++	HHI_GCLK_MPEG1				= 0x144,
++	HHI_VDEC_CLK_CNTL			= 0x1e0,
++	HHI_VDEC2_CLK_CNTL			= 0x1e4,	// upper half: HEVC
++};
++#define GCLK_MPEG0_DOS				(1 << 1)
++#define GCLK_MPEG1_DOS_PARSER		(1 << 25)
++#define VDEC_CLK_DIVIDER_MASK		0x7f
++#define VDEC_CLK_SOURCE_SHIFT		9
++#define VDEC_CLK_SOURCE_MASK		(3 << VDEC_CLK_SOURCE_SHIFT)
++#define VDEC_CLK_SOURCE_FCLK_DIV3	1			// 666.67 MHz
++#define VDEC_CLK_GATE				(1 << 8)
++
++// reset controller (byte offsets)
++enum {
++	RESET1						= 0x408,
++};
++#define RESET1_PARSER				(1 << 8)	// a pulse
++
++// the decoder's canvases (meson_canvas.h): 2 a frame (Y, CbCr)
++static const uint32 kFirstCanvas = 0x80;
++
++// DOS (byte offsets)
++enum {
++	ASSIST_MBOX1_CLR_REG		= 0x01d4,
++	ASSIST_MBOX1_MASK			= 0x01d8,
++	MPSR						= 0x0c04,
++	CPSR						= 0x0c84,
++	IMEM_DMA_CTRL				= 0x0d00,
++	IMEM_DMA_ADR				= 0x0d04,
++	IMEM_DMA_COUNT				= 0x0d08,
++	PSCALE_CTRL					= 0x2444,
++	GCLK_EN						= 0x260c,
++	MDEC_PIC_DC_CTRL			= 0x2638,
++	ANC0_CANVAS_ADDR			= 0x2640,	// H.264: to 23, the frames
++	MDEC_PIC_DC_THRESH			= 0x26e0,
++	AV_SCRATCH_0				= 0x2700,	// to _7: the frames' canvases
++											// H.264: the command
++	AV_SCRATCH_1				= 0x2704,	// H.264: to _6, frame reports
++	AV_SCRATCH_2				= 0x2708,
++	AV_SCRATCH_3				= 0x270c,
++	AV_SCRATCH_4				= 0x2710,	// later: sequence info
++	AV_SCRATCH_5				= 0x2714,	// later: picture info
++	AV_SCRATCH_6				= 0x2718,	// later: the width
++	AV_SCRATCH_7				= 0x271c,	// later: the height
++	AV_SCRATCH_8				= 0x2720,	// frame handed back
++	AV_SCRATCH_9				= 0x2724,	// frame decoded
++	AV_SCRATCH_A				= 0x2728,	// (width << 16) | height
++	AV_SCRATCH_B				= 0x272c,	// workspace + 5 KB
++	AV_SCRATCH_C				= 0x2730,	// error count
++	AV_SCRATCH_D				= 0x2734,	// the frame's stream offset
++	AV_SCRATCH_E				= 0x2738,	// waiting for a frame?
++	AV_SCRATCH_F				= 0x273c,	// 1: fatal error
++	AV_SCRATCH_G				= 0x2740,	// H.264: the extension
++	AV_SCRATCH_I				= 0x2748,	// H.264: the SEI buffer
++	AV_SCRATCH_J				= 0x274c,	// H.264: SEI data
++	MPEG1_2_REG					= 0x3004,
++	PIC_HEAD_INFO				= 0x300c,
++	POWER_CTL_VLD				= 0x3020,
++	M4_CONTROL_REG				= 0x30a4,
++	VLD_MEM_VIFIFO_START_PTR	= 0x3100,
++	VLD_MEM_VIFIFO_CURR_PTR		= 0x3104,
++	VLD_MEM_VIFIFO_END_PTR		= 0x3108,
++	VLD_MEM_VIFIFO_CONTROL		= 0x3110,
++	VLD_MEM_VIFIFO_WP			= 0x3114,
++	VLD_MEM_VIFIFO_RP			= 0x3118,
++	VLD_MEM_VIFIFO_LEVEL		= 0x311c,
++	VLD_MEM_VIFIFO_BUF_CNTL		= 0x3120,
++	VLD_MEM_VIFIFO_WRAP_COUNT	= 0x3144,
++	DOS_SW_RESET0				= 0xfc00,
++	DOS_GCLK_EN0				= 0xfc04,
++	DOS_GEN_CTRL0				= 0xfc08,
++	DOS_MEM_PD_VDEC				= 0xfcc0,
++	DOS_VDEC_MCRCC_STALL_CTRL	= 0xfd00,
++};
++#define IMEM_DMA_BUSY				(1 << 15)
++#define MDEC_PIC_DC_NV12			(1 << 17)
++#define MDEC_PIC_DC_BIT31			(1u << 31)
++#define VIFIFO_CONTROL_INIT			(1 << 0)
++#define VIFIFO_CONTROL_RUN			0x00110406
++	// FIFO count 0x11, fill on level, empty and fill enable
++#define VIFIFO_BUF_CNTL_INIT		(1 << 0)
++#define VIFIFO_BUF_CNTL_MANUAL		(1 << 1)
++#define BUFFEROUT_SKIP				0x00fe0000
++#define PIC_INFO_PROGRESSIVE		(1 << 15)
++
++// ESPARSER (byte offsets from its base)
++enum {
++	PARSER_CONTROL				= 0x00,
++	PARSER_FETCH_ADDR			= 0x04,
++	PARSER_FETCH_CMD			= 0x08,
++	PARSER_CONFIG				= 0x14,
++	PFIFO_WR_PTR				= 0x18,
++	PFIFO_RD_PTR				= 0x1c,
++	PARSER_SEARCH_PATTERN		= 0x24,
++	PARSER_SEARCH_MASK			= 0x28,
++	PARSER_INT_ENABLE			= 0x2c,
++	PARSER_INT_STATUS			= 0x30,
++	PARSER_ES_CONTROL			= 0x5c,
++	PARSER_VIDEO_START_PTR		= 0x80,
++	PARSER_VIDEO_END_PTR		= 0x84,
++	PARSER_VIDEO_WP				= 0x88,
++	PARSER_VIDEO_HOLE			= 0x90,
++};
++#define PARSER_START_SEARCH			0x03
++#define PARSER_START_WRITE_SEARCH	0x23	// with the pack size at bit 8
++#define PARSER_FETCH_ENDIAN_64		(7 << 27)
++#define PARSER_INT_START_CODE		(1 << 0)
++#define PARSER_INT_HOST_START_CODE	(1 << 8)
++
++static const uint32 kFirmwareSize = 16 * 1024;
++	// what the IMEM DMA loads; the H.264 file has an extension after it
++static const size_t kVififoSize = 8 * 1024 * 1024;
++static const size_t kWorkspaceSize = 128 * 1024;
++static const uint32 kWorkspaceOffset = 0x1400;
++	// the firmware takes the address 5 KB in
++static const size_t kInputSize = 256 * 1024;
++	// one parser fetch; plus the padding and the marker
++static const uint32 kMinimumFetch = 4096;
++static const uint32 kMarkerSize = 512;
++static const size_t kVififoMargin = 6 * 1024;
++	// the parser's own FIFO
++static const uint32 kFrameCount = 8;
++	// MPEG-1/2's
++static const uint32 kMaxFrames = 24;
++	// H.264's at most (and the queue's)
++static const uint32 kMaxWidth = 1920;
++static const uint32 kMaxHeight = 1088;
++static const bigtime_t kPollInterval = 2000;
++
++// H.264
++static const uint32 kH264ExtensionSize = 20 * 1024;
++static const size_t kH264WorkspaceSize = 0x1ee000;
++static const uint32 kH264WorkspaceBias = 0x01000000;
++	// the firmware adds it to the workspace address it is given
++static const size_t kH264SeiSize = 8 * 1024;
++static const uint32 kH264MaxReportFrames = 6;
++static const uint32 kMotionVectorBytes = 96;	// per macroblock and reference
++
++enum {
++	H264_COMMAND_SEQUENCE		= 1,	// geometry known, wants frames
++	H264_COMMAND_FRAMES			= 2,	// frames decoded
++	H264_COMMAND_FATAL			= 6,
++	H264_COMMAND_BAD_WIDTH		= 7,
++	H264_COMMAND_BAD_HEIGHT		= 8,
++};
++#define H264_STATUS_INDEX_MASK		0x1f
++#define H264_STATUS_ERROR			(1 << 9)
++#define H264_SEI_READY				(1 << 15)
++
++/*!	The end of an H.264 stream: a 16x16 IDR picture (SPS, PPS, slice;
++	encoded with x264). Before decoding an IDR picture, the firmware puts
++	out all it holds; the picture itself changes the size, which stops the
++	firmware until it gets frames for it, and it doesn't.
++*/
++static const uint8 kH264EndOfStream[] = {
++	0x00, 0x00, 0x00, 0x01, 0x67, 0x4d, 0x40, 0x0a, 0xda, 0x7b, 0x01, 0x10,
++	0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x06, 0x40, 0xf1, 0x22, 0x6a,
++	0x00, 0x00, 0x00, 0x01, 0x68, 0xef, 0x0f, 0x2c, 0x80, 0x00, 0x00, 0x01,
++	0x65, 0x88, 0x84, 0x1f, 0xff, 0xfe, 0xf4, 0xa3, 0xf8, 0x14, 0xd2, 0x6c,
++	0x4d
++};
++
++
++extern device_manager_info* gDeviceManager;
++extern meson_canvas_module_info* gCanvas;
++
++
++/*!	Writes back and invalidates the cache lines of a physical range through
++	the kernel's cached map of all memory: before the device reads what the
++	CPU wrote, and before the CPU reads what the device wrote.
++*/
++static inline void
++flush_cache_range(phys_addr_t physical, size_t size)
++{
++	uint64 ctr;
++	asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
++	const addr_t lineSize = 4 << ((ctr >> 16) & 0xf);
++	addr_t start = (KERNEL_PMAP_BASE + physical) & ~(lineSize - 1);
++	for (addr_t line = start; line < KERNEL_PMAP_BASE + physical + size;
++			line += lineSize) {
++		asm volatile("dc civac, %0" : : "r"(line) : "memory");
++	}
++	asm volatile("dsb sy" : : : "memory");
++}
++
++
++static inline uint32
++align_up(uint32 value, uint32 alignment)
++{
++	return (value + alignment - 1) & ~(alignment - 1);
++}
++
++
++struct dma_buffer {
++	area_id			area;
++	uint8*			address;
++	phys_addr_t		physical;
++	size_t			size;
++
++	dma_buffer() : area(-1), address(NULL), physical(0), size(0) {}
++};
++
++
++class MesonVdec {
++public:
++								MesonVdec(device_node* node);
++								~MesonVdec();
++
++			status_t			Init(phys_addr_t dos, phys_addr_t parser,
++									int32 vdecIrq, int32 parserIrq,
++									bool edgeTriggered);
++			device_node*		Node() const { return fNode; }
++
++			status_t			Open();
++			void				Close();
++			status_t			Control(uint32 op, void* buffer,
++									size_t length);
++			void				Dump();
++
++private:
++	static	int32				_VdecInterrupt(void* data);
++	static	int32				_ParserInterrupt(void* data);
++			bool				_CheckDecoder();
++			bool				_CheckMpeg12();
++			bool				_CheckH264();
++			bool				_CheckParser();
++			void				_QueueFrame(uint32 index, uint32 info,
++									uint32 offset);
++			void				_HandBack();
++			bool				_FirmwareDone();
++
++			status_t			_Start(meson_vdec_start& start,
++									const void* userFirmware);
++			status_t			_StartSession(meson_vdec_start& start,
++									const void* userFirmware);
++			void				_WarmUp(const meson_vdec_start& start,
++									const void* userFirmware);
++			void				_Stop(bool keepBuffers = false);
++			void				_FreeBuffers();
++			status_t			_KeepBuffer(const char* name, size_t size,
++									dma_buffer& buffer, bool userReadable,
++									bool clear);
++			status_t			_Write(const uint8* userData, size_t size,
++									uint32* _offset);
++			status_t			_Submit(size_t payload, bool marker);
++			status_t			_EndOfStream();
++			status_t			_GetFrame(meson_vdec_frame& frame);
++			status_t			_Recycle(uint32 index);
++
++			void				_PowerUp();
++			void				_PowerDown();
++			void				_SetupVififo();
++			status_t			_LoadFirmware(const void* userFirmware);
++			void				_StartCodec();
++			status_t			_StartH264(const void* userFirmware);
++	static	status_t			_SetupThread(void* data);
++			status_t			_SetupH264Frames(const uint32* info);
++			void				_FreeH264Frames();
++
++			// HEVC (experimental, meson_vdec_hevc.cpp)
++			bool				_IsHevc() const
++									{ return fCodec == MESON_VDEC_HEVC
++										|| fCodec == MESON_VDEC_HEVC_VENDOR; }
++			status_t			_StartHevc(meson_vdec_start& start,
++									const void* userFirmware);
++			void				_PowerUpHevc();
++			void				_PowerDownHevc();
++			void				_StopHevcProcessor();
++			void				_StartHevcCodec();
++			void				_InitHevcParser();
++			void				_PollHevc();
++			bool				_HevcSlice();
++			status_t			_SetupHevcFrames();
++			void				_FinishHevcPicture();
++			int32				_FreeHevcFrame();
++			status_t			_EndOfStreamHevc();
++			uint32				_Rpm(uint32 index) const;
++			void				_DumpHevc();
++			uint32				_StreamLevel();
++			void				_InitParser();
++			void				_WriteCanvas(uint32 index,
++									phys_addr_t address, uint32 bytesPerRow,
++									uint32 height);
++
++			status_t			_AllocateBuffer(const char* name, size_t size,
++									dma_buffer& buffer, bool userReadable);
++			void				_FreeBuffer(dma_buffer& buffer);
++
++			uint32				_Dos(uint32 offset)
++									{ return fDos[offset / 4]; }
++			void				_SetDos(uint32 offset, uint32 value)
++									{ fDos[offset / 4] = value; }
++			uint32				_Parser(uint32 offset)
++									{ return fParser[offset / 4]; }
++			void				_SetParser(uint32 offset, uint32 value)
++									{ fParser[offset / 4] = value; }
++
++private:
++			device_node*		fNode;
++			area_id				fDosArea;
++			area_id				fParserArea;
++			area_id				fAoArea;
++			area_id				fHhiArea;
++			area_id				fResetArea;
++			volatile uint32*	fDos;
++			volatile uint32*	fParser;
++			volatile uint32*	fAo;
++			volatile uint32*	fHhi;
++			volatile uint32*	fReset;
++			int32				fVdecIrq;
++			int32				fParserIrq;
++
++			mutex				fLock;
++				// one session, its calls one at a time (but GET_FRAME)
++			spinlock			fStateLock;
++				// the frame queue, the interrupt handlers
++			bool				fOpen;
++			bool				fRunning;
++			bool				fEndOfStream;
++			bool				fWarmedUp;
++
++			dma_buffer			fFirmware;
++			dma_buffer			fVififo;
++			dma_buffer			fWorkspace;
++			dma_buffer			fInput;
++			dma_buffer			fFrames;
++			uint32				fCodec;
++			uint32				fWidth;
++			uint32				fHeight;
++			uint32				fBytesPerRow;
++			uint32				fLumaSize;
++			size_t				fFrameSize;
++			uint32				fFrameCount;
++			uint32				fStreamBytes;
++				// written to the VIFIFO this session: the offsets the
++				// H.264 firmware gives its frames count from its start
++			uint32				fEndOffset;
++
++			// H.264: the extension of the firmware, the firmware's own
++			// memory, and the frames (one area each) and their motion
++			// vectors, which the firmware asks for
++			dma_buffer			fExtension;
++			dma_buffer			fSei;
++			dma_buffer			fMotionVectors;
++			dma_buffer			fFrameBuffers[kMaxFrames];
++			uint32				fFrameBuffersAllocated;
++			thread_id			fSetupThread;
++			sem_id				fSetupSem;
++			bool				fSetupPending;
++				// its command 1 waits for the setup thread
++			bool				fEndReached;
++				// the command 1 is the end of the stream's picture's: the
++				// firmware put out all frames before and stopped
++			uint32				fSetupInfo[4];
++				// AV_SCRATCH_1, 2, 3 and 6 of the command
++			uint32				fLastSetupInfo;
++
++			// HEVC
++			bool				fHevcVendor;
++			dma_buffer			fAux;
++			uint16				fRpm[128];
++			int32				fHevcPicture;
++				// the frame being decoded, or -1
++			uint32				fHevcPictureOffset;
++			uint32				fHevcCodedWidth;
++			uint32				fHevcCodedHeight;
++			uint32				fHevcLog2Ctb;
++			uint32				fHevcCtbColumns;
++			uint32				fHevcCtbRows;
++			uint32				fHevcMvUnit;
++			size_t				fHevcMvOffset;
++			bool				fHevcEnded;
++			uint32				fHevcLastStatus;
++			bigtime_t			fHevcLastChange;
++			uint32				fHevcReports;
++			uint32				fHevcSlices;
++			uint32				fHevcSkipped;
++			uint32				fDecodeErrors;
++			uint32				fBadPictures;
++
++			sem_id				fFrameSem;
++			sem_id				fParserSem;
++			uint32				fQueue[kMaxFrames];
++			uint32				fQueueInfo[kMaxFrames];
++			uint32				fQueueOffset[kMaxFrames];
++			uint32				fQueueHead;
++			uint32				fQueueCount;
++			uint32				fHeld;
++				// bit per frame: with the caller
++			uint32				fBack[kMaxFrames];
++			uint32				fBackHead;
++			uint32				fBackCount;
++				// H.264: frames given back, for the firmware's two places
++			bigtime_t			fLastReport;
++			bool				fFatal;
++
++			// the last events, for finding what the firmware does
++			struct trace_entry {
++				bigtime_t		time;
++				char			what;	// 'R'eport, 'B'ack, 'S'ubmit, 'E'nd
++				uint32			a, b, c, d;
++			};
++	static	const uint32		kTraceSize = 64;
++			trace_entry			fTrace[kTraceSize];
++			uint32				fTraceCount;
++			void				_Trace(char what, uint32 a, uint32 b = 0,
++									uint32 c = 0, uint32 d = 0);
++			void				_DumpTrace(bool debugger);
++
++			// counters, for the KDL command
++			uint32				fVdecInterrupts;
++			uint32				fParserInterrupts;
++			uint32				fFramesDecoded;
++			uint32				fFramesSkipped;
++			uint32				fSubmitted;
++			uint32				fParserTimeouts;
++};
++
++
++
++
++#endif	// MESON_VDEC_PRIVATE_H

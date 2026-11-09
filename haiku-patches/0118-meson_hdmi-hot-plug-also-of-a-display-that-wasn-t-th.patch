@@ -1,0 +1,334 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 16:21:11 -0400
+Subject: [PATCH 118/342] meson_hdmi: hot-plug, also of a display that wasn't
+ there at boot
+
+A thread watches the hot-plug signal twice a second. A display
+connected after boot gets its EDID read and its modes listed, and is
+shown the current mode; app_server isn't told and keeps its mode.
+
+When no display answered at boot, U-Boot drives composite video and
+leaves the HDMI controller and PHY initialised but not set up, so
+nothing could be shown on a display connected later. The driver now
+does the rest itself before the first mode set: composite video off,
+the video clock (VID_PLL_DIV /5, VCLK), the VPU's path to ENCP and the
+HDMI controller, the controller's sampler, packetizer, frame composer
+words, data path and colour converter, the DDC clock, the PHY and the
+TMDS clock pattern. The values are U-Boot's: the difference between
+the two states as "meson_hdmi regs" read them on an ODROID-C2.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../graphics/meson_hdmi/meson_hdmi.cpp        | 225 ++++++++++++++++++
+ 1 file changed, 225 insertions(+)
+
+diff --git a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+index 0a374cbd60..ce4da97680 100644
+--- a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
++++ b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+@@ -111,7 +111,9 @@ enum {
+ 	VD1_IF0_RANGE_MAP_CB		= 0x1a6b,
+ 	VD1_IF0_RANGE_MAP_CR		= 0x1a6c,
+ 	VD1_IF0_GEN_REG2			= 0x1a6d,
++	ENCI_VIDEO_EN				= 0x1b57,
+ 	VENC_DVI_SETTING			= 0x1b62,
++	VENC_VDAC_SETTING			= 0x1b7e,
+ 	ENCP_INFO_READ				= 0x271d,	// [28:16] line, [12:0] pixel
+ 	ENCP_VIDEO_EN				= 0x1b80,
+ 	ENCP_VIDEO_MODE				= 0x1b8d,
+@@ -210,8 +212,14 @@ enum {
+ 	HHI_HDMI_PHY_CNTL0			= 0x3a0,
+ 	HHI_HDMI_PHY_CNTL1			= 0x3a4,
+ 	HHI_HDMI_PHY_CNTL3			= 0x3ac,
++	HHI_VDAC_CNTL0				= 0x2f4,
++	HHI_VDAC_CNTL1				= 0x2f8,
+ };
+ 
++#define VID_PLL_DIV_ENABLE			(1 << 19)	// HHI_VID_PLL_CLK_DIV
++#define VID_PLL_DIV_PRESET			(1 << 15)
++#define VID_CLK_ENABLE				(1 << 19)	// HHI_VID_CLK_CNTL
++
+ #define HDMI_PLL_LOCK				(1u << 31)	// HHI_HDMI_PLL_CNTL
+ #define HDMI_PLL_RESET				(1 << 28)
+ #define HDMI_PLL_M_MASK				0x1ff
+@@ -257,6 +265,10 @@ enum {
+ 	HDMITX_DWC_ADDR				= 0x10,
+ 	HDMITX_DWC_DATA				= 0x14,
+ 
++	HDMITX_TOP_BIST_CNTL		= 0x06,	// [14:12] 1: normal TMDS output
++	HDMITX_TOP_TMDS_CLK_PTTN_01	= 0x0a,
++	HDMITX_TOP_TMDS_CLK_PTTN_23	= 0x0b,
++	HDMITX_TOP_TMDS_CLK_PTTN_CNTL = 0x0c,
+ 	HDMITX_TOP_STAT0			= 0x0e,	// bit 0: filtered HPD
+ };
+ 
+@@ -296,6 +308,7 @@ enum {
+ #define IH_I2CM_STAT0_DONE			(1 << 1)
+ #define FC_INVIDCONF_VSYNC_HIGH		(1 << 6)
+ #define FC_INVIDCONF_HSYNC_HIGH		(1 << 5)
++#define FC_INVIDCONF_HDMI			(1 << 3)	// 0: DVI
+ #define MC_SWRSTZ_TMDS				(1 << 1)	// active low
+ 
+ 
+@@ -646,6 +659,9 @@ private:
+ 			void				_HideOverlay();
+ 			void				_ResetPhy();
+ 			status_t			_WaitForPllLock();
++			void				_BringUpHdmi();
++			void				_DisplayConnected();
++	static	status_t			_HotPlugThread(void* data);
+ 			status_t			_SetHdmiPll(uint32 control, uint32 control2);
+ 			status_t			_ProgramMode(const meson_mode& mode,
+ 									phys_addr_t frameBuffer,
+@@ -702,6 +718,11 @@ private:
+ 				// by SetDisplayMode(); false: U-Boot's mode is shown
+ 			uint32				fPhyControl0;
+ 				// while the output is off (DPMS)
++			bool				fHdmiReady;
++				// U-Boot or _BringUpHdmi() set the HDMI path up
++			thread_id			fHotPlugThread;
++			sem_id				fHotPlugSem;
++				// deleted to stop the thread
+ 
+ 			struct overlay_buffer_info {
+ 				area_id			pagesArea;		// -1: unused slot
+@@ -773,6 +794,9 @@ MesonHdmi::MesonHdmi(device_node* node)
+ 	fModeCount(0),
+ 	fModeSet(false),
+ 	fPhyControl0(0),
++	fHdmiReady(false),
++	fHotPlugThread(-1),
++	fHotPlugSem(-1),
+ 	fOverlayPhysical(0),
+ 	fOverlayCanvas(0),
+ 	fOverlayEndian(CANVAS_SWAP_64)
+@@ -788,6 +812,11 @@ MesonHdmi::MesonHdmi(device_node* node)
+ 
+ MesonHdmi::~MesonHdmi()
+ {
++	if (fHotPlugThread >= 0) {
++		delete_sem(fHotPlugSem);
++		status_t result;
++		wait_for_thread(fHotPlugThread, &result);
++	}
+ 	delete fAudio;
+ 	if (fVpuArea >= 0)
+ 		delete_area(fVpuArea);
+@@ -855,6 +884,13 @@ MesonHdmi::Init()
+ 		(_TopRead(HDMITX_TOP_STAT0) & 1) != 0 ? "high" : "low",
+ 		fBootWidth, fBootHeight, fBootBytesPerRow, fBootFrameBuffer);
+ 
++	// U-Boot sets the HDMI path up only when a display answers at boot;
++	// otherwise it drives composite video and leaves HDMI half done
++	fHdmiReady = (_Hhi(HHI_VID_CLK_CNTL) & VID_CLK_ENABLE) != 0
++		&& (_Vpu(VPU_VIU_VENC_MUX_CTRL) & 0xf) == 0xa;
++	if (!fHdmiReady)
++		INFO("HDMI not set up (no display at boot): set up on hot-plug\n");
++
+ 	_CheckBootMode();
+ 	_ReadEdid();
+ 
+@@ -903,6 +939,14 @@ MesonHdmi::Init()
+ 		}
+ 	}
+ 	fShared->bytes_per_row = fBootBytesPerRow;
++
++	fHotPlugSem = create_sem(0, "meson_hdmi hot-plug");
++	if (fHotPlugSem >= 0) {
++		fHotPlugThread = spawn_kernel_thread(&_HotPlugThread,
++			"meson_hdmi hot-plug", B_LOW_PRIORITY, this);
++		if (fHotPlugThread >= 0)
++			resume_thread(fHotPlugThread);
++	}
+ 	return B_OK;
+ }
+ 
+@@ -1299,6 +1343,187 @@ MesonHdmi::_SetHdmiPll(uint32 control, uint32 control2)
+ }
+ 
+ 
++/*!	What U-Boot sets up for HDMI only when a display answers at boot, for
++	one connected later: U-Boot then drives composite video, with the HDMI
++	controller and PHY initialised but not set up. The values are U-Boot's:
++	the difference between the two states, read on an ODROID-C2
++	(logs/m25-hdmi-regs-*.txt in the port's project). _ProgramMode() sets
++	the mode afterwards.
++*/
++void
++MesonHdmi::_BringUpHdmi()
++{
++	INFO("setting the HDMI path up\n");
++
++	// composite video off: its encoder and DAC
++	_SetVpu(ENCI_VIDEO_EN, 0);
++	_SetVpu(VENC_VDAC_SETTING, 0xff);
++	_SetHhi(HHI_VDAC_CNTL0, 0);
++	_SetHhi(HHI_VDAC_CNTL1, 8);
++
++	// the video clock: the HDMI PLL through VID_PLL_DIV (/5) to VCLK (/2),
++	// whose first output clocks ENCP and the HDMI controller
++	const uint32 vidPllDiv = 0x000a739c;
++	_SetHhi(HHI_VID_PLL_CLK_DIV,
++		vidPllDiv & ~(VID_PLL_DIV_ENABLE | VID_PLL_DIV_PRESET));
++	_SetHhi(HHI_VID_PLL_CLK_DIV,
++		(vidPllDiv & ~VID_PLL_DIV_ENABLE) | VID_PLL_DIV_PRESET);
++	_SetHhi(HHI_VID_PLL_CLK_DIV, vidPllDiv & ~VID_PLL_DIV_ENABLE);
++	_SetHhi(HHI_VID_PLL_CLK_DIV, vidPllDiv);
++	_SetHhi(HHI_VID_CLK_DIV, 0x00000101);
++	_SetHhi(HHI_VID_CLK_CNTL, VID_CLK_ENABLE);
++	_SetHhi(HHI_VID_CLK_CNTL, VID_CLK_ENABLE | 1);
++
++	// VPU: OSD1 to ENCP, ENCP to the HDMI controller; the OSD scaler,
++	// which composite video used, off
++	static const struct {
++		uint16	word;
++		uint32	value;
++	} kVpu[] = {
++		{ VPU_VIU_VENC_MUX_CTRL, 0xa }, { VPU_HDMI_SETTING, 0x8e },
++		{ ENCP_VIDEO_MODE, 0x4040 }, { ENCP_VIDEO_MODE_ADV, 0x18 },
++		{ 0x1b98, 0 }, { 0x1b99, 0 }, { 0x1b9a, 0 }, { 0x1b9b, 0 },
++		{ 0x1b9c, 0 }, { 0x1b9d, 0 }, { 0x1b9e, 0 }, { 0x1bfc, 0 },
++		{ 0x1c0a, 0 }, { 0x1c0b, 0x321 }, { 0x1c0c, 0x54 },
++		{ 0x1c18, 0x1b00 }, { 0x1c19, 0 }, { 0x1c1a, 0 }, { 0x1c1b, 0 },
++		{ 0x1c1c, 0 }, { 0x1c1d, 0 }, { 0x1c1e, 0 },
++		{ 0x1c58, 0 }, { 0x1c59, 0x40 },
++		{ 0x1dc0, 0x01000000 }, { 0x1dc1, 0 }, { 0x1dc2, 0 },
++		{ 0x1dc8, 0 }, { 0x1dc9, 0 }, { 0x1dca, 0 }, { 0x1dcb, 0 },
++	};
++	for (size_t i = 0; i < B_COUNT_OF(kVpu); i++)
++		_SetVpu(kVpu[i].word, kVpu[i].value);
++
++	// HDMI controller: the video sampler (YCbCr 4:4:4, 8 bits) and its
++	// stuffing, the packetizer, the frame composer's control period and
++	// preambles, the main controller's clocks and the data path through
++	// the colour converter (YCbCr to RGB) with its coefficients, and the
++	// DDC clock
++	static const struct {
++		uint16	reg;
++		uint8	value;
++	} kDw[] = {
++		{ 0x0200, 0x09 }, { 0x0201, 0x07 }, { 0x0802, 0x27 },
++		{ 0x0804, 0x47 },
++		{ 0x1011, 0x0c }, { 0x1012, 0x20 }, { 0x1013, 0x01 },
++		{ 0x1014, 0x0b }, { 0x1015, 0x16 }, { 0x1016, 0x21 },
++		{ 0x4001, 0x64 }, { 0x4004, 0x01 },
++		{ 0x4100, 0x00 }, { 0x4101, 0x01 }, { 0x4102, 0x20 },
++		{ 0x4103, 0x00 }, { 0x4104, 0x69 }, { 0x4105, 0x26 },
++		{ 0x4106, 0x74 }, { 0x4107, 0xfd }, { 0x4108, 0x01 },
++		{ 0x4109, 0x0e }, { 0x410a, 0x20 }, { 0x410b, 0x00 },
++		{ 0x410c, 0x2c }, { 0x410d, 0xdd }, { 0x410e, 0x00 },
++		{ 0x410f, 0x00 }, { 0x4110, 0x7e }, { 0x4111, 0x9a },
++		{ 0x4112, 0x20 }, { 0x4113, 0x00 }, { 0x4114, 0x00 },
++		{ 0x4115, 0x00 }, { 0x4116, 0x38 }, { 0x4117, 0xb4 },
++		{ 0x4118, 0x7e }, { 0x4119, 0x3b },
++		{ 0x7e07, 0x03 }, { 0x7e0c, 0x67 }, { 0x7e0e, 0x78 },
++	};
++	for (size_t i = 0; i < B_COUNT_OF(kDw); i++)
++		_DwWrite(kDw[i].reg, kDw[i].value);
++	_DwWrite(DW_FC_INVIDCONF, _DwRead(DW_FC_INVIDCONF) | FC_INVIDCONF_HDMI);
++
++	// the PHY, normal TMDS output and the TMDS clock pattern
++	_SetHhi(HHI_HDMI_PHY_CNTL0, 0x33632122);
++	_SetHhi(HHI_HDMI_PHY_CNTL3, 0x2000115b);
++	_SetHhi(HHI_HDMI_PHY_CNTL1, 0x0392000e);
++	_TopWrite(HDMITX_TOP_BIST_CNTL, 0x1000);
++	_TopWrite(HDMITX_TOP_TMDS_CLK_PTTN_01, 0x001f001f);
++	_TopWrite(HDMITX_TOP_TMDS_CLK_PTTN_23, 0x001f001f);
++	_TopWrite(HDMITX_TOP_TMDS_CLK_PTTN_CNTL, 1);
++	spin(10);
++	_TopWrite(HDMITX_TOP_TMDS_CLK_PTTN_CNTL, 2);
++}
++
++
++/*!	A display was connected: sets the HDMI path up if U-Boot didn't, reads
++	its EDID and lists its modes, and shows it the current mode. app_server
++	isn't told: it keeps its mode, also one the display doesn't list.
++*/
++void
++MesonHdmi::_DisplayConnected()
++{
++	INFO("display connected\n");
++	// sinks assert hot-plug before their EDID is ready
++	snooze(1000000);
++
++	MutexLocker locker(fModeLock);
++	bool broughtUp = false;
++	if (!fHdmiReady) {
++		_BringUpHdmi();
++		fHdmiReady = true;
++		broughtUp = true;
++	}
++
++	uint8 oldEdid[sizeof(fEdid)];
++	uint32 oldEdidSize = fEdidSize;
++	memcpy(oldEdid, fEdid, sizeof(fEdid));
++	if (_ReadEdid() == B_OK && (fEdidSize != oldEdidSize
++			|| memcmp(oldEdid, fEdid, fEdidSize) != 0)) {
++		fShared->edid_size = fEdidSize;
++		memcpy(fShared->edid, fEdid, fEdidSize);
++		_BuildModeList();
++		if (fModeSet) {
++			bool listed = false;
++			for (uint32 i = 0; i < fModeCount; i++)
++				listed |= same_timing(fModes[i], fMode);
++			if (!listed) {
++				INFO("the display doesn't list the current mode %ux%u\n",
++					fMode.hActive, fMode.vActive);
++			}
++		}
++	}
++
++	if (fShared->dpms_mode != B_DPMS_ON) {
++		// shown when the display is switched on again
++		if (broughtUp) {
++			fPhyControl0 = _Hhi(HHI_HDMI_PHY_CNTL0);
++			_SetHhi(HHI_HDMI_PHY_CNTL0, 0);
++			_SetVpu(ENCP_VIDEO_EN, 0);
++		}
++		return;
++	}
++	if (fModeSet) {
++		_ProgramMode(fMode, fFrameBufferPhysical, fShared->bytes_per_row);
++		locker.Unlock();
++		if (fAudio != NULL)
++			fAudio->ModeChanged();
++	}
++}
++
++
++/*!	Watches the hot-plug signal twice a second; a change counts once it
++	held for two looks.
++*/
++/*static*/ status_t
++MesonHdmi::_HotPlugThread(void* data)
++{
++	MesonHdmi* device = (MesonHdmi*)data;
++	bool connected = (device->_TopRead(HDMITX_TOP_STAT0) & 1) != 0;
++	if (connected && !device->fHdmiReady)
++		device->_DisplayConnected();
++
++	int32 changedLooks = 0;
++	while (acquire_sem_etc(device->fHotPlugSem, 1, B_RELATIVE_TIMEOUT, 500000)
++			== B_TIMED_OUT) {
++		bool now = (device->_TopRead(HDMITX_TOP_STAT0) & 1) != 0;
++		if (now == connected) {
++			changedLooks = 0;
++			continue;
++		}
++		if (++changedLooks < 2)
++			continue;
++		changedLooks = 0;
++		connected = now;
++		if (connected)
++			device->_DisplayConnected();
++		else
++			INFO("display disconnected\n");
++	}
++	return B_OK;
++}
++
++
+ /*!	Blanks, programs a mode and shows \a frameBuffer in it. */
+ status_t
+ MesonHdmi::_ProgramMode(const meson_mode& mode, phys_addr_t frameBuffer,

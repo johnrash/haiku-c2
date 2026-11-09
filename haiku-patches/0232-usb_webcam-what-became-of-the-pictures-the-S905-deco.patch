@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 15:34:25 -0500
+Subject: [PATCH 232/342] usb_webcam: what became of the pictures the S905
+ decoded, in the log
+
+A line when the stream stops: the pictures taken, cut short, not
+written, without a frame, and the frames made.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../usb_webcam/addons/uvc/UVCCamDevice.cpp    | 24 ++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+index fd0171ac2c..5092690536 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+@@ -2035,6 +2035,13 @@ UVCCamDevice::_HardwareDecoderThread()
+ 	bool havePrevious = false;
+ 	int32 previousSequence = 0;
+ 	bigtime_t previousStamp = 0;
++	// what became of the pictures, logged at the end
++	int32 taken = 0;
++	int32 cutShort = 0;
++	int32 notWritten = 0;
++	int32 noFrame = 0;
++	int32 converted = 0;
++	bigtime_t start = system_time();
+ 	while (fDecoding) {
+ 		CamFrame* frame = NULL;
+ 		bigtime_t stamp = 0;
+@@ -2049,6 +2056,7 @@ UVCCamDevice::_HardwareDecoderThread()
+ 
+ 		bool written = false;
+ 		if (frame != NULL) {
++			taken++;
+ 			const uint8* data = (const uint8*)frame->Buffer();
+ 			size_t length = frame->BufferLength();
+ 			if (_IsWholePicture(data, length)) {
+@@ -2057,7 +2065,10 @@ UVCCamDevice::_HardwareDecoderThread()
+ 				write.size = length;
+ 				written = ioctl(fHardwareDecoder, MESON_VDEC_WRITE, &write,
+ 					sizeof(write)) == 0;
+-			}
++				if (!written)
++					notWritten++;
++			} else
++				cutShort++;
+ 			delete frame;
+ 		}
+ 
+@@ -2072,6 +2083,7 @@ UVCCamDevice::_HardwareDecoderThread()
+ 			ioctl(fHardwareDecoder, MESON_VDEC_RECYCLE_FRAME, &index,
+ 				sizeof(index));
+ 			havePrevious = false;
++			converted++;
+ 			_PublishDecoded(0, previousSequence, previousStamp);
+ 		}
+ 		if (!written)
+@@ -2080,8 +2092,10 @@ UVCCamDevice::_HardwareDecoderThread()
+ 		// its frame, and any that came late before it (the newest counts)
+ 		meson_vdec_frame decoded = {};
+ 		decoded.timeout = 200000;
++		bool got = false;
+ 		while (ioctl(fHardwareDecoder, MESON_VDEC_GET_FRAME, &decoded,
+ 				sizeof(decoded)) == 0) {
++			got = true;
+ 			if ((decoded.flags & (MESON_VDEC_FRAME_END_OF_STREAM
+ 					| MESON_VDEC_FRAME_GIVE_BACK)) != 0
+ 				|| decoded.cr_offset == 0) {
+@@ -2098,7 +2112,15 @@ UVCCamDevice::_HardwareDecoderThread()
+ 			previousStamp = stamp;
+ 			decoded.timeout = 0;
+ 		}
++		if (!got)
++			noFrame++;
+ 	}
++	bigtime_t elapsed = system_time() - start;
++	debug_printf("usb_webcam: S905 MJPEG decoding, %" B_PRId32 "x%" B_PRId32
++		": %" B_PRId32 " pictures in %.1f s, %" B_PRId32 " cut short, %"
++		B_PRId32 " not written, %" B_PRId32 " without a frame; %" B_PRId32
++		" frames\n", fStreamWidth, fStreamHeight, taken, elapsed / 1000000.0,
++		cutShort, notWritten, noFrame, converted);
+ 	if (havePrevious) {
+ 		uint32 index = previous.index;
+ 		ioctl(fHardwareDecoder, MESON_VDEC_RECYCLE_FRAME, &index,

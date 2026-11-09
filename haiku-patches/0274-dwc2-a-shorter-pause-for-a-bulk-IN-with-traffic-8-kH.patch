@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Tue, 3 Nov 2026 17:16:54 -0500
+Subject: [PATCH 274/342] dwc2: a shorter pause for a bulk IN with traffic, 8
+ kHz audio buffers
+
+With split audio running, the 9 ms pause of an idle bulk IN also hit traffic:
+TCP lands in that pause between its bursts, and a download fell to a quarter.
+With data in the last 100 ms the pause is now 1 ms.
+
+A USB audio buffer of 2048 frames is 256 packets at 8 kHz, and only 128 were
+taken: such a stream was refused and silent.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/busses/usb/dwc2.cpp | 19 +++++++++++++++----
+ src/add-ons/kernel/busses/usb/dwc2.h   |  4 +++-
+ 2 files changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.cpp b/src/add-ons/kernel/busses/usb/dwc2.cpp
+index 67393756ae..5fbad9f0e2 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2.cpp
+@@ -102,6 +102,8 @@ static const bigtime_t kInterruptRetryDelay = 10000;
+ static const bigtime_t kBulkYieldCheck = 1000;
+ static const bigtime_t kBulkIdleCheck = 20000;
+ static const bigtime_t kBulkSplitAudioPause = 9000;
++static const bigtime_t kBulkSplitAudioBusyPause = 1000;
++static const bigtime_t kBulkBusyTime = 100000;
+ 	// see _IsoSplitsRunning()
+ 
+ 
+@@ -206,6 +208,7 @@ DWC2::DWC2(Stack* stack, device_node* node, phys_addr_t registers,
+ 		lane.status = 0;
+ 		lane.mayYield = false;
+ 		lane.yielded = false;
++		lane.lastBulkData = 0;
+ 		lane.partial = false;
+ 	}
+ 
+@@ -870,8 +873,11 @@ DWC2::_Worker(dwc2_lane* lane)
+ 				retry = status == B_OK && nak;
+ 			}
+ 		}
+-		if ((pipe->Type() & USB_OBJECT_BULK_PIPE) != 0 && status == B_OK)
++		if ((pipe->Type() & USB_OBJECT_BULK_PIPE) != 0 && status == B_OK) {
+ 			atomic_add64(&fStatBulkBytes, actual);
++			if (actual > 0)
++				lane->lastBulkData = system_time();
++		}
+ 
+ 		locker.Lock();
+ 		lane->current = NULL;
+@@ -884,8 +890,12 @@ DWC2::_Worker(dwc2_lane* lane)
+ 			// a bulk IN that gave way goes on after what is queued
+ 			entry->due = system_time() + kInterruptRetryDelay;
+ 			if (lane->channel == kBulkLane) {
+-				entry->due = _IsoSplitsRunning()
+-					? system_time() + kBulkSplitAudioPause : 0;
++				entry->due = 0;
++				if (_IsoSplitsRunning()) {
++					bigtime_t now = system_time();
++					entry->due = now + (now - lane->lastBulkData < kBulkBusyTime
++						? kBulkSplitAudioBusyPause : kBulkSplitAudioPause);
++				}
+ 			}
+ 			lane->queue.Add(entry);
+ 			lane->idle.NotifyAll();
+@@ -1377,7 +1387,8 @@ DWC2::_RetrySplit(uint32 status, int32& errors, const char* phase)
+ 	that going on the complete-splits of audio behind a hub come too late: 5 to
+ 	13 % of a microphone's packets were lost with a wireless adapter just
+ 	waiting for frames. So meanwhile a bulk IN that moves nothing runs for a
+-	millisecond now and then. Data that comes is not held up after that.
++	millisecond in ten, or every other one with data in the last 100 ms: with
++	the longer pause alone, TCP's traffic went down to a quarter.
+ */
+ bool
+ DWC2::_IsoSplitsRunning()
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.h b/src/add-ons/kernel/busses/usb/dwc2.h
+index de296324df..1ebe586666 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.h
++++ b/src/add-ons/kernel/busses/usb/dwc2.h
+@@ -40,7 +40,8 @@ static const uint32 kIsoSlotCount = 4;
+ static const size_t kIsoSlotSize = 16 * 1024;
+ static const size_t kIsoHighSpeedSlotSize = 256 * 1024;
+ 	// 85 microframes of 3 x 1024 bytes (a webcam's high bandwidth endpoint)
+-static const uint32 kIsoMaxPackets = 128;
++static const uint32 kIsoMaxPackets = 256;
++	// a USB audio buffer of 2048 frames at 8 kHz
+ static const uint32 kIsoMaxPieces = 4;
+ 	// an IN packet the translator returns in pieces ("MDATA")
+ 
+@@ -162,6 +163,7 @@ struct dwc2_lane {
+ 	bool				mayYield;
+ 		// the transfer has moved nothing yet: a bulk IN may give way
+ 	bool				yielded;
++	bigtime_t			lastBulkData;	// when the last transfer moved any
+ 		// _RunChannel() halted the channel to give way
+ 	bool				partial;
+ 		// some packets came in as it did: the transfer isn't done

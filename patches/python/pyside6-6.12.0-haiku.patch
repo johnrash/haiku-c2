@@ -1,0 +1,162 @@
+PySide6 6.12.0 on Haiku: HaikuPorts' pyside6-6.10.3.patchset (MIT,
+haikuports/haikuports dev-python/pyside6) without its build_scripts/main.py
+hunk for haikuporter's native builds, which no longer applies and which a
+cross build doesn't use. New: Haiku as a target platform of shiboken's
+clang parser (aarch64-unknown-haiku, no host headers), and the sysroot and
+target passed to it when cross-compiling for Haiku.
+
+Ported 2026, haiku-odroid-c2 port authors.
+
+--- a/build_scripts/main.py	2026-10-01 11:02:02.000000000 -0400
++++ b/build_scripts/main.py	2026-11-07 14:25:52.613407906 -0500
+@@ -846,6 +846,10 @@
+         if OPTION["SKIP_MYPY_TEST"]:
+             cmake_cmd.append("-DSKIP_MYPY_TEST=1")
+ 
++        if OPTION["QT_TOOLS_PATH"]:
++            cmake_cmd.append(f"-DQDOC_EXECUTABLE={OPTION['QT_TOOLS_PATH']}")
++            cmake_cmd.append(f"-DQHELPGENERATOR_EXECUTABLE={OPTION['QT_TOOLS_PATH']}")
++
+         if self.cmake_toolchain_file:
+             cmake_cmd.append(f"-DCMAKE_TOOLCHAIN_FILE={self.cmake_toolchain_file}")
+ 
+--- a/build_scripts/options.py	2026-10-01 11:02:02.000000000 -0400
++++ b/build_scripts/options.py	2026-11-07 14:25:52.613811526 -0500
+@@ -269,6 +269,7 @@
+         # enabled, the extra include path of /app/include will be added to the option
+         # --shiboken-extra-include-paths.
+         ('flatpak', None, 'Build PySide6 for Flatpak.'),
++        ('qt-tools-path=', None, 'Path of Qt tools'),
+     ]
+ 
+     def __init__(self):
+@@ -334,6 +335,7 @@
+         self.shiboken_force_process_system_headers = False
+         self.shiboken_extra_include_paths = None
+         self.flatpak = False
++        self.qt_tools_path = None
+ 
+         # When initializing a command other than the main one (so the
+         # first one), we need to copy the user options from the main
+@@ -548,6 +550,7 @@
+             sys.exit(-1)
+ 
+         OPTION['PLAT_NAME'] = self.plat_name
++        OPTION['QT_TOOLS_PATH'] = self.qt_tools_path
+ 
+     def _extra_checks(self):
+         if self.is_cross_compile and not self.plat_name:
+--- a/build_scripts/utils.py	2026-10-01 11:02:02.000000000 -0400
++++ b/build_scripts/utils.py	2026-11-07 14:25:52.614173273 -0500
+@@ -80,7 +80,7 @@
+ 
+ def get_numpy_location():
+     for p in sys.path:
+-        if 'site-' in p:
++        if 'site-' in p or 'vendor-' in p:
+             numpy = Path(p).resolve() / 'numpy'
+             if numpy.is_dir():
+                 candidate = numpy / '_core' / 'include'  # Version 2
+--- a/build_scripts/wheel_files.py	2026-10-01 11:02:02.000000000 -0400
++++ b/build_scripts/wheel_files.py	2026-11-07 14:25:52.614483688 -0500
+@@ -138,7 +138,7 @@
+ 
+     @staticmethod
+     def get_extension_from_platform(platform: str) -> str:
+-        if platform == "linux":
++        if platform == "linux" or platform == "haiku":
+             return "so"
+         elif platform == "darwin":
+             return "dylib"
+--- a/sources/pyside6/cmake/Macros/PySideModules.cmake	2026-10-01 11:02:02.000000000 -0400
++++ b/sources/pyside6/cmake/Macros/PySideModules.cmake	2026-11-07 14:33:16.271788967 -0500
+@@ -68,6 +68,8 @@
+         set(ld_prefix_var_name "PATH")
+     elseif(APPLE)
+         set(ld_prefix_var_name "DYLD_LIBRARY_PATH")
++    elseif(HAIKU)
++        set(ld_prefix_var_name "LIBRARY_PATH")
+     else()
+         set(ld_prefix_var_name "LD_LIBRARY_PATH")
+     endif()
+@@ -366,6 +368,14 @@
+              "--clang-option=--target=${android_triple}")
+     endif()
+ 
++    if(CMAKE_SYSTEM_NAME STREQUAL "Haiku" AND CMAKE_SYSROOT)
++        # the cross g++ reports the sysroot's include paths; clang parses for
++        # Haiku, not the host
++        list(APPEND shiboken_command
++             "--compiler-argument=--sysroot=${CMAKE_SYSROOT}"
++             "--clang-option=--target=${CMAKE_SYSTEM_PROCESSOR}-unknown-haiku")
++    endif()
++
+     if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+         if(CMAKE_OSX_SYSROOT STREQUAL "iphonesimulator")
+             set(ios_triple
+--- a/sources/shiboken6/libshiboken/helper.cpp	2026-10-01 11:02:02.000000000 -0400
++++ b/sources/shiboken6/libshiboken/helper.cpp	2026-11-07 14:25:52.612821436 -0500
+@@ -607,7 +607,7 @@
+ {
+ #if defined(_WIN32)
+     return GetCurrentThreadId();
+-#elif defined(__APPLE_CC__)
++#elif defined(__APPLE_CC__) || defined(__HAIKU__)
+     return reinterpret_cast<ThreadId>(pthread_self());
+ #else
+     return pthread_self();
+--- a/sources/shiboken6_generator/ApiExtractor/clangparser/compilersupport.cpp	2026-10-01 11:02:02.000000000 -0400
++++ b/sources/shiboken6_generator/ApiExtractor/clangparser/compilersupport.cpp	2026-11-07 14:33:16.271281490 -0500
+@@ -452,7 +452,9 @@
+     // For Android cross-compilation, prevent clang from including host system headers that
+     // conflict with NDK headers.
+     // This addresses the mbstate_t typedef redefinition error in COIN for RHEL 9.4
+-    if (_optionsTriplet.platform() == Platform::Android
++    // (and for Haiku, whose headers come from the cross compiler's sysroot)
++    if ((_optionsTriplet.platform() == Platform::Android
++         || _optionsTriplet.platform() == Platform::Haiku)
+         && (_hostTriplet.platform() == Platform::Unix
+             || _hostTriplet.platform() == Platform::Linux)
+         && (_optionsTriplet.compiler() == Compiler::Clang
+--- a/sources/shiboken6_generator/ApiExtractor/clangparser/triplet.cpp	2026-10-01 11:02:02.000000000 -0400
++++ b/sources/shiboken6_generator/ApiExtractor/clangparser/triplet.cpp	2026-11-07 14:33:16.270802898 -0500
+@@ -71,6 +71,8 @@
+         return Platform::Android; // "androideabi"
+     if (name.compare("ios"_L1, Qt::CaseInsensitive) == 0)
+         return Platform::iOS;
++    if (name.compare("haiku"_L1, Qt::CaseInsensitive) == 0)
++        return Platform::Haiku;
+     return Platform::Unknown;
+ }
+ 
+@@ -134,7 +136,8 @@
+     case Architecture::Arm32:
+         return "armv7a"_ba;
+     case Architecture::Arm64:
+-        return m_platform == Platform::Android ? "aarch64"_ba : "arm64"_ba;
++        return m_platform == Platform::Android || m_platform == Platform::Haiku
++            ? "aarch64"_ba : "arm64"_ba;
+     case Architecture::Unknown:
+         break;
+     }
+@@ -171,6 +174,8 @@
+         break;
+     case Platform::iOS:
+         return "apple-ios"_ba;
++    case Platform::Haiku:
++        return "unknown-haiku"_ba;
+     case Platform::Unknown:
+         break;
+     }
+--- a/sources/shiboken6_generator/ApiExtractor/clangparser/triplet.h	2026-10-01 11:02:02.000000000 -0400
++++ b/sources/shiboken6_generator/ApiExtractor/clangparser/triplet.h	2026-11-07 14:33:16.269410761 -0500
+@@ -29,7 +29,8 @@
+     Windows,
+     macOS,
+     Android,
+-    iOS
++    iOS,
++    Haiku
+ };
+ 
+ enum class Architecture : std::uint8_t {

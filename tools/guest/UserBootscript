@@ -1,0 +1,88 @@
+#!/bin/sh
+# Haiku-side diagnostics for the ODROID-C2 port. Installed into an image as
+# ~/config/settings/boot/UserBootscript by tools/image-add-diag.sh; the
+# launch_daemon runs it in the desktop session. Everything goes to
+# /dev/dprintf, i.e. the kernel's serial debug output, so it shows up in the
+# console/QEMU serial log even when nothing reaches the screen.
+# If ~/config/settings/boot/diag-kdl exists, it then enters the kernel
+# debugger (KDL on the serial port) so blocked threads can be inspected.
+# (ftpd/telnetd now start from the system job tools/guest/c2-system.sh)
+
+dump()
+{
+	echo "=== diag $1: $(date)"
+	echo "--- ps"; ps
+	echo "--- syslog (tail)"; tail -n 120 /var/log/syslog
+	echo "=== diag $1 end"
+}
+
+sleep 60
+dump early > /dev/dprintf 2>&1
+
+# Each MMC disk: partitions, a hash of the first 4 MiB (partition table and,
+# on the SD card, the firmware) and raw read throughput (64 MiB further on).
+for disk in /dev/disk/mmc/*/raw; do
+	[ -e "$disk" ] || continue
+	echo "--- disk $disk"
+	ls "$(dirname "$disk")"
+	echo "first 4 MiB sha256: $(dd if="$disk" bs=1M count=4 2>/dev/null | sha256sum)"
+	echo "--- read benchmark $disk"
+	dd if="$disk" of=/dev/null bs=1M count=64 skip=64 2>&1
+done > /dev/dprintf 2>&1
+echo "--- mounted volumes" > /dev/dprintf
+df > /dev/dprintf 2>&1
+
+# Network (M5): interfaces, and whether the laptop answers.
+(
+	echo "--- network"
+	ls /dev/net/* 2>&1
+	ifconfig
+	ping -c 3 10.42.0.1
+) > /dev/dprintf 2>&1
+
+# Data test (M4.5 item 4): with the diag-writetest marker, the first boot
+# writes 100 MiB of random data and records its checksum; later boots
+# verify it, so the data has to survive a power cycle.
+if [ -e ~/config/settings/boot/diag-writetest ]; then
+	(
+		file=/boot/home/writetest.bin
+		if [ -e $file.sha256 ]; then
+			echo "--- writetest: verifying"
+			start=$(date +%s)
+			if sha256sum -c $file.sha256; then
+				echo "writetest: VERIFY OK after power cycle"
+			else
+				echo "writetest: VERIFY FAILED"
+			fi
+			echo "writetest: verify took $(( $(date +%s) - start )) s"
+		else
+			echo "--- writetest: data source and plain write speed"
+			dd if=/dev/urandom of=/dev/null bs=1M count=32 2>&1
+			dd if=/dev/zero of=/boot/home/zero.bin bs=1M count=100 conv=fsync 2>&1
+			rm -f /boot/home/zero.bin
+			echo "--- writetest: creating 100 MiB"
+			start=$(date +%s)
+			dd if=/dev/urandom of=$file bs=1M count=100 2>&1
+			sync
+			echo "writetest: write+sync took $(( $(date +%s) - start )) s"
+			sha256sum $file > $file.sha256
+			sync
+			echo "writetest: CREATED $(cat $file.sha256)"
+		fi
+	) > /dev/dprintf 2>&1
+fi
+
+# These block if a graphics driver hangs, so run them in the background.
+(
+	echo "--- /dev/graphics"; ls -l /dev/graphics
+	echo "--- screenmode"; screenmode
+	echo "--- graphics checks done"
+) > /dev/dprintf 2>&1 &
+
+sleep 30
+if [ -e ~/config/settings/boot/diag-kdl ]; then
+	kernel_debugger "diag: UserBootscript requested KDL"
+fi
+
+sleep 120
+dump late > /dev/dprintf 2>&1

@@ -1,0 +1,100 @@
+--- a/src/hgl/GLRendererRoster.h
++++ b/src/hgl/GLRendererRoster.h
+@@ -21,6 +21,7 @@
+ 	entry_ref	ref;
+ 	ino_t		node;
+ 	image_id	image;
++	int32		priority;	// the add-on's gl_renderer_priority, or 0
+ };
+ 
+ typedef std::vector<renderer_item> RendererMap;
+@@ -38,7 +39,7 @@
+ 		void AddDefaultPaths();
+ 		status_t AddPath(const char* path);
+ 		status_t AddRenderer(InstantiateRenderer entry, image_id image,
+-			const entry_ref* ref, ino_t node);
++			const entry_ref* ref, ino_t node, int32 priority);
+ 		status_t CreateRenderer(const entry_ref& ref);
+ 
+ 		static GLRendererRoster* fInstance;
+--- a/src/hgl/GLRendererRoster.cpp
++++ b/src/hgl/GLRendererRoster.cpp
+@@ -20,6 +20,7 @@
+ #include <strings.h>
+ #include "GLRendererRoster.h"
+ 
++#include <algorithm>
+ #include <new>
+ #include <string.h>
+ #include <stdio.h>
+@@ -30,6 +31,20 @@
+ 
+ GLRendererRoster *GLRendererRoster::fInstance = NULL;
+ 
++
++// Higher priority first (an add-on may export "int32 gl_renderer_priority";
++// without it, 0), then by name. A stable sort keeps the user folders before
++// the system ones for add-ons of the same name.
++static bool
++compare_renderers(const renderer_item& a, const renderer_item& b)
++{
++	if (a.priority != b.priority)
++		return a.priority > b.priority;
++	return strcmp(a.ref.name != NULL ? a.ref.name : "",
++		b.ref.name != NULL ? b.ref.name : "") < 0;
++}
++
++
+ GLRendererRoster *GLRendererRoster::Roster()
+ {
+ 	if (fInstance == NULL) {
+@@ -100,7 +115,9 @@
+ 		renderer_item item = *iterator;
+ 		BGLRenderer* renderer;
+ 		renderer = item.entry(view, options);
+-		return renderer;
++		// an add-on without its device (or switched off) declines
++		if (renderer != NULL)
++			return renderer;
+ 	}
+ 	return NULL;
+ }
+@@ -124,6 +141,8 @@
+ 		if (status == B_OK && path.Append("opengl") == B_OK)
+ 			AddPath(path.Path());
+ 	}
++
++	std::stable_sort(fRenderers.begin(), fRenderers.end(), compare_renderers);
+ }
+ 
+ 
+@@ -175,12 +194,13 @@
+ 
+ status_t
+ GLRendererRoster::AddRenderer(InstantiateRenderer entry,
+-	image_id image, const entry_ref* ref, ino_t node)
++	image_id image, const entry_ref* ref, ino_t node, int32 priority)
+ {
+ 	renderer_item item;
+ 	item.entry = entry;
+ 	item.image = image;
+ 	item.node = node;
++	item.priority = priority;
+ 	if (ref != NULL)
+ 		item.ref = *ref;
+ 
+@@ -218,7 +238,13 @@
+ 	);
+ 
+ 	if (status == B_OK) {
+-		if ((status = AddRenderer(instantiate_renderer, image, &ref, nodeRef.node)) != B_OK) {
++		int32* priority;
++		if (get_image_symbol(image, "gl_renderer_priority",
++				B_SYMBOL_TYPE_DATA, (void**)&priority) != B_OK) {
++			priority = NULL;
++		}
++		if ((status = AddRenderer(instantiate_renderer, image, &ref, nodeRef.node,
++				priority != NULL ? *priority : 0)) != B_OK) {
+ 			unload_add_on(image);
+ 			return status;
+ 		}

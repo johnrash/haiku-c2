@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 5 Nov 2026 00:48:21 -0500
+Subject: [PATCH 303/342] freebsd_network: m_free() deletes the tags of all
+ packet headers
+
+FreeBSD's mbuf zone destructor deletes an mbuf's tags, so m_free() itself
+only does it for M_NOFREE ones, which never reach the zone. There's no such
+destructor here, so all the other tags stayed allocated.
+
+net80211 tags each received frame with its receive parameters: about 42 MB
+per GB downloaded, and a board at full Wi-Fi load ran out of memory in 74
+minutes. KDL showed 7 million of them in the 256 byte block allocator.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/libs/compat/freebsd_network/mbuf.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/libs/compat/freebsd_network/mbuf.c b/src/libs/compat/freebsd_network/mbuf.c
+index c0d9ae2bfd..bd2dc432d0 100644
+--- a/src/libs/compat/freebsd_network/mbuf.c
++++ b/src/libs/compat/freebsd_network/mbuf.c
+@@ -309,7 +309,9 @@ m_free(struct mbuf* memoryBuffer)
+ {
+ 	struct mbuf* next = memoryBuffer->m_next;
+ 
+-	if ((memoryBuffer->m_flags & (M_PKTHDR|M_NOFREE)) == (M_PKTHDR|M_NOFREE))
++	// FreeBSD's mbuf zone does this for all but the M_NOFREE ones when they're
++	// freed; there's no such zone here, and a wireless driver tags each frame.
++	if ((memoryBuffer->m_flags & M_PKTHDR) != 0)
+ 		m_tag_delete_chain(memoryBuffer, NULL);
+ 	if (memoryBuffer->m_flags & M_EXT)
+ 		mb_free_ext(memoryBuffer);

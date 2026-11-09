@@ -1,0 +1,21 @@
+name			lcdshield
+version			1.5-2
+architecture	arm64
+summary			"A demo of Hardkernel's 16x2 LCD + IO Shield"
+description		"LCD Shield shows pages on the 16x2 LCD + IO Shield's display (the clock, the CPU with a bar graph, Blinken: a bar for each core, memory, the network, a Weather Board 2 on I2C B, a message of your own); the shield's SW1 turns the pages and SW2 changes what its seven LEDs show (CPU load, a scanner, set by hand); temperatures in Celsius or Fahrenheit, the clock in 24 hours or with AM/PM. Its window mirrors the shield, its display drawn in 5x8 dots like the module's, and its dragger puts all of it, the panel and its controls, on the Desktop as a replicant that runs the shield from Tracker. Needs meson_gpio's shield devices: lcd_io_shield true in ~/config/settings/kernel/drivers/meson_gpio. Private build for the ODROID-C2 port; see apps/LCDShield in the project."
+packager		"haiku-odroid-c2 port"
+vendor			"haiku-odroid-c2 port"
+copyrights		{
+	"2026 haiku-odroid-c2 port authors"
+}
+licenses		{
+	"MIT"
+}
+provides {
+	lcdshield = 1.5
+	app:LCD_Shield = 1.5
+}
+requires {
+	haiku >= r1~beta6
+	lib:libstdc++
+}

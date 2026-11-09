@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 16:55:30 -0400
+Subject: [PATCH 061/342] debugger: arm64 unwinding no longer crashes on the
+ vector registers
+
+ArchitectureARM64::InitRegisterRules() set "same value" rules for DWARF
+registers 64-95 (v0-v31), but the unwinder's context has only as many
+rules as the architecture has registers (70). RegisterRule() returned
+NULL for the rest, so the Debugger crashed as soon as it unwound through
+a frame with call frame information: every crash report on arm64 ended
+with the Debugger itself crashing, and with debug_server set to save
+reports, each crashed Debugger started another one.
+
+Tested on the ODROID-C2 with tools/probes/crashtest.cpp (debugger() in a
+BLooper's MessageReceived): a complete report with the stack trace
+through libbe.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kits/debugger/arch/arm64/ArchitectureARM64.cpp | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/src/kits/debugger/arch/arm64/ArchitectureARM64.cpp b/src/kits/debugger/arch/arm64/ArchitectureARM64.cpp
+index 40b6826c27..106ec26cc9 100644
+--- a/src/kits/debugger/arch/arm64/ArchitectureARM64.cpp
++++ b/src/kits/debugger/arch/arm64/ArchitectureARM64.cpp
+@@ -595,9 +595,13 @@ ArchitectureARM64::InitRegisterRules(CfaContext& context) const
+ 
+ 	// The base class only sets up DWARF registers below our register count;
+ 	// the vector registers are 64-95. GCC assumes "same value" for them, as
+-	// for the others.
+-	for (int32 i = 0; i < 32; i++)
+-		context.RegisterRule(kDwarfV0 + i)->SetToSameValue();
++	// for the others. The unwinder's context has as many rules as we have
++	// registers (70), so the upper vector registers have none: their CFI
++	// instructions are skipped (callee-saved d8-d15 are 72-79).
++	for (int32 i = 0; i < 32; i++) {
++		if (CfaRule* rule = context.RegisterRule(kDwarfV0 + i))
++			rule->SetToSameValue();
++	}
+ 
+ 	return B_OK;
+ }

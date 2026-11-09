@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 6 Nov 2026 23:03:42 -0500
+Subject: [PATCH 330/342] usb: print an invalid descriptor's length and
+ configuration the right way round
+
+"invalid descriptor length 0 in configuration 255" meant configuration 0
+and a length of 255: the arguments were swapped.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/bus_managers/usb/Device.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/bus_managers/usb/Device.cpp b/src/add-ons/kernel/bus_managers/usb/Device.cpp
+index fb4f8270f2..6b79e4b96c 100644
+--- a/src/add-ons/kernel/bus_managers/usb/Device.cpp
++++ b/src/add-ons/kernel/bus_managers/usb/Device.cpp
+@@ -185,7 +185,7 @@ Device::Device(Object* parent, int8 hubAddress, uint8 hubPort,
+ 			if (descriptorLength < 2 || descriptorStart + descriptorLength > actualLength) {
+ 				TRACE_ERROR("invalid descriptor length %" B_PRIu8 " in configuration %" B_PRId32
+ 					", ignoring!\n",
+-					i, descriptorLength);
++					descriptorLength, i);
+ 				break;
+ 			}
+ 

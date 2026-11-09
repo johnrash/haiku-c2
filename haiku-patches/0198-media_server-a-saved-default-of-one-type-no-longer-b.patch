@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 02:01:42 -0500
+Subject: [PATCH 198/342] media_server: a saved default of one type no longer
+ blocks the others (M45)
+
+DefaultManager::_FindPhysical() looked for the saved default of the type it
+searches, but left msg pointing at the last saved one when none matched.
+With only the audio output saved (HDMI), the video input, video output and
+audio input were then compared with uninitialized data and none was ever
+chosen: CodyCam found no video source although the C920's node was live.
+
+usb_webcam: VideoProducer's destructor calls BMediaEventLooper::Quit()
+first, as BMediaEventLooper asks.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp | 3 +++
+ src/servers/media/DefaultManager.cpp                    | 7 +++++--
+ 2 files changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp b/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
+index 606e2b84fa..bdee00917f 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
+@@ -94,6 +94,9 @@ VideoProducer::VideoProducer(
+ 
+ VideoProducer::~VideoProducer()
+ {
++	// no more events while the node comes apart
++	BMediaEventLooper::Quit();
++
+ 	if (fInitStatus == B_OK) {
+ 		/* Clean up after ourselves, in case the application didn't make us
+ 		 * do so. */
+diff --git a/src/servers/media/DefaultManager.cpp b/src/servers/media/DefaultManager.cpp
+index 4132382691..7604c45b61 100644
+--- a/src/servers/media/DefaultManager.cpp
++++ b/src/servers/media/DefaultManager.cpp
+@@ -449,10 +449,13 @@ DefaultManager::_FindPhysical(volatile media_node_id *id, uint32 default_type,
+ 		|| (type == B_MEDIA_ENCODED_AUDIO);
+ 
+ 	for (int32 i = 0; i < fMsgList.CountItems(); i++) {
+-		msg = (BMessage *)fMsgList.ItemAt(i);
++		BMessage* item = (BMessage *)fMsgList.ItemAt(i);
+ 		int32 msgType;
+-		if (msg->FindInt32(kDefaultManagerType, &msgType) == B_OK
++		if (item->FindInt32(kDefaultManagerType, &msgType) == B_OK
+ 			&& ((uint32)msgType == default_type)) {
++			// only a saved default of this type limits the choice; with
++			// none, any physical node will do
++			msg = item;
+ 			const char *name = NULL;
+ 			const char *path = NULL;
+ 			msg->FindInt32(kDefaultManagerAddon, &msgDninfo.addon);

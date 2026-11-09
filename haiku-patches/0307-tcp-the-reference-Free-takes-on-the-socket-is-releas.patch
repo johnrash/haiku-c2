@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 5 Nov 2026 12:28:42 -0500
+Subject: [PATCH 307/342] tcp: the reference Free() takes on the socket is
+ released once
+
+SegmentReceived() and the time wait timer each release it when they find it's
+time, with no record of it having gone. A reset arriving just after the timer
+had dropped the lock released it twice. And if the timer had set
+FLAG_DELETE_ON_CLOSE before Free(), which then took no reference, a segment
+released one that was never taken.
+
+Found by reading the code; neither was seen happening. tcpchurn with the server
+closing normally, with and without the client resetting, runs through both
+paths: 1.06 million connections, no panic.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/network/protocols/tcp/TCPEndpoint.cpp  | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp b/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+index 5961b9ec31..7a6ed8b3de 100644
+--- a/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
++++ b/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+@@ -325,7 +325,8 @@ enum {
+ 	FLAG_AUTO_RECEIVE_BUFFER_SIZE = 0x100,
+ 	FLAG_CAN_NOTIFY 			= 0x200,
+ 	FLAG_USER_CLOSED			= 0x400,
+-	FLAG_DESTROYED				= 0x800
++	FLAG_DESTROYED				= 0x800,
++	FLAG_SOCKET_RETAINED		= 0x1000
+ };
+ 
+ 
+@@ -594,6 +595,7 @@ TCPEndpoint::Free()
+ 	if ((fFlags & FLAG_DELETE_ON_CLOSE) == 0) {
+ 		// we'll be freed later when the 2MSL timer expires
+ 		gSocketModule->acquire_socket(socket);
++		fFlags |= FLAG_SOCKET_RETAINED;
+ 
+ 		// we are only interested in the timer, not in changing state
+ 		_EnterTimeWait();
+@@ -2041,8 +2043,11 @@ TCPEndpoint::SegmentReceived(tcp_segment_header& segment, net_buffer* buffer)
+ 		segmentAction &= ~RESET;
+ 	}
+ 
+-	if ((fFlags & (FLAG_CLOSED | FLAG_DELETE_ON_CLOSE))
+-			== (FLAG_CLOSED | FLAG_DELETE_ON_CLOSE)) {
++	// The reference Free() took goes once: this and the time wait timer can
++	// both find it's time, and without Free() having taken one, there's none.
++	if ((fFlags & (FLAG_CLOSED | FLAG_DELETE_ON_CLOSE | FLAG_SOCKET_RETAINED))
++			== (FLAG_CLOSED | FLAG_DELETE_ON_CLOSE | FLAG_SOCKET_RETAINED)) {
++		fFlags &= ~FLAG_SOCKET_RETAINED;
+ 
+ 		locker.Unlock();
+ 		if (gSocketModule->release_socket(socket))
+@@ -2730,6 +2735,10 @@ TCPEndpoint::_TimeWaitTimer(net_timer* timer, void* _endpoint)
+ 		return;
+ 	}
+ 
++	if ((endpoint->fFlags & FLAG_SOCKET_RETAINED) == 0)
++		return;
++	endpoint->fFlags &= ~FLAG_SOCKET_RETAINED;
++
+ 	locker.Unlock();
+ 
+ 	gSocketModule->release_socket(endpoint->socket);

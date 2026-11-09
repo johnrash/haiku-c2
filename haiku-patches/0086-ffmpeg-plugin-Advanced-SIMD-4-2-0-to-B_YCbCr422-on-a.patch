@@ -1,0 +1,165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 08:55:29 -0400
+Subject: [PATCH 086/342] ffmpeg plugin: Advanced SIMD 4:2:0 to B_YCbCr422 on
+ arm64
+
+Video for overlays that can't show B_RGB32 (the Amlogic VPU's video
+layer) is decoded to B_YCbCr422. For planar 4:2:0 that went through
+swscale's yv12toyuy2(), which is C on arm64: 5.6 ms a 1920x1080 frame on
+the ODROID-C2. gfx_conv_yuv420p_ycbcr422_neon() does the same 32 pixels
+at a time: the same bytes (identical hashes for 90 frames of H.264, HEVC,
+VP9 and AV1), 2.3-3 ms less per 1080p frame, and MediaPlayer's frame
+generator thread went from 28% to 18-23% of a core.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../media/plugins/ffmpeg/AVCodecDecoder.cpp   | 21 ++++++++
+ src/add-ons/media/plugins/ffmpeg/Jamfile      |  4 ++
+ .../media/plugins/ffmpeg/gfx_conv_neon.c      | 51 +++++++++++++++++++
+ .../media/plugins/ffmpeg/gfx_conv_neon.h      | 24 +++++++++
+ 4 files changed, 100 insertions(+)
+ create mode 100644 src/add-ons/media/plugins/ffmpeg/gfx_conv_neon.c
+ create mode 100644 src/add-ons/media/plugins/ffmpeg/gfx_conv_neon.h
+
+diff --git a/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.cpp b/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.cpp
+index af9dd2da68..b1c57d899f 100644
+--- a/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.cpp
++++ b/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.cpp
+@@ -26,6 +26,9 @@
+ #include <String.h>
+ 
+ #include "Utilities.h"
++#if defined(__aarch64__)
++#	include "gfx_conv_neon.h"
++#endif
+ 
+ 
+ static const int kMinimumVideoThreads = 8;
+@@ -1709,6 +1712,24 @@ AVCodecDecoder::_DeinterlaceAndColorConvertVideoFrame()
+ 	fPostProcessedDecodedPicture->linesize[0]
+ 		= fHeader.u.raw_video.bytes_per_row;
+ 
++#if defined(__aarch64__)
++	if (fOutputColorSpace == B_YCbCr422
++		&& fCodecContext->pix_fmt == AV_PIX_FMT_YUV420P) {
++		// swscale does this in C on arm64
++		if (useDeinterlacedPicture) {
++			AVFrame deinterlacedFrame;
++			for (int i = 0; i < 4; i++) {
++				deinterlacedFrame.data[i] = deinterlacedPicture.data[i];
++				deinterlacedFrame.linesize[i] = deinterlacedPicture.linesize[i];
++			}
++			gfx_conv_yuv420p_ycbcr422_neon(&deinterlacedFrame,
++				fPostProcessedDecodedPicture, displayWidth, displayHeight);
++		} else {
++			gfx_conv_yuv420p_ycbcr422_neon(fRawDecodedPicture,
++				fPostProcessedDecodedPicture, displayWidth, displayHeight);
++		}
++	} else
++#endif
+ #if USE_SWS_FOR_COLOR_SPACE_CONVERSION
+ 	if (fSwsContext != NULL) {
+ #else
+diff --git a/src/add-ons/media/plugins/ffmpeg/Jamfile b/src/add-ons/media/plugins/ffmpeg/Jamfile
+index 6d1e79902b..7f4d927e6a 100644
+--- a/src/add-ons/media/plugins/ffmpeg/Jamfile
++++ b/src/add-ons/media/plugins/ffmpeg/Jamfile
+@@ -22,6 +22,10 @@ local sources =
+ 	gfx_util.cpp
+ 	;
+ 
++if $(TARGET_ARCH) = arm64 {
++	sources += gfx_conv_neon.c ;
++}
++
+ #if $(TARGET_ARCH) != x86_64 {
+ #	sources +=
+ #		gfx_conv_mmx.cpp
+diff --git a/src/add-ons/media/plugins/ffmpeg/gfx_conv_neon.c b/src/add-ons/media/plugins/ffmpeg/gfx_conv_neon.c
+new file mode 100644
+index 0000000000..5beea4f9b0
+--- /dev/null
++++ b/src/add-ons/media/plugins/ffmpeg/gfx_conv_neon.c
+@@ -0,0 +1,51 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "gfx_conv_neon.h"
++
++// The build includes GCC's headers like its own, with -Werror.
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wsign-compare"
++#pragma GCC diagnostic ignored "-Wmissing-braces"
++#include <arm_neon.h>
++#pragma GCC diagnostic pop
++
++
++/*!	Planar 4:2:0 (AV_PIX_FMT_YUV420P) to packed 4:2:2 Y0 Cb Y1 Cr
++	(B_YCbCr422), what overlays that can't show B_RGB32 take. Each chroma row
++	serves two rows, as in swscale's yv12toyuy2(), which does this in C on
++	arm64 (5.6 ms for a 1920x1080 frame on the ODROID-C2): the same bytes, 32
++	pixels at a time. Like swscale, an odd width's last column is left out.
++*/
++void
++gfx_conv_yuv420p_ycbcr422_neon(AVFrame* in, AVFrame* out, int width,
++	int height)
++{
++	int y;
++	for (y = 0; y < height; y++) {
++		const uint8_t* luma = in->data[0] + (size_t)y * in->linesize[0];
++		const uint8_t* cb = in->data[1] + (size_t)(y / 2) * in->linesize[1];
++		const uint8_t* cr = in->data[2] + (size_t)(y / 2) * in->linesize[2];
++		uint8_t* pixel = out->data[0] + (size_t)y * out->linesize[0];
++
++		int x = 0;
++		for (; x + 32 <= width; x += 32) {
++			uint8x16x2_t lumaPairs = vld2q_u8(luma + x);
++			uint8x16x4_t packed;
++			packed.val[0] = lumaPairs.val[0];
++			packed.val[1] = vld1q_u8(cb + x / 2);
++			packed.val[2] = lumaPairs.val[1];
++			packed.val[3] = vld1q_u8(cr + x / 2);
++			vst4q_u8(pixel + 2 * x, packed);
++		}
++		for (; x + 1 < width; x += 2) {
++			pixel[2 * x] = luma[x];
++			pixel[2 * x + 1] = cb[x / 2];
++			pixel[2 * x + 2] = luma[x + 1];
++			pixel[2 * x + 3] = cr[x / 2];
++		}
++	}
++}
+diff --git a/src/add-ons/media/plugins/ffmpeg/gfx_conv_neon.h b/src/add-ons/media/plugins/ffmpeg/gfx_conv_neon.h
+new file mode 100644
+index 0000000000..4b913a5cd6
+--- /dev/null
++++ b/src/add-ons/media/plugins/ffmpeg/gfx_conv_neon.h
+@@ -0,0 +1,24 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef GFX_CONV_NEON_H
++#define GFX_CONV_NEON_H
++
++
++#include "avcodec.h"
++
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++void gfx_conv_yuv420p_ycbcr422_neon(AVFrame* in, AVFrame* out, int width,
++	int height);
++
++#ifdef __cplusplus
++}
++#endif
++
++
++#endif	// GFX_CONV_NEON_H

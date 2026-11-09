@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 19:46:31 -0400
+Subject: [PATCH 072/342] MediaPlayer: go back to the frame after switching the
+ decoded format
+
+MediaTrackVideoSupplier::SwitchFormat(), which the Controller uses to
+have the video decoded to B_YCbCr422 for overlays that need it (since
+35c1a61529), makes the decoder negotiate again. The ffmpeg plugin then
+reopens the codec and decodes a frame to settle the format, from where
+the track is: after the packets the old format's first frame took. A
+codec started there throws away everything up to the next keyframe, and
+playback began at that keyframe. With B-frames that is often the next
+IDR frame, 8.3 s into a file x264 made: the picture ran 8.3 s ahead of
+the sound, and stood still at the end until the sound caught up. Without
+B-frames it was the next scene cut, typically a second or so.
+
+SwitchFormat() now seeks the track back to the frame it was at (frame 0
+before playback); the plugin's SeekedTo() flushes the codec and drops the
+frame decoded for the negotiation.
+
+Measured on the ODROID-C2 with the HDMI capture, a clip with a flash and
+a beep at irregular times: sound 8.32-8.34 s after the picture before,
+-7..+19 ms after (the capture path itself shows sound 50-150 ms early).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../supplier/MediaTrackVideoSupplier.cpp      | 23 +++++++++++++++++++
+ .../supplier/MediaTrackVideoSupplier.h        |  4 +---
+ 2 files changed, 24 insertions(+), 3 deletions(-)
+
+diff --git a/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.cpp b/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.cpp
+index 96931a158c..473e17fa4f 100644
+--- a/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.cpp
++++ b/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.cpp
+@@ -286,6 +286,29 @@ MediaTrackVideoSupplier::BytesPerRow() const
+ // #pragma mark -
+ 
+ 
++status_t
++MediaTrackVideoSupplier::SwitchFormat(color_space format, uint32 bytesPerRow)
++{
++	status_t status = _SwitchFormat(format, bytesPerRow);
++	if (status != B_OK)
++		return status;
++
++	// To settle the new format, the decoder decodes a frame, from where the
++	// track is: after the packets it took for the old format's first frame.
++	// A codec started over there throws away everything up to the next
++	// keyframe (with B-frames often the next IDR frame, seconds later), and
++	// playback then started there: the picture ran that far ahead of the
++	// sound, and stood still at the end until the sound caught up. Go back.
++	int64 frame = fCurrentFrame;
++	if (fVideoTrack->SeekToFrame(&frame, B_MEDIA_SEEK_CLOSEST_BACKWARD)
++			== B_OK) {
++		fCurrentFrame = fVideoTrack->CurrentFrame();
++		fPerformanceTime = fVideoTrack->CurrentTime();
++	}
++	return B_OK;
++}
++
++
+ status_t
+ MediaTrackVideoSupplier::_SwitchFormat(color_space format, uint32 bytesPerRow)
+ {
+diff --git a/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.h b/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.h
+index 299fabd1f0..1f85756551 100644
+--- a/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.h
++++ b/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.h
+@@ -44,9 +44,7 @@ class MediaTrackVideoSupplier : public VideoTrackSupplier {
+ 	virtual	uint32				BytesPerRow() const;
+ 
+ 	virtual	status_t			SwitchFormat(color_space format,
+-									uint32 bytesPerRow)
+-									{ return _SwitchFormat(format,
+-										bytesPerRow); }
++									uint32 bytesPerRow);
+ 
+ 	virtual	int32				TrackIndex() const
+ 									{ return fTrackIndex; }

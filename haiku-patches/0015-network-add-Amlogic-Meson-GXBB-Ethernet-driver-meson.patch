@@ -1,0 +1,1238 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 02:22:28 -0400
+Subject: [PATCH 015/342] network: add Amlogic Meson GXBB Ethernet driver
+ (meson_dwmac)
+
+Device-manager driver for the DesignWare GMAC 3.70a of the S905
+(ODROID-C2), attached through the device tree ("amlogic,meson-gxbb-dwmac"),
+published as net/meson_dwmac/0:
+
+- relies on the firmware for clocks, pin muxing, power domain, the
+  Amlogic PRG_ETH0 glue (RGMII, 2 ns TX delay) and PHY reset; resets and
+  programs the MAC/DMA side only
+- 64+64 chained "normal" descriptors, each in its own cache line, 2 KB
+  copy buffers; explicit cache maintenance (the DMA does not snoop)
+- read/write hooks, DMA interrupts wake readers/writers; the handler
+  clears until nothing is pending and also claims the MAC/MMC/PMT summary
+  bits, and all sources are masked before it is installed (an unclaimed
+  interrupt had made the kernel disable the IRQ)
+- RTL8211F link polled over MDIO once a second (speed, duplex)
+- pass-all-multicast filter, promiscuous mode, link state reporting
+
+Tested on the ODROID-C2: DHCP, 1000 Mbit/s full duplex, ping both ways
+(~1.3 ms), 2 x 10000-packet flood pings without loss, 100 MB FTP round
+trip with matching sha256 (30.5 MB/s up incl. eMMC write, 18.8 MB/s down).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/jam/packages/Haiku                      |    1 +
+ .../kernel/drivers/network/ether/Jamfile      |    1 +
+ .../drivers/network/ether/meson_dwmac/Jamfile |   10 +
+ .../network/ether/meson_dwmac/meson_dwmac.cpp | 1156 +++++++++++++++++
+ 4 files changed, 1168 insertions(+)
+ create mode 100644 src/add-ons/kernel/drivers/network/ether/meson_dwmac/Jamfile
+ create mode 100644 src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
+
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index 5e0ae56310..42ccd4bc46 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -145,6 +145,7 @@ AddNewDriversToPackage sensor
+ AddNewDriversToPackage network :
+ 	usb_ecm
+ 	virtio_net
++	meson_dwmac@arm64
+ 	;
+ AddNewDriversToPackage input :
+ 	hyperv_hid@x86,x86_64
+diff --git a/src/add-ons/kernel/drivers/network/ether/Jamfile b/src/add-ons/kernel/drivers/network/ether/Jamfile
+index 61cb733534..f5d776832f 100644
+--- a/src/add-ons/kernel/drivers/network/ether/Jamfile
++++ b/src/add-ons/kernel/drivers/network/ether/Jamfile
+@@ -2,6 +2,7 @@ SubDir HAIKU_TOP src add-ons kernel drivers network ether ;
+ 
+ # Haiku-native drivers
+ HaikuSubInclude etherpci ;
++HaikuSubInclude meson_dwmac ;
+ HaikuSubInclude virtio ;
+ HaikuSubInclude usb_davicom ;
+ HaikuSubInclude usb_ecm ;
+diff --git a/src/add-ons/kernel/drivers/network/ether/meson_dwmac/Jamfile b/src/add-ons/kernel/drivers/network/ether/meson_dwmac/Jamfile
+new file mode 100644
+index 0000000000..a742076ef7
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/network/ether/meson_dwmac/Jamfile
+@@ -0,0 +1,10 @@
++SubDir HAIKU_TOP src add-ons kernel drivers network ether meson_dwmac ;
++
++UsePrivateKernelHeaders ;
++UsePrivateHeaders drivers net ;
++
++if $(TARGET_ARCH) = arm64 {
++	KernelAddon meson_dwmac :
++		meson_dwmac.cpp
++	;
++}
+diff --git a/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp b/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
+new file mode 100644
+index 0000000000..84de96406d
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
+@@ -0,0 +1,1156 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * Ethernet for the Amlogic Meson GXBB (S905, ODROID-C2): Synopsys
++ * DesignWare GMAC 3.70a ("snps,dwmac") with "normal" DMA descriptors and an
++ * RGMII PHY (RTL8211F) reached over MDIO.
++ *
++ * The register model follows the DesignWare GMAC as used by NetBSD's
++ * dwc_gmac.c and meson_dwmac.c (BSD-2-Clause) and FreeBSD's dwc1000 code
++ * (BSD-2-Clause); no code was taken from them.
++ *
++ * Design:
++ * - the firmware (U-Boot, which uses this interface for TFTP) has set up
++ *   clocks, pin muxing, the Ethernet power domain, the Amlogic PRG_ETH0
++ *   glue register (RGMII, TX delay) and the PHY; we reset and program only
++ *   the MAC/DMA side;
++ * - one RX and one TX ring of chained descriptors, each descriptor alone in
++ *   a 64-byte cache line, with 2 KB copy buffers: the DMA engine does not
++ *   snoop the CPU caches, so every hand-over is a cache clean or invalidate;
++ * - read()/write() hooks copy one frame each; DMA interrupts wake readers
++ *   and writers;
++ * - the link is polled over MDIO once a second.
++ */
++
++
++#include <algorithm>
++#include <new>
++#include <stdio.h>
++#include <string.h>
++
++#include <ByteOrder.h>
++#include <KernelExport.h>
++#include <device_manager.h>
++#include <drivers/bus/FDT.h>
++#include <net/if_media.h>
++
++#include <AutoDeleterDrivers.h>
++#include <arch/arm64/arch_kernel.h>
++#include <condition_variable.h>
++#include <ether_driver.h>
++#include <lock.h>
++#include <util/AutoLock.h>
++
++
++#define DRIVER_MODULE_NAME	"drivers/network/meson_dwmac/driver_v1"
++#define DEVICE_MODULE_NAME	"drivers/network/meson_dwmac/device_v1"
++
++#define INFO(x...)			dprintf("meson_dwmac: " x)
++#define ERROR(x...)			dprintf("meson_dwmac: " x)
++
++
++// MAC registers
++enum {
++	kMacConfiguration	= 0x0000,
++	kMacFrameFilter		= 0x0004,
++	kMacMdioAddress		= 0x0010,
++	kMacMdioData		= 0x0014,
++	kMacVersion			= 0x0020,
++	kMacPmtControl		= 0x002c,
++	kMacInterruptStatus	= 0x0038,
++	kMacInterruptMask	= 0x003c,
++	kMacAddressHigh		= 0x0040,
++	kMacAddressLow		= 0x0044,
++	kMacRgmiiStatus		= 0x00d8,
++	kMmcRxInterrupt		= 0x0104,
++	kMmcTxInterrupt		= 0x0108,
++	kMmcRxInterruptMask	= 0x010c,
++	kMmcTxInterruptMask	= 0x0110,
++	kMmcIpcRxInterruptMask = 0x0200,
++	kMmcIpcRxInterrupt	= 0x0208,
++};
++
++// DMA registers
++enum {
++	kDmaBusMode			= 0x1000,
++	kDmaTxPollDemand	= 0x1004,
++	kDmaRxPollDemand	= 0x1008,
++	kDmaRxDescList		= 0x100c,
++	kDmaTxDescList		= 0x1010,
++	kDmaStatus			= 0x1014,
++	kDmaOperationMode	= 0x1018,
++	kDmaInterruptEnable	= 0x101c,
++	kDmaMissedFrames	= 0x1020,
++	kDmaHwFeature		= 0x1058,
++};
++
++#define MAC_CONFIG_RE			(1 << 2)
++#define MAC_CONFIG_TE			(1 << 3)
++#define MAC_CONFIG_DM			(1 << 11)	// full duplex
++#define MAC_CONFIG_FES			(1 << 14)	// 100 Mbps (with PS)
++#define MAC_CONFIG_PS			(1 << 15)	// 10/100 port select
++#define MAC_CONFIG_SPEED_MASK	(MAC_CONFIG_FES | MAC_CONFIG_PS)
++
++#define FRAME_FILTER_PR			(1 << 0)	// promiscuous
++#define FRAME_FILTER_PM			(1 << 4)	// pass all multicast
++
++#define MDIO_BUSY				(1 << 0)
++#define MDIO_WRITE				(1 << 1)
++#define MDIO_CLOCK_SHIFT		2
++#define MDIO_CLOCK_MASK			(0xf << MDIO_CLOCK_SHIFT)
++#define MDIO_REGISTER_SHIFT		6
++#define MDIO_PHY_SHIFT			11
++
++#define BUS_MODE_SOFT_RESET		(1 << 0)
++#define BUS_MODE_PBL_SHIFT		8
++
++#define DMA_STATUS_TI			(1 << 0)
++#define DMA_STATUS_RI			(1 << 6)
++#define DMA_STATUS_RU			(1 << 7)
++#define DMA_STATUS_FBI			(1 << 13)
++#define DMA_STATUS_AIS			(1 << 15)
++#define DMA_STATUS_NIS			(1 << 16)
++#define DMA_STATUS_CLEAR_MASK	0x1ffff
++#define DMA_STATUS_GLI			(1 << 26)	// MAC line interface (RGMII)
++#define DMA_STATUS_GMI			(1 << 27)	// MMC counters
++#define DMA_STATUS_GPI			(1 << 28)	// power management
++#define DMA_STATUS_SUMMARY_MASK	(DMA_STATUS_GLI | DMA_STATUS_GMI \
++	| DMA_STATUS_GPI)
++
++#define OPERATION_SR			(1 << 1)	// start receive
++#define OPERATION_ST			(1 << 13)	// start transmit
++#define OPERATION_TSF			(1 << 21)	// TX store and forward
++#define OPERATION_RSF			(1 << 25)	// RX store and forward
++
++#define INTERRUPT_TIE			(1 << 0)
++#define INTERRUPT_RIE			(1 << 6)
++#define INTERRUPT_RUE			(1 << 7)
++#define INTERRUPT_FBE			(1 << 13)
++#define INTERRUPT_AIE			(1 << 15)
++#define INTERRUPT_NIE			(1 << 16)
++
++// "normal" descriptors
++#define DESC_OWN				(1u << 31)
++#define RX_STATUS_FRAME_LENGTH_SHIFT 16
++#define RX_STATUS_FRAME_LENGTH_MASK 0x3fff
++#define RX_STATUS_ERROR			(1 << 15)
++#define RX_STATUS_FIRST			(1 << 9)
++#define RX_STATUS_LAST			(1 << 8)
++#define RX_CONTROL_CHAINED		(1 << 24)
++#define TX_CONTROL_INTERRUPT	(1u << 31)
++#define TX_CONTROL_LAST			(1 << 30)
++#define TX_CONTROL_FIRST		(1 << 29)
++#define TX_CONTROL_CHAINED		(1 << 24)
++#define DESC_BUFFER_SIZE_MASK	0x7ff
++
++// PHY (IEEE 802.3 clause 22, plus RTL8211F extras)
++#define PHY_BMSR				1
++#define PHY_ID1					2
++#define PHY_ID2					3
++#define PHY_BMSR_LINK			(1 << 2)
++#define RTL8211F_PAGE_SELECT	0x1f
++#define RTL8211F_PHYSR_PAGE		0xa43
++#define RTL8211F_PHYSR			0x1a
++#define RTL8211F_PHYSR_DUPLEX	(1 << 3)
++#define RTL8211F_PHYSR_SPEED_SHIFT 4
++
++static const uint32 kRxCount = 64;
++static const uint32 kTxCount = 64;
++static const uint32 kDescriptorStride = 64;		// one per cache line
++static const uint32 kBufferSize = 2048;
++static const uint32 kRxBufferLength = 1536;
++static const uint32 kMaxFrameSize = 1514;		// without the FCS
++static const uint32 kFcsLength = 4;
++
++// Amlogic PRG_ETH0, only logged: the firmware set it up
++static const phys_addr_t kPeriphsPage = 0xc8834000;
++static const uint32 kPrgEth0Offset = 0x540;
++
++
++static device_manager_info* gDeviceManager;
++
++
++struct descriptor {
++	uint32	status;
++	uint32	control;
++	uint32	buffer;
++	uint32	next;
++};
++
++
++static void
++dcache_maintain(phys_addr_t physical, size_t length, bool invalidate)
++{
++	// all RAM is mapped at KERNEL_PMAP_BASE as normal write-back memory
++	uint64 ctr;
++	asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
++	const addr_t lineSize = 4 << ((ctr >> 16) & 0xf);
++
++	addr_t start = (KERNEL_PMAP_BASE + physical) & ~(lineSize - 1);
++	addr_t end = KERNEL_PMAP_BASE + physical + length;
++	for (addr_t address = start; address < end; address += lineSize) {
++		if (invalidate)
++			asm volatile("dc civac, %0" : : "r"(address) : "memory");
++		else
++			asm volatile("dc cvac, %0" : : "r"(address) : "memory");
++	}
++	asm volatile("dsb sy" : : : "memory");
++}
++
++
++class MesonDwmac {
++public:
++								MesonDwmac(device_node* node);
++								~MesonDwmac();
++
++			status_t			Init(phys_addr_t registers, size_t length,
++									int32 irq, const uint8* dtMacAddress);
++
++			status_t			Open();
++			void				Close();
++
++			status_t			Read(void* buffer, size_t* _length);
++			status_t			Write(const void* buffer, size_t* _length);
++			status_t			Control(uint32 op, void* buffer, size_t length);
++
++			device_node*		Node() const { return fNode; }
++
++private:
++			uint32				_Read(uint32 offset)
++									{ return fRegisters[offset / 4]; }
++			void				_Write(uint32 offset, uint32 value)
++									{ fRegisters[offset / 4] = value; }
++
++			status_t			_AllocateRings();
++			void				_InitRings();
++			status_t			_ResetDma();
++			void				_Start();
++			void				_Stop();
++
++			volatile descriptor* _RxDescriptor(uint32 index)
++									{ return (volatile descriptor*)
++										((uint8*)fDescriptors
++											+ index * kDescriptorStride); }
++			volatile descriptor* _TxDescriptor(uint32 index)
++									{ return _RxDescriptor(kRxCount + index); }
++			phys_addr_t			_DescriptorPhysical(uint32 slot)
++									{ return fDescriptorsPhysical
++										+ slot * kDescriptorStride; }
++			phys_addr_t			_BufferPhysical(uint32 slot)
++									{ return fBuffersPhysical
++										+ slot * kBufferSize; }
++			uint8*				_Buffer(uint32 slot)
++									{ return (uint8*)fBuffers
++										+ slot * kBufferSize; }
++			void				_SyncDescriptor(uint32 slot, bool invalidate)
++									{ dcache_maintain(_DescriptorPhysical(slot),
++										sizeof(descriptor), invalidate); }
++
++			status_t			_MdioRead(uint32 reg, uint16* value);
++			status_t			_MdioWrite(uint32 reg, uint16 value);
++			void				_UpdateLink();
++			void				_ClearSummaryInterrupts();
++	static	status_t			_LinkThread(void* data);
++	static	int32				_InterruptHandler(void* data);
++
++private:
++			device_node*		fNode;
++			area_id				fRegisterArea;
++			volatile uint32*	fRegisters;
++			int32				fIrq;
++			bool				fInterruptInstalled;
++
++			area_id				fDescriptorArea;
++			void*				fDescriptors;
++			phys_addr_t			fDescriptorsPhysical;
++			area_id				fBufferArea;
++			void*				fBuffers;
++			phys_addr_t			fBuffersPhysical;
++
++			uint8				fMacAddress[6];
++			uint32				fPhyAddress;
++			uint32				fMdioClock;
++
++			mutex				fRxLock;
++			mutex				fTxLock;
++			mutex				fMdioLock;
++			ConditionVariable	fRxCondition;
++			ConditionVariable	fTxCondition;
++			uint32				fRxHead;
++			uint32				fTxHead;
++			bool				fNonBlocking;
++			bool				fOpen;
++			int32				fOpenCount;
++
++			thread_id			fLinkThread;
++			bool				fStopLinkThread;
++			bool				fLinkUp;
++			bool				fFullDuplex;
++			uint32				fSpeed;			// Mbit/s
++			sem_id				fLinkStateSemaphore;
++};
++
++
++MesonDwmac::MesonDwmac(device_node* node)
++	:
++	fNode(node),
++	fRegisterArea(-1),
++	fRegisters(NULL),
++	fIrq(0),
++	fInterruptInstalled(false),
++	fDescriptorArea(-1),
++	fDescriptors(NULL),
++	fDescriptorsPhysical(0),
++	fBufferArea(-1),
++	fBuffers(NULL),
++	fBuffersPhysical(0),
++	fPhyAddress(0),
++	fMdioClock(4),
++	fRxHead(0),
++	fTxHead(0),
++	fNonBlocking(false),
++	fOpen(false),
++	fOpenCount(0),
++	fLinkThread(-1),
++	fStopLinkThread(false),
++	fLinkUp(false),
++	fFullDuplex(true),
++	fSpeed(0),
++	fLinkStateSemaphore(-1)
++{
++	memset(fMacAddress, 0, sizeof(fMacAddress));
++	mutex_init(&fRxLock, "meson_dwmac rx");
++	mutex_init(&fTxLock, "meson_dwmac tx");
++	mutex_init(&fMdioLock, "meson_dwmac mdio");
++	fRxCondition.Init(this, "meson_dwmac rx");
++	fTxCondition.Init(&fTxHead, "meson_dwmac tx");
++}
++
++
++MesonDwmac::~MesonDwmac()
++{
++	_Stop();
++	if (fInterruptInstalled)
++		remove_io_interrupt_handler(fIrq, _InterruptHandler, this);
++	if (fDescriptorArea >= 0)
++		delete_area(fDescriptorArea);
++	if (fBufferArea >= 0)
++		delete_area(fBufferArea);
++	if (fRegisterArea >= 0)
++		delete_area(fRegisterArea);
++	mutex_destroy(&fRxLock);
++	mutex_destroy(&fTxLock);
++	mutex_destroy(&fMdioLock);
++}
++
++
++status_t
++MesonDwmac::Init(phys_addr_t registers, size_t length, int32 irq,
++	const uint8* dtMacAddress)
++{
++	void* mapped;
++	fRegisterArea = map_physical_memory("meson_dwmac registers", registers,
++		length, B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++		&mapped);
++	if (fRegisterArea < 0)
++		return fRegisterArea;
++	fRegisters = (volatile uint32*)mapped;
++	fIrq = irq;
++
++	// The firmware leaves the MAC address in the address registers; the
++	// device tree copy (from U-Boot) is the fallback.
++	uint32 low = _Read(kMacAddressLow);
++	uint32 high = _Read(kMacAddressHigh);
++	fMacAddress[0] = low;
++	fMacAddress[1] = low >> 8;
++	fMacAddress[2] = low >> 16;
++	fMacAddress[3] = low >> 24;
++	fMacAddress[4] = high;
++	fMacAddress[5] = high >> 8;
++	bool valid = (low != 0xffffffff || (high & 0xffff) != 0xffff)
++		&& (low != 0 || (high & 0xffff) != 0);
++	if (!valid && dtMacAddress != NULL)
++		memcpy(fMacAddress, dtMacAddress, sizeof(fMacAddress));
++
++	uint32 mdio = _Read(kMacMdioAddress);
++	if (((mdio & MDIO_CLOCK_MASK) >> MDIO_CLOCK_SHIFT) != 0)
++		fMdioClock = (mdio & MDIO_CLOCK_MASK) >> MDIO_CLOCK_SHIFT;
++
++	uint32 prgEth0 = 0;
++	void* periphs;
++	area_id periphsArea = map_physical_memory("meson periphs", kPeriphsPage,
++		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA, &periphs);
++	if (periphsArea >= 0) {
++		prgEth0 = ((volatile uint32*)periphs)[kPrgEth0Offset / 4];
++		delete_area(periphsArea);
++	}
++
++	INFO("version %#" B_PRIx32 ", hw feature %#" B_PRIx32 ", PRG_ETH0 %#"
++		B_PRIx32 ", MDC divider %" B_PRIu32 ", MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
++		_Read(kMacVersion), _Read(kDmaHwFeature), prgEth0, fMdioClock,
++		fMacAddress[0], fMacAddress[1], fMacAddress[2], fMacAddress[3],
++		fMacAddress[4], fMacAddress[5]);
++
++	uint16 id1 = 0, id2 = 0;
++	_MdioRead(PHY_ID1, &id1);
++	_MdioRead(PHY_ID2, &id2);
++	INFO("PHY %" B_PRIu32 ": id %04x:%04x\n", fPhyAddress, id1, id2);
++
++	status_t status = _AllocateRings();
++	if (status != B_OK)
++		return status;
++
++	// Silence every interrupt source before installing the handler; an
++	// unclaimed level interrupt makes the kernel disable the IRQ.
++	_Write(kDmaInterruptEnable, 0);
++	_Write(kMacInterruptMask, 0x7ff);
++	_Write(kMmcRxInterruptMask, 0xffffffff);
++	_Write(kMmcTxInterruptMask, 0xffffffff);
++	_Write(kMmcIpcRxInterruptMask, 0xffffffff);
++	_ClearSummaryInterrupts();
++	_Write(kDmaStatus, DMA_STATUS_CLEAR_MASK);
++
++	if (fIrq > 0 && install_io_interrupt_handler(fIrq, _InterruptHandler, this,
++			0) == B_OK) {
++		fInterruptInstalled = true;
++	} else
++		ERROR("cannot install interrupt handler for IRQ %" B_PRId32 "\n", fIrq);
++
++	return B_OK;
++}
++
++
++status_t
++MesonDwmac::_AllocateRings()
++{
++	size_t descriptorSize = (kRxCount + kTxCount) * kDescriptorStride;
++	fDescriptorArea = create_area("meson_dwmac descriptors", &fDescriptors,
++		B_ANY_KERNEL_ADDRESS, (descriptorSize + B_PAGE_SIZE - 1) & ~(B_PAGE_SIZE - 1),
++		B_32_BIT_CONTIGUOUS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
++	if (fDescriptorArea < 0)
++		return fDescriptorArea;
++
++	size_t bufferSize = (kRxCount + kTxCount) * kBufferSize;
++	fBufferArea = create_area("meson_dwmac buffers", &fBuffers,
++		B_ANY_KERNEL_ADDRESS, (bufferSize + B_PAGE_SIZE - 1) & ~(B_PAGE_SIZE - 1),
++		B_32_BIT_CONTIGUOUS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
++	if (fBufferArea < 0)
++		return fBufferArea;
++
++	physical_entry entry;
++	get_memory_map(fDescriptors, B_PAGE_SIZE, &entry, 1);
++	fDescriptorsPhysical = entry.address;
++	get_memory_map(fBuffers, B_PAGE_SIZE, &entry, 1);
++	fBuffersPhysical = entry.address;
++	return B_OK;
++}
++
++
++void
++MesonDwmac::_InitRings()
++{
++	memset(fDescriptors, 0, (kRxCount + kTxCount) * kDescriptorStride);
++
++	for (uint32 i = 0; i < kRxCount; i++) {
++		volatile descriptor* desc = _RxDescriptor(i);
++		desc->control = RX_CONTROL_CHAINED | kRxBufferLength;
++		desc->buffer = (uint32)_BufferPhysical(i);
++		desc->next = (uint32)_DescriptorPhysical((i + 1) % kRxCount);
++		desc->status = DESC_OWN;
++	}
++	for (uint32 i = 0; i < kTxCount; i++) {
++		volatile descriptor* desc = _TxDescriptor(i);
++		desc->control = TX_CONTROL_CHAINED;
++		desc->buffer = (uint32)_BufferPhysical(kRxCount + i);
++		desc->next = (uint32)_DescriptorPhysical(kRxCount
++			+ (i + 1) % kTxCount);
++		desc->status = 0;
++	}
++
++	// descriptors to memory; RX buffers must not hold dirty lines that
++	// could be written back over received data
++	dcache_maintain(fDescriptorsPhysical,
++		(kRxCount + kTxCount) * kDescriptorStride, false);
++	dcache_maintain(fBuffersPhysical, kRxCount * kBufferSize, true);
++
++	fRxHead = 0;
++	fTxHead = 0;
++}
++
++
++status_t
++MesonDwmac::_ResetDma()
++{
++	_Write(kDmaBusMode, BUS_MODE_SOFT_RESET);
++	bigtime_t deadline = system_time() + 200000;
++	while ((_Read(kDmaBusMode) & BUS_MODE_SOFT_RESET) != 0) {
++		if (system_time() > deadline) {
++			ERROR("DMA reset timed out (no PHY clock?)\n");
++			return B_TIMED_OUT;
++		}
++		snooze(100);
++	}
++	return B_OK;
++}
++
++
++void
++MesonDwmac::_Start()
++{
++	_Write(kDmaBusMode, 8 << BUS_MODE_PBL_SHIFT);
++	_Write(kDmaRxDescList, (uint32)_DescriptorPhysical(0));
++	_Write(kDmaTxDescList, (uint32)_DescriptorPhysical(kRxCount));
++
++	// no MAC or counter (MMC) interrupts, we poll the link
++	_Write(kMacInterruptMask, 0x7ff);
++	_Write(kMmcRxInterruptMask, 0xffffffff);
++	_Write(kMmcTxInterruptMask, 0xffffffff);
++	_Write(kMmcIpcRxInterruptMask, 0xffffffff);
++
++	_Write(kMacAddressHigh, fMacAddress[4] | (fMacAddress[5] << 8));
++	_Write(kMacAddressLow, fMacAddress[0] | (fMacAddress[1] << 8)
++		| (fMacAddress[2] << 16) | ((uint32)fMacAddress[3] << 24));
++	_Write(kMacFrameFilter, FRAME_FILTER_PM);
++
++	_UpdateLink();
++	uint32 config = _Read(kMacConfiguration);
++	_Write(kMacConfiguration, config | MAC_CONFIG_TE | MAC_CONFIG_RE);
++
++	_Write(kDmaStatus, DMA_STATUS_CLEAR_MASK);
++	_Write(kDmaInterruptEnable, INTERRUPT_NIE | INTERRUPT_AIE | INTERRUPT_FBE
++		| INTERRUPT_RUE | INTERRUPT_RIE | INTERRUPT_TIE);
++	_Write(kDmaOperationMode, OPERATION_RSF | OPERATION_TSF | OPERATION_ST
++		| OPERATION_SR);
++}
++
++
++void
++MesonDwmac::_Stop()
++{
++	if (fRegisters == NULL)
++		return;
++	_Write(kDmaInterruptEnable, 0);
++	_Write(kDmaOperationMode, 0);
++	_Write(kMacConfiguration,
++		_Read(kMacConfiguration) & ~(MAC_CONFIG_TE | MAC_CONFIG_RE));
++}
++
++
++status_t
++MesonDwmac::Open()
++{
++	if (atomic_add(&fOpenCount, 1) > 0)
++		return B_OK;
++
++	status_t status = _ResetDma();
++	if (status != B_OK) {
++		atomic_add(&fOpenCount, -1);
++		return status;
++	}
++	_InitRings();
++	fOpen = true;
++	_Start();
++
++	fStopLinkThread = false;
++	fLinkThread = spawn_kernel_thread(_LinkThread, "meson_dwmac link",
++		B_LOW_PRIORITY, this);
++	if (fLinkThread >= 0)
++		resume_thread(fLinkThread);
++	return B_OK;
++}
++
++
++void
++MesonDwmac::Close()
++{
++	if (atomic_add(&fOpenCount, -1) > 1)
++		return;
++
++	fOpen = false;
++	fStopLinkThread = true;
++	if (fLinkThread >= 0) {
++		status_t result;
++		wait_for_thread(fLinkThread, &result);
++		fLinkThread = -1;
++	}
++	_Stop();
++	fRxCondition.NotifyAll(B_FILE_ERROR);
++	fTxCondition.NotifyAll(B_FILE_ERROR);
++}
++
++
++status_t
++MesonDwmac::Read(void* buffer, size_t* _length)
++{
++	MutexLocker locker(fRxLock);
++
++	while (true) {
++		if (!fOpen)
++			return B_FILE_ERROR;
++
++		volatile descriptor* desc = _RxDescriptor(fRxHead);
++		ConditionVariableEntry entry;
++		fRxCondition.Add(&entry);
++		_SyncDescriptor(fRxHead, true);
++		uint32 status = desc->status;
++		if ((status & DESC_OWN) != 0) {
++			if (fNonBlocking)
++				return B_WOULD_BLOCK;
++			locker.Unlock();
++			// the timeout also covers a lost interrupt
++			status_t waitStatus = entry.Wait(
++				B_CAN_INTERRUPT | B_RELATIVE_TIMEOUT, 1000000);
++			locker.Lock();
++			if (waitStatus != B_OK && waitStatus != B_TIMED_OUT)
++				return waitStatus;
++			continue;
++		}
++
++		uint32 slot = fRxHead;
++		fRxHead = (fRxHead + 1) % kRxCount;
++
++		uint32 frameLength = (status >> RX_STATUS_FRAME_LENGTH_SHIFT)
++			& RX_STATUS_FRAME_LENGTH_MASK;
++		bool good = (status & RX_STATUS_ERROR) == 0
++			&& (status & (RX_STATUS_FIRST | RX_STATUS_LAST))
++				== (RX_STATUS_FIRST | RX_STATUS_LAST)
++			&& frameLength > kFcsLength && frameLength <= kRxBufferLength;
++
++		status_t result = B_OK;
++		size_t length = 0;
++		if (good) {
++			length = std::min((size_t)(frameLength - kFcsLength), *_length);
++			dcache_maintain(_BufferPhysical(slot), frameLength, true);
++			result = user_memcpy(buffer, _Buffer(slot), length);
++		}
++
++		// give the descriptor back to the DMA engine
++		desc->control = RX_CONTROL_CHAINED | kRxBufferLength;
++		asm volatile("dmb sy" : : : "memory");
++		desc->status = DESC_OWN;
++		_SyncDescriptor(slot, false);
++		_Write(kDmaRxPollDemand, 1);
++
++		if (!good)
++			continue;
++		if (result != B_OK)
++			return result;
++		*_length = length;
++		return B_OK;
++	}
++}
++
++
++status_t
++MesonDwmac::Write(const void* buffer, size_t* _length)
++{
++	size_t length = *_length;
++	if (length == 0 || length > kMaxFrameSize)
++		return B_BAD_VALUE;
++
++	MutexLocker locker(fTxLock);
++
++	uint32 slot = fTxHead;
++	volatile descriptor* desc = _TxDescriptor(slot);
++	while (true) {
++		if (!fOpen)
++			return B_FILE_ERROR;
++
++		ConditionVariableEntry entry;
++		fTxCondition.Add(&entry);
++		_SyncDescriptor(kRxCount + slot, true);
++		if ((desc->status & DESC_OWN) == 0)
++			break;
++		if (fNonBlocking)
++			return B_WOULD_BLOCK;
++		locker.Unlock();
++		status_t waitStatus = entry.Wait(B_CAN_INTERRUPT | B_RELATIVE_TIMEOUT,
++			100000);
++		locker.Lock();
++		if (waitStatus != B_OK && waitStatus != B_TIMED_OUT)
++			return waitStatus;
++	}
++
++	status_t status = user_memcpy(_Buffer(kRxCount + slot), buffer, length);
++	if (status != B_OK)
++		return status;
++	dcache_maintain(_BufferPhysical(kRxCount + slot), length, false);
++
++	desc->buffer = (uint32)_BufferPhysical(kRxCount + slot);
++	desc->control = TX_CONTROL_INTERRUPT | TX_CONTROL_LAST | TX_CONTROL_FIRST
++		| TX_CONTROL_CHAINED | (length & DESC_BUFFER_SIZE_MASK);
++	asm volatile("dmb sy" : : : "memory");
++	desc->status = DESC_OWN;
++	_SyncDescriptor(kRxCount + slot, false);
++	_Write(kDmaTxPollDemand, 1);
++
++	fTxHead = (fTxHead + 1) % kTxCount;
++	return B_OK;
++}
++
++
++status_t
++MesonDwmac::Control(uint32 op, void* buffer, size_t length)
++{
++	switch (op) {
++		case ETHER_INIT:
++			return B_OK;
++
++		case ETHER_GETADDR:
++			return user_memcpy(buffer, fMacAddress, sizeof(fMacAddress));
++
++		case ETHER_GETFRAMESIZE:
++		{
++			uint32 frameSize = kMaxFrameSize;
++			return user_memcpy(buffer, &frameSize, sizeof(frameSize));
++		}
++
++		case ETHER_NONBLOCK:
++		{
++			int32 value;
++			if (user_memcpy(&value, buffer, sizeof(value)) != B_OK)
++				return B_BAD_ADDRESS;
++			fNonBlocking = value != 0;
++			return B_OK;
++		}
++
++		case ETHER_SETPROMISC:
++		{
++			int32 value;
++			if (user_memcpy(&value, buffer, sizeof(value)) != B_OK)
++				return B_BAD_ADDRESS;
++			uint32 filter = _Read(kMacFrameFilter);
++			_Write(kMacFrameFilter, value != 0
++				? filter | FRAME_FILTER_PR : filter & ~FRAME_FILTER_PR);
++			return B_OK;
++		}
++
++		case ETHER_ADDMULTI:
++		case ETHER_REMMULTI:
++			// all multicast frames are passed (FRAME_FILTER_PM)
++			return B_OK;
++
++		case ETHER_SET_LINK_STATE_SEM:
++			if (user_memcpy(&fLinkStateSemaphore, buffer, sizeof(sem_id))
++					!= B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			return B_OK;
++
++		case ETHER_GET_LINK_STATE:
++		{
++			ether_link_state_t state;
++			state.media = IFM_ETHER;
++			if (fLinkUp) {
++				state.media |= IFM_ACTIVE
++					| (fFullDuplex ? IFM_FULL_DUPLEX : IFM_HALF_DUPLEX)
++					| (fSpeed == 1000 ? IFM_1000_T
++						: fSpeed == 100 ? IFM_100_TX : IFM_10_T);
++			}
++			state.speed = fLinkUp ? fSpeed * 1000000ULL : 0;
++			state.quality = 1000;
++			return user_memcpy(buffer, &state, sizeof(state));
++		}
++	}
++
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++status_t
++MesonDwmac::_MdioRead(uint32 reg, uint16* value)
++{
++	MutexLocker locker(fMdioLock);
++	_Write(kMacMdioAddress, (fPhyAddress << MDIO_PHY_SHIFT)
++		| (reg << MDIO_REGISTER_SHIFT) | (fMdioClock << MDIO_CLOCK_SHIFT)
++		| MDIO_BUSY);
++	for (int32 i = 0; i < 1000; i++) {
++		if ((_Read(kMacMdioAddress) & MDIO_BUSY) == 0) {
++			*value = _Read(kMacMdioData) & 0xffff;
++			return B_OK;
++		}
++		spin(10);
++	}
++	return B_TIMED_OUT;
++}
++
++
++status_t
++MesonDwmac::_MdioWrite(uint32 reg, uint16 value)
++{
++	MutexLocker locker(fMdioLock);
++	_Write(kMacMdioData, value);
++	_Write(kMacMdioAddress, (fPhyAddress << MDIO_PHY_SHIFT)
++		| (reg << MDIO_REGISTER_SHIFT) | (fMdioClock << MDIO_CLOCK_SHIFT)
++		| MDIO_WRITE | MDIO_BUSY);
++	for (int32 i = 0; i < 1000; i++) {
++		if ((_Read(kMacMdioAddress) & MDIO_BUSY) == 0)
++			return B_OK;
++		spin(10);
++	}
++	return B_TIMED_OUT;
++}
++
++
++/*!	The MAC, counter and power management interrupts show up in the DMA
++	status as summary bits that clear only when their source registers are
++	read.
++*/
++void
++MesonDwmac::_ClearSummaryInterrupts()
++{
++	_Read(kMacInterruptStatus);
++	_Read(kMacRgmiiStatus);
++	_Read(kMmcRxInterrupt);
++	_Read(kMmcTxInterrupt);
++	_Read(kMmcIpcRxInterrupt);
++	_Read(kMacPmtControl);
++}
++
++
++void
++MesonDwmac::_UpdateLink()
++{
++	uint16 bmsr = 0;
++	// the link bit latches low: the second read is the current state
++	_MdioRead(PHY_BMSR, &bmsr);
++	if (_MdioRead(PHY_BMSR, &bmsr) != B_OK)
++		return;
++	bool linkUp = (bmsr & PHY_BMSR_LINK) != 0;
++
++	uint32 speed = 0;
++	bool fullDuplex = true;
++	if (linkUp) {
++		uint16 physr = 0;
++		_MdioWrite(RTL8211F_PAGE_SELECT, RTL8211F_PHYSR_PAGE);
++		_MdioRead(RTL8211F_PHYSR, &physr);
++		_MdioWrite(RTL8211F_PAGE_SELECT, 0);
++		switch ((physr >> RTL8211F_PHYSR_SPEED_SHIFT) & 3) {
++			case 2:
++				speed = 1000;
++				break;
++			case 1:
++				speed = 100;
++				break;
++			default:
++				speed = 10;
++				break;
++		}
++		fullDuplex = (physr & RTL8211F_PHYSR_DUPLEX) != 0;
++	}
++
++	if (linkUp == fLinkUp && speed == fSpeed && fullDuplex == fFullDuplex)
++		return;
++
++	fLinkUp = linkUp;
++	fSpeed = speed;
++	fFullDuplex = fullDuplex;
++
++	if (linkUp) {
++		uint32 config = _Read(kMacConfiguration)
++			& ~(MAC_CONFIG_SPEED_MASK | MAC_CONFIG_DM);
++		if (speed == 100)
++			config |= MAC_CONFIG_PS | MAC_CONFIG_FES;
++		else if (speed == 10)
++			config |= MAC_CONFIG_PS;
++		if (fullDuplex)
++			config |= MAC_CONFIG_DM;
++		_Write(kMacConfiguration, config);
++		INFO("link up, %" B_PRIu32 " Mbit/s %s duplex\n", speed,
++			fullDuplex ? "full" : "half");
++	} else
++		INFO("link down\n");
++
++	if (fLinkStateSemaphore >= 0)
++		release_sem_etc(fLinkStateSemaphore, 1, B_DO_NOT_RESCHEDULE);
++}
++
++
++/*static*/ status_t
++MesonDwmac::_LinkThread(void* data)
++{
++	MesonDwmac* self = (MesonDwmac*)data;
++	while (!self->fStopLinkThread) {
++		self->_UpdateLink();
++		for (int32 i = 0; i < 10 && !self->fStopLinkThread; i++)
++			snooze(100000);
++	}
++	return B_OK;
++}
++
++
++/*static*/ int32
++MesonDwmac::_InterruptHandler(void* data)
++{
++	MesonDwmac* self = (MesonDwmac*)data;
++
++	// Clear until nothing is pending: if the line is configured as edge
++	// triggered, a bit set while we clear would otherwise keep it asserted
++	// and no further interrupt would ever arrive.
++	uint32 status = 0;
++	for (int32 i = 0; i < 16; i++) {
++		uint32 pending = self->_Read(kDmaStatus)
++			& (DMA_STATUS_CLEAR_MASK | DMA_STATUS_SUMMARY_MASK);
++		if (pending == 0)
++			break;
++		if ((pending & DMA_STATUS_SUMMARY_MASK) != 0)
++			self->_ClearSummaryInterrupts();
++		self->_Write(kDmaStatus, pending & DMA_STATUS_CLEAR_MASK);
++		status |= pending;
++	}
++	if (status == 0)
++		return B_UNHANDLED_INTERRUPT;
++
++	if ((status & DMA_STATUS_FBI) != 0)
++		dprintf("meson_dwmac: fatal bus error, status %#" B_PRIx32 "\n", status);
++	if ((status & (DMA_STATUS_RI | DMA_STATUS_RU)) != 0)
++		self->fRxCondition.NotifyAll();
++	if ((status & DMA_STATUS_TI) != 0)
++		self->fTxCondition.NotifyAll();
++	return B_INVOKE_SCHEDULER;
++}
++
++
++//	#pragma mark - device tree helpers
++
++
++static bool
++fdt_device_enabled(fdt_device_module_info* module, fdt_device* device)
++{
++	int length;
++	const char* status = (const char*)module->get_prop(device, "status",
++		&length);
++	return status == NULL || strcmp(status, "okay") == 0
++		|| strcmp(status, "ok") == 0;
++}
++
++
++//	#pragma mark - driver module
++
++
++static float
++supports_device(device_node* parent)
++{
++	const char* bus;
++	if (gDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false)
++			!= B_OK || strcmp(bus, "fdt") != 0) {
++		return 0.0f;
++	}
++
++	const char* compatible;
++	if (gDeviceManager->get_attr_string(parent, "fdt/compatible", &compatible,
++			false) != B_OK
++		|| strcmp(compatible, "amlogic,meson-gxbb-dwmac") != 0) {
++		return 0.0f;
++	}
++
++	fdt_device_module_info* fdtModule;
++	fdt_device* fdtDevice;
++	if (gDeviceManager->get_driver(parent, (driver_module_info**)&fdtModule,
++			(void**)&fdtDevice) == B_OK
++		&& !fdt_device_enabled(fdtModule, fdtDevice)) {
++		return 0.0f;
++	}
++
++	return 0.8f;
++}
++
++
++static status_t
++register_device(device_node* parent)
++{
++	device_attr attrs[] = {
++		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE,
++			{ .string = "Amlogic Meson GXBB Ethernet" } },
++		{ NULL }
++	};
++
++	return gDeviceManager->register_node(parent, DRIVER_MODULE_NAME, attrs,
++		NULL, NULL);
++}
++
++
++static status_t
++init_driver(device_node* node, void** _cookie)
++{
++	DeviceNodePutter<&gDeviceManager> fdtNode(
++		gDeviceManager->get_parent_node(node));
++
++	fdt_device_module_info* fdtModule;
++	fdt_device* fdtDevice;
++	if (gDeviceManager->get_driver(fdtNode.Get(),
++			(driver_module_info**)&fdtModule, (void**)&fdtDevice) != B_OK) {
++		return B_ERROR;
++	}
++	if (!fdt_device_enabled(fdtModule, fdtDevice))
++		return B_DEVICE_NOT_FOUND;
++
++	// The MAC sits directly in "soc" (identity "ranges"): its reg is the
++	// CPU physical address.
++	uint64 registers;
++	uint64 length;
++	if (!fdtModule->get_reg(fdtDevice, 0, &registers, &length))
++		return B_ERROR;
++
++	uint64 irq = 0;
++	if (!fdtModule->get_interrupt(fdtDevice, 0, NULL, &irq))
++		irq = 0;
++
++	int macLength;
++	const uint8* dtMacAddress = (const uint8*)fdtModule->get_prop(fdtDevice,
++		"local-mac-address", &macLength);
++	if (macLength != 6)
++		dtMacAddress = NULL;
++
++	MesonDwmac* device = new(std::nothrow) MesonDwmac(node);
++	if (device == NULL)
++		return B_NO_MEMORY;
++
++	status_t status = device->Init(registers, length, (int32)irq,
++		dtMacAddress);
++	if (status != B_OK) {
++		delete device;
++		return status;
++	}
++
++	*_cookie = device;
++	return B_OK;
++}
++
++
++static void
++uninit_driver(void* cookie)
++{
++	delete (MesonDwmac*)cookie;
++}
++
++
++static status_t
++register_child_devices(void* cookie)
++{
++	MesonDwmac* device = (MesonDwmac*)cookie;
++	return gDeviceManager->publish_device(device->Node(),
++		"net/meson_dwmac/0", DEVICE_MODULE_NAME);
++}
++
++
++//	#pragma mark - device module
++
++
++static status_t
++device_init(void* driverCookie, void** _deviceCookie)
++{
++	*_deviceCookie = driverCookie;
++	return B_OK;
++}
++
++
++static void
++device_uninit(void* deviceCookie)
++{
++}
++
++
++static status_t
++device_open(void* deviceCookie, const char* path, int openMode,
++	void** _cookie)
++{
++	MesonDwmac* device = (MesonDwmac*)deviceCookie;
++	status_t status = device->Open();
++	if (status != B_OK)
++		return status;
++	*_cookie = device;
++	return B_OK;
++}
++
++
++static status_t
++device_close(void* cookie)
++{
++	((MesonDwmac*)cookie)->Close();
++	return B_OK;
++}
++
++
++static status_t
++device_free(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++device_read(void* cookie, off_t position, void* buffer, size_t* _length)
++{
++	return ((MesonDwmac*)cookie)->Read(buffer, _length);
++}
++
++
++static status_t
++device_write(void* cookie, off_t position, const void* buffer,
++	size_t* _length)
++{
++	return ((MesonDwmac*)cookie)->Write(buffer, _length);
++}
++
++
++static status_t
++device_control(void* cookie, uint32 op, void* buffer, size_t length)
++{
++	return ((MesonDwmac*)cookie)->Control(op, buffer, length);
++}
++
++
++module_dependency module_dependencies[] = {
++	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&gDeviceManager },
++	{}
++};
++
++
++static struct device_module_info sMesonDwmacDevice = {
++	{
++		DEVICE_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	device_init,
++	device_uninit,
++	NULL,	// device_removed
++
++	device_open,
++	device_close,
++	device_free,
++	device_read,
++	device_write,
++	NULL,	// io
++	device_control,
++
++	NULL,	// select
++	NULL,	// deselect
++};
++
++
++static struct driver_module_info sMesonDwmacDriver = {
++	{
++		DRIVER_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	supports_device,
++	register_device,
++	init_driver,
++	uninit_driver,
++	register_child_devices,
++	NULL,	// rescan
++	NULL,	// device_removed
++};
++
++
++module_info* modules[] = {
++	(module_info*)&sMesonDwmacDriver,
++	(module_info*)&sMesonDwmacDevice,
++	NULL
++};

@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 15:21:39 -0400
+Subject: [PATCH 112/342] scheduler: no thread waits on a busy core while
+ another core idles
+
+A kernel trace of four threads woken in a row on the ODROID-C2 showed
+the case the steal on going idle missed: two of them landed on one
+core, the second preempted the first, and the CPU of the waking thread
+went idle at the same microsecond, while the first was between the run
+queue and the CPU, so it found nothing to take and slept; the first
+thread then waited 3 ms for the second.
+
+Two halves close it, in low latency mode:
+- A preempted thread is enqueued, which sends it to an idle core of
+  the package if there is one, instead of put back on its busy core.
+- The idle thread, which only runs once its CPU counts as idle, checks
+  for a thread waiting on a busy core of the package before the CPU
+  sleeps, and reschedules to take it (a few tries).
+Whichever CPU acts second sees the other.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/kernel/kscheduler.h         |  1 +
+ src/system/kernel/main.cpp                  |  4 +-
+ src/system/kernel/scheduler/scheduler.cpp   | 54 ++++++++++++++++++++-
+ src/system/kernel/scheduler/scheduler_cpu.h |  2 +
+ 4 files changed, 58 insertions(+), 3 deletions(-)
+
+diff --git a/headers/private/kernel/kscheduler.h b/headers/private/kernel/kscheduler.h
+index 9b53067401..749350bd1d 100644
+--- a/headers/private/kernel/kscheduler.h
++++ b/headers/private/kernel/kscheduler.h
+@@ -38,6 +38,7 @@ void scheduler_reschedule_ici(void);
+ 	The caller must hold the current thread \c scheduler_lock.
+ */
+ void scheduler_reschedule(int32 next_state);
++void scheduler_idle(void);
+ 
+ /*!	Sets the given thread's priority.
+ 	The thread may be running or may be in the ready-to-run queue.
+diff --git a/src/system/kernel/main.cpp b/src/system/kernel/main.cpp
+index d578bba3db..90cb9db479 100644
+--- a/src/system/kernel/main.cpp
++++ b/src/system/kernel/main.cpp
+@@ -281,8 +281,10 @@ _start(kernel_args *bootKernelArgs, int currentCPU)
+ 	enable_interrupts();
+ #endif
+ 
+-	for (;;)
++	for (;;) {
++		scheduler_idle();
+ 		cpu_idle();
++	}
+ 
+ 	return 0;
+ }
+diff --git a/src/system/kernel/scheduler/scheduler.cpp b/src/system/kernel/scheduler/scheduler.cpp
+index 69fd95bfc8..a135180b96 100644
+--- a/src/system/kernel/scheduler/scheduler.cpp
++++ b/src/system/kernel/scheduler/scheduler.cpp
+@@ -500,9 +500,16 @@ reschedule(int32 nextState)
+ 
+ 	if (nextThread != oldThread) {
+ 		if (enqueueOldThread) {
+-			if (putOldThreadAtBack)
++			// A thread preempted while a core of the package idles goes
++			// there (enqueue() finds it), rather than waiting here.
++			if (putOldThreadAtBack
++				|| (gCurrentModeID == SCHEDULER_MODE_LOW_LATENCY
++					&& !gSingleCore && !oldThreadData->IsIdle()
++					&& oldThread->pinned_to_cpu == 0
++					&& core->Package()->FindIdleCore(oldThreadMask)
++						!= NULL)) {
+ 				enqueue(oldThread, false);
+-			else
++			} else
+ 				oldThreadData->PutBack();
+ 		}
+ 
+@@ -545,6 +552,49 @@ reschedule(int32 nextState)
+ }
+ 
+ 
++/*!	Whether a thread waits in the run queue of a busy core of \a core's
++	package. Unlocked reads: a hint.
++*/
++static bool
++thread_waits_elsewhere(CoreEntry* core)
++{
++	PackageEntry* package = core->Package();
++	for (int32 i = 0; i < gCoreCount; i++) {
++		CoreEntry* other = &gCoreEntries[i];
++		if (other != core && other->Package() == package
++			&& !other->HasIdleCPU() && other->QueuedThreadCount() > 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++
++/*!	Called by the idle thread before its CPU sleeps. A thread put back on a
++	busy core just before this CPU counted as idle was neither sent here
++	nor found when the CPU's last thread left it; take it now (reschedule()
++	steals it). Gives up after a few tries (a thread that can't run on
++	this CPU, one another CPU is just switching away from), and lets the
++	CPU sleep.
++*/
++void
++scheduler_idle(void)
++{
++	if (!sSchedulerEnabled || gSingleCore
++		|| gCurrentModeID != SCHEDULER_MODE_LOW_LATENCY) {
++		return;
++	}
++
++	// the idle thread doesn't change CPUs
++	CoreEntry* core = CoreEntry::GetCore(smp_get_current_cpu());
++	for (int32 i = 0; i < 3 && thread_waits_elsewhere(core); i++) {
++		Thread* thread = thread_get_current_thread();
++		InterruptsSpinLocker _(thread->scheduler_lock);
++		scheduler_reschedule(B_THREAD_READY);
++	}
++}
++
++
+ /*!	Runs the scheduler.
+ 	Note: expects thread spinlock to be held
+ */
+diff --git a/src/system/kernel/scheduler/scheduler_cpu.h b/src/system/kernel/scheduler/scheduler_cpu.h
+index e6d39255ae..9ab592107e 100644
+--- a/src/system/kernel/scheduler/scheduler_cpu.h
++++ b/src/system/kernel/scheduler/scheduler_cpu.h
+@@ -143,6 +143,8 @@ public:
+ 	inline				int32			ThreadCount() const;
+ 	inline				bool			HasIdleCPU() const
+ 											{ return fIdleCPUCount > 0; }
++	inline				int32			QueuedThreadCount() const
++											{ return fThreadCount; }
+ 
+ 	inline				void			LockRunQueue();
+ 	inline				void			UnlockRunQueue();

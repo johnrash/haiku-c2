@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 12:23:35 -0400
+Subject: [PATCH 097/342] meson_i2c: the stop after setup times out every boot,
+ don't log it
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp | 11 +++++------
+ 1 file changed, 5 insertions(+), 6 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp b/src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp
+index 3293707566..593d2257b8 100644
+--- a/src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp
++++ b/src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp
+@@ -415,12 +415,12 @@ MesonI2c::_SetupPinsAndClock(phys_addr_t base)
+ 		B_PRIu32 ", %" B_PRIu32 " Hz\n", (uint64)base, clk81, divider,
+ 		clk81 / (divider * kDividerFactor));
+ 
+-	// the first token list after the pins are muxed doesn't finish (seen at
+-	// boot on the ODROID-C2): run a stop
++	// the first token list after the pins are muxed never finishes (every
++	// boot on the ODROID-C2; the next ones do): run a stop, which times out
+ 	_AddToken(kTokenStop);
+ 	status_t status = _Run();
+-	if (status != B_OK)
+-		INFO("first stop after setup: %s\n", strerror(status));
++	TRACE("first stop after setup: %s\n", strerror(status));
++	(void)status;
+ }
+ 
+ 
+@@ -598,8 +598,7 @@ MesonI2c::_LooksLikePcf8563(const uint8* registers)
+ status_t
+ MesonI2c::ScanBus()
+ {
+-	// the first transfer after the pins are muxed can fail (at boot on the
+-	// ODROID-C2, not later)
++	// in case the stop after setup didn't take the first transfer's failure
+ 	uint8 reg = 0;
+ 	uint8 registers[9];
+ 	status_t status = B_ERROR;

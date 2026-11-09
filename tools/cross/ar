@@ -1,0 +1,3 @@
+#!/bin/sh
+# the cross ar for makefile-engine STATIC targets (see cc)
+exec "$HAIKU_TOOLS/aarch64-unknown-haiku-ar" "$@"

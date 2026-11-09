@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Mon, 2 Nov 2026 15:24:00 -0500
+Subject: [PATCH 260/342] MediaPlayer: Ctrl+right and Ctrl+left wind 10 seconds
+
+Between the arrows' 5 seconds and Shift's 30, for a remote control's
+"skip 10 seconds" buttons. Paused, they step two frames.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apps/mediaplayer/MainWin.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/src/apps/mediaplayer/MainWin.cpp b/src/apps/mediaplayer/MainWin.cpp
+index 2de857a85d..b00588624a 100644
+--- a/src/apps/mediaplayer/MainWin.cpp
++++ b/src/apps/mediaplayer/MainWin.cpp
+@@ -2429,6 +2429,10 @@ MainWin::_KeyDown(BMessage* msg)
+ 				if ((modifier & B_SHIFT_KEY) != 0) {
+ 					windMessage.AddInt64("how much", 30000000LL);
+ 					windMessage.AddInt64("frames", 5);
++				} else if ((modifier & B_CONTROL_KEY) != 0) {
++					// 10 seconds, between the arrow's 5 and Shift's 30
++					windMessage.AddInt64("how much", 10000000LL);
++					windMessage.AddInt64("frames", 2);
+ 				} else {
+ 					windMessage.AddInt64("how much", 5000000LL);
+ 					windMessage.AddInt64("frames", 1);
+@@ -2445,6 +2449,10 @@ MainWin::_KeyDown(BMessage* msg)
+ 				if ((modifier & B_SHIFT_KEY) != 0) {
+ 					windMessage.AddInt64("how much", -30000000LL);
+ 					windMessage.AddInt64("frames", -5);
++				} else if ((modifier & B_CONTROL_KEY) != 0) {
++					// 10 seconds, between the arrow's 5 and Shift's 30
++					windMessage.AddInt64("how much", -10000000LL);
++					windMessage.AddInt64("frames", -2);
+ 				} else {
+ 					windMessage.AddInt64("how much", -5000000LL);
+ 					windMessage.AddInt64("frames", -1);

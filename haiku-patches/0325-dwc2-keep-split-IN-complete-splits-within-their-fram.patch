@@ -1,0 +1,182 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 6 Nov 2026 19:58:24 -0500
+Subject: [PATCH 325/342] dwc2: keep split IN complete-splits within their
+ frame
+
+A 48 kHz stereo OUT packet behind the hub's translator goes as two
+start-splits in microframes 0 and 1, which must come in a row; a split
+microphone stream of the same adapter starts in microframe 2 and could
+take up to six complete-splits, up to microframes 0 and 1 of the next
+frame. Under bulk traffic its complete-splits came late and were retried
+into that window, and the OUT stream's second part, armed behind one of
+them, went out two microframes late (the next of its parity): the
+translator lost the packet, a 1 ms click. +333's report showed every OUT
+gap as the second part, armed in time and sent 367-371 us later.
+
+A complete-split is now given up when it would run past the frame's last
+microframe, or after a gap of its own (the data is lost then anyway: what
+follows gets NYET). The stream report counts those packets as given up and
+shows data at complete-splits 1 to 5; OUT gap records also show which
+other streams' channels were waiting when the part was armed.
+
+Test board, AB13X at 48 kHz with its microphone running, 3 minutes while
+the USB stick was read (about 36 MB/s): +333 had 17, 5 and 7 OUT gaps,
++334 had 0 and 0, every OUT part done within 221 us. The microphone got
+161,000 of 180,000 packets through (157,000 of 179,000 before). Linux 6.18
+on the same board, playback only, recorded no dropouts under the same
+load.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/busses/usb/dwc2.h          |  9 ++++
+ .../kernel/busses/usb/dwc2_isochronous.cpp    | 54 ++++++++++++++++---
+ 2 files changed, 57 insertions(+), 6 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.h b/src/add-ons/kernel/busses/usb/dwc2.h
+index c3f707a582..aaa78827fd 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.h
++++ b/src/add-ons/kernel/busses/usb/dwc2.h
+@@ -100,7 +100,12 @@ struct dwc2_iso_statistics {
+ 		uint32	sinceArm;			// us
+ 		uint32	part;
+ 		uint32	lanesRunning;		// bit per lane: channel enabled
++		uint32	isoWaiting;			// OUT: bit per stream: channel enabled
++		uint32	isoOdd;				// when the part was armed; of those,
++									// armed for an odd microframe
+ 	}			gapRecord[8];		// split: the first gaps
++	uint64		abandoned;			// split IN: given up at a gap or at
++									// the end of the frame
+ };
+ 
+ 
+@@ -147,6 +152,10 @@ struct dwc2_iso_stream {
+ 	bool					stopping;
+ 	bigtime_t				timerTarget;
+ 	uint32					partFrame;		// microframe the part is for
++	uint32					packetFrame;	// split IN: of the start-split
++	uint32					armIsoWaiting;	// split OUT, later parts: other
++	uint32					armIsoOdd;		// streams' channels enabled when
++											// armed, and their parity
+ 	bigtime_t				armTime;		// the running part's
+ 	uint32					armFrame;		// HFNUM then
+ 
+diff --git a/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp b/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
+index 1f7a2a1e74..1531c31b5b 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
+@@ -420,10 +420,12 @@ DWC2::_CancelIsochronous(Pipe* pipe, bool force)
+ 				stats.empty);
+ 		} else if (in) {
+ 			snprintf(detail, sizeof(detail), "%" B_PRIu64 " split gaps, %"
+-				B_PRIu64 " empty, data at complete-split 1-4: %" B_PRIu32 " %"
+-				B_PRIu32 " %" B_PRIu32 " %" B_PRIu32, stats.gaps, stats.empty,
+-				stats.completeSplits[1], stats.completeSplits[2],
+-				stats.completeSplits[3], stats.completeSplits[4]);
++				B_PRIu64 " given up, %" B_PRIu64 " empty, data at complete-"
++				"split 1-5: %" B_PRIu32 " %" B_PRIu32 " %" B_PRIu32 " %"
++				B_PRIu32 " %" B_PRIu32, stats.gaps, stats.abandoned,
++				stats.empty, stats.completeSplits[1], stats.completeSplits[2],
++				stats.completeSplits[3], stats.completeSplits[4],
++				stats.completeSplits[5]);
+ 		} else {
+ 			snprintf(detail, sizeof(detail), "%" B_PRIu64 " split gaps",
+ 				stats.gaps);
+@@ -449,12 +451,13 @@ DWC2::_CancelIsochronous(Pipe* pipe, bool force)
+ 			INFO("  gap: part %" B_PRIu32 " for microframe %" B_PRIu32
+ 				", armed in %" B_PRIu32 " (%" B_PRIu32 " left), halt handled"
+ 				" in %" B_PRIu32 " (%" B_PRIu32 " left) %" B_PRIu32 " us"
+-				" later; lanes running %#" B_PRIx32 "\n", record.part,
++				" later; lanes running %#" B_PRIx32 ", streams waiting when"
++				" armed %#" B_PRIx32 " (odd %#" B_PRIx32 ")\n", record.part,
+ 				record.partFrame, record.armFrame & 0x3fff,
+ 				record.armFrame >> HFNUM_FRREM_SHIFT,
+ 				record.haltFrame & 0x3fff,
+ 				record.haltFrame >> HFNUM_FRREM_SHIFT, record.sinceArm,
+-				record.lanesRunning);
++				record.lanesRunning, record.isoWaiting, record.isoOdd);
+ 		}
+ 	}
+ 
+@@ -564,6 +567,18 @@ DWC2::_IsoStartPart(dwc2_iso_stream* stream, bool oddFrame)
+ 	_Write(HC_TSIZ(channel), size | (1 << HCTSIZ_PKTCNT_SHIFT)
+ 		| (PID_DATA0 << HCTSIZ_PID_SHIFT));
+ 	_Write(HC_DMA(channel), (uint32)(stream->bouncePhysical + offset));
++	if (!stream->in && stream->part > 0) {
++		stream->armIsoWaiting = 0;
++		stream->armIsoOdd = 0;
++		for (uint32 i = 0; i < kIsoStreamCount; i++) {
++			uint32 other = _Read(HC_CHAR(kLaneCount + i));
++			if ((other & HCCHAR_CHENA) != 0) {
++				stream->armIsoWaiting |= 1 << i;
++				if ((other & HCCHAR_ODDFRM) != 0)
++					stream->armIsoOdd |= 1 << i;
++			}
++		}
++	}
+ 	stream->armFrame = _Read(kHfnum);
+ 	stream->armTime = system_time();
+ 	asm volatile("dsb sy" : : : "memory");
+@@ -705,6 +720,7 @@ DWC2::_IsoHalted(dwc2_iso_stream* stream, uint32 status)
+ 	uint32 nextFrame = (stream->part == 0 ? frame & ~(uint32)1
+ 		: stream->partFrame) + 1;
+ 	nextFrame &= 0x3fff;
++	bool gap = false;
+ 	if (((frame - nextFrame) & 0x3fff) < 0x2000 && frame != nextFrame) {
+ 		if (stream->stats.gapRecords < B_COUNT_OF(stream->stats.gapRecord)) {
+ 			auto& record = stream->stats.gapRecord[stream->stats.gapRecords++];
+@@ -719,14 +735,29 @@ DWC2::_IsoHalted(dwc2_iso_stream* stream, uint32 status)
+ 				if ((_Read(HC_CHAR(i)) & HCCHAR_CHENA) != 0)
+ 					record.lanesRunning |= 1 << i;
+ 			}
++			record.isoWaiting = stream->in ? 0 : stream->armIsoWaiting;
++			record.isoOdd = stream->in ? 0 : stream->armIsoOdd;
+ 		}
+ 		stream->stats.gaps++;
++		gap = true;
+ 		nextFrame = (frame + 1) & 0x3fff;
+ 	}
++	if (stream->part == 0)
++		stream->packetFrame = (nextFrame - 1) & 0x3fff;
+ 	stream->partFrame = nextFrame;
+ 	bool nextOdd = (nextFrame & 1) != 0;
+ 	status_t error = dwc2_channel_error(status);
+ 
++	// IN: complete-splits stay within the packet's frame. Past it they would
++	// run in the next frame's first microframes, those of the OUT streams'
++	// start-splits, and a complete-split waiting there for its parity holds
++	// up a start-split armed behind it by two microframes: a gap in that OUT
++	// packet, so it is lost. After a gap of its own, the packet is lost
++	// anyway: what follows gets NYET.
++	bool giveUp = stream->in && stream->part > 0
++		&& (gap || ((nextFrame - stream->packetFrame) & 0x3fff)
++			> 7 - start_microframe(stream));
++
+ 	if (!stream->in) {
+ 		// start-splits of isochronous OUT get no handshake
+ 		if (error == B_OK && (status & HCINT_XFERCOMPL) != 0) {
+@@ -749,6 +780,12 @@ DWC2::_IsoHalted(dwc2_iso_stream* stream, uint32 status)
+ 		}
+ 	} else if ((status & HCINT_NYET) != 0) {
+ 		// the translator does not have the data yet
++		if (giveUp) {
++			stream->stats.abandoned++;
++			stream->stats.lastError = status;
++			_IsoPacketDone(stream, B_DEV_DATA_UNDERRUN, 0);
++			return;
++		}
+ 		if (stream->part < kMaxCompleteSplits) {
+ 			stream->part++;
+ 			_IsoStartPart(stream, nextOdd);
+@@ -765,6 +802,11 @@ DWC2::_IsoHalted(dwc2_iso_stream* stream, uint32 status)
+ 		entry->pieces[stream->packet][pieces++] = got;
+ 		stream->received += got;
+ 		stream->pieceOffset = (stream->pieceOffset + got + 3) & ~(uint32)3;
++		if (more && giveUp) {
++			stream->stats.abandoned++;
++			_IsoPacketDone(stream, B_DEV_DATA_UNDERRUN, 0);
++			return;
++		}
+ 		if (more && stream->part < kMaxCompleteSplits
+ 			&& pieces < kIsoMaxPieces) {
+ 			// the rest follows in the next microframe

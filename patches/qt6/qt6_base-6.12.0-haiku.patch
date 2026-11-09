@@ -1,0 +1,834 @@
+Haiku support for qtbase 6.12.0: HaikuPorts' qt6_base-6.10.3.patchset (MIT,
+haikuports/haikuports dev-qt/qt6-base) carried forward. The hunks that no
+longer applied were redone for 6.12: bootstrap without shared memory, ICU
+time zones on Haiku (no zoneinfo files; the conditions now name Haiku
+rather than changing them for every platform), and the shared memory
+retry without O_CLOEXEC, which 6.12 dropped there. New for 6.12: the TCP
+keepalive idle option only where TCP_KEEPALIVE or TCP_KEEPIDLE exists (Haiku
+has neither).
+
+Ported 2026, haiku-odroid-c2 port authors.
+
+--- a/cmake/QtBuildHelpers.cmake	2026-06-04 12:29:11.000000000 -0400
++++ b/cmake/QtBuildHelpers.cmake	2026-11-07 13:29:52.316348618 -0500
+@@ -62,7 +62,7 @@
+ 
+ macro(qt_internal_setup_position_independent_code)
+     ## Position independent code:
+-    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
++    set(CMAKE_POSITION_INDEPENDENT_CODE OFF)
+ 
+     # Does the linker support position independent code?
+     include(CheckPIESupported)
+--- a/cmake/QtMkspecHelpers.cmake	2026-06-04 12:29:11.000000000 -0400
++++ b/cmake/QtMkspecHelpers.cmake	2026-11-07 13:29:52.316455032 -0500
+@@ -50,6 +50,12 @@
+         elseif(CLANG)
+             set(QT_DEFAULT_MKSPEC linux-clang)
+         endif()
++    elseif(HAIKU)
++        if(GCC)
++            set(QT_DEFAULT_MKSPEC haiku-g++)
++        elseif(CLANG)
++            set(QT_DEFAULT_MKSPEC haiku-clang)
++        endif()
+     elseif(ANDROID)
+         if(GCC)
+             set(QT_DEFAULT_MKSPEC android-g++)
+--- a/cmake/QtRpathHelpers.cmake	2026-06-04 12:29:11.000000000 -0400
++++ b/cmake/QtRpathHelpers.cmake	2026-11-07 13:29:52.316550844 -0500
+@@ -8,6 +8,8 @@
+         set(rpath_rel_base "@loader_path")
+     elseif(LINUX OR SOLARIS OR FREEBSD OR HURD OR OPENBSD)
+         set(rpath_rel_base "$ORIGIN")
++    elseif(HAIKU)
++        set(rpath_rel_base "$ORIGIN")
+     else()
+         set(rpath_rel_base "NO_KNOWN_RPATH_REL_BASE")
+     endif()
+--- a/mkspecs/features/create_cmake.prf	2026-06-04 12:29:11.000000000 -0400
++++ b/mkspecs/features/create_cmake.prf	2026-11-07 13:29:52.313434472 -0500
+@@ -112,6 +112,9 @@
+         CMAKE_DLL_DIR = $$[QT_INSTALL_BINS]/
+         CMAKE_DLL_DIR_IS_ABSOLUTE = True
+     }
++} else:haiku {
++    CMAKE_DLL_DIR = develop/$$CMAKE_LIB_DIR
++    CMAKE_DLL_DIR_IS_ABSOLUTE = $$CMAKE_LIB_DIR_IS_ABSOLUTE
+ } else {
+     CMAKE_DLL_DIR = $$CMAKE_LIB_DIR
+     CMAKE_DLL_DIR_IS_ABSOLUTE = $$CMAKE_LIB_DIR_IS_ABSOLUTE
+--- a/mkspecs/features/toolchain.prf	2026-06-04 12:29:11.000000000 -0400
++++ b/mkspecs/features/toolchain.prf	2026-11-07 13:29:52.314345359 -0500
+@@ -263,7 +263,7 @@
+                 }
+             }
+         }
+-        if(!darwin:clang)|intel_icc {
++        if(!darwin:clang)|haiku|intel_icc {
+             # Clang on a non-Apple system (that is, a system without ld64 -- say, with GNU ld
+             # or gold under Linux) will not print any library search path. Need to use another
+             # invocation with different options (which in turn doesn't print include search
+--- a/src/3rdparty/forkfd/forkfd.c	2026-06-04 12:29:11.000000000 -0400
++++ b/src/3rdparty/forkfd/forkfd.c	2026-11-07 13:29:52.314989570 -0500
+@@ -680,7 +680,7 @@
+         /* parent process */
+         info->deathPipe = death_pipe[1];
+         fd = death_pipe[0];
+-        ffd_atomic_store(&info->pid, pid, FFD_ATOMIC_RELEASE);
++        ffd_atomic_store(&info->pid, (int32_t)pid, FFD_ATOMIC_RELEASE);
+ 
+         /* release the child */
+ #ifdef HAVE_EVENTFD
+--- a/src/3rdparty/sha3/brg_endian.h	2026-06-04 12:29:11.000000000 -0400
++++ b/src/3rdparty/sha3/brg_endian.h	2026-11-07 13:29:52.314448728 -0500
+@@ -39,10 +39,10 @@
+ #elif defined( BSD ) && ( BSD >= 199103 ) || defined( __APPLE__ ) || \
+       defined( __CYGWIN32__ ) || defined( __DJGPP__ ) || defined( __osf__ )
+ #  include <machine/endian.h>
+-#elif defined( __linux__ ) || defined( __GNUC__ ) || defined( __GNU_LIBRARY__ )
++#elif defined( __linux__ ) || defined( __HAIKU__ ) || defined( __GNUC__ ) || defined( __GNU_LIBRARY__ )
+ #  if !defined( __MINGW32__ ) && !defined( _AIX ) && !defined(Q_OS_QNX)
+ #    include <endian.h>
+-#    if !defined( __BEOS__ ) && !defined(Q_OS_RTEMS) && !defined(Q_OS_VXWORKS)
++#    if !defined( __BEOS__ ) && !defined( __HAIKU__ ) && !defined(Q_OS_RTEMS) && !defined(Q_OS_VXWORKS)
+ #      include <byteswap.h>
+ #    endif
+ #  endif
+--- a/src/corelib/CMakeLists.txt	2026-06-04 12:29:11.000000000 -0400
++++ b/src/corelib/CMakeLists.txt	2026-11-07 13:30:54.274154539 -0500
+@@ -1082,6 +1082,7 @@
+     CONDITION
+         QT_FEATURE_timezone AND UNIX AND NOT VXWORKS AND NOT WASM
+         AND NOT ANDROID AND NOT OHOS AND NOT APPLE AND NOT QT_FEATURE_timezone_tzdb
++        AND NOT (HAIKU AND QT_FEATURE_icu)
+     SOURCES
+         time/qtimezoneprivate_tz.cpp
+ )
+@@ -1089,7 +1090,7 @@
+ qt_internal_extend_target(Core
+     CONDITION
+         QT_FEATURE_icu AND QT_FEATURE_timezone
+-        AND (VXWORKS OR OHOS OR NOT UNIX) AND NOT QT_FEATURE_timezone_tzdb
++        AND (VXWORKS OR OHOS OR HAIKU OR NOT UNIX) AND NOT QT_FEATURE_timezone_tzdb
+     SOURCES
+         time/qtimezoneprivate_icu.cpp
+ )
+@@ -1152,6 +1153,11 @@
+         io/qfilesystemwatcher_fsevents.mm io/qfilesystemwatcher_fsevents_p.h
+ )
+ 
++qt_internal_extend_target(Core CONDITION QT_FEATURE_filesystemwatcher AND HAIKU
++    SOURCES
++        io/qfilesystemwatcher_haiku.cpp io/qfilesystemwatcher_haiku_p.h
++)
++
+ qt_internal_extend_target(Core CONDITION QT_FEATURE_filesystemwatcher AND QT_FEATURE_inotify AND UNIX AND NOT MACOS
+     SOURCES
+         io/qfilesystemwatcher_inotify.cpp io/qfilesystemwatcher_inotify_p.h
+--- a/src/corelib/global/qtypes.h	2026-06-04 12:29:11.000000000 -0400
++++ b/src/corelib/global/qtypes.h	2026-11-07 13:29:52.324802170 -0500
+@@ -179,7 +179,7 @@
+ 
+ #ifndef __cplusplus
+ // In C++ mode, we define below using QIntegerForSize template
+-static_assert(sizeof(ptrdiff_t) == sizeof(size_t), "Weird ptrdiff_t and size_t definitions");
++_Static_assert(sizeof(ptrdiff_t) == sizeof(size_t), "Weird ptrdiff_t and size_t definitions");
+ typedef ptrdiff_t qptrdiff;
+ typedef ptrdiff_t qsizetype;
+ typedef ptrdiff_t qintptr;
+--- a/src/corelib/io/qfilesystemwatcher.cpp	2026-06-04 12:29:11.000000000 -0400
++++ b/src/corelib/io/qfilesystemwatcher.cpp	2026-11-07 13:29:52.315483858 -0500
+@@ -18,6 +18,8 @@
+ #include "qfilesystemwatcher_polling_p.h"
+ #if defined(Q_OS_WIN)
+ #  include "qfilesystemwatcher_win_p.h"
++#elif defined(Q_OS_HAIKU)
++#  include "qfilesystemwatcher_haiku_p.h"
+ #elif defined(USE_INOTIFY)
+ #  include "qfilesystemwatcher_inotify_p.h"
+ #elif defined(Q_OS_FREEBSD) || defined(Q_OS_NETBSD) || defined(Q_OS_OPENBSD) || defined(QT_PLATFORM_UIKIT)
+@@ -39,6 +41,8 @@
+ {
+ #if defined(Q_OS_WIN)
+     return new QWindowsFileSystemWatcherEngine(parent);
++#elif defined(Q_OS_HAIKU)
++    return new QHaikuFileSystemWatcherEngine(parent);
+ #elif defined(USE_INOTIFY)
+     // there is a chance that inotify may fail on Linux pre-2.6.13 (August
+     // 2005), so we can't just new inotify directly.
+--- a/src/corelib/io/qfilesystemwatcher_haiku.cpp	1969-12-31 19:00:00.000000000 -0500
++++ b/src/corelib/io/qfilesystemwatcher_haiku.cpp	2026-11-07 13:29:52.315656975 -0500
+@@ -0,0 +1,254 @@
++/****************************************************************************
++**
++** Copyright (C) 2020 The Qt Company Ltd.
++** Copyright (C) 2015-2020 Gerasim Troeglazov,
++** Contact: 3dEyes@gmail.com
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU
++** General Public License version 2.0 or (at your option) the GNU General
++** Public license version 3 or any later version approved by the KDE Free
++** Qt Foundation. The licenses are as published by the Free Software
++** Foundation and appearing in the file LICENSE.GPL2 and LICENSE.GPL3
++** included in the packaging of this file. Please review the following
++** information to ensure the GNU General Public License requirements will
++** be met: https://www.gnu.org/licenses/gpl-2.0.html and
++** https://www.gnu.org/licenses/gpl-3.0.html.
++**
++****************************************************************************/
++
++#include "qfilesystemwatcher_haiku_p.h"
++#include <QtCore/qscopeguard.h>
++#include <QtCore/qtimer.h>
++#include <QDebug>
++
++QT_BEGIN_NAMESPACE
++
++QHaikuFileWatcher::QHaikuFileWatcher() : QObject(), BLooper() {};
++QHaikuDirWatcher::QHaikuDirWatcher() : QObject(), BLooper() {};
++
++QHaikuFileSystemWatcherEngine::QHaikuFileSystemWatcherEngine(QObject *parent)
++	: QFileSystemWatcherEngine(parent)
++{
++	fileLooper = new QHaikuFileWatcher();
++	connect(fileLooper, SIGNAL(fileChanged(const QString &, bool)), SLOT(bfsFileChanged(const QString &, bool)));
++	fileLooper->Run();
++
++	dirLooper = new QHaikuDirWatcher();
++	connect(dirLooper, SIGNAL(directoryChanged(const QString &, bool)), SLOT(bfsDirectoryChanged(const QString &, bool)));
++	dirLooper->Run();
++}
++
++QHaikuFileSystemWatcherEngine::~QHaikuFileSystemWatcherEngine()
++{
++	stop_watching(fileLooper);
++	if (fileLooper->Lock())
++		fileLooper->Quit();
++
++	stop_watching(dirLooper);
++	if (dirLooper->Lock())
++		dirLooper->Quit();
++}
++
++QStringList QHaikuFileSystemWatcherEngine::addPaths(const QStringList &paths,
++                                                      QStringList *files,
++                                                      QStringList *directories)
++{
++	QStringList unhandled;
++	for (const QString &path : paths) {
++		QFileInfo fi(path);
++		bool isDir = fi.isDir();
++		auto sg = qScopeGuard([&]{ unhandled.push_back(path); });
++		if (isDir) {
++			if (directories->contains(path))
++				continue;
++		} else {
++			if (files->contains(path))
++				continue;
++		}
++
++		BEntry entry(path.toUtf8().constData());       
++		if (!entry.Exists())
++			continue;
++
++		node_ref nref;
++		entry.GetNodeRef(&nref);
++		status_t status = isDir ?
++			watch_node(&nref, (B_WATCH_NAME | B_WATCH_ATTR | B_WATCH_STAT | B_WATCH_DIRECTORY), dirLooper):
++			watch_node(&nref, (B_WATCH_NAME | B_WATCH_ATTR | B_WATCH_STAT), fileLooper);
++
++		if (status != B_OK) {
++			qWarning("watch_node(%s) failed:", path.toUtf8().constData());
++			continue;
++		}
++
++		sg.dismiss();
++
++		if (isDir)
++			directories->append(path);
++		else
++			files->append(path);
++	}
++	return unhandled;
++}
++
++QStringList QHaikuFileSystemWatcherEngine::removePaths(const QStringList &paths,
++                                                         QStringList *files,
++                                                         QStringList *directories)
++{
++	QStringList unhandled;
++	for (const QString &path : paths) {
++		auto sg = qScopeGuard([&]{ unhandled.push_back(path); });
++
++		BEntry entry(path.toUtf8().constData());
++		node_ref nref;
++		entry.GetNodeRef(&nref);
++
++		if (directories->contains(path)) {
++			directories->removeAll(path);
++			watch_node(&nref, B_STOP_WATCHING, dirLooper);
++		} else if (files->contains(path)) {
++			files->removeAll(path);
++			watch_node(&nref, B_STOP_WATCHING, fileLooper);
++		} else {
++			continue;
++		}
++
++		sg.dismiss();
++	}
++
++	return unhandled;
++}
++
++void
++QHaikuDirWatcher::MessageReceived(BMessage* message)
++{
++	if (message->what == B_NODE_MONITOR) {
++		int32 opcode;
++
++		if (message->FindInt32("opcode", &opcode) != B_OK)
++			return;
++
++		switch (opcode) {
++			case B_ENTRY_MOVED:
++				{
++					int32 device = 0;
++					int64 srcFolder = 0;
++					int64 dstFolder = 0;
++					const char* name = NULL;
++					if (message->FindInt32("device", &device) != B_OK
++						|| message->FindInt64("to directory", &dstFolder) != B_OK
++						|| message->FindInt64("from directory", &srcFolder) != B_OK
++						|| message->FindString("name", &name) != B_OK)
++							break;
++
++					entry_ref ref(device, srcFolder, name);
++					BEntry entry(&ref);
++
++					BEntry dirEntry;
++					entry.GetParent(&dirEntry);
++
++					BPath path;
++					dirEntry.GetPath(&path);
++					
++					QString qpath = QString::fromUtf8(path.Path());
++
++					emit directoryChanged(qpath, false);
++				}
++				break;
++			case B_ENTRY_CREATED:
++			case B_ENTRY_REMOVED:
++				{
++					int64 directory;
++					int32 device;
++					int64 node;
++					const char *name;
++					if (message->FindInt64("directory", &directory) != B_OK
++						|| message->FindInt32("device", &device) != B_OK
++						|| message->FindInt64("node", &node) != B_OK
++						|| message->FindString("name", &name) != B_OK)
++							break;
++
++					entry_ref ref(device, directory, name);
++					BEntry entry(&ref);				
++					BEntry dirEntry;
++					entry.GetParent(&dirEntry);
++
++					BPath path;
++					dirEntry.GetPath(&path);
++
++					QString qpath = QString::fromUtf8(path.Path());
++					emit directoryChanged(qpath, opcode == B_ENTRY_REMOVED);
++				}
++				break;
++		}
++	}
++}
++
++void
++QHaikuFileWatcher::MessageReceived(BMessage* message)
++{
++	if (message->what == B_NODE_MONITOR) {
++		int32 opcode;
++		node_ref nref;
++		const char *name;
++
++		if (message->FindInt32("opcode", &opcode) != B_OK)
++			return;
++
++		switch (opcode) {
++			case B_ENTRY_MOVED:
++				{
++					int32 device = 0;
++					int64 srcFolder = 0;
++					int64 dstFolder = 0;
++					const char* name = NULL;
++					if (message->FindInt32("device", &device) != B_OK
++						|| message->FindInt64("to directory", &dstFolder) != B_OK
++						|| message->FindInt64("from directory", &srcFolder) != B_OK
++						|| message->FindString("name", &name) != B_OK)
++							break;
++
++					entry_ref ref(device, srcFolder, name);
++					BEntry entry(&ref);
++
++					BPath path;
++					entry.GetPath(&path);
++
++					QString qpath = QString::fromUtf8(path.Path());
++
++					emit fileChanged(qpath, false);
++				}
++				break;
++			case B_STAT_CHANGED:
++			case B_ATTR_CHANGED:
++				BString path;
++				if (message->FindString("path", &path) == B_OK) {
++					QString qpath = QString::fromUtf8(path.String());
++
++			        QFileInfo fi(qpath);
++			        if (!fi.exists())
++			            emit fileChanged(qpath, true);
++			        else
++			            emit fileChanged(qpath, false);
++				}
++				break;
++		}
++	}
++}
++
++void 
++QHaikuFileSystemWatcherEngine::bfsDirectoryChanged(const QString &path, bool removed)
++{
++	emit directoryChanged(path, removed);
++}
++
++void
++QHaikuFileSystemWatcherEngine::bfsFileChanged(const QString &path, bool removed)
++{
++	emit fileChanged(path, removed);
++}
++
++QT_END_NAMESPACE
++
++#include "moc_qfilesystemwatcher_haiku_p.cpp"
+--- a/src/corelib/io/qfilesystemwatcher_haiku_p.h	1969-12-31 19:00:00.000000000 -0500
++++ b/src/corelib/io/qfilesystemwatcher_haiku_p.h	2026-11-07 13:29:52.324712773 -0500
+@@ -0,0 +1,95 @@
++/****************************************************************************
++**
++** Copyright (C) 2020 The Qt Company Ltd.
++** Copyright (C) 2015-2020 Gerasim Troeglazov,
++** Contact: 3dEyes@gmail.com
++**
++** GNU General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU
++** General Public License version 2.0 or (at your option) the GNU General
++** Public license version 3 or any later version approved by the KDE Free
++** Qt Foundation. The licenses are as published by the Free Software
++** Foundation and appearing in the file LICENSE.GPL2 and LICENSE.GPL3
++** included in the packaging of this file. Please review the following
++** information to ensure the GNU General Public License requirements will
++** be met: https://www.gnu.org/licenses/gpl-2.0.html and
++** https://www.gnu.org/licenses/gpl-3.0.html.
++**
++****************************************************************************/
++
++#ifndef QFILESYSTEMWATCHER_HAIKU_P_H
++#define QFILESYSTEMWATCHER_HAIKU_P_H
++
++//
++//  W A R N I N G
++//  -------------
++//
++// This file is not part of the Qt API. It exists purely as an
++// implementation detail. This header file may change from version to
++// version without notice, or even be removed.
++//
++// We mean it.
++//
++
++#include <QtCore/qfileinfo.h>
++#include <QtCore/qmutex.h>
++#include <QtCore/qdatetime.h>
++#include <QtCore/qdir.h>
++#include <QtCore/qtimer.h>
++#include <QtCore/qhash.h>
++
++#include <Application.h>
++#include <NodeMonitor.h>
++#include <Looper.h>
++#include <String.h>
++#include <Autolock.h>
++#include <Handler.h>
++#include <Entry.h>
++#include <Path.h>
++
++#include "qfilesystemwatcher_p.h"
++
++QT_REQUIRE_CONFIG(filesystemwatcher);
++QT_BEGIN_NAMESPACE
++
++class QHaikuDirWatcher : public QObject, public BLooper {
++	Q_OBJECT
++public:
++	QHaikuDirWatcher();
++	virtual	void MessageReceived(BMessage* msg) override;
++Q_SIGNALS:
++	void directoryChanged(const QString &path, bool removed);
++};
++
++class QHaikuFileWatcher : public QObject, public BLooper {
++	Q_OBJECT
++public:
++	QHaikuFileWatcher();
++	virtual	void MessageReceived(BMessage* msg) override;
++Q_SIGNALS:
++	void fileChanged(const QString &path, bool removed);
++};
++
++class QHaikuFileSystemWatcherEngine : public QFileSystemWatcherEngine
++{
++    Q_OBJECT
++
++public:
++    QHaikuFileSystemWatcherEngine(QObject *parent);
++    ~QHaikuFileSystemWatcherEngine();
++
++    QStringList addPaths(const QStringList &paths, QStringList *files, QStringList *directories) override;
++    QStringList removePaths(const QStringList &paths, QStringList *files, QStringList *directories) override;
++
++private:
++	QHaikuDirWatcher *dirLooper;
++	QHaikuFileWatcher *fileLooper;
++
++private Q_SLOTS:
++	void bfsDirectoryChanged(const QString &path, bool removed);
++	void bfsFileChanged(const QString &path, bool removed);
++};
++
++QT_END_NAMESPACE
++#endif // QFILESYSTEMWATCHER_HAIKU_P_H
++
+--- a/src/corelib/io/qprocess_unix.cpp	2026-06-04 12:29:11.000000000 -0400
++++ b/src/corelib/io/qprocess_unix.cpp	2026-11-07 13:29:52.321082641 -0500
+@@ -892,6 +892,7 @@
+             return "setsid";
+     }
+ 
++#ifndef Q_OS_HAIKU
+     // Disconnect from the controlling TTY. This probably won't fail. Must be
+     // done after the session settings from above.
+     if (params.flags.testFlag(QProcess::UnixProcessFlag::DisconnectControllingTerminal)) {
+@@ -908,6 +909,7 @@
+         }
+ #endif
+     }
++#endif
+ 
+     // Disable core dumps near the end. This isn't expected to fail.
+     if (params.flags.testFlag(QProcess::UnixProcessFlag::DisableCoreDumps)) {
+--- a/src/corelib/io/qstandardpaths_haiku.cpp	2026-06-04 12:29:11.000000000 -0400
++++ b/src/corelib/io/qstandardpaths_haiku.cpp	2026-11-07 13:29:52.313590823 -0500
+@@ -112,15 +112,16 @@
+         return haikuStandardPath(B_USER_NONPACKAGED_BIN_DIRECTORY);
+     case TempLocation:
+         return haikuStandardPath(B_SYSTEM_TEMP_DIRECTORY);
+-    case AppDataLocation: // fall through
++    case AppDataLocation:
++    	return haikuAppStandardPath(B_SYSTEM_CACHE_DIRECTORY);
+     case AppLocalDataLocation:
+-        return haikuAppStandardPath(B_USER_NONPACKAGED_DATA_DIRECTORY);
++        return haikuAppStandardPath(B_USER_CACHE_DIRECTORY);
+     case GenericDataLocation:
+-        return haikuStandardPath(B_USER_NONPACKAGED_DATA_DIRECTORY);
++        return haikuAppStandardPath(B_SYSTEM_CACHE_DIRECTORY);
+     case CacheLocation:
+         return haikuAppStandardPath(B_USER_CACHE_DIRECTORY);
+     case GenericCacheLocation:
+-        return haikuStandardPath(B_USER_CACHE_DIRECTORY);
++        return haikuStandardPath(B_SYSTEM_CACHE_DIRECTORY);
+     case ConfigLocation:
+     case AppConfigLocation:
+     case StateLocation:
+@@ -129,7 +130,7 @@
+     case GenericConfigLocation:
+         return haikuStandardPath(B_USER_SETTINGS_DIRECTORY);
+     default:
+-        return QString();
++        return haikuAppStandardPath(B_USER_SETTINGS_DIRECTORY);
+     }
+ }
+ 
+@@ -150,7 +151,7 @@
+     case PublicShareLocation:
+     case TemplatesLocation:
+     case HomeLocation:
+-        paths += haikuStandardPath(B_USER_NONPACKAGED_DIRECTORY);
++        paths += haikuStandardPath(B_USER_DIRECTORY);
+         break;
+     case FontsLocation:
+         paths += haikuStandardPaths(B_FIND_PATH_FONTS_DIRECTORY);
+@@ -174,7 +175,7 @@
+         break;
+     case ConfigLocation: // fall through
+     case AppConfigLocation:
+-        paths += haikuAppStandardPath(B_SYSTEM_SETTINGS_DIRECTORY);
++        paths += haikuAppStandardPath(B_USER_SETTINGS_DIRECTORY);
+         break;
+     case GenericConfigLocation:
+         paths += haikuStandardPath(B_SYSTEM_SETTINGS_DIRECTORY);
+--- a/src/corelib/ipc/qsharedmemory_posix.cpp	2026-06-04 12:29:11.000000000 -0400
++++ b/src/corelib/ipc/qsharedmemory_posix.cpp	2026-11-07 13:30:54.271235420 -0500
+@@ -65,6 +65,10 @@
+ 
+     int fd;
+     QT_EINTR_LOOP(fd, ::shm_open(shmName.constData(), O_RDWR | O_CREAT | O_EXCL, 0600));
++#ifdef Q_OS_HAIKU
++    if (fd == -1)
++       QT_EINTR_LOOP(fd, ::shm_open(shmName.constData(), O_RDWR, 0600));
++#endif
+     if (fd == -1) {
+         const int errorNumber = errno;
+         const auto function = "QSharedMemory::attach (shm_open)"_L1;
+--- a/src/corelib/kernel/qcoreapplication.cpp	2026-06-04 12:29:11.000000000 -0400
++++ b/src/corelib/kernel/qcoreapplication.cpp	2026-11-07 13:29:52.320360041 -0500
+@@ -604,7 +604,7 @@
+     // QLocal8Bit hard-codes this, and we need to be consistent.
+ #  if defined(Q_OS_INTEGRITY)
+     setlocale(LC_CTYPE, "UTF-8");
+-#  elif defined(Q_OS_QNX)
++#  elif defined(Q_OS_QNX) || defined(Q_OS_HAIKU)
+     // QNX has no nl_langinfo, so we can't check.
+     // FIXME: Shouldn't we still setlocale("UTF-8")?
+ #  elif defined(Q_OS_ANDROID) && __ANDROID_API__ < __ANDROID_API_O__
+--- a/src/corelib/plugin/qelfparser_p.cpp	2026-06-04 12:29:11.000000000 -0400
++++ b/src/corelib/plugin/qelfparser_p.cpp	2026-11-07 13:29:52.316816436 -0500
+@@ -21,6 +21,12 @@
+ #  error "Need ELF header to parse plugins."
+ #endif
+ 
++#ifdef __HAIKU__
++#define PF_R PF_READ
++#define PF_W PF_WRITE
++#define PF_X PF_EXECUTE
++#endif
++
+ QT_BEGIN_NAMESPACE
+ 
+ using namespace Qt::StringLiterals;
+@@ -207,18 +213,26 @@
+     // byte 7
+     static bool checkOsAbi(const uchar *ident)
+     {
++#ifndef __HAIKU__
+         uchar osabi = ident[EI_OSABI];
+         // we don't check
+         Q_UNUSED(osabi);
++#else
++	 	Q_UNUSED(ident);
++#endif
+         return true;
+     }
+ 
+     // byte 8
+     static bool checkAbiVersion(const uchar *ident)
+     {
++#ifndef __HAIKU__
+         uchar abiversion = ident[EI_ABIVERSION];
+         // we don't check (and I don't know anyone who uses this)
+         Q_UNUSED(abiversion);
++#else
++	 	Q_UNUSED(ident);
++#endif
+         return true;
+     }
+ 
+@@ -336,6 +350,9 @@
+         break;
+     }
+ 
++#ifdef __HAIKU__
++	d << " (Haiku v1)";
++#else
+     switch (e_ident[EI_OSABI]) {
+     case ELFOSABI_SYSV:     d << " (SYSV"; break;
+     case ELFOSABI_HPUX:     d << " (HP-UX"; break;
+@@ -352,7 +369,7 @@
+     if (e_ident[EI_ABIVERSION])
+         d << " v" << e_ident[EI_ABIVERSION];
+     d << ')';
+-
++#endif
+     if (e_ident[EI_VERSION] != 1) {
+         d << ", file version " << e_ident[EI_VERSION];
+         return d;
+@@ -447,11 +464,12 @@
+         d << 'A';
+     if (s.shdr->sh_flags & SHF_EXECINSTR)
+         d << 'X';
++#ifndef __HAIKU__
+     if (s.shdr->sh_flags & SHF_STRINGS)
+         d << 'S';
+     if (s.shdr->sh_flags & SHF_TLS)
+         d << 'T';
+-
++#endif
+     d.space() << "offset" << s.shdr->sh_offset << "size" << s.shdr->sh_size;
+     return d;
+ }
+--- a/src/corelib/plugin/qlibrary_unix.cpp	2026-06-04 12:29:11.000000000 -0400
++++ b/src/corelib/plugin/qlibrary_unix.cpp	2026-11-07 13:29:52.316220364 -0500
+@@ -164,7 +164,7 @@
+         prefixes.append(QString());
+     }
+ 
+-#if defined(Q_PROCESSOR_X86) && !defined(Q_OS_DARWIN)
++#if defined(Q_PROCESSOR_X86) && !defined(Q_OS_DARWIN) && !defined(Q_OS_HAIKU)
+     if (qCpuHasFeature(ArchHaswell)) {
+         auto transform = [](QStringList &list, void (*f)(QString *)) {
+             QStringList tmp;
+--- a/src/corelib/text/qbytearray.cpp	2026-06-04 12:29:11.000000000 -0400
++++ b/src/corelib/text/qbytearray.cpp	2026-11-07 13:29:52.325247092 -0500
+@@ -73,6 +73,8 @@
+ 
+     Used in QByteArrayView::lastIndexOf() overload for a single char.
+ */
++extern void		*memrchr(const void *source, int value, size_t length);
++
+ const void *qmemrchr(const void *s, int needle, size_t size) noexcept
+ {
+ #if QT_CONFIG(memrchr)
+--- a/src/corelib/time/qtimezone.cpp	2026-06-04 12:29:11.000000000 -0400
++++ b/src/corelib/time/qtimezone.cpp	2026-11-07 13:30:54.270420592 -0500
+@@ -31,7 +31,7 @@
+     return new QMacTimeZonePrivate();
+ #elif defined(Q_OS_ANDROID)
+     return new QAndroidTimeZonePrivate();
+-#elif defined(Q_OS_UNIX) && !defined(Q_OS_VXWORKS) && !defined(Q_OS_WASM) && !defined(Q_OS_HARMONY)
++#elif defined(Q_OS_UNIX) && !defined(Q_OS_VXWORKS) && !defined(Q_OS_WASM) && !defined(Q_OS_HARMONY) && !defined(Q_OS_HAIKU)
+     return new QTzTimeZonePrivate();
+ #elif QT_CONFIG(icu)
+     return new QIcuTimeZonePrivate();
+@@ -52,7 +52,7 @@
+     return new QMacTimeZonePrivate(ianaId);
+ #elif defined(Q_OS_ANDROID)
+     return new QAndroidTimeZonePrivate(ianaId);
+-#elif defined(Q_OS_UNIX) && !defined(Q_OS_VXWORKS) && !defined(Q_OS_WASM) && !defined(Q_OS_HARMONY)
++#elif defined(Q_OS_UNIX) && !defined(Q_OS_VXWORKS) && !defined(Q_OS_WASM) && !defined(Q_OS_HARMONY) && !defined(Q_OS_HAIKU)
+     return new QTzTimeZonePrivate(ianaId);
+ #elif QT_CONFIG(icu)
+     return new QIcuTimeZonePrivate(ianaId);
+--- a/src/corelib/time/qtimezoneprivate_p.h	2026-06-04 12:29:11.000000000 -0400
++++ b/src/corelib/time/qtimezoneprivate_p.h	2026-11-07 13:30:54.270421777 -0500
+@@ -399,7 +399,7 @@
+ 
+     QJniObject androidTimeZone;
+ };
+-#elif defined(Q_OS_UNIX) && !defined(Q_OS_VXWORKS) && !defined(Q_OS_WASM) && !defined(Q_OS_HARMONY)
++#elif defined(Q_OS_UNIX) && !defined(Q_OS_VXWORKS) && !defined(Q_OS_WASM) && !defined(Q_OS_HARMONY) && !defined(Q_OS_HAIKU)
+ struct QTzTransitionTime
+ {
+     qint64 atMSecsSinceEpoch;
+--- a/src/network/CMakeLists.txt	2026-06-04 12:29:11.000000000 -0400
++++ b/src/network/CMakeLists.txt	2026-11-07 13:29:52.316654859 -0500
+@@ -226,6 +226,11 @@
+         NOMINMAX
+ )
+ 
++qt_internal_extend_target(Network CONDITION HAIKU
++    LIBRARIES
++        network
++)
++
+ qt_internal_extend_target(Network CONDITION APPLE AND NOT UIKIT
+     LIBRARIES
+         ${FWCoreServices}
+--- a/src/network/kernel/qhostinfo_unix.cpp	2026-06-04 12:29:11.000000000 -0400
++++ b/src/network/kernel/qhostinfo_unix.cpp	2026-11-07 13:29:52.314526449 -0500
+@@ -51,6 +51,8 @@
+     // res_init() is not thread-safe; executing it leads to state corruption.
+     // Whether it reloads resolv.conf on its own is unknown.
+     return;
++#elif defined(Q_OS_HAIKU)
++    return;
+ #endif
+ 
+ #if QT_CONFIG(libresolv)
+--- a/src/network/kernel/qnetworkinterface_unix.cpp	2026-06-04 12:29:11.000000000 -0400
++++ b/src/network/kernel/qnetworkinterface_unix.cpp	2026-11-07 13:29:52.314631065 -0500
+@@ -22,7 +22,7 @@
+ # include <ifaddrs.h>
+ #endif
+ 
+-#ifdef QT_LINUXBASE
++#if defined(QT_LINUXBASE) || defined(Q_OS_HAIKU)
+ #  include <arpa/inet.h>
+ #  ifndef SIOCGIFBRDADDR
+ #    define SIOCGIFBRDADDR 0x8919
+--- a/src/network/socket/qnativesocketengine_unix.cpp	2026-06-04 12:29:11.000000000 -0400
++++ b/src/network/socket/qnativesocketengine_unix.cpp	2026-11-07 14:08:39.885147820 -0500
+@@ -227,12 +227,14 @@
+         }
+         break;
+     case QNativeSocketEngine::KeepAliveIdleOption:
++#if defined(TCP_KEEPALIVE)
+         level = IPPROTO_TCP;
+-#ifdef TCP_KEEPALIVE
+         n = TCP_KEEPALIVE;
+-#else
++#elif defined(TCP_KEEPIDLE)
++        level = IPPROTO_TCP;
+         n = TCP_KEEPIDLE;
+ #endif
++        // (Haiku has neither: the option is not supported there)
+         break;
+     case QNativeSocketEngine::KeepAliveIntervalOption:
+ #ifdef TCP_KEEPINTVL
+@@ -271,8 +273,12 @@
+     }
+     int protocol = 0;
+ #endif // QT_NO_SCTP
++#ifdef Q_OS_HAIKU
++	int domain = AF_INET;
++#else
+     int domain = (socketProtocol == QAbstractSocket::IPv6Protocol
+                   || socketProtocol == QAbstractSocket::AnyIPProtocol) ? AF_INET6 : AF_INET;
++#endif
+     int type = (socketType == QAbstractSocket::UdpSocket) ? SOCK_DGRAM : SOCK_STREAM;
+ 
+     int socket = qt_safe_socket(domain, type, protocol, O_NONBLOCK);
+--- a/src/network/ssl/qsslsocket.cpp	2026-06-04 12:29:11.000000000 -0400
++++ b/src/network/ssl/qsslsocket.cpp	2026-11-07 13:29:52.313743250 -0500
+@@ -2981,6 +2981,7 @@
+         ba("/usr/local/ssl/certs/"), // Solaris
+         ba("/etc/openssl/certs/"), // BlackBerry
+         ba("/opt/openssl/certs/"), // HP-UX
++        ba("/system/data/ssl/"), // Haiku
+         ba("/etc/ssl/"), // OpenBSD
+         ba("/etc/security/certificates/"), // HarmonyOS
+     };
+--- a/src/testlib/qtestcrashhandler_unix.cpp	2026-06-04 12:29:11.000000000 -0400
++++ b/src/testlib/qtestcrashhandler_unix.cpp	2026-11-07 13:29:52.324574228 -0500
+@@ -40,7 +40,9 @@
+ # elif __has_include(<ucontext.h>)
+ #  include <ucontext.h>
+ # else
++# if !defined(Q_OS_HAIKU)
+ using ucontext_t = void;
++#endif
+ # endif
+ 
+ #if defined(Q_OS_MACOS)
+--- a/src/tools/bootstrap/CMakeLists.txt	2026-06-04 12:29:11.000000000 -0400
++++ b/src/tools/bootstrap/CMakeLists.txt	2026-11-07 13:30:54.271444918 -0500
+@@ -78,6 +78,7 @@
+         QT_BOOTSTRAPPED
+         QT_NO_CAST_FROM_ASCII
+         QT_NO_CAST_TO_ASCII
++        QT_NO_SHAREDMEMORY
+     INCLUDE_DIRECTORIES
+         ..
+         ../../3rdparty/tinycbor/src

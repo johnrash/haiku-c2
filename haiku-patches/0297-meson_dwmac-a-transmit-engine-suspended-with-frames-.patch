@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 4 Nov 2026 18:50:43 -0500
+Subject: [PATCH 297/342] meson_dwmac: a transmit engine suspended with frames
+ waiting
+
+Under a sustained TCP send the engine stayed in its suspended state, on the last
+slot it read, with hundreds of frames queued behind and poll demands going in for
+each, until the device was closed. So the link stopped sending for good, while
+receiving went on. Seen within two boots of a fresh boot, a Wi-Fi upload and two
+Ethernet blasts. Nothing logged: no bus error or link change.
+
+Checked once a second now. After 2 s in that state it's logged with the descriptors
+around, followed by a poll demand and then a restart of the transmit engine alone.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../network/ether/meson_dwmac/meson_dwmac.cpp | 75 +++++++++++++++----
+ 1 file changed, 61 insertions(+), 14 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp b/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
+index e7bcd23154..857139ad41 100644
+--- a/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
++++ b/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
+@@ -897,7 +897,10 @@ MesonDwmac::_ConfigureEee()
+ }
+ 
+ 
+-/*!	Logs it when the DMA engine sits on a frame it owns for 3 s. */
++/*!	The transmit engine can stay suspended with frames waiting, whatever
++	the poll demands say. Seen under sustained sending; everything else goes
++	on working. Restarted here, without the frame that's lost in the ring.
++*/
+ void
+ MesonDwmac::_CheckTransmit()
+ {
+@@ -905,24 +908,65 @@ MesonDwmac::_CheckTransmit()
+ 		return;
+ 
+ 	MutexLocker locker(fTxLock);
++	bool suspended = ((_Read(kDmaStatus) >> 20) & 7) == 6;
+ 	uint32 current = (_Read(kDmaCurrentTxDesc)
+ 		- (uint32)_DescriptorPhysical(kRxCount)) / kDescriptorStride;
+ 	if (current >= kTxCount)
+ 		return;
+-	_SyncDescriptor(kRxCount + current, true);
+-	bool owned = (_TxDescriptor(current)->status & DESC_OWN) != 0;
+ 
+-	if (!owned || current != fTxLastCurrent) {
+-		if (fTxStuckSeconds >= 3)
+-			INFO("transmit moving again after %" B_PRId32 " s\n", fTxStuckSeconds);
++	// the engine's slot is the last one it read, or the one it waits for
++	bool waiting = false;
++	for (uint32 i = 0; i < 2 && !waiting; i++) {
++		uint32 slot = (current + i) % kTxCount;
++		_SyncDescriptor(kRxCount + slot, true);
++		waiting = (_TxDescriptor(slot)->status & DESC_OWN) != 0;
++	}
++
++	if (!suspended || !waiting || current != fTxLastCurrent) {
+ 		fTxStuckSeconds = 0;
+ 		fTxLastCurrent = current;
+ 		return;
+ 	}
+-	if (++fTxStuckSeconds == 3) {
+-		ERROR("transmit stuck on a frame for 3 s\n");
+-		DumpState(&dprintf);
++	if (++fTxStuckSeconds < 2)
++		return;
++	fTxStuckSeconds = 0;
++
++	ERROR("transmit suspended with frames waiting\n");
++	DumpState(&dprintf);
++
++	_Write(kDmaTxPollDemand, 1);
++	spin(1000);
++	uint32 status = _Read(kDmaStatus);
++	ERROR("after a poll demand: state %" B_PRIu32 ", slot %" B_PRIu32 "\n",
++		(status >> 20) & 7, (_Read(kDmaCurrentTxDesc)
++			- (uint32)_DescriptorPhysical(kRxCount)) / kDescriptorStride);
++	if (((status >> 20) & 7) != 6)
++		return;
++
++	uint32 operation = _Read(kDmaOperationMode);
++	_Write(kDmaOperationMode, operation & ~OPERATION_ST);
++	for (int32 i = 0; i < 100 && ((_Read(kDmaStatus) >> 20) & 7) != 0; i++)
++		spin(100);
++
++	uint32 first = current;
++	for (uint32 i = 0; i < kTxCount; i++) {
++		uint32 slot = (current + i) % kTxCount;
++		_SyncDescriptor(kRxCount + slot, true);
++		if ((_TxDescriptor(slot)->status & DESC_OWN) != 0) {
++			first = slot;
++			break;
++		}
+ 	}
++	_Write(kDmaTxDescList, (uint32)_DescriptorPhysical(kRxCount + first));
++	_Write(kDmaOperationMode, operation);
++	_Write(kDmaTxPollDemand, 1);
++	spin(1000);
++
++	status = _Read(kDmaStatus);
++	ERROR("transmit restarted at slot %" B_PRIu32 ": state %" B_PRIu32
++		", slot %" B_PRIu32 "\n", first, (status >> 20) & 7,
++		(_Read(kDmaCurrentTxDesc) - (uint32)_DescriptorPhysical(kRxCount))
++			/ kDescriptorStride);
+ }
+ 
+ 
+@@ -950,11 +994,14 @@ MesonDwmac::DumpState(void (*print)(const char*, ...))
+ 		" of the engine, %" B_PRIu32 " of the driver\n", current, fTxHead,
+ 		_Read(kDmaCurrentTxBuffer), currentRx, fRxHead);
+ 	if (current < kTxCount) {
+-		_SyncDescriptor(kRxCount + current, true);
+-		volatile descriptor* desc = _TxDescriptor(current);
+-		print("meson_dwmac: its descriptor: status %#" B_PRIx32 ", control %#"
+-			B_PRIx32 ", buffer %#" B_PRIx32 ", next %#" B_PRIx32 "\n",
+-			desc->status, desc->control, desc->buffer, desc->next);
++		for (uint32 i = kTxCount - 2; i < kTxCount + 3; i++) {
++			uint32 slot = (current + i) % kTxCount;
++			_SyncDescriptor(kRxCount + slot, true);
++			volatile descriptor* desc = _TxDescriptor(slot);
++			print("meson_dwmac: slot %" B_PRIu32 ": status %#" B_PRIx32
++				", control %#" B_PRIx32 ", next %#" B_PRIx32 "\n", slot,
++				desc->status, desc->control, desc->next);
++		}
+ 	}
+ 	print("meson_dwmac: counters: sent %" B_PRIu32 " frames, %" B_PRIu32
+ 		" bytes; received %" B_PRIu32 " frames, %" B_PRIu32 " CRC errors; "

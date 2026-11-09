@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 6 Nov 2026 01:29:04 -0500
+Subject: [PATCH 318/342] tcp: reset on data that arrives after the socket was
+ closed
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A connection closed normally (FIN) while the peer kept sending queued what
+arrived for a reader that no longer existed, and held it until the 2 MSL
+timer freed the endpoint: on the test board, 4 senders took used memory
+from 250 to 1,503 MB in 4 minutes (1,062 connections), the rest of the
+memory left in empty slabs of the net buffer caches. _Disconnect() already
+resets when unread data is queued at close; RFC 2525 § 2.17 asks the same
+"if any new data is received". After Free() (the application has closed
+the socket, FLAG_CLOSED), new data in FINISH_SENT or FINISH_ACKNOWLEDGED
+now gets a reset, and the endpoint closes through _Close(), whose
+FLAG_DELETE_ON_CLOSE lets SegmentReceived() release the reference Free()
+took, once, as before. A half-close (shutdown(SHUT_WR)) keeps receiving.
+Same load afterwards: used memory flat at 250 MB over 66,715 connections.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/network/protocols/tcp/TCPEndpoint.cpp   | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp b/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+index 7a6ed8b3de..795ff8babc 100644
+--- a/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
++++ b/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+@@ -1925,6 +1925,20 @@ TCPEndpoint::_Receive(tcp_segment_header& segment, net_buffer* buffer)
+ 	// the size as we still need it later.
+ 	const uint32 bufferSize = buffer->size;
+ 
++	// New data after the application closed the socket has no reader: the
++	// peer doesn't know, so reset instead of keeping what arrives until the
++	// time wait ends ("or if any new data is received", RFC 2525 § 2.17;
++	// _Disconnect() covers data already queued at close). A half-close
++	// (shutdown(SHUT_WR)) doesn't set FLAG_CLOSED and keeps receiving.
++	if (bufferSize > 0 && (fFlags & FLAG_CLOSED) != 0
++		&& (fState == FINISH_SENT || fState == FINISH_ACKNOWLEDGED)
++		&& tcp_sequence(segment.sequence + bufferSize) > fReceiveNext) {
++		TRACE("Receive(): data after close, resetting");
++		_SendReset(true);
++		_Close();
++		return DROP;
++	}
++
+ 	if ((bufferSize > 0 || (segment.flags & TCP_FLAG_FINISH) != 0)
+ 		&& _ShouldReceive())
+ 		notify = _AddData(segment, buffer);

@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Tue, 3 Nov 2026 17:13:31 -0500
+Subject: [PATCH 272/342] usb_audio: a device goes by its own name
+
+All were called "USB Audio", which told four adapters apart neither in the
+Media preferences nor for the media add-on, which keeps a node's settings under
+its name and hands them out in order. With adapters added or removed, a saved
+rate went to another adapter: the AB13X was set to 8 kHz, which dwc2 refused, and
+it was silent. The name now comes from the device's product string.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/drivers/audio/usb/Device.cpp       | 35 ++++++++++++++++++-
+ src/add-ons/kernel/drivers/audio/usb/Device.h |  2 ++
+ 2 files changed, 36 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Device.cpp b/src/add-ons/kernel/drivers/audio/usb/Device.cpp
+index 45dbb17998..0ba520d78e 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Device.cpp
++++ b/src/add-ons/kernel/drivers/audio/usb/Device.cpp
+@@ -41,6 +41,7 @@ Device::Device(usb_device device)
+ 	fVendorID = deviceDescriptor->vendor_id;
+ 	fProductID = deviceDescriptor->product_id;
+ 	fUSBVersion = deviceDescriptor->usb_version;
++	_ReadName(deviceDescriptor->product);
+ 
+ 	fBuffersReadySem = create_sem(0, DRIVER_NAME "_buffers_ready");
+ 	if (fBuffersReadySem < B_OK) {
+@@ -422,6 +423,38 @@ Device::SetupDevice(bool deviceReplugged)
+ }
+ 
+ 
++/*!	The device's own name, for the Media preferences and for the media add-on,
++	which keeps a node's settings under its name: with all called "USB Audio",
++	a saved rate of one adapter went to another and could silence it.
++*/
++void
++Device::_ReadName(uint8 stringIndex)
++{
++	strlcpy(fName, "USB Audio", sizeof(fName));
++
++	uint8 descriptor[2 + 2 * (sizeof(fName) - 1)];
++	size_t length = 0;
++	if (stringIndex == 0 || gUSBModule->get_descriptor(fDevice,
++			USB_DESCRIPTOR_STRING, stringIndex, 0x0409, descriptor,
++			sizeof(descriptor), &length) != B_OK || length <= 2) {
++		return;
++	}
++	length = min_c(length, (size_t)descriptor[0]);
++
++	char name[sizeof(fName)];
++	size_t count = 0;
++	for (size_t i = 2; i + 1 < length; i += 2) {
++		name[count++] = descriptor[i + 1] == 0 && descriptor[i] >= 0x20
++			&& descriptor[i] < 0x7f ? descriptor[i] : '?';
++	}
++	while (count > 0 && name[count - 1] == ' ')
++		count--;
++	name[count] = '\0';
++	if (count > 0)
++		strlcpy(fName, name, sizeof(fName));
++}
++
++
+ status_t
+ Device::CompareAndReattach(usb_device device)
+ {
+@@ -478,7 +511,7 @@ Device::_MultiGetDescription(multi_description* multiDescription)
+ 	Description.interface_version = B_CURRENT_INTERFACE_VERSION;
+ 	Description.interface_minimum = B_CURRENT_INTERFACE_VERSION;
+ 
+-	strlcpy(Description.friendly_name, "USB Audio",
++	strlcpy(Description.friendly_name, fName,
+ 		sizeof(Description.friendly_name));
+ 
+ 	strlcpy(Description.vendor_info, "S.Zharski",
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Device.h b/src/add-ons/kernel/drivers/audio/usb/Device.h
+index b40a2187ad..5a28d67299 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Device.h
++++ b/src/add-ons/kernel/drivers/audio/usb/Device.h
+@@ -44,6 +44,7 @@ public:
+ 
+ private:
+ 			status_t		_SetupEndpoints();
++			void			_ReadName(uint8 stringIndex);
+ 
+ // protected:
+ 	virtual	status_t		StartDevice() { return B_OK; }
+@@ -61,6 +62,7 @@ private:
+ 			uint16			fUSBVersion;
+ 			uint16			fVendorID;
+ 			uint16			fProductID;
++			char			fName[32];
+ 	const	char*			fDescription;
+ 			bool			fNonBlocking;
+ 

@@ -1,0 +1,255 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 10:53:00 -0400
+Subject: [PATCH 057/342] usb_audio: survive unplugging and replugging while in
+ use
+
+Unplugged while the media_server used it, the device stopped its
+transfers, and the buffer exchange waited for them forever: the media
+node using the device as its time source stopped its clock, and the
+mixer and players depending on it died in
+"BTimeSource::RealTimeFor: performance time too large". Replugged, the
+endpoints were set up again by creating a second set of streams next to
+the old ones, whose pipes were gone; the exchange hung again.
+
+* Removal wakes up a waiting buffer exchange. While the device is gone,
+  the exchange goes on in real time, the streams' buffers in turn, as if
+  they were played and recorded: clocks keep going.
+* A replugged device keeps its streams (the client has their buffers
+  mapped); only their pipes are renewed, the streams start again with
+  the next exchange, and the sampling rate is set again (the device
+  forgot it).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/drivers/audio/usb/Device.cpp       | 47 ++++++++++++++++--
+ src/add-ons/kernel/drivers/audio/usb/Device.h |  3 ++
+ .../kernel/drivers/audio/usb/Stream.cpp       | 48 ++++++++++++++++++-
+ src/add-ons/kernel/drivers/audio/usb/Stream.h |  3 ++
+ 4 files changed, 97 insertions(+), 4 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Device.cpp b/src/add-ons/kernel/drivers/audio/usb/Device.cpp
+index bafea383b1..7bff275cda 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Device.cpp
++++ b/src/add-ons/kernel/drivers/audio/usb/Device.cpp
+@@ -23,7 +23,8 @@ Device::Device(usb_device device)
+ 	fDevice(device),
+ 	fNonBlocking(false),
+ 	fAudioControl(this),
+-	fBuffersReadySem(-1)
++	fBuffersReadySem(-1),
++	fRemovedExchanges(0)
+ {
+ 	const usb_device_descriptor* deviceDescriptor
+ 		= gUSBModule->get_device_descriptor(device);
+@@ -404,6 +405,9 @@ Device::Removed()
+ 
+ 	for (int i = 0; i < fStreams.Count(); i++)
+ 		fStreams[i]->OnRemove();
++
++	// wake up a buffer exchange waiting for the streams
++	release_sem_etc(fBuffersReadySem, 1, B_DO_NOT_RESCHEDULE);
+ }
+ 
+ 
+@@ -694,6 +698,9 @@ Device::_MultiBufferExchange(multi_buffer_info* multiInfo)
+ 		return B_BAD_ADDRESS;
+ 	}
+ 
++	if (fRemoved)
++		return _ExchangeWhileRemoved(&Info, multiInfo);
++
+ 	for (int i = 0; i < fStreams.Count(); i++) {
+ 		if (!fStreams[i]->IsRunning())
+ 			fStreams[i]->Start();
+@@ -705,6 +712,8 @@ Device::_MultiBufferExchange(multi_buffer_info* multiInfo)
+ 		TRACE(ERR, "Timeout during buffers exchange.\n");
+ 		return status;
+ 	}
++	if (fRemoved)
++		return _ExchangeWhileRemoved(&Info, multiInfo);
+ 
+ 	status = B_ERROR;
+ 	for (int i = 0; i < fStreams.Count(); i++) {
+@@ -726,6 +735,33 @@ Device::_MultiBufferExchange(multi_buffer_info* multiInfo)
+ }
+ 
+ 
++/*!	The device was unplugged (and may come back): the exchange goes on in
++	real time, the streams' buffers in turn, as if they were played and
++	recorded. A media node using the device as its time source would
++	otherwise stop its clock, and the nodes that depend on it fail.
++*/
++status_t
++Device::_ExchangeWhileRemoved(multi_buffer_info* info,
++	multi_buffer_info* userInfo)
++{
++	if (fStreams.Count() == 0)
++		return B_ERROR;
++
++	Stream* stream = fStreams[fRemovedExchanges++ % fStreams.Count()];
++	bigtime_t duration = stream->BufferDuration();
++	if (duration == 0) {
++		snooze(10000);
++		return B_ERROR;
++	}
++	snooze(duration / fStreams.Count());
++	stream->SimulateExchange(info);
++
++	if (user_memcpy(userInfo, info, sizeof(multi_buffer_info)) != B_OK)
++		return B_BAD_ADDRESS;
++	return B_OK;
++}
++
++
+ status_t
+ Device::_MultiBufferForceStop()
+ {
+@@ -793,6 +829,10 @@ Device::_SetupEndpoints()
+ 		return B_ERROR;
+ 	}
+ 
++	// a replugged device keeps its streams (their buffers are mapped by the
++	// client), only their pipes are new
++	bool replugged = fStreams.Count() > 0;
++
+ 	for (size_t i = 0; i < config->interface_count; i++) {
+ 		usb_interface_info* Interface = config->interface[i].active;
+ 		if (Interface == NULL || Interface->descr == NULL)
+@@ -802,10 +842,11 @@ Device::_SetupEndpoints()
+ 
+ 		switch (Interface->descr->interface_subclass) {
+ 			case USB_AUDIO_INTERFACE_AUDIOCONTROL_SUBCLASS:
+-				fAudioControl.Init(i, Interface);
++				if (!replugged)
++					fAudioControl.Init(i, Interface);
+ 				break;
+ 			case USB_AUDIO_INTERFACE_AUDIOSTREAMING_SUBCLASS:
+-				{
++				if (!replugged) {
+ 					Stream* stream = new(std::nothrow) Stream(this, i,
+ 						&config->interface[i]);
+ 					if (stream->Init() == B_OK) {
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Device.h b/src/add-ons/kernel/drivers/audio/usb/Device.h
+index 5f52566bb5..2353425da7 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Device.h
++++ b/src/add-ons/kernel/drivers/audio/usb/Device.h
+@@ -79,8 +79,11 @@ private:
+ 			status_t		_MultiListMixControls(multi_mix_control_info* Info);
+ 			status_t		_MultiBufferExchange(multi_buffer_info* Info);
+ 			status_t		_MultiBufferForceStop();
++			status_t		_ExchangeWhileRemoved(multi_buffer_info* info,
++								multi_buffer_info* userInfo);
+ 
+ 			sem_id			fBuffersReadySem;
++			uint32			fRemovedExchanges;
+ };
+ 
+ 
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Stream.cpp b/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
+index 343d7525eb..9e50dd9bdb 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
++++ b/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
+@@ -162,6 +162,9 @@ Stream::OnRemove()
+ 		snooze(100);
+ 
+ 	gUSBModule->cancel_queued_transfers(fStreamEndpoint);
++
++	// if the device is replugged, the next buffer exchange starts anew
++	fIsRunning = false;
+ }
+ 
+ 
+@@ -268,6 +271,9 @@ Stream::OnSetConfiguration(usb_device device,
+ 			fStreamEndpoint = interface->endpoint[i].handle;
+ 			TRACE(INF, "%s Stream Endpoint [address %#04x] handle is: %#010x.\n",
+ 				fIsInput ? "Input" : "Output", address, fStreamEndpoint);
++			// a replugged device has forgotten the sampling rate set before
++			if (fAreaSize != 0)
++				_SetSamplingRate();
+ 			return B_OK;
+ 		}
+ 	}
+@@ -452,13 +458,20 @@ Stream::SetGlobalFormat(multi_format_info* Format)
+ 	if (status != B_OK)
+ 		return status;
+ 
++	return _SetSamplingRate();
++}
++
++
++status_t
++Stream::_SetSamplingRate()
++{
+ 	// set endpoint speed
+ 	uint32 samplingRate = fAlternates[fActiveAlternate]->GetSamplingRate();
+ 	size_t actualLength = 0;
+ 	usb_audio_sampling_freq freq = _ASFormatDescriptor::GetSamFreq(samplingRate);
+ 	uint8 address = fAlternates[fActiveAlternate]->Endpoint()->fEndpointAddress;
+ 
+-	status = gUSBModule->send_request(fDevice->fDevice,
++	status_t status = gUSBModule->send_request(fDevice->fDevice,
+ 		USB_REQTYPE_CLASS | USB_REQTYPE_ENDPOINT_OUT,
+ 		USB_AUDIO_SET_CUR, USB_AUDIO_SAMPLING_FREQ_CONTROL << 8,
+ 		address, sizeof(freq), &freq, &actualLength);
+@@ -542,6 +555,39 @@ Stream::GetBuffers(multi_buffer_list* List)
+ }
+ 
+ 
++/*!	How long one of the buffers plays (or records), 0 if there are none. */
++bigtime_t
++Stream::BufferDuration()
++{
++	uint32 rate = fAlternates[fActiveAlternate]->GetSamplingRate();
++	size_t frames = fSamplesCount / kSamplesBufferCount;
++	if (rate == 0 || frames == 0)
++		return 0;
++	return (bigtime_t)frames * 1000000 / rate;
++}
++
++
++/*!	The device is gone: reports the current buffer as done, as
++	ExchangeBuffer() would, so that the client's clock keeps going.
++*/
++void
++Stream::SimulateExchange(multi_buffer_info* Info)
++{
++	size_t frames = fSamplesCount / kSamplesBufferCount;
++	fRealTime = system_time();
++	fCurrentBuffer = (fCurrentBuffer + 1) % kSamplesBufferCount;
++	if (fIsInput) {
++		Info->recorded_real_time = fRealTime;
++		Info->recorded_frames_count += frames;
++		Info->record_buffer_cycle = fCurrentBuffer;
++	} else {
++		Info->played_real_time = fRealTime;
++		Info->played_frames_count += frames;
++		Info->playback_buffer_cycle = fCurrentBuffer;
++	}
++}
++
++
+ bool
+ Stream::ExchangeBuffer(multi_buffer_info* Info)
+ {
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Stream.h b/src/add-ons/kernel/drivers/audio/usb/Stream.h
+index 4490e4c2c6..472deb5aef 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Stream.h
++++ b/src/add-ons/kernel/drivers/audio/usb/Stream.h
+@@ -34,6 +34,8 @@ public:
+ 							const usb_configuration_info* config);
+ 
+ 			bool			ExchangeBuffer(multi_buffer_info* Info);
++			bigtime_t		BufferDuration();
++			void			SimulateExchange(multi_buffer_info* Info);
+ 			status_t		GetEnabledChannels(uint32& offset,
+ 								multi_channel_enable* Enable);
+ 			status_t		SetEnabledChannels(uint32& offset,
+@@ -65,6 +67,7 @@ protected:
+ private:
+ 			status_t		_ChooseAlternate();
+ 			status_t		_SetupBuffers();
++			status_t		_SetSamplingRate();
+ 			status_t		_QueueNextTransfer(size_t buffer, bool start);
+ 	static	void			_TransferCallback(void* cookie, status_t status,
+ 								void* data, size_t actualLength);

@@ -1,0 +1,209 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 04:13:19 -0400
+Subject: [PATCH 160/342] meson_scpi: the clock follows the load by default,
+ and the scheduler mode
+
+The governor was opt-in ("dvfs on", then "auto" written to the device),
+so the ODROID-C2 ran at 1536 MHz all the time. It now starts in "auto";
+"dvfs off" in the driver settings keeps the boot firmware's clock. It
+looks every 50 ms instead of 200, goes one point down only after 150 ms
+of low load, and follows the scheduler's mode (ProcessController's
+"Power saving"): low latency, the default, goes to the highest point at
+once above 80 % load and down to 1000 MHz; power saving goes one point
+at a time, down to 250 MHz. The thermal limits stay.
+
+ODROID-C2: a fixed loop runs at full speed under load in both modes
+(1.30 s and 1.44 s for 400 M iterations, 1.30 s at a fixed 1536 MHz); a
+20 M burst after idling takes 82-94 ms (65 ms fixed), 128-193 ms in
+power saving; idle at 1000 MHz and 250 MHz.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../drivers/power/meson_scpi/meson_scpi.cpp   | 88 ++++++++++++++-----
+ 1 file changed, 66 insertions(+), 22 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/power/meson_scpi/meson_scpi.cpp b/src/add-ons/kernel/drivers/power/meson_scpi/meson_scpi.cpp
+index 001237a7b5..4ac102de6e 100644
+--- a/src/add-ons/kernel/drivers/power/meson_scpi/meson_scpi.cpp
++++ b/src/add-ons/kernel/drivers/power/meson_scpi/meson_scpi.cpp
+@@ -12,11 +12,13 @@
+ 	- write: "<MHz>" (the highest operating point not above it), "max", or
+ 	  "auto" (a governor following load and temperature).
+ 
+-	Changing the clock is off unless the driver settings file
+-	(~/config/settings/kernel/drivers/meson_scpi) contains "dvfs on": the
+-	C2's device tree disables its SCPI clock node. The clock is never set
+-	above 1536 MHz, the frequency the boot firmware runs at; the firmware's
+-	table goes higher, and the C2 is not stable there.
++	The clock follows the load from the start ("auto"): the C2's device
++	tree disables its SCPI clock node, but the firmware's operating points
++	work. "dvfs off" in the driver settings file
++	(~/config/settings/kernel/drivers/meson_scpi) leaves the clock as the
++	boot firmware set it. The clock is never set above 1536 MHz, the
++	frequency the boot firmware runs at; the firmware's table goes higher,
++	and the C2 is not stable there.
+ 
+ 	Sources: the GXBB device tree for addresses, TF-A's plat/amlogic
+ 	(BSD-3-Clause) for the mailbox handshake and command word, ARM's SCPI
+@@ -37,6 +39,7 @@
+ 
+ #include <AutoDeleterDrivers.h>
+ #include <cpu.h>
++#include <kscheduler.h>
+ #include <smp.h>
+ #include <util/AutoLock.h>
+ 
+@@ -86,8 +89,13 @@ enum {
+ static const uint32 kMaxOperatingPoints = 16;
+ static const uint32 kMaxFrequency = 1536000000;		// the boot clock
+ static const uint32 kAutoFloorFrequency = 1000000000;
++	// "auto" in the scheduler's low latency mode, and the thermal floor
++static const uint32 kPowerSavingFloorFrequency = 250000000;
++	// "auto" in its power saving mode (ProcessController's "Power saving")
+ static const bigtime_t kCommandTimeout = 100000;
+-static const bigtime_t kGovernorInterval = 200000;
++static const bigtime_t kGovernorInterval = 50000;
++static const int32 kStepDownWindows = 3;
++	// governor intervals of low load before the clock goes one point down
+ static const int32 kThermalStepDown = 80;			// device tree passive trip
+ static const int32 kThermalFloor = 90;				// device tree hot trip
+ static const int32 kThermalHysteresis = 2;
+@@ -146,6 +154,8 @@ private:
+ 			uint32				fMilliVolts[kMaxOperatingPoints];
+ 			int32				fMaxIndex;		// highest allowed
+ 			int32				fFloorIndex;	// lowest for "auto"
++			int32				fPowerSavingFloorIndex;
++				// lowest for "auto" in power saving mode
+ 			int32				fCurrentIndex;	// -1: unknown
+ 
+ 			bool				fClockControl;	// "dvfs on"
+@@ -170,6 +180,7 @@ MesonScpi::MesonScpi(device_node* node)
+ 	fOperatingPointCount(0),
+ 	fMaxIndex(-1),
+ 	fFloorIndex(0),
++	fPowerSavingFloorIndex(0),
+ 	fCurrentIndex(-1),
+ 	fClockControl(false),
+ 	fAuto(false),
+@@ -272,6 +283,8 @@ MesonScpi::Init()
+ 				fMaxIndex = i;
+ 			if (fFrequency[i] <= kAutoFloorFrequency)
+ 				fFloorIndex = i;
++			if (fFrequency[i] <= kPowerSavingFloorFrequency)
++				fPowerSavingFloorIndex = i;
+ 		}
+ 		char list[256];
+ 		size_t used = 0;
+@@ -292,19 +305,21 @@ MesonScpi::Init()
+ 
+ 	void* settings = load_driver_settings("meson_scpi");
+ 	if (settings != NULL) {
+-		fClockControl = get_driver_boolean_parameter(settings, "dvfs", false,
++		fClockControl = get_driver_boolean_parameter(settings, "dvfs", true,
+ 			true);
+ 		unload_driver_settings(settings);
+-	}
++	} else
++		fClockControl = true;
+ 	if (fClockControl && fMaxIndex >= 0 && !fGivenUp) {
+ 		fRequestedIndex = fMaxIndex;
++		fAuto = true;
+ 		fThermalLimit = fMaxIndex;
+ 		fGovernorThread = spawn_kernel_thread(_GovernorThread,
+ 			"meson_scpi governor", B_NORMAL_PRIORITY, this);
+ 		if (fGovernorThread >= 0)
+ 			resume_thread(fGovernorThread);
+ 	}
+-	INFO("clock control %s\n", fClockControl ? "on" : "off");
++	INFO("clock control %s\n", fClockControl ? "on, auto" : "off");
+ 	return B_OK;
+ }
+ 
+@@ -438,11 +453,14 @@ MesonScpi::_GovernorThread(void* data)
+ }
+ 
+ 
+-/*!	Runs while clock control is on. In "auto" mode the clock follows the
+-	busiest CPU: above 80 % load the highest allowed point, below 30 % one
+-	point lower, down to 1000 MHz. In every mode the temperature limits it:
+-	from 80 C one point lower per second, from 90 C the 1000 MHz floor,
+-	released 2 C below the limit.
++/*!	Runs while clock control is on, every 50 ms. In "auto" mode the clock
++	follows the busiest CPU, as the scheduler's mode asks:
++	- low latency (the default): above 80 % load the highest allowed point
++	  at once; below 30 % for 150 ms one point lower, down to 1000 MHz;
++	- power saving: above 80 % one point higher, below 30 % for 150 ms one
++	  point lower, down to 250 MHz.
++	In every mode the temperature limits it: from 80 C one point lower per
++	second, from 90 C the 1000 MHz floor, released 2 C below the limit.
+ */
+ void
+ MesonScpi::_Governor()
+@@ -454,6 +472,8 @@ MesonScpi::_Governor()
+ 	bigtime_t lastTime = system_time();
+ 	bigtime_t nextThermal = 0;
+ 	int32 hotReadings = 0;
++	int32 lowWindows = 0;
++	bool wasPowerSaving = false;
+ 
+ 	while (!fStopGovernor && !fGivenUp) {
+ 		snooze(kGovernorInterval);
+@@ -502,13 +522,29 @@ MesonScpi::_Governor()
+ 
+ 		int32 target = fRequestedIndex;
+ 		if (fAuto) {
++			bool powerSaving
++				= _user_get_scheduler_mode() == SCHEDULER_MODE_POWER_SAVING;
++			if (powerSaving != wasPowerSaving) {
++				wasPowerSaving = powerSaving;
++				INFO("scheduler mode %s: down to %" B_PRIu32 " MHz\n",
++					powerSaving ? "power saving" : "low latency",
++					fFrequency[powerSaving ? fPowerSavingFloorIndex
++						: fFloorIndex] / 1000000);
++			}
++			int32 floor = powerSaving ? fPowerSavingFloorIndex : fFloorIndex;
+ 			int32 current = fCurrentIndex >= 0 ? fCurrentIndex : fMaxIndex;
+-			if (load > 80)
+-				target = fMaxIndex;
+-			else if (load < 30)
+-				target = max_c(current - 1, fFloorIndex);
+-			else
+-				target = current;
++			target = current;
++			if (load > 80) {
++				target = powerSaving ? current + 1 : fMaxIndex;
++				lowWindows = 0;
++			} else if (load < 30) {
++				if (++lowWindows >= kStepDownWindows) {
++					target = current - 1;
++					lowWindows = 0;
++				}
++			} else
++				lowWindows = 0;
++			target = max_c(min_c(target, fMaxIndex), floor);
+ 		}
+ 		target = min_c(target, fThermalLimit);
+ 		if (target >= 0 && target != fCurrentIndex)
+@@ -543,11 +579,19 @@ MesonScpi::_Describe(char* buffer, size_t size)
+ 	}
+ 	ADD("\n");
+ 	if (!fClockControl) {
+-		ADD("Clock control: off (\"dvfs on\" in "
+-			"~/config/settings/kernel/drivers/meson_scpi turns it on)\n");
++		ADD("Clock control: off (\"dvfs off\" in "
++			"~/config/settings/kernel/drivers/meson_scpi)\n");
+ 	} else {
+ 		ADD("Clock control: %s, write \"<MHz>\", \"max\" or \"auto\"\n",
+ 			fAuto ? "auto" : "manual");
++		if (fAuto) {
++			bool powerSaving
++				= _user_get_scheduler_mode() == SCHEDULER_MODE_POWER_SAVING;
++			ADD("Scheduler mode: %s (auto goes down to %" B_PRIu32 " MHz)\n",
++				powerSaving ? "power saving" : "low latency",
++				fFrequency[powerSaving ? fPowerSavingFloorIndex
++					: fFloorIndex] / 1000000);
++		}
+ 		if (fThermalLimit >= 0 && fThermalLimit < fMaxIndex) {
+ 			ADD("Thermal limit: %" B_PRIu32 " MHz\n",
+ 				fFrequency[fThermalLimit] / 1000000);

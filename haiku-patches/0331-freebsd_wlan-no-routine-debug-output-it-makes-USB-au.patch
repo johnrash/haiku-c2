@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 6 Nov 2026 23:52:06 -0500
+Subject: [PATCH 331/342] freebsd_wlan: no routine debug output, it makes USB
+ audio skip
+
+Kernel debug output is written to the serial port with interrupts off on
+the printing CPU, milliseconds a line, whether anything is attached or not.
+On a C2 on Wi-Fi the Wi-Fi layer printed a line for every wireless ioctl
+(TRACE_WLAN: 162 in 40 minutes) and four lines each time the access
+point's beacon changed its WME parameters, among other routine net80211
+messages; dwc2's timer that arms USB audio packets came up to 8.4 ms late
+and a packet was skipped about every two minutes, the stutters left after
++334. On the test board, kernel output from a driver during playback gave
+5 skipped packets, 30 split gaps and a timer 16.5 ms late in 2 minutes,
+and with serial_debug_output off none, the timer within 104 us.
+
+TRACE_WLAN is off, and a vap's net80211 debug messages are only those of
+the connection's state: association, authentication, state changes,
+802.11h and roaming (no more WME, node, rate and inactivity messages).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../freebsd_wlan/net80211/ieee80211_haiku.cpp      | 14 ++++++++------
+ 1 file changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/src/libs/compat/freebsd_wlan/net80211/ieee80211_haiku.cpp b/src/libs/compat/freebsd_wlan/net80211/ieee80211_haiku.cpp
+index 5989443667..be09531c4f 100644
+--- a/src/libs/compat/freebsd_wlan/net80211/ieee80211_haiku.cpp
++++ b/src/libs/compat/freebsd_wlan/net80211/ieee80211_haiku.cpp
+@@ -62,7 +62,10 @@ extern "C" {
+ #include <shared.h>
+ 
+ 
+-#define TRACE_WLAN
++// Every line of kernel debug output goes to the serial port with interrupts
++// off on its CPU, milliseconds each: these traces, and the routine net80211
++// messages below, made a board's USB audio skip packets (PLAN.md M82).
++//#define TRACE_WLAN
+ #ifdef TRACE_WLAN
+ #	define TRACE(x...) dprintf(x);
+ #else
+@@ -809,14 +812,13 @@ ieee80211_vap_xmitpkt(struct ieee80211vap *vap, struct mbuf *m)
+ void
+ ieee80211_sysctl_vattach(struct ieee80211vap* vap)
+ {
+-	vap->iv_debug = IEEE80211_MSG_XRATE
+-		| IEEE80211_MSG_NODE
+-		| IEEE80211_MSG_ASSOC
++	// only what the connection does, not what it carries: the WME
++	// parameters came again with every change in the access point's beacon
++	// (four lines a time), the nodes and rates with every reference
++	vap->iv_debug = IEEE80211_MSG_ASSOC
+ 		| IEEE80211_MSG_AUTH
+ 		| IEEE80211_MSG_STATE
+-		| IEEE80211_MSG_WME
+ 		| IEEE80211_MSG_DOTH
+-		| IEEE80211_MSG_INACT
+ 		| IEEE80211_MSG_ROAM;
+ }
+ 

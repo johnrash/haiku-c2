@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Tue, 3 Nov 2026 19:13:08 -0500
+Subject: [PATCH 279/342] net_server: an automatic join after a second scan,
+ without a dialog
+
+The first scan after a start often misses 5 GHz access points on channels that
+are only listened to, so a Wi-Fi network with both bands was joined on 2.4 GHz on
+all three cold boots tried, and stayed there. A second scan now comes first.
+
+The supplicant opens a password dialog when a join doesn't finish in 15 s. For an
+automatic join, with the saved password, nobody may be there to answer it, and
+until then nothing rejoins. It now gets "automatic" and just leaves, and the
+net_server tries again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/servers/net/AutoconfigLooper.cpp | 15 +++++++++++++--
+ src/servers/net/AutoconfigLooper.h   |  1 +
+ src/servers/net/NetServer.cpp        |  4 ++++
+ 3 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/src/servers/net/AutoconfigLooper.cpp b/src/servers/net/AutoconfigLooper.cpp
+index 9b2a1f1961..76817fbaf6 100644
+--- a/src/servers/net/AutoconfigLooper.cpp
++++ b/src/servers/net/AutoconfigLooper.cpp
+@@ -47,7 +47,8 @@ AutoconfigLooper::AutoconfigLooper(BMessenger target, const char* device)
+ 	fRescanRunner(NULL),
+ 	fNextAutoJoin(0),
+ 	fNextRescan(0),
+-	fAutoJoinAttempts(0)
++	fAutoJoinAttempts(0),
++	fScanned(false)
+ {
+ 	BMessage ready(kMsgReadyToRun);
+ 	PostMessage(&ready);
+@@ -238,7 +239,17 @@ AutoconfigLooper::_NetworkMonitorNotification(BMessage* message)
+ 		}
+ 
+ 		case B_NETWORK_WLAN_SCANNED:
+-			// any scan while there is no link may join a saved network
++			// any scan while there is no link may join a saved network, but
++			// not the first one: it often misses access points on channels
++			// that are only listened to (much of 5 GHz), and then the
++			// supplicant settles on 2.4 GHz
++			if (!fScanned && (fLastMediaStatus & IFM_ACTIVE) == 0
++				&& (BNetworkInterface(fDevice.String()).Flags() & IFF_UP)
++					!= 0) {
++				fScanned = true;
++				BNetworkDevice(fDevice.String()).Scan(false, false);
++				break;
++			}
+ 			_AutoJoin();
+ 			break;
+ 	}
+diff --git a/src/servers/net/AutoconfigLooper.h b/src/servers/net/AutoconfigLooper.h
+index 335a485463..c609f36273 100644
+--- a/src/servers/net/AutoconfigLooper.h
++++ b/src/servers/net/AutoconfigLooper.h
+@@ -43,6 +43,7 @@ private:
+ 			bigtime_t			fNextAutoJoin;
+ 			bigtime_t			fNextRescan;
+ 			int32				fAutoJoinAttempts;
++			bool				fScanned;
+ };
+ 
+ #endif	// AUTOCONFIG_LOOPER_H
+diff --git a/src/servers/net/NetServer.cpp b/src/servers/net/NetServer.cpp
+index 6c0daecec1..955f3db1c2 100644
+--- a/src/servers/net/NetServer.cpp
++++ b/src/servers/net/NetServer.cpp
+@@ -1170,6 +1170,10 @@ NetServer::_JoinNetwork(const BMessage& message, const BNetworkAddress* address,
+ 		status = join.AddString("name", network.name);
+ 	if (status == B_OK)
+ 		status = join.AddFlat("address", &network.address);
++	if (status == B_OK && message.what == kMsgAutoJoinNetwork) {
++		// nobody may be there to answer a dialog should it fail
++		status = join.AddBool("automatic", true);
++	}
+ 	if (status == B_OK && oneAccessPoint) {
+ 		// joined by address alone: the supplicant is to use that one
+ 		status = join.AddData("bssid", B_RAW_TYPE,

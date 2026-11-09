@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 5 Nov 2026 21:40:25 -0500
+Subject: [PATCH 313/342] freebsd_wlan: with WPA, the link is up once the
+ pairwise key is in
+
+The link went up at association, while with WPA nothing but the supplicant's
+handshake gets through before it has installed the pairwise key. The
+net_server started DHCP on that link, and its first requests went nowhere;
+the ARP announcements after a link change could too.
+
+A station with WPA now has its link up when the pairwise key for its access
+point is set (ieee80211_notify_pairwise_key(), from
+ieee80211_ioctl_setkey()); without WPA, at association as before.
+
+Found by a review of +319 (odroid-c2-plus319-open-issues-report.pdf).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../freebsd_wlan/net80211/ieee80211_haiku.cpp | 19 ++++++++++++++++++-
+ .../freebsd_wlan/net80211/ieee80211_ioctl.c   |  4 ++++
+ .../freebsd_wlan/net80211/ieee80211_proto.h   |  2 ++
+ 3 files changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/src/libs/compat/freebsd_wlan/net80211/ieee80211_haiku.cpp b/src/libs/compat/freebsd_wlan/net80211/ieee80211_haiku.cpp
+index aeb7aac2d8..5989443667 100644
+--- a/src/libs/compat/freebsd_wlan/net80211/ieee80211_haiku.cpp
++++ b/src/libs/compat/freebsd_wlan/net80211/ieee80211_haiku.cpp
+@@ -855,7 +855,11 @@ ieee80211_notify_node_join(struct ieee80211_node* ni, int newassoc)
+ 
+ 	TRACE("%s\n", __FUNCTION__);
+ 
+-	if (ni == vap->iv_bss)
++	// With WPA, nothing but the supplicant's handshake gets through before
++	// it has installed the pairwise key: the link is up from then on
++	// (ieee80211_notify_pairwise_key()), so that DHCP and the ARP
++	// announcements don't go out into nothing.
++	if (ni == vap->iv_bss && (vap->iv_flags & IEEE80211_F_WPA) == 0)
+ 		if_link_state_change(ifp, LINK_STATE_UP);
+ 
+ 	if (sNotificationModule != NULL) {
+@@ -871,6 +875,19 @@ ieee80211_notify_node_join(struct ieee80211_node* ni, int newassoc)
+ }
+ 
+ 
++/*!	The supplicant has installed a pairwise key for \a ni: with WPA, that's
++	when a station's traffic can flow (see ieee80211_notify_node_join()).
++*/
++void
++ieee80211_notify_pairwise_key(struct ieee80211vap* vap,
++	struct ieee80211_node* ni)
++{
++	if (vap->iv_opmode == IEEE80211_M_STA && ni == vap->iv_bss
++		&& vap->iv_state == IEEE80211_S_RUN)
++		if_link_state_change(vap->iv_ifp, LINK_STATE_UP);
++}
++
++
+ void
+ ieee80211_notify_node_leave(struct ieee80211_node* ni)
+ {
+diff --git a/src/libs/compat/freebsd_wlan/net80211/ieee80211_ioctl.c b/src/libs/compat/freebsd_wlan/net80211/ieee80211_ioctl.c
+index 33c59c959e..0d317d6937 100644
+--- a/src/libs/compat/freebsd_wlan/net80211/ieee80211_ioctl.c
++++ b/src/libs/compat/freebsd_wlan/net80211/ieee80211_ioctl.c
+@@ -1243,6 +1243,10 @@ ieee80211_ioctl_setkey(struct ieee80211vap *vap, struct ieee80211req *ireq)
+ 	} else
+ 		error = ENXIO;
+ 	ieee80211_key_update_end(vap);
++#ifdef __HAIKU__
++	if (error == 0 && ni != NULL)
++		ieee80211_notify_pairwise_key(vap, ni);
++#endif
+ 	if (ni != NULL)
+ 		ieee80211_free_node(ni);
+ 	return error;
+diff --git a/src/libs/compat/freebsd_wlan/net80211/ieee80211_proto.h b/src/libs/compat/freebsd_wlan/net80211/ieee80211_proto.h
+index 13a9ab5534..391f31cdcc 100644
+--- a/src/libs/compat/freebsd_wlan/net80211/ieee80211_proto.h
++++ b/src/libs/compat/freebsd_wlan/net80211/ieee80211_proto.h
+@@ -443,6 +443,8 @@ void	ieee80211_cac_completeswitch(struct ieee80211vap *);
+  * is OS-specific.
+  */
+ void	ieee80211_notify_node_join(struct ieee80211_node *, int newassoc);
++void	ieee80211_notify_pairwise_key(struct ieee80211vap *,
++		struct ieee80211_node *);
+ void	ieee80211_notify_node_leave(struct ieee80211_node *);
+ void	ieee80211_notify_scan_done(struct ieee80211vap *);
+ void	ieee80211_notify_wds_discover(struct ieee80211_node *);

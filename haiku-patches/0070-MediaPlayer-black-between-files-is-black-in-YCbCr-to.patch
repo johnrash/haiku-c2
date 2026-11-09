@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 18:34:20 -0400
+Subject: [PATCH 070/342] MediaPlayer: black between files is black in YCbCr
+ too
+
+Switching to the next file in full screen showed a green screen for
+about two seconds with an overlay in B_YCbCr422:
+- VideoProducer cleared a frame it could not fill with zeros (its TODO
+  asked for the color space's black), which is green in YCbCr. It now
+  fills luma 16, chroma 128 for B_YCbCr422/B_YUV422 and the 4:4:4 spaces.
+- VideoView, after giving up the overlay, drew its YCbCr bitmap, which
+  app_server can't draw, so the overlay key colour stayed. It fills the
+  video frame black instead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apps/mediaplayer/VideoView.cpp            | 17 +++++++++
+ .../video/VideoProducer.cpp                   | 36 +++++++++++++++++--
+ .../video/VideoProducer.h                     |  1 +
+ 3 files changed, 51 insertions(+), 3 deletions(-)
+
+diff --git a/src/apps/mediaplayer/VideoView.cpp b/src/apps/mediaplayer/VideoView.cpp
+index 8040007382..91ee9df8bd 100644
+--- a/src/apps/mediaplayer/VideoView.cpp
++++ b/src/apps/mediaplayer/VideoView.cpp
+@@ -398,6 +398,23 @@ void
+ VideoView::_DrawBitmap(const BBitmap* bitmap)
+ {
+ 	SetDrawingMode(B_OP_COPY);
++
++	switch (bitmap->ColorSpace()) {
++		case B_YCbCr422:
++		case B_YCbCr411:
++		case B_YCbCr444:
++		case B_YCbCr420:
++			// An overlay bitmap, after the overlay was given up (between
++			// two files): app_server can't draw it, and the overlay's key
++			// colour (green) would stay on the screen until the next file
++			// shows.
++			SetHighColor(0, 0, 0);
++			FillRect(fVideoFrame);
++			return;
++		default:
++			break;
++	}
++
+ 	uint32 options = B_WAIT_FOR_RETRACE;
+ 	if (fUseBilinearScaling)
+ 		options |= B_FILTER_BITMAP_BILINEAR;
+diff --git a/src/apps/mediaplayer/media_node_framework/video/VideoProducer.cpp b/src/apps/mediaplayer/media_node_framework/video/VideoProducer.cpp
+index f0905096aa..44cfb8bd4f 100644
+--- a/src/apps/mediaplayer/media_node_framework/video/VideoProducer.cpp
++++ b/src/apps/mediaplayer/media_node_framework/video/VideoProducer.cpp
+@@ -629,6 +629,38 @@ VideoProducer::_FrameGeneratorThreadEntry(void* data)
+ }
+ 
+ 
++/*!	Black in the connected color space: all zeros is green in YCbCr. */
++void
++VideoProducer::_FillBlack(void* data, size_t size)
++{
++	switch (fConnectedFormat.display.format) {
++		case B_YCbCr422:
++		case B_YUV422:
++		{
++			// Y0 Cb Y1 Cr: luma 16, chroma 128
++			uint32* pixels = (uint32*)data;
++			for (size_t i = 0; i < size / 4; i++)
++				pixels[i] = B_HOST_TO_LENDIAN_INT32(0x80108010);
++			break;
++		}
++		case B_YCbCr444:
++		case B_YUV444:
++		{
++			uint8* bytes = (uint8*)data;
++			for (size_t i = 0; i + 2 < size; i += 3) {
++				bytes[i] = 16;
++				bytes[i + 1] = 128;
++				bytes[i + 2] = 128;
++			}
++			break;
++		}
++		default:
++			memset(data, 0, size);
++			break;
++	}
++}
++
++
+ int32
+ VideoProducer::_FrameGeneratorThread()
+ {
+@@ -771,9 +803,7 @@ VideoProducer::_FrameGeneratorThread()
+ 					}
+ 					// clean the buffer if something went wrong
+ 					if (err != B_OK && err != B_LAST_BUFFER_ERROR) {
+-						// TODO: should use "back value" according
+-						// to color space!
+-						memset(buffer->Data(), 0, h->size_used);
++						_FillBlack(buffer->Data(), h->size_used);
+ 						err = B_OK;
+ 					} else if (err == B_LAST_BUFFER_ERROR) {
+ 						wasCached = true;
+diff --git a/src/apps/mediaplayer/media_node_framework/video/VideoProducer.h b/src/apps/mediaplayer/media_node_framework/video/VideoProducer.h
+index e8a5b1c776..d8242f42db 100644
+--- a/src/apps/mediaplayer/media_node_framework/video/VideoProducer.h
++++ b/src/apps/mediaplayer/media_node_framework/video/VideoProducer.h
+@@ -104,6 +104,7 @@ protected:
+ 
+ 	static	int32			_FrameGeneratorThreadEntry(void* data);
+ 			int32			_FrameGeneratorThread();
++			void			_FillBlack(void* data, size_t size);
+ 
+ 		status_t			fInitStatus;
+ 

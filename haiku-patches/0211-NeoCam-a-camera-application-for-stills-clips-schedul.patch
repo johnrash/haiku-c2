@@ -1,0 +1,4473 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 11:21:08 -0500
+Subject: [PATCH 211/342] NeoCam: a camera application for stills, clips,
+ schedules and motion
+
+Stills and video clips at any frame size the camera has; captures on a
+schedule (a still or a clip every so many seconds, minutes or hours)
+and when something moves (simple motion detection with a sensitivity);
+saved in a folder and uploaded by FTP (its own client) or SFTP (the
+sftp command, the password through SSH_ASKPASS). In the Deskbar's
+Applications.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/jam/images/definitions/regular |    2 +
+ src/apps/Jamfile                     |    1 +
+ src/apps/neocam/CameraConsumer.cpp   |  497 +++++++++++
+ src/apps/neocam/CameraConsumer.h     |  124 +++
+ src/apps/neocam/CameraController.cpp |  408 +++++++++
+ src/apps/neocam/CameraController.h   |   83 ++
+ src/apps/neocam/CaptureManager.cpp   |  306 +++++++
+ src/apps/neocam/CaptureManager.h     |   58 ++
+ src/apps/neocam/Jamfile              |   31 +
+ src/apps/neocam/MainWindow.cpp       | 1227 ++++++++++++++++++++++++++
+ src/apps/neocam/MainWindow.h         |  135 +++
+ src/apps/neocam/MotionDetector.cpp   |  121 +++
+ src/apps/neocam/MotionDetector.h     |   53 ++
+ src/apps/neocam/NeoCam.cpp           |  117 +++
+ src/apps/neocam/NeoCam.h             |   79 ++
+ src/apps/neocam/NeoCam.rdef          |   64 ++
+ src/apps/neocam/PreviewView.cpp      |  236 +++++
+ src/apps/neocam/PreviewView.h        |   57 ++
+ src/apps/neocam/Uploader.cpp         |  647 ++++++++++++++
+ src/apps/neocam/Uploader.h           |   35 +
+ 20 files changed, 4281 insertions(+)
+ create mode 100644 src/apps/neocam/CameraConsumer.cpp
+ create mode 100644 src/apps/neocam/CameraConsumer.h
+ create mode 100644 src/apps/neocam/CameraController.cpp
+ create mode 100644 src/apps/neocam/CameraController.h
+ create mode 100644 src/apps/neocam/CaptureManager.cpp
+ create mode 100644 src/apps/neocam/CaptureManager.h
+ create mode 100644 src/apps/neocam/Jamfile
+ create mode 100644 src/apps/neocam/MainWindow.cpp
+ create mode 100644 src/apps/neocam/MainWindow.h
+ create mode 100644 src/apps/neocam/MotionDetector.cpp
+ create mode 100644 src/apps/neocam/MotionDetector.h
+ create mode 100644 src/apps/neocam/NeoCam.cpp
+ create mode 100644 src/apps/neocam/NeoCam.h
+ create mode 100644 src/apps/neocam/NeoCam.rdef
+ create mode 100644 src/apps/neocam/PreviewView.cpp
+ create mode 100644 src/apps/neocam/PreviewView.h
+ create mode 100644 src/apps/neocam/Uploader.cpp
+ create mode 100644 src/apps/neocam/Uploader.h
+
+diff --git a/build/jam/images/definitions/regular b/build/jam/images/definitions/regular
+index 7e36dc560c..7386258530 100644
+--- a/build/jam/images/definitions/regular
++++ b/build/jam/images/definitions/regular
+@@ -45,6 +45,7 @@ SYSTEM_APPS += [ FFilterByBuildFeatures
+ 	MediaConverter
+ 	MediaPlayer
+ 	MidiPlayer@fluidlite
++	NeoCam
+ 	People
+ 	PoorMan
+ 	PowerStatus
+@@ -65,6 +66,7 @@ DESKBAR_APPLICATIONS +=
+ 	MediaConverter
+ 	MediaPlayer
+ 	MidiPlayer
++	NeoCam
+ 	People
+ 	PoorMan
+ 	SerialConnect
+diff --git a/src/apps/Jamfile b/src/apps/Jamfile
+index c883cf7b07..fc7d64da79 100644
+--- a/src/apps/Jamfile
++++ b/src/apps/Jamfile
+@@ -34,6 +34,7 @@ HaikuSubInclude mediaconverter ;
+ HaikuSubInclude mediaplayer ;
+ HaikuSubInclude midiplayer ;
+ HaikuSubInclude musiccollection ;
++HaikuSubInclude neocam ;
+ HaikuSubInclude networkstatus ;
+ HaikuSubInclude overlayimage ;
+ HaikuSubInclude packageinstaller ;
+diff --git a/src/apps/neocam/CameraConsumer.cpp b/src/apps/neocam/CameraConsumer.cpp
+new file mode 100644
+index 0000000000..e4f466c773
+--- /dev/null
++++ b/src/apps/neocam/CameraConsumer.cpp
+@@ -0,0 +1,497 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "CameraConsumer.h"
++
++#include <stdio.h>
++#include <string.h>
++
++#include <Autolock.h>
++#include <Bitmap.h>
++#include <Buffer.h>
++#include <BufferGroup.h>
++#include <Message.h>
++#include <TimeSource.h>
++#include <Window.h>
++
++#include "NeoCam.h"
++#include "PreviewView.h"
++#include "VideoRecorder.h"
++
++
++// motion detection at most this often
++static const bigtime_t kAnalysisInterval = 100000;
++// a frame this late isn't shown (it is still recorded)
++static const bigtime_t kMaxShowLateness = 100000;
++
++
++CameraConsumer::CameraConsumer(PreviewView* view, const BMessenger& window,
++	const BMessenger& captureManager)
++	:
++	BMediaNode("NeoCam"),
++	BMediaEventLooper(),
++	BBufferConsumer(B_MEDIA_RAW_VIDEO),
++	fView(view),
++	fWindow(view->Window()),
++	fWindowMessenger(window),
++	fCaptureManager(captureManager),
++	fConnected(false),
++	fBuffers(NULL),
++	fLock("camera consumer"),
++	fRecorder(NULL),
++	fMotionEnabled(false),
++	fShowMotion(false),
++	fMotion(false),
++	fLastAnalysis(0),
++	fStatsStart(0),
++	fStatsFrames(0)
++{
++	AddNodeKind(B_PHYSICAL_OUTPUT);
++	SetEventLatency(0);
++	SetPriority(B_DISPLAY_PRIORITY);
++
++	for (int32 i = 0; i < kBufferCount; i++) {
++		fBitmaps[i] = NULL;
++		fBufferMap[i] = NULL;
++	}
++}
++
++
++CameraConsumer::~CameraConsumer()
++{
++	Quit();
++
++	// a recording ends with the node: its file is finished
++	VideoRecorder* recorder = DetachRecorder();
++	if (recorder != NULL) {
++		recorder->Stop();
++		delete recorder;
++	}
++
++	_DeleteBuffers();
++}
++
++
++void
++CameraConsumer::TakeStill(const char* trigger)
++{
++	BAutolock _(fLock);
++	fStillTriggers.Add(trigger);
++}
++
++
++status_t
++CameraConsumer::StartRecording(const char* path, float frameRate)
++{
++	BAutolock _(fLock);
++	if (fRecorder != NULL)
++		return EALREADY;
++	if (!fConnected || fBitmaps[0] == NULL)
++		return B_NO_INIT;
++
++	VideoRecorder* recorder = new VideoRecorder();
++	status_t status = recorder->Start(path, Width(), Height(),
++		fBitmaps[0]->BytesPerRow(), frameRate);
++	if (status != B_OK) {
++		delete recorder;
++		return status;
++	}
++	fRecorder = recorder;
++	return B_OK;
++}
++
++
++VideoRecorder*
++CameraConsumer::DetachRecorder()
++{
++	BAutolock _(fLock);
++	VideoRecorder* recorder = fRecorder;
++	fRecorder = NULL;
++	return recorder;
++}
++
++
++bool
++CameraConsumer::IsRecording()
++{
++	BAutolock _(fLock);
++	return fRecorder != NULL;
++}
++
++
++void
++CameraConsumer::SetMotionDetection(bool enabled, int32 sensitivity,
++	bool showCells)
++{
++	BAutolock _(fLock);
++	if (enabled && !fMotionEnabled) {
++		fDetector.Reset();
++		fMotion = false;
++	}
++	fMotionEnabled = enabled;
++	fShowMotion = enabled && showCells;
++	fDetector.SetSensitivity(sensitivity);
++}
++
++
++uint32
++CameraConsumer::Width() const
++{
++	return fInput.format.u.raw_video.display.line_width;
++}
++
++
++uint32
++CameraConsumer::Height() const
++{
++	return fInput.format.u.raw_video.display.line_count;
++}
++
++
++BMediaAddOn*
++CameraConsumer::AddOn(int32* _internalID) const
++{
++	if (_internalID != NULL)
++		*_internalID = 0;
++	return NULL;
++}
++
++
++void
++CameraConsumer::NodeRegistered()
++{
++	fInput.node = Node();
++	fInput.destination.port = ControlPort();
++	fInput.destination.id = 0;
++	fInput.source = media_source::null;
++	fInput.format.type = B_MEDIA_RAW_VIDEO;
++	fInput.format.u.raw_video = media_raw_video_format::wildcard;
++	fInput.format.u.raw_video.display.format = B_RGB32;
++	strcpy(fInput.name, "NeoCam input");
++
++	Run();
++}
++
++
++status_t
++CameraConsumer::HandleMessage(int32 message, const void* data, size_t size)
++{
++	return B_ERROR;
++}
++
++
++void
++CameraConsumer::HandleEvent(const media_timed_event* event,
++	bigtime_t lateness, bool realTimeEvent)
++{
++	switch (event->type) {
++		case BTimedEventQueue::B_START:
++			fStatsStart = system_time();
++			fStatsFrames = 0;
++			break;
++
++		case BTimedEventQueue::B_STOP:
++			EventQueue()->FlushEvents(event->event_time,
++				BTimedEventQueue::B_ALWAYS, true,
++				BTimedEventQueue::B_HANDLE_BUFFER);
++			break;
++
++		case BTimedEventQueue::B_HANDLE_BUFFER:
++		{
++			BBuffer* buffer = (BBuffer*)event->pointer;
++			if (RunState() == B_STARTED && fConnected)
++				_HandleFrame(buffer, lateness);
++			buffer->Recycle();
++			break;
++		}
++
++		default:
++			break;
++	}
++}
++
++
++void
++CameraConsumer::_HandleFrame(BBuffer* buffer, bigtime_t lateness)
++{
++	// one of our bitmaps, or a copy into the first
++	int32 index = 0;
++	while (index < kBufferCount && buffer != fBufferMap[index])
++		index++;
++	if (index == kBufferCount) {
++		index = 0;
++		size_t size = buffer->SizeUsed();
++		if (size > (size_t)fBitmaps[0]->BitsLength())
++			size = fBitmaps[0]->BitsLength();
++		memcpy(fBitmaps[0]->Bits(), buffer->Data(), size);
++	}
++	BBitmap* bitmap = fBitmaps[index];
++
++	bool analyze = false;
++	bool showMotion = false;
++	bool motion = false;
++	{
++		BAutolock _(fLock);
++
++		// every frame goes into a recording, also one too late to show
++		if (fRecorder != NULL)
++			fRecorder->AddFrame(bitmap->Bits(), buffer->Header()->start_time);
++
++		// a still for each request
++		for (int32 i = 0; i < fStillTriggers.CountStrings(); i++) {
++			BBitmap* still = new BBitmap(bitmap->Bounds(), B_RGB32);
++			if (!still->IsValid()) {
++				delete still;
++				continue;
++			}
++			memcpy(still->Bits(), bitmap->Bits(), still->BitsLength());
++			BMessage message(kMsgSaveStill);
++			message.AddPointer("bitmap", still);
++			message.AddString("trigger", fStillTriggers.StringAt(i));
++			message.AddInt64("time", (int64)real_time_clock());
++			if (fCaptureManager.SendMessage(&message) != B_OK)
++				delete still;
++		}
++		fStillTriggers.MakeEmpty();
++
++		bigtime_t now = system_time();
++		if (fMotionEnabled && now - fLastAnalysis >= kAnalysisInterval) {
++			fLastAnalysis = now;
++			analyze = true;
++			float level = fDetector.Analyze((const uint8*)bitmap->Bits(),
++				Width(), Height(), bitmap->BytesPerRow());
++			fMotion = level >= fDetector.Threshold();
++			BMessage message(kMsgMotionLevel);
++			message.AddFloat("level", level);
++			message.AddFloat("threshold", fDetector.Threshold());
++			message.AddBool("motion", fMotion);
++			fWindowMessenger.SendMessage(&message);
++		}
++		showMotion = fShowMotion;
++		motion = fMotionEnabled && fMotion;
++	}
++
++	if (lateness <= kMaxShowLateness
++		&& fWindow->LockWithTimeout(50000) == B_OK) {
++		{
++			// the changed cells are copied after each analysis
++			BAutolock _(fLock);
++			fView->SetMotion(analyze ? &fDetector : NULL, motion,
++				showMotion);
++		}
++		fView->DrawFrame(bitmap);
++		fWindow->Unlock();
++	}
++
++	// the frame rate, once a second
++	fStatsFrames++;
++	bigtime_t now = system_time();
++	if (now - fStatsStart >= 1000000) {
++		BMessage message(kMsgFrameStats);
++		message.AddFloat("fps", fStatsFrames * 1000000.0f
++			/ (now - fStatsStart));
++		fWindowMessenger.SendMessage(&message);
++		fStatsStart = now;
++		fStatsFrames = 0;
++	}
++}
++
++
++status_t
++CameraConsumer::AcceptFormat(const media_destination& where,
++	media_format* format)
++{
++	if (where != fInput.destination)
++		return B_MEDIA_BAD_DESTINATION;
++
++	if (format->type == B_MEDIA_NO_TYPE)
++		format->type = B_MEDIA_RAW_VIDEO;
++	if (format->type != B_MEDIA_RAW_VIDEO)
++		return B_MEDIA_BAD_FORMAT;
++
++	color_space& colorSpace = format->u.raw_video.display.format;
++	if (colorSpace == media_raw_video_format::wildcard.display.format)
++		colorSpace = B_RGB32;
++	if (colorSpace != B_RGB32)
++		return B_MEDIA_BAD_FORMAT;
++
++	return B_OK;
++}
++
++
++status_t
++CameraConsumer::GetNextInput(int32* cookie, media_input* _input)
++{
++	if (*cookie != 0)
++		return B_BAD_INDEX;
++
++	*_input = fInput;
++	(*cookie)++;
++	return B_OK;
++}
++
++
++void
++CameraConsumer::DisposeInputCookie(int32 cookie)
++{
++}
++
++
++void
++CameraConsumer::BufferReceived(BBuffer* buffer)
++{
++	if (RunState() == B_STOPPED) {
++		buffer->Recycle();
++		return;
++	}
++
++	media_timed_event event(buffer->Header()->start_time,
++		BTimedEventQueue::B_HANDLE_BUFFER, buffer,
++		BTimedEventQueue::B_RECYCLE_BUFFER);
++	EventQueue()->AddEvent(event);
++}
++
++
++void
++CameraConsumer::ProducerDataStatus(const media_destination& forWhom,
++	int32 status, bigtime_t atPerformanceTime)
++{
++}
++
++
++status_t
++CameraConsumer::GetLatencyFor(const media_destination& forWhom,
++	bigtime_t* _latency, media_node_id* _timeSource)
++{
++	if (forWhom != fInput.destination)
++		return B_MEDIA_BAD_DESTINATION;
++
++	*_latency = 20000;
++	*_timeSource = TimeSource()->ID();
++	return B_OK;
++}
++
++
++status_t
++CameraConsumer::Connected(const media_source& producer,
++	const media_destination& where, const media_format& format,
++	media_input* _input)
++{
++	if (where != fInput.destination)
++		return B_MEDIA_BAD_DESTINATION;
++
++	fInput.source = producer;
++	fInput.format = format;
++	*_input = fInput;
++
++	status_t status = _CreateBuffers(format);
++	if (status != B_OK)
++		return status;
++
++	int32 changeTag = 1;
++	SetOutputBuffersFor(producer, fInput.destination, fBuffers, NULL,
++		&changeTag, true);
++
++	fConnected = true;
++	return B_OK;
++}
++
++
++void
++CameraConsumer::Disconnected(const media_source& producer,
++	const media_destination& where)
++{
++	if (where != fInput.destination || producer != fInput.source)
++		return;
++
++	fConnected = false;
++	fInput.source = media_source::null;
++
++	// the preview must not draw a bitmap that is going away
++	if (fWindow->Lock()) {
++		fView->ClearFrame();
++		fWindow->Unlock();
++	}
++}
++
++
++status_t
++CameraConsumer::FormatChanged(const media_source& producer,
++	const media_destination& consumer, int32 changeTag,
++	const media_format& format)
++{
++	if (consumer != fInput.destination)
++		return B_MEDIA_BAD_DESTINATION;
++	if (producer != fInput.source)
++		return B_MEDIA_BAD_SOURCE;
++
++	if (fWindow->Lock()) {
++		fView->ClearFrame();
++		fWindow->Unlock();
++	}
++	fInput.format = format;
++	return _CreateBuffers(format);
++}
++
++
++status_t
++CameraConsumer::_CreateBuffers(const media_format& format)
++{
++	_DeleteBuffers();
++
++	uint32 width = format.u.raw_video.display.line_width;
++	uint32 height = format.u.raw_video.display.line_count;
++	if (width == 0 || height == 0)
++		return B_MEDIA_BAD_FORMAT;
++
++	fBuffers = new BBufferGroup();
++	status_t status = fBuffers->InitCheck();
++	if (status != B_OK)
++		return status;
++
++	for (int32 i = 0; i < kBufferCount; i++) {
++		// in an area of its own, which the producer clones
++		fBitmaps[i] = new BBitmap(BRect(0, 0, width - 1, height - 1),
++			B_BITMAP_IS_AREA, B_RGB32);
++		if (!fBitmaps[i]->IsValid())
++			return B_NO_MEMORY;
++
++		buffer_clone_info info;
++		info.area = area_for(fBitmaps[i]->Bits());
++		if (info.area < 0)
++			return info.area;
++		area_info areaInfo;
++		get_area_info(info.area, &areaInfo);
++		info.offset = (addr_t)fBitmaps[i]->Bits() - (addr_t)areaInfo.address;
++		info.size = fBitmaps[i]->BitsLength();
++		info.flags = i;
++		info.buffer = 0;
++		status = fBuffers->AddBuffer(info);
++		if (status != B_OK)
++			return status;
++	}
++
++	BBuffer* buffers[kBufferCount];
++	status = fBuffers->GetBufferList(kBufferCount, buffers);
++	if (status != B_OK)
++		return status;
++	for (int32 i = 0; i < kBufferCount; i++)
++		fBufferMap[i] = buffers[i];
++	return B_OK;
++}
++
++
++void
++CameraConsumer::_DeleteBuffers()
++{
++	delete fBuffers;
++	fBuffers = NULL;
++	for (int32 i = 0; i < kBufferCount; i++) {
++		delete fBitmaps[i];
++		fBitmaps[i] = NULL;
++		fBufferMap[i] = NULL;
++	}
++}
+diff --git a/src/apps/neocam/CameraConsumer.h b/src/apps/neocam/CameraConsumer.h
+new file mode 100644
+index 0000000000..0cf34df774
+--- /dev/null
++++ b/src/apps/neocam/CameraConsumer.h
+@@ -0,0 +1,124 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef CAMERA_CONSUMER_H
++#define CAMERA_CONSUMER_H
++
++
++#include <BufferConsumer.h>
++#include <Locker.h>
++#include <MediaEventLooper.h>
++#include <Messenger.h>
++#include <StringList.h>
++
++#include "MotionDetector.h"
++
++
++class BBitmap;
++class BBufferGroup;
++class BWindow;
++class PreviewView;
++class VideoRecorder;
++
++
++/*!	NeoCam's media node: the camera's frames (B_RGB32) arrive in bitmaps of
++	its own, are shown in the preview, go to a recording, to motion
++	detection, and a copy of one to the capture manager for a still. The
++	requests come from other threads, under its lock.
++*/
++class CameraConsumer : public BMediaEventLooper, public BBufferConsumer {
++public:
++								CameraConsumer(PreviewView* view,
++									const BMessenger& window,
++									const BMessenger& captureManager);
++	virtual						~CameraConsumer();
++
++			void				TakeStill(const char* trigger);
++			status_t			StartRecording(const char* path,
++									float frameRate);
++			VideoRecorder*		DetachRecorder();
++									// the caller stops and deletes it
++			bool				IsRecording();
++			void				SetMotionDetection(bool enabled,
++									int32 sensitivity, bool showCells);
++
++			uint32				Width() const;
++			uint32				Height() const;
++
++	// BMediaNode
++	virtual	BMediaAddOn*		AddOn(int32* _internalID) const;
++
++protected:
++	virtual	void				NodeRegistered();
++	virtual	status_t			HandleMessage(int32 message, const void* data,
++									size_t size);
++
++	// BMediaEventLooper
++	virtual	void				HandleEvent(const media_timed_event* event,
++									bigtime_t lateness, bool realTimeEvent);
++
++	// BBufferConsumer
++	virtual	status_t			AcceptFormat(const media_destination& where,
++									media_format* format);
++	virtual	status_t			GetNextInput(int32* cookie,
++									media_input* _input);
++	virtual	void				DisposeInputCookie(int32 cookie);
++	virtual	void				BufferReceived(BBuffer* buffer);
++	virtual	void				ProducerDataStatus(
++									const media_destination& forWhom,
++									int32 status, bigtime_t atPerformanceTime);
++	virtual	status_t			GetLatencyFor(const media_destination& forWhom,
++									bigtime_t* _latency,
++									media_node_id* _timeSource);
++	virtual	status_t			Connected(const media_source& producer,
++									const media_destination& where,
++									const media_format& format,
++									media_input* _input);
++	virtual	void				Disconnected(const media_source& producer,
++									const media_destination& where);
++	virtual	status_t			FormatChanged(const media_source& producer,
++									const media_destination& consumer,
++									int32 changeTag,
++									const media_format& format);
++
++private:
++			status_t			_CreateBuffers(const media_format& format);
++			void				_DeleteBuffers();
++			void				_HandleFrame(BBuffer* buffer,
++									bigtime_t lateness);
++
++private:
++	enum {
++		kBufferCount = 3
++	};
++
++			PreviewView*		fView;
++			BWindow*			fWindow;
++			BMessenger			fWindowMessenger;
++			BMessenger			fCaptureManager;
++
++			media_input			fInput;
++			bool				fConnected;
++			BBufferGroup*		fBuffers;
++			BBitmap*			fBitmaps[kBufferCount];
++			BBuffer*			fBufferMap[kBufferCount];
++
++			BLocker				fLock;
++				// for what follows
++			BStringList			fStillTriggers;
++			VideoRecorder*		fRecorder;
++			bool				fMotionEnabled;
++			bool				fShowMotion;
++			bool				fMotion;
++				// the last analysis found motion
++			MotionDetector		fDetector;
++
++			// in the node's thread only
++			bigtime_t			fLastAnalysis;
++			bigtime_t			fStatsStart;
++			int32				fStatsFrames;
++};
++
++
++#endif	// CAMERA_CONSUMER_H
+diff --git a/src/apps/neocam/CameraController.cpp b/src/apps/neocam/CameraController.cpp
+new file mode 100644
+index 0000000000..6b9615e749
+--- /dev/null
++++ b/src/apps/neocam/CameraController.cpp
+@@ -0,0 +1,408 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "CameraController.h"
++
++#include <stddef.h>
++#include <stdio.h>
++#include <string.h>
++
++#include <Catalog.h>
++#include <MediaRoster.h>
++#include <MessageRunner.h>
++#include <ParameterWeb.h>
++#include <TimeSource.h>
++#include <scheduler.h>
++
++#include "CameraConsumer.h"
++#include "NeoCam.h"
++#include "PreviewView.h"
++
++
++#undef B_TRANSLATION_CONTEXT
++#define B_TRANSLATION_CONTEXT "CameraController"
++
++
++// a camera that appears is connected to after this
++static const bigtime_t kSettleDelay = 1500000;
++
++
++CameraController::CameraController(PreviewView* view,
++	const BMessenger& window, const BMessenger& captureManager)
++	:
++	BLooper("camera controller"),
++	fView(view),
++	fWindow(window),
++	fCaptureManager(captureManager),
++	fRoster(NULL),
++	fHasProducer(false),
++	fConsumer(NULL),
++	fConnected(false),
++	fWatching(false),
++	fSizeCount(0),
++	fWantedWidth(0),
++	fWantedHeight(0),
++	fMotionEnabled(false),
++	fMotionSensitivity(50),
++	fShowMotion(false)
++{
++}
++
++
++CameraController::~CameraController()
++{
++	_Disconnect(true);
++}
++
++
++void
++CameraController::MessageReceived(BMessage* message)
++{
++	switch (message->what) {
++		case kMsgConnect:
++		{
++			uint32 width = message->GetUInt32("width", fWantedWidth);
++			uint32 height = message->GetUInt32("height", fWantedHeight);
++			fWantedWidth = width;
++			fWantedHeight = height;
++			// a recording is finished first (it has the old size)
++			_FinishRecording(NULL);
++			_Disconnect(false);
++			status_t status = _Connect(width, height);
++			if (status != B_OK)
++				_Disconnect(false);
++			break;
++		}
++
++		case kMsgDisconnect:
++			_FinishRecording(NULL);
++			_Disconnect(true);
++			if (fRoster != NULL && fWatching) {
++				fRoster->StopWatching(BMessenger(this));
++				fWatching = false;
++			}
++			message->SendReply(B_OK);
++			break;
++
++		case kMsgGetWeb:
++		{
++			BParameterWeb* web = NULL;
++			if (fRoster != NULL && fHasProducer)
++				fRoster->GetParameterWebFor(fProducer, &web);
++			BMessage reply(B_REPLY);
++			reply.AddPointer("web", web);
++			reply.AddData("node", B_RAW_TYPE, &fProducer, sizeof(fProducer));
++			message->SendReply(&reply);
++			break;
++		}
++
++		case kMsgTakeStill:
++			if (fConsumer != NULL && fConnected)
++				fConsumer->TakeStill(message->GetString("trigger", ""));
++			break;
++
++		case kMsgStartRecording:
++		{
++			status_t status = B_NO_INIT;
++			const char* trigger = message->GetString("trigger", kTriggerClip);
++			if (fConsumer != NULL && fConnected) {
++				status = fConsumer->StartRecording(
++					message->GetString("path", ""),
++					message->GetFloat("fps", 30));
++				if (status == B_OK)
++					fClipTrigger = trigger;
++			}
++			BMessage started(kMsgRecordingStarted);
++			started.AddInt32("status", status);
++			started.AddString("path", message->GetString("path", ""));
++			started.AddString("trigger", trigger);
++			fWindow.SendMessage(&started);
++			break;
++		}
++
++		case kMsgStopRecording:
++			_FinishRecording(message->GetString("trigger", NULL));
++			break;
++
++		case kMsgSetMotion:
++			fMotionEnabled = message->GetBool("enabled", false);
++			fMotionSensitivity = message->GetInt32("sensitivity", 50);
++			fShowMotion = message->GetBool("show", false);
++			if (fConsumer != NULL) {
++				fConsumer->SetMotionDetection(fMotionEnabled,
++					fMotionSensitivity, fShowMotion);
++			}
++			break;
++
++		case B_MEDIA_NODE_CREATED:
++		case B_MEDIA_DEFAULT_CHANGED:
++			// a camera that was plugged in: try it once it settled
++			if (!fConnected) {
++				BMessage connect(kMsgConnect);
++				BMessageRunner::StartSending(BMessenger(this), &connect,
++					kSettleDelay, 1);
++			}
++			break;
++
++		default:
++			BLooper::MessageReceived(message);
++	}
++}
++
++
++status_t
++CameraController::_Connect(uint32 width, uint32 height)
++{
++	status_t status = B_OK;
++	if (fRoster == NULL) {
++		fRoster = BMediaRoster::Roster(&status);
++		if (fRoster == NULL) {
++			_Failed(B_TRANSLATE("The media services aren't running."),
++				status);
++			return status;
++		}
++	}
++	if (!fWatching) {
++		fWatching = fRoster->StartWatching(BMessenger(this),
++			B_MEDIA_NODE_CREATED | B_MEDIA_DEFAULT_CHANGED) == B_OK;
++	}
++
++	status = fRoster->GetVideoInput(&fProducer);
++	if (status != B_OK) {
++		_Failed(B_TRANSLATE("No camera found. NeoCam connects to one when "
++			"it is plugged in."), status);
++		return status;
++	}
++	fHasProducer = true;
++
++	status = _QueryFrameSizes();
++	if (status != B_OK || fSizeCount == 0) {
++		_Failed(B_TRANSLATE("The camera doesn't say which frame sizes it "
++			"has."), status);
++		return B_ERROR;
++	}
++	int32 chosen = _ChooseSize(width, height);
++
++	status = fRoster->GetTimeSource(&fTimeSource);
++	if (status != B_OK) {
++		_Failed(B_TRANSLATE("No time source."), status);
++		return status;
++	}
++
++	if (fConsumer == NULL) {
++		fConsumer = new CameraConsumer(fView, fWindow, fCaptureManager);
++		status = fRoster->RegisterNode(fConsumer);
++		if (status != B_OK) {
++			fConsumer->Release();
++			fConsumer = NULL;
++			_Failed(B_TRANSLATE("NeoCam's media node couldn't be "
++				"registered."), status);
++			return status;
++		}
++		fConsumer->SetMotionDetection(fMotionEnabled, fMotionSensitivity,
++			fShowMotion);
++	}
++
++	int32 count = 0;
++	status = fRoster->GetFreeOutputsFor(fProducer, &fOutput, 1, &count,
++		B_MEDIA_RAW_VIDEO);
++	if (status != B_OK || count < 1) {
++		_Failed(B_TRANSLATE("The camera is in use by another application."),
++			B_BUSY);
++		return B_BUSY;
++	}
++	count = 0;
++	status = fRoster->GetFreeInputsFor(fConsumer->Node(), &fInput, 1, &count,
++		B_MEDIA_RAW_VIDEO);
++	if (status != B_OK || count < 1) {
++		_Failed(B_TRANSLATE("NeoCam's media node has no free input."),
++			B_ERROR);
++		return B_ERROR;
++	}
++
++	media_format format;
++	format.type = B_MEDIA_RAW_VIDEO;
++	format.u.raw_video = media_raw_video_format::wildcard;
++	format.u.raw_video.display.format = B_RGB32;
++	format.u.raw_video.display.line_width = fSizes[chosen].width;
++	format.u.raw_video.display.line_count = fSizes[chosen].height;
++	format.u.raw_video.display.bytes_per_row = fSizes[chosen].width * 4;
++	status = fRoster->Connect(fOutput.source, fInput.destination, &format,
++		&fOutput, &fInput);
++	if (status != B_OK) {
++		_Failed(B_TRANSLATE("The camera couldn't be connected."), status);
++		return status;
++	}
++	fConnected = true;
++
++	fRoster->SetTimeSourceFor(fProducer.node, fTimeSource.node);
++	fRoster->SetTimeSourceFor(fConsumer->ID(), fTimeSource.node);
++
++	bigtime_t latency = 0;
++	fRoster->GetLatencyFor(fProducer, &latency);
++	fRoster->SetProducerRunModeDelay(fProducer, latency);
++	bigtime_t initialLatency = 0;
++	fRoster->GetInitialLatencyFor(fProducer, &initialLatency);
++	initialLatency += estimate_max_scheduling_latency();
++
++	BTimeSource* timeSource = fRoster->MakeTimeSourceFor(fProducer);
++	if (timeSource == NULL) {
++		_Failed(B_TRANSLATE("No time source."), B_ERROR);
++		return B_ERROR;
++	}
++	bigtime_t real = BTimeSource::RealTime();
++	if (!timeSource->IsRunning()) {
++		// without a sound card nothing starts the system time source
++		fRoster->StartTimeSource(fTimeSource, real);
++		fRoster->SeekTimeSource(fTimeSource, 0, real);
++	}
++	bigtime_t performance = timeSource->PerformanceTimeFor(real + latency
++		+ initialLatency);
++	timeSource->Release();
++
++	status = fRoster->StartNode(fProducer, performance);
++	if (status == B_OK)
++		status = fRoster->StartNode(fConsumer->Node(), performance);
++	if (status != B_OK) {
++		_Failed(B_TRANSLATE("The camera couldn't be started."), status);
++		return status;
++	}
++
++	live_node_info info;
++	BMessage ready(kMsgCameraReady);
++	if (fRoster->GetLiveNodeInfo(fProducer, &info) == B_OK)
++		ready.AddString("name", info.name);
++	for (int32 i = 0; i < fSizeCount; i++) {
++		ready.AddUInt32("width", fSizes[i].width);
++		ready.AddUInt32("height", fSizes[i].height);
++		ready.AddFloat("fps", fSizes[i].frame_rate);
++		ready.AddBool("compressed",
++			(fSizes[i].flags & VIDEO_FRAME_SIZE_COMPRESSED) != 0);
++	}
++	ready.AddInt32("current", chosen);
++	fWindow.SendMessage(&ready);
++	return B_OK;
++}
++
++
++void
++CameraController::_Disconnect(bool releaseConsumer)
++{
++	if (fConsumer != NULL) {
++		if (fConnected) {
++			fRoster->StopNode(fConsumer->Node(), 0, true);
++			fRoster->Disconnect(fOutput.node.node, fOutput.source,
++				fInput.node.node, fInput.destination);
++			fConnected = false;
++		}
++		if (releaseConsumer) {
++			// the node goes with its last reference
++			fRoster->ReleaseNode(fConsumer->Node());
++			fConsumer = NULL;
++		}
++	}
++	if (fHasProducer) {
++		fRoster->ReleaseNode(fProducer);
++		fHasProducer = false;
++	}
++}
++
++
++/*!	A recording ends: its file is finished (and uploaded) by the capture
++	manager, which has a thread for the wait.
++*/
++void
++CameraController::_FinishRecording(const char* trigger)
++{
++	if (fConsumer == NULL)
++		return;
++	VideoRecorder* recorder = fConsumer->DetachRecorder();
++	if (recorder == NULL)
++		return;
++
++	BMessage message(kMsgFinishClip);
++	message.AddPointer("recorder", recorder);
++	message.AddString("trigger", trigger != NULL ? trigger
++		: fClipTrigger.String());
++	fCaptureManager.SendMessage(&message);
++}
++
++
++status_t
++CameraController::_QueryFrameSizes()
++{
++	fSizeCount = 0;
++	port_id replyPort = create_port(1, "frame sizes reply");
++	if (replyPort < 0)
++		return replyPort;
++
++	video_frame_sizes_request request;
++	request.reply_port = replyPort;
++	status_t status = write_port_etc(fProducer.port,
++		VIDEO_FRAME_SIZES_REQUEST, &request, sizeof(request),
++		B_RELATIVE_TIMEOUT, 1000000);
++
++	video_frame_sizes_reply* reply = NULL;
++	if (status == B_OK) {
++		reply = new video_frame_sizes_reply;
++		int32 code;
++		ssize_t size = read_port_etc(replyPort, &code, reply, sizeof(*reply),
++			B_RELATIVE_TIMEOUT, 2000000);
++		if (size < 0)
++			status = size;
++		else if (code != VIDEO_FRAME_SIZES_REPLY
++			|| size < (ssize_t)offsetof(video_frame_sizes_reply, sizes))
++			status = B_BAD_DATA;
++		else
++			status = reply->status;
++	}
++	delete_port(replyPort);
++
++	if (status == B_OK) {
++		for (int32 i = 0; i < reply->count && i < VIDEO_FRAME_SIZES_MAX; i++)
++			fSizes[fSizeCount++] = reply->sizes[i];
++	} else {
++		// a producer that doesn't answer: what it suggests (0x0 is the
++		// wildcard)
++		fSizes[0].width = 0;
++		fSizes[0].height = 0;
++		fSizes[0].frame_rate = 0;
++		fSizes[0].flags = 0;
++		fSizeCount = 1;
++		status = B_OK;
++	}
++	delete reply;
++	return status;
++}
++
++
++/*!	The size asked for, else 1280x720, else the largest below it, else the
++	smallest.
++*/
++int32
++CameraController::_ChooseSize(uint32 width, uint32 height) const
++{
++	for (int32 i = 0; i < fSizeCount; i++) {
++		if (fSizes[i].width == width && fSizes[i].height == height)
++			return i;
++	}
++	int32 chosen = 0;
++	for (int32 i = 0; i < fSizeCount; i++) {
++		if (fSizes[i].width <= 1280 && fSizes[i].height <= 720)
++			chosen = i;
++	}
++	return chosen;
++}
++
++
++void
++CameraController::_Failed(const char* text, status_t status)
++{
++	fprintf(stderr, "NeoCam: %s (%s)\n", text, strerror(status));
++	BMessage message(kMsgCameraFailed);
++	message.AddString("text", text);
++	fWindow.SendMessage(&message);
++}
+diff --git a/src/apps/neocam/CameraController.h b/src/apps/neocam/CameraController.h
+new file mode 100644
+index 0000000000..0126fe4146
+--- /dev/null
++++ b/src/apps/neocam/CameraController.h
+@@ -0,0 +1,83 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef CAMERA_CONTROLLER_H
++#define CAMERA_CONTROLLER_H
++
++
++#include <Looper.h>
++#include <MediaNode.h>
++#include <Messenger.h>
++#include <String.h>
++
++#include <VideoFrameSizes.h>
++
++
++class BMediaRoster;
++class BParameterWeb;
++class CameraConsumer;
++class PreviewView;
++
++
++/*!	Connects the default video input to NeoCam's node at the frame size
++	asked for, and changes it, in a thread of its own: the media roster's
++	calls wait for the nodes. Tells the window when the camera is ready (with
++	its frame sizes) or why it isn't. With no camera, it connects when one
++	appears.
++*/
++class CameraController : public BLooper {
++public:
++	enum {
++		kMsgConnect			= 'ccon',	// "width", "height"
++		kMsgDisconnect		= 'cdis',	// replied to when done
++		kMsgGetWeb			= 'cweb',	// reply: "web" (pointer, the
++										// caller deletes it), "node"
++		kMsgTakeStill		= 'ctst',	// "trigger"
++		kMsgStartRecording	= 'cstr',	// "path", "fps", "trigger"; the
++										// window hears how it went
++		kMsgStopRecording	= 'cstp',	// the clip goes to the capture
++										// manager
++		kMsgSetMotion		= 'cmot'	// "enabled", "sensitivity", "show"
++	};
++
++								CameraController(PreviewView* view,
++									const BMessenger& window,
++									const BMessenger& captureManager);
++	virtual						~CameraController();
++
++	virtual	void				MessageReceived(BMessage* message);
++
++private:
++			status_t			_Connect(uint32 width, uint32 height);
++			void				_Disconnect(bool releaseConsumer);
++			void				_FinishRecording(const char* trigger);
++			status_t			_QueryFrameSizes();
++			int32				_ChooseSize(uint32 width,
++									uint32 height) const;
++			void				_Failed(const char* text, status_t status);
++
++			PreviewView*		fView;
++			BMessenger			fWindow;
++			BMessenger			fCaptureManager;
++			BMediaRoster*		fRoster;
++			media_node			fTimeSource;
++			media_node			fProducer;
++			bool				fHasProducer;
++			CameraConsumer*		fConsumer;
++			media_output		fOutput;
++			media_input			fInput;
++			bool				fConnected;
++			bool				fWatching;
++			video_frame_size	fSizes[VIDEO_FRAME_SIZES_MAX];
++			int32				fSizeCount;
++			uint32				fWantedWidth;
++			uint32				fWantedHeight;
++			bool				fMotionEnabled;
++			int32				fMotionSensitivity;
++			bool				fShowMotion;
++			BString				fClipTrigger;
++};
++
++
++#endif	// CAMERA_CONTROLLER_H
+diff --git a/src/apps/neocam/CaptureManager.cpp b/src/apps/neocam/CaptureManager.cpp
+new file mode 100644
+index 0000000000..cea839bad9
+--- /dev/null
++++ b/src/apps/neocam/CaptureManager.cpp
+@@ -0,0 +1,306 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "CaptureManager.h"
++
++#include <stdio.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++
++#include <Bitmap.h>
++#include <BitmapStream.h>
++#include <Catalog.h>
++#include <Directory.h>
++#include <Entry.h>
++#include <File.h>
++#include <FindDirectory.h>
++#include <NodeInfo.h>
++#include <Path.h>
++#include <TranslatorRoster.h>
++
++#include "NeoCam.h"
++#include "VideoRecorder.h"
++
++
++#undef B_TRANSLATION_CONTEXT
++#define B_TRANSLATION_CONTEXT "CaptureManager"
++
++
++CaptureManager::CaptureManager(const BMessenger& window)
++	:
++	BLooper("capture manager"),
++	fWindow(window),
++	fFolder("/boot/home/NeoCam"),
++	fStillType('JPEG'),
++	fStillTranslator(0),
++	fKeepLocal(true)
++{
++	fTarget.kind = UPLOAD_NONE;
++	fTarget.passive = true;
++}
++
++
++void
++CaptureManager::MessageReceived(BMessage* message)
++{
++	switch (message->what) {
++		case kMsgSetDestination:
++			fFolder = message->GetString("folder", fFolder);
++			fStillType = message->GetUInt32("still type", fStillType);
++			fStillTranslator = message->GetInt32("still translator",
++				fStillTranslator);
++			fKeepLocal = message->GetBool("keep local", true);
++			fTarget.kind = (upload_kind)message->GetInt32("upload",
++				UPLOAD_NONE);
++			fTarget.server = message->GetString("server", "");
++			fTarget.user = message->GetString("user", "");
++			fTarget.password = message->GetString("password", "");
++			fTarget.folder = message->GetString("remote folder", "");
++			fTarget.passive = message->GetBool("passive", true);
++			fTarget.askPassProgram = message->GetString("askpass", "");
++			break;
++
++		case kMsgSaveStill:
++		{
++			BBitmap* bitmap;
++			if (message->FindPointer("bitmap", (void**)&bitmap) != B_OK)
++				break;
++			_SaveStill(bitmap, message->GetString("trigger", kTriggerManual),
++				(time_t)message->GetInt64("time", real_time_clock()));
++			break;
++		}
++
++		case kMsgFinishClip:
++			_FinishClip(message);
++			break;
++
++		case kMsgUploadTest:
++		{
++			if (fTarget.kind == UPLOAD_NONE) {
++				_Status(B_TRANSLATE("Choose FTP or SFTP first."), true);
++				break;
++			}
++			BPath path;
++			find_directory(B_SYSTEM_TEMP_DIRECTORY, &path);
++			BString name = CapturePath(path.Path(), "test", "txt",
++				real_time_clock());
++			FILE* file = fopen(name.String(), "w");
++			if (file == NULL) {
++				_Status(B_TRANSLATE("Couldn't write the test file."), true);
++				break;
++			}
++			fprintf(file, "A test upload from NeoCam.\n");
++			fclose(file);
++
++			_Status(B_TRANSLATE("Uploading a test file" B_UTF8_ELLIPSIS),
++				false);
++			BString error;
++			status_t status = upload_file(fTarget, name.String(),
++				BPath(name.String()).Leaf(), error);
++			unlink(name.String());
++			if (status == B_OK) {
++				BString text(B_TRANSLATE("The test file \"%name%\" was "
++					"uploaded."));
++				text.ReplaceFirst("%name%", BPath(name.String()).Leaf());
++				_Status(text, false);
++			} else {
++				BString text(B_TRANSLATE("The test upload failed: %error%"));
++				text.ReplaceFirst("%error%", error);
++				_Status(text, true);
++			}
++			break;
++		}
++
++		default:
++			BLooper::MessageReceived(message);
++	}
++}
++
++
++/*!	"NeoCam 2026-11-01 14-05-00 motion.jpg" in \a folder, with a number
++	after it if that is taken.
++*/
++/*static*/ BString
++CaptureManager::CapturePath(const char* folder, const char* trigger,
++	const char* extension, time_t when)
++{
++	struct tm local;
++	localtime_r(&when, &local);
++	char stamp[64];
++	strftime(stamp, sizeof(stamp), "%Y-%m-%d %H-%M-%S", &local);
++
++	BString path;
++	for (int32 number = 1; ; number++) {
++		path.SetToFormat("%s/NeoCam %s %s", folder, stamp, trigger);
++		if (number > 1)
++			path << " " << number;
++		path << "." << extension;
++		if (!BEntry(path.String()).Exists())
++			return path;
++	}
++}
++
++
++BString
++CaptureManager::_StillExtension() const
++{
++	BString mimeType;
++	const translation_format* formats;
++	int32 count;
++	if (BTranslatorRoster::Default()->GetOutputFormats(fStillTranslator,
++			&formats, &count) == B_OK) {
++		for (int32 i = 0; i < count; i++) {
++			if (formats[i].type == fStillType) {
++				mimeType = formats[i].MIME;
++				break;
++			}
++		}
++	}
++
++	static const struct {
++		const char* type;
++		const char* extension;
++	} kExtensions[] = {
++		{ "image/jpeg", "jpg" },
++		{ "image/png", "png" },
++		{ "image/gif", "gif" },
++		{ "image/tiff", "tif" },
++		{ "image/webp", "webp" },
++		{ "image/bmp", "bmp" },
++		{ "image/x-bmp", "bmp" },
++		{ "image/x-portable-pixmap", "ppm" },
++		{ "image/x-targa", "tga" },
++	};
++	for (size_t i = 0; i < sizeof(kExtensions) / sizeof(kExtensions[0]); i++) {
++		if (mimeType.ICompare(kExtensions[i].type) == 0)
++			return kExtensions[i].extension;
++	}
++	int32 slash = mimeType.FindFirst('/');
++	if (slash < 0)
++		return "image";
++	BString extension;
++	mimeType.CopyInto(extension, slash + 1, mimeType.Length() - slash - 1);
++	if (extension.FindFirst("x-") == 0)
++		extension.Remove(0, 2);
++	return extension;
++}
++
++
++void
++CaptureManager::_SaveStill(BBitmap* bitmap, const char* trigger,
++	time_t when)
++{
++	create_directory(fFolder.String(), 0755);
++	BString path = CapturePath(fFolder.String(), trigger,
++		_StillExtension().String(), when);
++
++	BFile file(path.String(), B_CREATE_FILE | B_ERASE_FILE | B_WRITE_ONLY);
++	status_t status = file.InitCheck();
++	if (status == B_OK) {
++		BBitmapStream stream(bitmap);
++		status = BTranslatorRoster::Default()->Translate(fStillTranslator,
++			&stream, NULL, &file, fStillType);
++		stream.DetachBitmap(&bitmap);
++	}
++	delete bitmap;
++
++	if (status != B_OK) {
++		BString text(B_TRANSLATE("Couldn't save \"%path%\": %error%"));
++		text.ReplaceFirst("%path%", path);
++		text.ReplaceFirst("%error%", strerror(status));
++		_Status(text, true);
++		return;
++	}
++
++	const translation_format* formats;
++	int32 count;
++	if (BTranslatorRoster::Default()->GetOutputFormats(fStillTranslator,
++			&formats, &count) == B_OK) {
++		for (int32 i = 0; i < count; i++) {
++			if (formats[i].type == fStillType) {
++				BNodeInfo(&file).SetType(formats[i].MIME);
++				break;
++			}
++		}
++	}
++	file.Unset();
++	_Deliver(path, trigger);
++}
++
++
++void
++CaptureManager::_FinishClip(BMessage* message)
++{
++	VideoRecorder* recorder;
++	if (message->FindPointer("recorder", (void**)&recorder) != B_OK)
++		return;
++
++	_Status(B_TRANSLATE("Finishing the clip" B_UTF8_ELLIPSIS), false);
++	BString path = recorder->Path();
++	status_t status = recorder->Stop();
++	delete recorder;
++
++	if (status != B_OK) {
++		BString text(B_TRANSLATE("The clip \"%path%\" couldn't be finished: "
++			"%error%"));
++		text.ReplaceFirst("%path%", path);
++		text.ReplaceFirst("%error%", strerror(status));
++		_Status(text, true);
++		return;
++	}
++	_Deliver(path, message->GetString("trigger", kTriggerClip));
++}
++
++
++/*!	A capture is saved: uploaded where that is set up, and then removed
++	unless it is to be kept.
++*/
++void
++CaptureManager::_Deliver(const BString& path, const char* what)
++{
++	BString name(BPath(path.String()).Leaf());
++	if (fTarget.kind == UPLOAD_NONE) {
++		BString text(B_TRANSLATE("Saved \"%name%\"."));
++		text.ReplaceFirst("%name%", name);
++		_Status(text, false);
++		return;
++	}
++
++	BString text(B_TRANSLATE("Uploading \"%name%\"" B_UTF8_ELLIPSIS));
++	text.ReplaceFirst("%name%", name);
++	_Status(text, false);
++
++	BString error;
++	status_t status = upload_file(fTarget, path.String(), name.String(),
++		error);
++	if (status != B_OK) {
++		text = B_TRANSLATE("Saved \"%name%\", but the upload failed: "
++			"%error%");
++		text.ReplaceFirst("%name%", name);
++		text.ReplaceFirst("%error%", error);
++		_Status(text, true);
++		return;
++	}
++
++	if (!fKeepLocal)
++		BEntry(path.String()).Remove();
++	text = fTarget.kind == UPLOAD_FTP
++		? B_TRANSLATE("Uploaded \"%name%\" by FTP.")
++		: B_TRANSLATE("Uploaded \"%name%\" by SFTP.");
++	text.ReplaceFirst("%name%", name);
++	_Status(text, false);
++}
++
++
++void
++CaptureManager::_Status(const char* text, bool error)
++{
++	BMessage message(kMsgCaptureStatus);
++	message.AddString("text", text);
++	message.AddBool("error", error);
++	fWindow.SendMessage(&message);
++}
+diff --git a/src/apps/neocam/CaptureManager.h b/src/apps/neocam/CaptureManager.h
+new file mode 100644
+index 0000000000..e3c08d3d04
+--- /dev/null
++++ b/src/apps/neocam/CaptureManager.h
+@@ -0,0 +1,58 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef CAPTURE_MANAGER_H
++#define CAPTURE_MANAGER_H
++
++
++#include <Looper.h>
++#include <Messenger.h>
++#include <String.h>
++
++#include "Uploader.h"
++
++
++class BBitmap;
++
++
++/*!	Saves what was captured and uploads it, one capture after the other in a
++	thread of its own: stills are written as the chosen image format, clips
++	finished (their encoder may still have frames to write). Each capture is
++	named for its time and what took it, in the capture folder; uploaded, it
++	is kept there or removed as the settings say. The window hears how each
++	went.
++*/
++class CaptureManager : public BLooper {
++public:
++								CaptureManager(const BMessenger& window);
++
++			void				SetWindow(const BMessenger& window)
++									{ fWindow = window; }
++									// before it runs
++
++	virtual	void				MessageReceived(BMessage* message);
++
++	static	BString				CapturePath(const char* folder,
++									const char* trigger,
++									const char* extension, time_t when);
++
++private:
++			void				_SaveStill(BBitmap* bitmap,
++									const char* trigger, time_t when);
++			void				_FinishClip(BMessage* message);
++			void				_Deliver(const BString& path,
++									const char* what);
++			void				_Status(const char* text, bool error);
++			BString				_StillExtension() const;
++
++			BMessenger			fWindow;
++			BString				fFolder;
++			uint32				fStillType;
++			int32				fStillTranslator;
++			bool				fKeepLocal;
++			UploadTarget		fTarget;
++};
++
++
++#endif	// CAPTURE_MANAGER_H
+diff --git a/src/apps/neocam/Jamfile b/src/apps/neocam/Jamfile
+new file mode 100644
+index 0000000000..ce78908b9a
+--- /dev/null
++++ b/src/apps/neocam/Jamfile
+@@ -0,0 +1,31 @@
++SubDir HAIKU_TOP src apps neocam ;
++
++UsePrivateHeaders interface media shared ;
++
++# CodyCam's recorder
++SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src apps codycam ] ;
++
++Application NeoCam :
++	CameraConsumer.cpp
++	CameraController.cpp
++	CaptureManager.cpp
++	MainWindow.cpp
++	MotionDetector.cpp
++	NeoCam.cpp
++	PreviewView.cpp
++	Uploader.cpp
++	VideoRecorder.cpp
++	: be localestub media network tracker translation
++		[ TargetLibstdc++ ]
++	: NeoCam.rdef
++;
++
++DoCatalogs NeoCam :
++	x-vnd.c2-NeoCam
++	:
++	CameraController.cpp
++	CaptureManager.cpp
++	MainWindow.cpp
++	PreviewView.cpp
++	Uploader.cpp
++;
+diff --git a/src/apps/neocam/MainWindow.cpp b/src/apps/neocam/MainWindow.cpp
+new file mode 100644
+index 0000000000..497cae5a46
+--- /dev/null
++++ b/src/apps/neocam/MainWindow.cpp
+@@ -0,0 +1,1227 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "MainWindow.h"
++
++#include <math.h>
++#include <stdio.h>
++#include <time.h>
++
++#include <AboutWindow.h>
++#include <Application.h>
++#include <Button.h>
++#include <Catalog.h>
++#include <CheckBox.h>
++#include <Directory.h>
++#include <Entry.h>
++#include <FilePanel.h>
++#include <LayoutBuilder.h>
++#include <MediaTheme.h>
++#include <Menu.h>
++#include <MenuBar.h>
++#include <MenuField.h>
++#include <MenuItem.h>
++#include <MessageRunner.h>
++#include <ParameterWeb.h>
++#include <Path.h>
++#include <PopUpMenu.h>
++#include <RadioButton.h>
++#include <Roster.h>
++#include <ScrollView.h>
++#include <SeparatorView.h>
++#include <Slider.h>
++#include <Spinner.h>
++#include <StringView.h>
++#include <TabView.h>
++#include <TextControl.h>
++#include <TranslationDefs.h>
++#include <TranslationUtils.h>
++#include <TranslatorFormats.h>
++
++#include "CameraController.h"
++#include "CaptureManager.h"
++#include "NeoCam.h"
++#include "PreviewView.h"
++
++
++#undef B_TRANSLATION_CONTEXT
++#define B_TRANSLATION_CONTEXT "MainWindow"
++
++
++static const bigtime_t kPulseInterval = 250000;
++// what the encoder manages next to the camera's decoding, in pixels a
++// second (MPEG-4 on four Cortex-A53 cores: 1920x1080 at 15 frames a second)
++static const float kEncodePixelsPerSecond = 32e6f;
++static const float kClipRates[] = { 30, 25, 20, 15, 10, 5, 2, 1 };
++
++
++enum {
++	kMsgMotionSetting		= 'mset',
++	kMsgScheduleSetting		= 'sset',
++	kMsgAbout				= 'abou'
++};
++
++
++// #pragma mark - MotionMeter
++
++
++/*!	How much of the picture changed, as a bar with the share that counts as
++	motion marked; on a square root scale up to half the picture.
++*/
++class MotionMeter : public BView {
++public:
++	MotionMeter()
++		:
++		BView("motion meter", B_WILL_DRAW),
++		fLevel(0),
++		fThreshold(0.03f),
++		fMotion(false)
++	{
++		SetExplicitMinSize(BSize(120, 14));
++		SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, 14));
++	}
++
++	void SetLevel(float level, float threshold, bool motion)
++	{
++		fLevel = level;
++		fThreshold = threshold;
++		fMotion = motion;
++		Invalidate();
++	}
++
++	virtual void Draw(BRect updateRect)
++	{
++		BRect bounds = Bounds();
++		SetHighColor(tint_color(ui_color(B_PANEL_BACKGROUND_COLOR),
++			B_DARKEN_2_TINT));
++		StrokeRect(bounds);
++		bounds.InsetBy(1, 1);
++		SetHighColor(40, 40, 44);
++		FillRect(bounds);
++
++		float filled = _Position(fLevel, bounds);
++		if (filled > bounds.left) {
++			if (fMotion)
++				SetHighColor(230, 120, 20);
++			else
++				SetHighColor(80, 170, 90);
++			FillRect(BRect(bounds.left, bounds.top, filled, bounds.bottom));
++		}
++		float mark = _Position(fThreshold, bounds);
++		SetHighColor(255, 255, 255);
++		StrokeLine(BPoint(mark, bounds.top), BPoint(mark, bounds.bottom));
++	}
++
++private:
++	float _Position(float share, BRect bounds) const
++	{
++		float scaled = sqrtf(fmaxf(0, fminf(share / 0.5f, 1)));
++		return bounds.left + scaled * bounds.Width();
++	}
++
++	float				fLevel;
++	float				fThreshold;
++	bool				fMotion;
++};
++
++
++// #pragma mark - CameraSettingsWindow
++
++
++/*!	The camera's own controls (brightness, exposure...), as the media theme
++	shows its parameters.
++*/
++class CameraSettingsWindow : public BWindow {
++public:
++	CameraSettingsWindow(BParameterWeb* web)
++		:
++		BWindow(BRect(140, 140, 500, 500), B_TRANSLATE("Camera settings"),
++			B_TITLED_WINDOW, B_AUTO_UPDATE_SIZE_LIMITS
++				| B_ASYNCHRONOUS_CONTROLS),
++		fWeb(web),
++		fView(BMediaTheme::ViewFor(web))
++	{
++		if (fView == NULL) {
++			fView = new BStringView("none",
++				B_TRANSLATE("The camera has no settings."));
++		}
++		BScrollView* scrollView = new BScrollView("scroller", fView, 0,
++			false, true, B_NO_BORDER);
++		BLayoutBuilder::Group<>(this, B_VERTICAL, 0)
++			.Add(scrollView);
++		BSize preferred = fView->PreferredSize();
++		ResizeTo(fminf(preferred.width + 20, 600),
++			fminf(preferred.height + 10, 600));
++	}
++
++	~CameraSettingsWindow()
++	{
++		// the views use the web's parameters: they go first
++		BView* scrollView = ChildAt(0);
++		if (scrollView != NULL) {
++			scrollView->RemoveSelf();
++			delete scrollView;
++		}
++		delete fWeb;
++	}
++
++private:
++	BParameterWeb*		fWeb;
++	BView*				fView;
++};
++
++
++// #pragma mark - MainWindow
++
++
++MainWindow::MainWindow(const BMessage& settings,
++	CaptureManager* captureManager)
++	:
++	BWindow(BRect(80, 60, 780, 780), B_TRANSLATE_SYSTEM_NAME("NeoCam"),
++		B_TITLED_WINDOW, B_AUTO_UPDATE_SIZE_LIMITS | B_ASYNCHRONOUS_CONTROLS
++			| B_QUIT_ON_WINDOW_CLOSE),
++	fFolderPanel(NULL),
++	fController(NULL),
++	fCaptureManager(captureManager),
++	fPulseRunner(NULL),
++	fConnected(false),
++	fSizeCount(0),
++	fCurrentSize(-1),
++	fWantedWidth(0),
++	fWantedHeight(0),
++	fRecording(false),
++	fRecordingPending(false),
++	fRecordEnd(0),
++	fNextSchedule(0),
++	fNextMotionCapture(0),
++	fMotionNow(false)
++{
++	// the menus
++	BMenuBar* menuBar = new BMenuBar("menu");
++	BMenu* menu = new BMenu(B_TRANSLATE("File"));
++	menu->AddItem(new BMenuItem(B_TRANSLATE("Take still"),
++		new BMessage(kMsgSnapshot), 'T'));
++	menu->AddItem(new BMenuItem(B_TRANSLATE("Record clip"),
++		new BMessage(kMsgRecord), 'R'));
++	menu->AddSeparatorItem();
++	menu->AddItem(new BMenuItem(B_TRANSLATE("Open capture folder"),
++		new BMessage(kMsgOpenFolder), 'O'));
++	menu->AddSeparatorItem();
++	menu->AddItem(new BMenuItem(B_TRANSLATE("About NeoCam" B_UTF8_ELLIPSIS),
++		new BMessage(kMsgAbout)));
++	menu->AddSeparatorItem();
++	menu->AddItem(new BMenuItem(B_TRANSLATE("Quit"),
++		new BMessage(B_QUIT_REQUESTED), 'Q'));
++	menuBar->AddItem(menu);
++	menu = new BMenu(B_TRANSLATE("Camera"));
++	menu->AddItem(new BMenuItem(B_TRANSLATE("Camera settings" B_UTF8_ELLIPSIS),
++		new BMessage(kMsgCameraSettings), ','));
++	menu->AddItem(new BMenuItem(B_TRANSLATE("Reconnect"),
++		new BMessage(kMsgReconnect)));
++	menuBar->AddItem(menu);
++
++	// the picture and what to do with it
++	fPreview = new PreviewView();
++	fSizeMenu = new BPopUpMenu(B_TRANSLATE("none"));
++	fSizeField = new BMenuField("size", B_TRANSLATE("Frame size:"),
++		fSizeMenu);
++	fSnapshotButton = new BButton("snapshot", B_TRANSLATE("Take still"),
++		new BMessage(kMsgSnapshot));
++	fRecordButton = new BButton("record", B_TRANSLATE("Record clip"),
++		new BMessage(kMsgRecord));
++	fInfoView = new BStringView("info", "");
++	fInfoView->SetExplicitMinSize(BSize(150, B_SIZE_UNSET));
++	fInfoView->SetAlignment(B_ALIGN_RIGHT);
++	fStatusView = new BStringView("status", "");
++	fStatusView->SetExplicitMinSize(BSize(200, B_SIZE_UNSET));
++	fStatusView->SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, B_SIZE_UNSET));
++
++	BTabView* tabView = new BTabView("tabs", B_WIDTH_FROM_LABEL);
++	tabView->SetBorder(B_NO_BORDER);
++	tabView->AddTab(_CaptureTab());
++	tabView->AddTab(_ScheduleTab());
++	tabView->AddTab(_MotionTab());
++	tabView->AddTab(_UploadTab());
++
++	BLayoutBuilder::Group<>(this, B_VERTICAL, 0)
++		.Add(menuBar)
++		.Add(fPreview, 10)
++		.AddGroup(B_HORIZONTAL)
++			.SetInsets(B_USE_WINDOW_SPACING, B_USE_SMALL_SPACING,
++				B_USE_WINDOW_SPACING, 0)
++			.Add(fSnapshotButton)
++			.Add(fRecordButton)
++			.Add(fSizeField)
++			.AddGlue()
++			.Add(fInfoView)
++		.End()
++		.Add(tabView, 0)
++		.Add(new BSeparatorView(B_HORIZONTAL))
++		.AddGroup(B_HORIZONTAL)
++			.SetInsets(B_USE_WINDOW_SPACING, B_USE_SMALL_SPACING,
++				B_USE_WINDOW_SPACING, B_USE_SMALL_SPACING)
++			.Add(fStatusView)
++		.End();
++
++	_ApplySettings(settings);
++
++	// NeoCam answers ssh's password prompt for sftp
++	app_info info;
++	if (be_app->GetAppInfo(&info) == B_OK)
++		fAskPassProgram = BPath(&info.ref).Path();
++
++	_UpdateControls();
++}
++
++
++MainWindow::~MainWindow()
++{
++	delete fPulseRunner;
++	delete fFolderPanel;
++}
++
++
++void
++MainWindow::Start()
++{
++	_SendDestination();
++
++	fController = new CameraController(fPreview, BMessenger(this),
++		BMessenger(fCaptureManager));
++	fController->Run();
++	_SendMotion();
++
++	BMessage connect(CameraController::kMsgConnect);
++	connect.AddUInt32("width", fWantedWidth);
++	connect.AddUInt32("height", fWantedHeight);
++	BMessenger(fController).SendMessage(&connect);
++
++	BMessage pulse(kMsgPulse);
++	fPulseRunner = new BMessageRunner(BMessenger(this), &pulse,
++		kPulseInterval);
++}
++
++
++bool
++MainWindow::QuitRequested()
++{
++	if (fController != NULL) {
++		// a recording is finished, the camera let go
++		BMessage reply;
++		BMessenger(fController).SendMessage(
++			CameraController::kMsgDisconnect, &reply);
++		if (fController->Lock())
++			fController->Quit();
++		fController = NULL;
++	}
++	BMessage settings;
++	GetSettings(settings);
++	save_settings(settings);
++	return true;
++}
++
++
++void
++MainWindow::MessageReceived(BMessage* message)
++{
++	switch (message->what) {
++		case kMsgSnapshot:
++			_TakeStill(kTriggerManual);
++			break;
++
++		case kMsgRecord:
++			if (fRecording || fRecordingPending)
++				_StopClip();
++			else
++				_StartClip(kTriggerClip);
++			break;
++
++		case kMsgFrameSize:
++		{
++			int32 index = message->GetInt32("index", -1);
++			if (index < 0 || index >= fSizeCount || index == fCurrentSize)
++				break;
++			fWantedWidth = fSizes[index].width;
++			fWantedHeight = fSizes[index].height;
++			fConnected = false;
++			_UpdateControls();
++			fPreview->SetMessage(B_TRANSLATE("Changing the frame size"
++				B_UTF8_ELLIPSIS));
++			BMessage connect(CameraController::kMsgConnect);
++			connect.AddUInt32("width", fWantedWidth);
++			connect.AddUInt32("height", fWantedHeight);
++			BMessenger(fController).SendMessage(&connect);
++			break;
++		}
++
++		case kMsgReconnect:
++		{
++			fConnected = false;
++			_UpdateControls();
++			fPreview->SetMessage(B_TRANSLATE("Connecting to the camera"
++				B_UTF8_ELLIPSIS));
++			BMessage connect(CameraController::kMsgConnect);
++			connect.AddUInt32("width", fWantedWidth);
++			connect.AddUInt32("height", fWantedHeight);
++			BMessenger(fController).SendMessage(&connect);
++			break;
++		}
++
++		case kMsgCameraSettings:
++			_ShowCameraSettings();
++			break;
++
++		case kMsgOpenFolder:
++			_OpenFolder();
++			break;
++
++		case kMsgChooseFolder:
++			if (fFolderPanel == NULL) {
++				BMessenger target(this);
++				BMessage chosen(kMsgFolderChosen);
++				fFolderPanel = new BFilePanel(B_OPEN_PANEL, &target, NULL,
++					B_DIRECTORY_NODE, false, &chosen);
++				fFolderPanel->Window()->SetTitle(
++					B_TRANSLATE("NeoCam: Capture folder"));
++			}
++			fFolderPanel->Show();
++			break;
++
++		case kMsgFolderChosen:
++		{
++			entry_ref ref;
++			if (message->FindRef("refs", &ref) == B_OK) {
++				fFolderControl->SetText(BPath(&ref).Path());
++				_SendDestination();
++			}
++			break;
++		}
++
++		case kMsgStillFormat:
++		case kMsgUploadChanged:
++			_UpdateControls();
++			_SendDestination();
++			break;
++
++		case kMsgSettingChanged:
++			_UpdateClipRateLabel();
++			_SendDestination();
++			break;
++
++		case kMsgScheduleSetting:
++			_ScheduleChanged();
++			break;
++
++		case kMsgMotionSetting:
++			_UpdateControls();
++			_SendMotion();
++			break;
++
++		case kMsgTestUpload:
++			_SendDestination();
++			BMessenger(fCaptureManager).SendMessage(kMsgUploadTest);
++			break;
++
++		case kMsgAbout:
++		{
++			BAboutWindow* about = new BAboutWindow(
++				B_TRANSLATE_SYSTEM_NAME("NeoCam"), kAppSignature);
++			about->AddCopyright(2026, "haiku-odroid-c2 port authors");
++			about->AddDescription(B_TRANSLATE("Stills and video clips from "
++				"a camera, at any of its frame sizes: when you ask, on a "
++				"schedule or when something moves; saved here or uploaded "
++				"by FTP or SFTP."));
++			about->Show();
++			break;
++		}
++
++		case kMsgPulse:
++			_Pulse();
++			break;
++
++		case kMsgCameraReady:
++			_CameraReady(message);
++			break;
++
++		case kMsgCameraFailed:
++			_CameraFailed(message);
++			break;
++
++		case kMsgRecordingStarted:
++			_RecordingStarted(message);
++			break;
++
++		case kMsgFrameStats:
++		{
++			if (!fConnected || fCurrentSize < 0)
++				break;
++			BString text;
++			text.SetToFormat("%" B_PRIu32 " × %" B_PRIu32 ", %.1f fps",
++				fSizes[fCurrentSize].width, fSizes[fCurrentSize].height,
++				message->GetFloat("fps", 0));
++			fInfoView->SetText(text);
++			break;
++		}
++
++		case kMsgMotionLevel:
++			_Motion(message);
++			break;
++
++		case kMsgCaptureStatus:
++			_SetStatus(message->GetString("text", ""),
++				message->GetBool("error", false));
++			break;
++
++		default:
++			BWindow::MessageReceived(message);
++	}
++}
++
++
++BView*
++MainWindow::_CaptureTab()
++{
++	BMessage model(kMsgStillFormat);
++	fStillFormatMenu = new BPopUpMenu(B_TRANSLATE("none"));
++	BTranslationUtils::AddTranslationItems(fStillFormatMenu,
++		B_TRANSLATOR_BITMAP, &model);
++	fStillFormatMenu->SetTargetForItems(this);
++	BMenuField* formatField = new BMenuField("format",
++		B_TRANSLATE("Still format:"), fStillFormatMenu);
++
++	fClipLength = new BSpinner("clip length", B_TRANSLATE("Clip length:"),
++		new BMessage(kMsgSettingChanged));
++	fClipLength->SetRange(1, 3600);
++	fClipLength->SetValue(10);
++	BStringView* seconds = new BStringView("seconds",
++		B_TRANSLATE("seconds"));
++
++	fClipRateMenu = new BPopUpMenu(B_TRANSLATE("Auto"));
++	BMessage* rate = new BMessage(kMsgSettingChanged);
++	rate->AddFloat("fps", 0);
++	fClipRateMenu->AddItem(new BMenuItem(B_TRANSLATE("Auto"), rate));
++	for (size_t i = 0; i < sizeof(kClipRates) / sizeof(kClipRates[0]); i++) {
++		BString label;
++		label.SetToFormat(B_TRANSLATE("%g frames a second"), kClipRates[i]);
++		rate = new BMessage(kMsgSettingChanged);
++		rate->AddFloat("fps", kClipRates[i]);
++		fClipRateMenu->AddItem(new BMenuItem(label, rate));
++	}
++	fClipRateMenu->ItemAt(0)->SetMarked(true);
++	BMenuField* rateField = new BMenuField("rate",
++		B_TRANSLATE("Clip frame rate:"), fClipRateMenu);
++
++	BView* view = new BView(B_TRANSLATE("Capture"), 0);
++	BLayoutBuilder::Grid<>(view, B_USE_DEFAULT_SPACING, B_USE_SMALL_SPACING)
++		.SetInsets(B_USE_WINDOW_SPACING)
++		.AddMenuField(formatField, 0, 0)
++		.Add(fClipLength->CreateLabelLayoutItem(), 0, 1)
++		.AddGroup(B_HORIZONTAL, B_USE_SMALL_SPACING, 1, 1)
++			.Add(fClipLength->CreateTextViewLayoutItem())
++			.Add(seconds)
++			.AddGlue()
++		.End()
++		.AddMenuField(rateField, 0, 2)
++		.AddGlue(0, 3, 2);
++	return view;
++}
++
++
++BView*
++MainWindow::_ScheduleTab()
++{
++	fScheduleBox = new BCheckBox("schedule",
++		B_TRANSLATE("Capture on a schedule"),
++		new BMessage(kMsgScheduleSetting));
++	fScheduleEvery = new BSpinner("every", B_TRANSLATE("Every:"),
++		new BMessage(kMsgScheduleSetting));
++	fScheduleEvery->SetRange(1, 9999);
++	fScheduleEvery->SetValue(5);
++	fScheduleUnitMenu = new BPopUpMenu(B_TRANSLATE("minutes"));
++	const char* units[] = { B_TRANSLATE("seconds"), B_TRANSLATE("minutes"),
++		B_TRANSLATE("hours") };
++	for (int32 i = 0; i < 3; i++) {
++		BMessage* unit = new BMessage(kMsgScheduleSetting);
++		unit->AddInt32("unit", i);
++		fScheduleUnitMenu->AddItem(new BMenuItem(units[i], unit));
++	}
++	fScheduleUnitMenu->ItemAt(1)->SetMarked(true);
++	BMenuField* unitField = new BMenuField("unit", NULL, fScheduleUnitMenu);
++	fScheduleStill = new BRadioButton("still",
++		B_TRANSLATE("Take a still"), new BMessage(kMsgScheduleSetting));
++	fScheduleClip = new BRadioButton("clip",
++		B_TRANSLATE("Record a clip (its length is on the Capture tab)"),
++		new BMessage(kMsgScheduleSetting));
++	fScheduleStill->SetValue(B_CONTROL_ON);
++	fNextView = new BStringView("next", "");
++
++	BView* view = new BView(B_TRANSLATE("Schedule"), 0);
++	BLayoutBuilder::Group<>(view, B_VERTICAL, B_USE_SMALL_SPACING)
++		.SetInsets(B_USE_WINDOW_SPACING)
++		.Add(fScheduleBox)
++		.AddGroup(B_HORIZONTAL, B_USE_SMALL_SPACING)
++			.Add(fScheduleEvery)
++			.Add(unitField)
++			.AddGlue()
++		.End()
++		.Add(fScheduleStill)
++		.Add(fScheduleClip)
++		.Add(fNextView)
++		.AddGlue();
++	return view;
++}
++
++
++BView*
++MainWindow::_MotionTab()
++{
++	fMotionBox = new BCheckBox("motion",
++		B_TRANSLATE("Capture when something moves"),
++		new BMessage(kMsgMotionSetting));
++	fSensitivity = new BSlider("sensitivity", B_TRANSLATE("Sensitivity:"),
++		new BMessage(kMsgMotionSetting), 1, 100, B_HORIZONTAL);
++	fSensitivity->SetModificationMessage(new BMessage(kMsgMotionSetting));
++	fSensitivity->SetLimitLabels(B_TRANSLATE("Low"), B_TRANSLATE("High"));
++	fSensitivity->SetValue(50);
++	fMeter = new MotionMeter();
++	fMotionStill = new BRadioButton("motion still",
++		B_TRANSLATE("Take a still"), new BMessage(kMsgMotionSetting));
++	fMotionClip = new BRadioButton("motion clip",
++		B_TRANSLATE("Record a clip, longer while it goes on"),
++		new BMessage(kMsgMotionSetting));
++	fMotionStill->SetValue(B_CONTROL_ON);
++	fMotionWait = new BSpinner("wait", B_TRANSLATE("Wait between captures:"),
++		new BMessage(kMsgMotionSetting));
++	fMotionWait->SetRange(0, 3600);
++	fMotionWait->SetValue(10);
++	BStringView* seconds = new BStringView("seconds",
++		B_TRANSLATE("seconds"));
++	fShowMotionBox = new BCheckBox("show",
++		B_TRANSLATE("Show what moved in the picture"),
++		new BMessage(kMsgMotionSetting));
++
++	BView* view = new BView(B_TRANSLATE("Motion"), 0);
++	BLayoutBuilder::Group<>(view, B_VERTICAL, B_USE_SMALL_SPACING)
++		.SetInsets(B_USE_WINDOW_SPACING)
++		.Add(fMotionBox)
++		.Add(fSensitivity)
++		.Add(fMeter)
++		.AddGroup(B_HORIZONTAL, B_USE_DEFAULT_SPACING)
++			.AddGroup(B_VERTICAL, 0)
++				.Add(fMotionStill)
++				.Add(fMotionClip)
++			.End()
++			.AddGlue()
++		.End()
++		.AddGroup(B_HORIZONTAL, B_USE_SMALL_SPACING)
++			.Add(fMotionWait)
++			.Add(seconds)
++			.AddGlue()
++		.End()
++		.Add(fShowMotionBox)
++		.AddGlue();
++	return view;
++}
++
++
++BView*
++MainWindow::_UploadTab()
++{
++	fFolderControl = new BTextControl("folder", B_TRANSLATE("Save in:"),
++		"/boot/home/NeoCam", new BMessage(kMsgSettingChanged));
++	BButton* chooseButton = new BButton("choose",
++		B_TRANSLATE("Choose" B_UTF8_ELLIPSIS),
++		new BMessage(kMsgChooseFolder));
++
++	fUploadMenu = new BPopUpMenu(B_TRANSLATE("Don't upload"));
++	const char* kinds[] = { B_TRANSLATE("Don't upload"), "FTP", "SFTP" };
++	for (int32 i = 0; i < 3; i++) {
++		BMessage* kind = new BMessage(kMsgUploadChanged);
++		kind->AddInt32("upload", i);
++		fUploadMenu->AddItem(new BMenuItem(kinds[i], kind));
++	}
++	fUploadMenu->ItemAt(0)->SetMarked(true);
++	BMenuField* uploadField = new BMenuField("upload",
++		B_TRANSLATE("Upload:"), fUploadMenu);
++
++	fServerControl = new BTextControl("server", B_TRANSLATE("Server:"), "",
++		new BMessage(kMsgSettingChanged));
++	fServerControl->SetToolTip(B_TRANSLATE("A host name or address, with "
++		":port after it for another port than the usual"));
++	fUserControl = new BTextControl("user", B_TRANSLATE("User:"), "",
++		new BMessage(kMsgSettingChanged));
++	fPasswordControl = new BTextControl("password", B_TRANSLATE("Password:"),
++		"", new BMessage(kMsgSettingChanged));
++	fPasswordControl->TextView()->HideTyping(true);
++	fRemoteFolderControl = new BTextControl("remote folder",
++		B_TRANSLATE("Folder there:"), "", new BMessage(kMsgSettingChanged));
++	fPassiveBox = new BCheckBox("passive", B_TRANSLATE("Passive FTP"),
++		new BMessage(kMsgSettingChanged));
++	fPassiveBox->SetValue(B_CONTROL_ON);
++	fKeepLocalBox = new BCheckBox("keep", B_TRANSLATE("Keep what was "
++		"uploaded here too"), new BMessage(kMsgSettingChanged));
++	fKeepLocalBox->SetValue(B_CONTROL_ON);
++	fTestButton = new BButton("test", B_TRANSLATE("Test upload"),
++		new BMessage(kMsgTestUpload));
++
++	// every change counts, not only Enter
++	BTextControl* controls[] = { fFolderControl, fServerControl,
++		fUserControl, fPasswordControl, fRemoteFolderControl };
++	for (size_t i = 0; i < sizeof(controls) / sizeof(controls[0]); i++)
++		controls[i]->SetModificationMessage(new BMessage(kMsgSettingChanged));
++
++	BView* view = new BView(B_TRANSLATE("Save & upload"), 0);
++	BLayoutBuilder::Grid<>(view, B_USE_DEFAULT_SPACING, B_USE_SMALL_SPACING)
++		.SetInsets(B_USE_WINDOW_SPACING)
++		.AddTextControl(fFolderControl, 0, 0)
++		.Add(chooseButton, 2, 0)
++		.AddMenuField(uploadField, 0, 1)
++		.AddTextControl(fServerControl, 0, 2)
++		.AddTextControl(fUserControl, 0, 3)
++		.AddTextControl(fPasswordControl, 0, 4)
++		.AddTextControl(fRemoteFolderControl, 0, 5)
++		.AddGroup(B_HORIZONTAL, B_USE_DEFAULT_SPACING, 1, 6, 2)
++			.Add(fPassiveBox)
++			.Add(fKeepLocalBox)
++			.AddGlue()
++			.Add(fTestButton)
++		.End();
++	return view;
++}
++
++
++static void
++mark_item_with(BMenu* menu, const char* field, int32 value)
++{
++	for (int32 i = 0; BMenuItem* item = menu->ItemAt(i); i++) {
++		if (item->Message() != NULL
++			&& item->Message()->GetInt32(field, -1) == value) {
++			item->SetMarked(true);
++			return;
++		}
++	}
++}
++
++
++void
++MainWindow::_ApplySettings(const BMessage& settings)
++{
++	BRect frame;
++	if (settings.FindRect("window frame", &frame) == B_OK) {
++		MoveTo(frame.LeftTop());
++		ResizeTo(frame.Width(), frame.Height());
++	}
++	fWantedWidth = settings.GetUInt32("width", 0);
++	fWantedHeight = settings.GetUInt32("height", 0);
++
++	// the still format: JPEG unless another was chosen
++	uint32 type = settings.GetUInt32("still type", 'JPEG');
++	for (int32 i = 0; BMenuItem* item = fStillFormatMenu->ItemAt(i); i++) {
++		if (item->Message() != NULL
++			&& item->Message()->GetUInt32("be:type", 0) == type) {
++			item->SetMarked(true);
++			break;
++		}
++	}
++	if (fStillFormatMenu->FindMarked() == NULL
++		&& fStillFormatMenu->ItemAt(0) != NULL) {
++		fStillFormatMenu->ItemAt(0)->SetMarked(true);
++	}
++
++	fClipLength->SetValue(settings.GetInt32("clip seconds", 10));
++	float rate = settings.GetFloat("clip fps", 0);
++	for (int32 i = 0; BMenuItem* item = fClipRateMenu->ItemAt(i); i++) {
++		if (item->Message()->GetFloat("fps", -1) == rate)
++			item->SetMarked(true);
++	}
++
++	fScheduleBox->SetValue(settings.GetBool("schedule", false));
++	fScheduleEvery->SetValue(settings.GetInt32("schedule every", 5));
++	mark_item_with(fScheduleUnitMenu, "unit",
++		settings.GetInt32("schedule unit", 1));
++	if (settings.GetBool("schedule clip", false))
++		fScheduleClip->SetValue(B_CONTROL_ON);
++
++	fMotionBox->SetValue(settings.GetBool("motion", false));
++	fSensitivity->SetValue(settings.GetInt32("motion sensitivity", 50));
++	if (settings.GetBool("motion clip", false))
++		fMotionClip->SetValue(B_CONTROL_ON);
++	fMotionWait->SetValue(settings.GetInt32("motion wait", 10));
++	fShowMotionBox->SetValue(settings.GetBool("motion show", false));
++
++	fFolderControl->SetText(settings.GetString("folder",
++		"/boot/home/NeoCam"));
++	mark_item_with(fUploadMenu, "upload", settings.GetInt32("upload",
++		UPLOAD_NONE));
++	fServerControl->SetText(settings.GetString("server", ""));
++	fUserControl->SetText(settings.GetString("user", ""));
++	fPasswordControl->SetText(settings.GetString("password", ""));
++	fRemoteFolderControl->SetText(settings.GetString("remote folder", ""));
++	fPassiveBox->SetValue(settings.GetBool("passive", true));
++	fKeepLocalBox->SetValue(settings.GetBool("keep local", true));
++
++	if (fScheduleBox->Value() == B_CONTROL_ON)
++		fNextSchedule = system_time() + _ScheduleInterval();
++}
++
++
++void
++MainWindow::GetSettings(BMessage& settings)
++{
++	settings.AddRect("window frame", Frame());
++	settings.AddUInt32("width", fWantedWidth);
++	settings.AddUInt32("height", fWantedHeight);
++
++	BMenuItem* item = fStillFormatMenu->FindMarked();
++	if (item != NULL && item->Message() != NULL) {
++		settings.AddUInt32("still type",
++			item->Message()->GetUInt32("be:type", 'JPEG'));
++	}
++	settings.AddInt32("clip seconds", fClipLength->Value());
++	item = fClipRateMenu->FindMarked();
++	settings.AddFloat("clip fps",
++		item != NULL ? item->Message()->GetFloat("fps", 0) : 0);
++
++	settings.AddBool("schedule", fScheduleBox->Value() == B_CONTROL_ON);
++	settings.AddInt32("schedule every", fScheduleEvery->Value());
++	item = fScheduleUnitMenu->FindMarked();
++	settings.AddInt32("schedule unit",
++		item != NULL ? item->Message()->GetInt32("unit", 1) : 1);
++	settings.AddBool("schedule clip", fScheduleClip->Value() == B_CONTROL_ON);
++
++	settings.AddBool("motion", fMotionBox->Value() == B_CONTROL_ON);
++	settings.AddInt32("motion sensitivity", fSensitivity->Value());
++	settings.AddBool("motion clip", fMotionClip->Value() == B_CONTROL_ON);
++	settings.AddInt32("motion wait", fMotionWait->Value());
++	settings.AddBool("motion show", fShowMotionBox->Value() == B_CONTROL_ON);
++
++	settings.AddString("folder", fFolderControl->Text());
++	item = fUploadMenu->FindMarked();
++	settings.AddInt32("upload",
++		item != NULL ? item->Message()->GetInt32("upload", 0) : 0);
++	settings.AddString("server", fServerControl->Text());
++	settings.AddString("user", fUserControl->Text());
++	settings.AddString("password", fPasswordControl->Text());
++	settings.AddString("remote folder", fRemoteFolderControl->Text());
++	settings.AddBool("passive", fPassiveBox->Value() == B_CONTROL_ON);
++	settings.AddBool("keep local", fKeepLocalBox->Value() == B_CONTROL_ON);
++}
++
++
++void
++MainWindow::_SendDestination()
++{
++	BMessage destination(kMsgSetDestination);
++	destination.AddString("folder", fFolderControl->Text());
++	BMenuItem* item = fStillFormatMenu->FindMarked();
++	if (item != NULL && item->Message() != NULL) {
++		destination.AddUInt32("still type",
++			item->Message()->GetUInt32("be:type", 'JPEG'));
++		destination.AddInt32("still translator",
++			item->Message()->GetInt32("be:translator", 0));
++	}
++	destination.AddBool("keep local", fKeepLocalBox->Value() == B_CONTROL_ON);
++	item = fUploadMenu->FindMarked();
++	destination.AddInt32("upload",
++		item != NULL ? item->Message()->GetInt32("upload", 0) : 0);
++	destination.AddString("server", fServerControl->Text());
++	destination.AddString("user", fUserControl->Text());
++	destination.AddString("password", fPasswordControl->Text());
++	destination.AddString("remote folder", fRemoteFolderControl->Text());
++	destination.AddBool("passive", fPassiveBox->Value() == B_CONTROL_ON);
++	destination.AddString("askpass", fAskPassProgram);
++	BMessenger(fCaptureManager).SendMessage(&destination);
++}
++
++
++void
++MainWindow::_SendMotion()
++{
++	if (fController == NULL)
++		return;
++	BMessage motion(CameraController::kMsgSetMotion);
++	motion.AddBool("enabled", fMotionBox->Value() == B_CONTROL_ON);
++	motion.AddInt32("sensitivity", fSensitivity->Value());
++	motion.AddBool("show", fShowMotionBox->Value() == B_CONTROL_ON);
++	BMessenger(fController).SendMessage(&motion);
++	if (fMotionBox->Value() != B_CONTROL_ON) {
++		fMeter->SetLevel(0, 0, false);
++		fMotionNow = false;
++	}
++}
++
++
++void
++MainWindow::_TakeStill(const char* trigger)
++{
++	if (!fConnected)
++		return;
++	BMessage still(CameraController::kMsgTakeStill);
++	still.AddString("trigger", trigger);
++	BMessenger(fController).SendMessage(&still);
++}
++
++
++void
++MainWindow::_StartClip(const char* trigger)
++{
++	if (!fConnected || fRecording || fRecordingPending)
++		return;
++
++	BString folder(fFolderControl->Text());
++	create_directory(folder.String(), 0755);
++	BString path = CaptureManager::CapturePath(folder.String(), trigger,
++		"mkv", real_time_clock());
++
++	BMessage start(CameraController::kMsgStartRecording);
++	start.AddString("path", path);
++	start.AddFloat("fps", _ClipFrameRate());
++	start.AddString("trigger", trigger);
++	BMessenger(fController).SendMessage(&start);
++	fRecordingPending = true;
++	fRecordTrigger = trigger;
++	fRecordEnd = system_time() + (bigtime_t)fClipLength->Value() * 1000000;
++	_UpdateControls();
++}
++
++
++void
++MainWindow::_RecordingStarted(BMessage* message)
++{
++	fRecordingPending = false;
++	status_t status = message->GetInt32("status", B_ERROR);
++	if (status != B_OK) {
++		BString text(B_TRANSLATE("The clip couldn't be started: %error%"));
++		text.ReplaceFirst("%error%", strerror(status));
++		_SetStatus(text, true);
++		fRecording = false;
++		_UpdateControls();
++		return;
++	}
++	fRecording = true;
++	fPreview->SetRecording(true, system_time());
++	BString text(B_TRANSLATE("Recording \"%name%\"" B_UTF8_ELLIPSIS));
++	text.ReplaceFirst("%name%", BPath(message->GetString("path", "")).Leaf());
++	_SetStatus(text, false);
++	_UpdateControls();
++}
++
++
++void
++MainWindow::_StopClip()
++{
++	if (!fRecording && !fRecordingPending)
++		return;
++	BMessenger(fController).SendMessage(CameraController::kMsgStopRecording);
++	fRecording = false;
++	fRecordingPending = false;
++	fPreview->SetRecording(false);
++	if (fRecordTrigger == kTriggerMotion) {
++		fNextMotionCapture = system_time()
++			+ (bigtime_t)fMotionWait->Value() * 1000000;
++	}
++	_UpdateControls();
++}
++
++
++void
++MainWindow::_Pulse()
++{
++	bigtime_t now = system_time();
++
++	if (fRecording && fRecordEnd > 0 && now >= fRecordEnd)
++		_StopClip();
++
++	if (fScheduleBox->Value() == B_CONTROL_ON && fConnected) {
++		if (now >= fNextSchedule) {
++			if (fScheduleClip->Value() == B_CONTROL_ON) {
++				if (fRecording || fRecordingPending) {
++					_SetStatus(B_TRANSLATE("A scheduled clip was left out: "
++						"a clip is being recorded."), true);
++				} else
++					_StartClip(kTriggerSchedule);
++			} else
++				_TakeStill(kTriggerSchedule);
++			fNextSchedule += _ScheduleInterval();
++			if (fNextSchedule <= now)
++				fNextSchedule = now + _ScheduleInterval();
++		}
++		time_t next = real_time_clock() + (fNextSchedule - now + 999999)
++			/ 1000000;
++		struct tm local;
++		localtime_r(&next, &local);
++		char clock[32];
++		strftime(clock, sizeof(clock), "%X", &local);
++		BString text(B_TRANSLATE("The next capture is at %time%."));
++		text.ReplaceFirst("%time%", clock);
++		fNextView->SetText(text);
++	} else if (fScheduleBox->Value() == B_CONTROL_ON)
++		fNextView->SetText(B_TRANSLATE("Waiting for the camera."));
++	else
++		fNextView->SetText("");
++
++	// the recording time in the picture, also without frames
++	if (fRecording)
++		fPreview->Invalidate(BRect(0, 0, 200, 60));
++}
++
++
++void
++MainWindow::_Motion(BMessage* message)
++{
++	if (fMotionBox->Value() != B_CONTROL_ON)
++		return;
++	float level = message->GetFloat("level", 0);
++	bool motion = message->GetBool("motion", false);
++	fMeter->SetLevel(level, message->GetFloat("threshold", 0), motion);
++	fMotionNow = motion;
++	if (!motion || !fConnected)
++		return;
++
++	bigtime_t now = system_time();
++	bool clip = fMotionClip->Value() == B_CONTROL_ON;
++	if (clip && fRecording && fRecordTrigger == kTriggerMotion) {
++		// it goes on: so does the clip
++		bigtime_t end = now + (bigtime_t)fClipLength->Value() * 1000000;
++		if (end > fRecordEnd)
++			fRecordEnd = end;
++		return;
++	}
++	if (now < fNextMotionCapture)
++		return;
++
++	if (clip) {
++		if (fRecording || fRecordingPending)
++			return;
++		_StartClip(kTriggerMotion);
++	} else {
++		_TakeStill(kTriggerMotion);
++		fNextMotionCapture = now + (bigtime_t)fMotionWait->Value() * 1000000;
++	}
++}
++
++
++void
++MainWindow::_CameraReady(BMessage* message)
++{
++	fSizeCount = 0;
++	while (fSizeCount < VIDEO_FRAME_SIZES_MAX) {
++		video_frame_size& size = fSizes[fSizeCount];
++		if (message->FindUInt32("width", fSizeCount, &size.width) != B_OK)
++			break;
++		size.height = message->GetUInt32("height", fSizeCount, 0);
++		size.frame_rate = message->GetFloat("fps", fSizeCount, 0);
++		size.flags = message->GetBool("compressed", fSizeCount, false)
++			? VIDEO_FRAME_SIZE_COMPRESSED : 0;
++		fSizeCount++;
++	}
++	fCurrentSize = message->GetInt32("current", 0);
++
++	fSizeMenu->RemoveItems(0, fSizeMenu->CountItems(), true);
++	for (int32 i = 0; i < fSizeCount; i++) {
++		BString label;
++		if (fSizes[i].width == 0) {
++			label = B_TRANSLATE("The camera's own");
++		} else if (fSizes[i].frame_rate > 0) {
++			label.SetToFormat("%" B_PRIu32 " × %" B_PRIu32 " (%g fps)",
++				fSizes[i].width, fSizes[i].height,
++				roundf(fSizes[i].frame_rate * 10) / 10);
++		} else {
++			label.SetToFormat("%" B_PRIu32 " × %" B_PRIu32,
++				fSizes[i].width, fSizes[i].height);
++		}
++		BMessage* select = new BMessage(kMsgFrameSize);
++		select->AddInt32("index", i);
++		BMenuItem* item = new BMenuItem(label, select);
++		item->SetTarget(this);
++		item->SetMarked(i == fCurrentSize);
++		fSizeMenu->AddItem(item);
++	}
++	if (fCurrentSize >= 0 && fCurrentSize < fSizeCount
++		&& fSizes[fCurrentSize].width != 0) {
++		fWantedWidth = fSizes[fCurrentSize].width;
++		fWantedHeight = fSizes[fCurrentSize].height;
++	}
++
++	fConnected = true;
++	fPreview->SetMessage("");
++	BString text(B_TRANSLATE("Connected to \"%camera%\"."));
++	text.ReplaceFirst("%camera%", message->GetString("name", "?"));
++	_SetStatus(text, false);
++	fInfoView->SetText("");
++	_UpdateClipRateLabel();
++	_UpdateControls();
++}
++
++
++void
++MainWindow::_CameraFailed(BMessage* message)
++{
++	fConnected = false;
++	fRecording = false;
++	fRecordingPending = false;
++	fPreview->SetRecording(false);
++	fPreview->ClearFrame();
++	fPreview->SetMessage(message->GetString("text", ""));
++	fInfoView->SetText("");
++	_UpdateControls();
++}
++
++
++void
++MainWindow::_ScheduleChanged()
++{
++	if (fScheduleBox->Value() == B_CONTROL_ON)
++		fNextSchedule = system_time() + _ScheduleInterval();
++	_UpdateControls();
++	_Pulse();
++}
++
++
++bigtime_t
++MainWindow::_ScheduleInterval() const
++{
++	static const bigtime_t kUnits[] = { 1000000, 60000000, 3600000000LL };
++	BMenuItem* item = fScheduleUnitMenu->FindMarked();
++	int32 unit = item != NULL ? item->Message()->GetInt32("unit", 1) : 1;
++	if (unit < 0 || unit > 2)
++		unit = 1;
++	return fScheduleEvery->Value() * kUnits[unit];
++}
++
++
++/*!	The camera's rate as far as the encoder keeps up at this frame size. */
++float
++MainWindow::_AutoClipFrameRate() const
++{
++	float cameraRate = 30;
++	uint32 pixels = 640 * 480;
++	if (fCurrentSize >= 0 && fCurrentSize < fSizeCount) {
++		if (fSizes[fCurrentSize].frame_rate > 0)
++			cameraRate = fSizes[fCurrentSize].frame_rate;
++		if (fSizes[fCurrentSize].width > 0) {
++			pixels = fSizes[fCurrentSize].width
++				* fSizes[fCurrentSize].height;
++		}
++	}
++
++	float budget = kEncodePixelsPerSecond / pixels;
++	for (size_t i = 0; i < sizeof(kClipRates) / sizeof(kClipRates[0]); i++) {
++		if (kClipRates[i] <= budget && kClipRates[i] <= cameraRate + 0.5f)
++			return kClipRates[i];
++	}
++	return 1;
++}
++
++
++float
++MainWindow::_ClipFrameRate() const
++{
++	BMenuItem* item = fClipRateMenu->FindMarked();
++	float chosen = item != NULL ? item->Message()->GetFloat("fps", 0) : 0;
++	if (chosen <= 0)
++		return _AutoClipFrameRate();
++
++	float cameraRate = 30;
++	if (fCurrentSize >= 0 && fCurrentSize < fSizeCount
++		&& fSizes[fCurrentSize].frame_rate > 0) {
++		cameraRate = fSizes[fCurrentSize].frame_rate;
++	}
++	return fminf(chosen, cameraRate);
++}
++
++
++void
++MainWindow::_UpdateClipRateLabel()
++{
++	// what Auto gives depends on the frame size
++	BMenuItem* item = fClipRateMenu->ItemAt(0);
++	BString label(B_TRANSLATE("Auto"));
++	if (fConnected) {
++		label.SetToFormat(B_TRANSLATE("Auto (%g frames a second)"),
++			_AutoClipFrameRate());
++	}
++	item->SetLabel(label);
++	if (item->IsMarked())
++		item->SetMarked(true);
++}
++
++
++void
++MainWindow::_UpdateControls()
++{
++	bool recording = fRecording || fRecordingPending;
++	fSnapshotButton->SetEnabled(fConnected);
++	fRecordButton->SetEnabled(fConnected || recording);
++	fRecordButton->SetLabel(recording ? B_TRANSLATE("Stop recording")
++		: B_TRANSLATE("Record clip"));
++	fSizeField->SetEnabled(fConnected && !recording);
++
++	BMenuItem* item = fUploadMenu->FindMarked();
++	int32 upload = item != NULL ? item->Message()->GetInt32("upload", 0) : 0;
++	fServerControl->SetEnabled(upload != UPLOAD_NONE);
++	fUserControl->SetEnabled(upload != UPLOAD_NONE);
++	fPasswordControl->SetEnabled(upload != UPLOAD_NONE);
++	fRemoteFolderControl->SetEnabled(upload != UPLOAD_NONE);
++	fPassiveBox->SetEnabled(upload == UPLOAD_FTP);
++	fKeepLocalBox->SetEnabled(upload != UPLOAD_NONE);
++	fTestButton->SetEnabled(upload != UPLOAD_NONE);
++
++	bool schedule = fScheduleBox->Value() == B_CONTROL_ON;
++	fScheduleEvery->SetEnabled(schedule);
++	fScheduleStill->SetEnabled(schedule);
++	fScheduleClip->SetEnabled(schedule);
++
++	bool motion = fMotionBox->Value() == B_CONTROL_ON;
++	fSensitivity->SetEnabled(motion);
++	fMotionStill->SetEnabled(motion);
++	fMotionClip->SetEnabled(motion);
++	fMotionWait->SetEnabled(motion);
++	fShowMotionBox->SetEnabled(motion);
++}
++
++
++void
++MainWindow::_SetStatus(const char* text, bool error)
++{
++	fStatusView->SetText(text);
++	if (error)
++		fStatusView->SetHighColor(200, 30, 30);
++	else
++		fStatusView->SetHighUIColor(B_PANEL_TEXT_COLOR);
++	fStatusView->Invalidate();
++}
++
++
++void
++MainWindow::_ShowCameraSettings()
++{
++	if (fController == NULL)
++		return;
++	BMessage reply;
++	if (BMessenger(fController).SendMessage(CameraController::kMsgGetWeb,
++			&reply) != B_OK) {
++		return;
++	}
++	BParameterWeb* web = NULL;
++	reply.FindPointer("web", (void**)&web);
++	if (web == NULL) {
++		_SetStatus(B_TRANSLATE("The camera has no settings to show."), true);
++		return;
++	}
++	(new CameraSettingsWindow(web))->Show();
++}
++
++
++void
++MainWindow::_OpenFolder()
++{
++	BString folder(fFolderControl->Text());
++	create_directory(folder.String(), 0755);
++	entry_ref ref;
++	if (get_ref_for_path(folder.String(), &ref) == B_OK)
++		be_roster->Launch(&ref);
++}
+diff --git a/src/apps/neocam/MainWindow.h b/src/apps/neocam/MainWindow.h
+new file mode 100644
+index 0000000000..d20a738bef
+--- /dev/null
++++ b/src/apps/neocam/MainWindow.h
+@@ -0,0 +1,135 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef MAIN_WINDOW_H
++#define MAIN_WINDOW_H
++
++
++#include <String.h>
++#include <Window.h>
++
++#include <VideoFrameSizes.h>
++
++
++class BButton;
++class BCheckBox;
++class BFilePanel;
++class BMenuField;
++class BMessageRunner;
++class BPopUpMenu;
++class BRadioButton;
++class BSlider;
++class BSpinner;
++class BStringView;
++class BTextControl;
++class CameraController;
++class CaptureManager;
++class MotionMeter;
++class PreviewView;
++
++
++class MainWindow : public BWindow {
++public:
++								MainWindow(const BMessage& settings,
++									CaptureManager* captureManager);
++	virtual						~MainWindow();
++
++	virtual	bool				QuitRequested();
++	virtual	void				MessageReceived(BMessage* message);
++
++			void				Start();
++			void				GetSettings(BMessage& settings);
++
++private:
++			BView*				_CaptureTab();
++			BView*				_ScheduleTab();
++			BView*				_MotionTab();
++			BView*				_UploadTab();
++			void				_ApplySettings(const BMessage& settings);
++
++			void				_SendDestination();
++			void				_SendMotion();
++			void				_TakeStill(const char* trigger);
++			void				_StartClip(const char* trigger);
++			void				_StopClip();
++			void				_RecordingStarted(BMessage* message);
++			void				_Pulse();
++			void				_Motion(BMessage* message);
++			void				_CameraReady(BMessage* message);
++			void				_CameraFailed(BMessage* message);
++			void				_ScheduleChanged();
++			void				_UpdateControls();
++			void				_UpdateClipRateLabel();
++			void				_SetStatus(const char* text, bool error);
++			float				_AutoClipFrameRate() const;
++			float				_ClipFrameRate() const;
++			bigtime_t			_ScheduleInterval() const;
++			void				_ShowCameraSettings();
++			void				_OpenFolder();
++
++			PreviewView*		fPreview;
++			BPopUpMenu*			fSizeMenu;
++			BMenuField*			fSizeField;
++			BButton*			fSnapshotButton;
++			BButton*			fRecordButton;
++			BStringView*		fInfoView;
++			BStringView*		fStatusView;
++
++			BPopUpMenu*			fStillFormatMenu;
++			BSpinner*			fClipLength;
++			BPopUpMenu*			fClipRateMenu;
++
++			BCheckBox*			fScheduleBox;
++			BSpinner*			fScheduleEvery;
++			BPopUpMenu*			fScheduleUnitMenu;
++			BRadioButton*		fScheduleStill;
++			BRadioButton*		fScheduleClip;
++			BStringView*		fNextView;
++
++			BCheckBox*			fMotionBox;
++			BSlider*			fSensitivity;
++			BRadioButton*		fMotionStill;
++			BRadioButton*		fMotionClip;
++			BSpinner*			fMotionWait;
++			BCheckBox*			fShowMotionBox;
++			MotionMeter*		fMeter;
++
++			BTextControl*		fFolderControl;
++			BFilePanel*			fFolderPanel;
++			BPopUpMenu*			fUploadMenu;
++			BTextControl*		fServerControl;
++			BTextControl*		fUserControl;
++			BTextControl*		fPasswordControl;
++			BTextControl*		fRemoteFolderControl;
++			BCheckBox*			fPassiveBox;
++			BCheckBox*			fKeepLocalBox;
++			BButton*			fTestButton;
++
++			CameraController*	fController;
++			CaptureManager*		fCaptureManager;
++			BMessageRunner*		fPulseRunner;
++			BString				fAskPassProgram;
++
++			// the camera
++			bool				fConnected;
++			video_frame_size	fSizes[VIDEO_FRAME_SIZES_MAX];
++			int32				fSizeCount;
++			int32				fCurrentSize;
++			uint32				fWantedWidth;
++			uint32				fWantedHeight;
++
++			// a recording
++			bool				fRecording;
++			bool				fRecordingPending;
++			bigtime_t			fRecordEnd;
++			BString				fRecordTrigger;
++
++			// captures that come by themselves
++			bigtime_t			fNextSchedule;
++			bigtime_t			fNextMotionCapture;
++			bool				fMotionNow;
++};
++
++
++#endif	// MAIN_WINDOW_H
+diff --git a/src/apps/neocam/MotionDetector.cpp b/src/apps/neocam/MotionDetector.cpp
+new file mode 100644
+index 0000000000..b5bc56c566
+--- /dev/null
++++ b/src/apps/neocam/MotionDetector.cpp
+@@ -0,0 +1,121 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "MotionDetector.h"
++
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++
++
++// pixels sampled in each cell, across and down
++static const int32 kSamples = 4;
++// the first analyses only build the background
++static const int32 kWarmUpFrames = 10;
++
++
++MotionDetector::MotionDetector()
++	:
++	fSensitivity(50)
++{
++	Reset();
++}
++
++
++void
++MotionDetector::Reset()
++{
++	fFrames = 0;
++	memset(fChanged, 0, sizeof(fChanged));
++}
++
++
++void
++MotionDetector::SetSensitivity(int32 sensitivity)
++{
++	if (sensitivity < 1)
++		sensitivity = 1;
++	if (sensitivity > 100)
++		sensitivity = 100;
++	fSensitivity = sensitivity;
++}
++
++
++/*!	From 30% of the picture at sensitivity 1 to 0.3% at 100. */
++float
++MotionDetector::Threshold() const
++{
++	return 0.30f * powf(0.01f, (fSensitivity - 1) / 99.0f);
++}
++
++
++float
++MotionDetector::Analyze(const uint8* bits, uint32 width, uint32 height,
++	uint32 bytesPerRow)
++{
++	if (width < kColumns || height < kRows)
++		return 0;
++
++	// the cells' brightness
++	int32 total = 0;
++	for (int32 row = 0; row < kRows; row++) {
++		uint32 top = row * height / kRows;
++		uint32 cellHeight = (row + 1) * height / kRows - top;
++		for (int32 column = 0; column < kColumns; column++) {
++			uint32 left = column * width / kColumns;
++			uint32 cellWidth = (column + 1) * width / kColumns - left;
++			uint32 sum = 0;
++			for (int32 sy = 0; sy < kSamples; sy++) {
++				const uint8* line = bits + (size_t)(top
++					+ (2 * sy + 1) * cellHeight / (2 * kSamples)) * bytesPerRow;
++				for (int32 sx = 0; sx < kSamples; sx++) {
++					const uint8* pixel = line + 4 * (left
++						+ (2 * sx + 1) * cellWidth / (2 * kSamples));
++					// B, G, R
++					sum += (29 * pixel[0] + 150 * pixel[1] + 77 * pixel[2])
++						>> 8;
++				}
++			}
++			uint8 brightness = sum / (kSamples * kSamples);
++			fCurrent[row * kColumns + column] = brightness;
++			total += brightness;
++		}
++	}
++
++	const int32 cells = kRows * kColumns;
++	if (fFrames == 0) {
++		for (int32 i = 0; i < cells; i++)
++			fBackground[i] = fCurrent[i] * 16;
++	}
++
++	// the change of the whole picture is not motion
++	int32 backgroundTotal = 0;
++	for (int32 i = 0; i < cells; i++)
++		backgroundTotal += fBackground[i];
++	int32 shift = (total * 16 - backgroundTotal) / cells;
++
++	// a step of 12 brightness levels at sensitivity 100, 52 at 1
++	int32 step = (12 + (100 - fSensitivity) * 40 / 99) * 16;
++	int32 changed = 0;
++	for (int32 i = 0; i < cells; i++) {
++		int32 current = fCurrent[i] * 16;
++		int32 difference = current - fBackground[i] - shift;
++		fChanged[i] = abs(difference) > step;
++		if (fChanged[i])
++			changed++;
++
++		// the background follows: quickly where it is still, slowly where
++		// something moves (something that stays becomes background within
++		// some seconds)
++		fBackground[i] += (current - fBackground[i]) / (fChanged[i] ? 32 : 8);
++	}
++
++	if (++fFrames <= kWarmUpFrames) {
++		memset(fChanged, 0, sizeof(fChanged));
++		return 0;
++	}
++	return (float)changed / cells;
++}
+diff --git a/src/apps/neocam/MotionDetector.h b/src/apps/neocam/MotionDetector.h
+new file mode 100644
+index 0000000000..ecbdc70414
+--- /dev/null
++++ b/src/apps/neocam/MotionDetector.h
+@@ -0,0 +1,53 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef MOTION_DETECTOR_H
++#define MOTION_DETECTOR_H
++
++
++#include <SupportDefs.h>
++
++
++/*!	Simple motion detection: the picture as a grid of cells, each the
++	average brightness of a few pixels, compared with a background that
++	follows the picture slowly. A cell whose brightness differs from the
++	background by more than a step (after taking off the change of the whole
++	picture, as when the camera adjusts its exposure) has changed; motion is
++	when more of the picture changed than the sensitivity allows.
++*/
++class MotionDetector {
++public:
++	enum {
++		kColumns = 64,
++		kRows = 48
++	};
++
++								MotionDetector();
++
++			void				Reset();
++			void				SetSensitivity(int32 sensitivity);
++									// 1 (only big changes) to 100
++			int32				Sensitivity() const { return fSensitivity; }
++
++			float				Analyze(const uint8* bits, uint32 width,
++									uint32 height, uint32 bytesPerRow);
++									// B_RGB32; the share of the picture
++									// that changed (0 while warming up)
++			float				Threshold() const;
++									// the share that counts as motion
++			bool				Changed(int32 column, int32 row) const
++									{ return fChanged[row * kColumns
++										+ column]; }
++
++private:
++			int32				fSensitivity;
++			int32				fFrames;
++			int32				fBackground[kRows * kColumns];
++				// brightness * 16
++			uint8				fCurrent[kRows * kColumns];
++			bool				fChanged[kRows * kColumns];
++};
++
++
++#endif	// MOTION_DETECTOR_H
+diff --git a/src/apps/neocam/NeoCam.cpp b/src/apps/neocam/NeoCam.cpp
+new file mode 100644
+index 0000000000..341da2b3ae
+--- /dev/null
++++ b/src/apps/neocam/NeoCam.cpp
+@@ -0,0 +1,117 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "NeoCam.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#include <Application.h>
++#include <Catalog.h>
++#include <File.h>
++#include <FindDirectory.h>
++#include <Path.h>
++
++#include "CaptureManager.h"
++#include "MainWindow.h"
++
++
++#undef B_TRANSLATION_CONTEXT
++#define B_TRANSLATION_CONTEXT "NeoCam"
++
++
++static const char* kSettingsName = "NeoCam settings";
++
++
++status_t
++load_settings(BMessage& settings)
++{
++	BPath path;
++	status_t status = find_directory(B_USER_SETTINGS_DIRECTORY, &path);
++	if (status != B_OK)
++		return status;
++	path.Append(kSettingsName);
++	BFile file(path.Path(), B_READ_ONLY);
++	status = file.InitCheck();
++	if (status != B_OK)
++		return status;
++	return settings.Unflatten(&file);
++}
++
++
++status_t
++save_settings(const BMessage& settings)
++{
++	BPath path;
++	status_t status = find_directory(B_USER_SETTINGS_DIRECTORY, &path);
++	if (status != B_OK)
++		return status;
++	path.Append(kSettingsName);
++	BFile file(path.Path(), B_WRITE_ONLY | B_CREATE_FILE | B_ERASE_FILE);
++	status = file.InitCheck();
++	if (status != B_OK)
++		return status;
++	// the password is in it: for its owner only
++	file.SetPermissions(0600);
++	return settings.Flatten(&file);
++}
++
++
++class NeoCam : public BApplication {
++public:
++	NeoCam()
++		:
++		BApplication(kAppSignature),
++		fCaptureManager(NULL)
++	{
++	}
++
++	virtual void ReadyToRun()
++	{
++		BMessage settings;
++		load_settings(settings);
++
++		// the window gets the capture manager's messages
++		fCaptureManager = new CaptureManager(BMessenger());
++		MainWindow* window = new MainWindow(settings, fCaptureManager);
++		fCaptureManager->SetWindow(BMessenger(window));
++		fCaptureManager->Run();
++		window->Show();
++		window->Start();
++	}
++
++	/*!	What is still being saved or uploaded is finished first. */
++	void FinishCaptures()
++	{
++		if (fCaptureManager == NULL)
++			return;
++		thread_id thread = fCaptureManager->Thread();
++		fCaptureManager->PostMessage(B_QUIT_REQUESTED);
++		status_t result;
++		wait_for_thread(thread, &result);
++		fCaptureManager = NULL;
++	}
++
++private:
++	CaptureManager*		fCaptureManager;
++};
++
++
++int
++main(int argc, char** argv)
++{
++	// started by ssh as its SSH_ASKPASS program (for sftp): the password
++	const char* secret = getenv(kAskPassVariable);
++	if (secret != NULL) {
++		printf("%s\n", secret);
++		return 0;
++	}
++
++	NeoCam app;
++	app.Run();
++	app.FinishCaptures();
++	return 0;
++}
+diff --git a/src/apps/neocam/NeoCam.h b/src/apps/neocam/NeoCam.h
+new file mode 100644
+index 0000000000..5d1bb52466
+--- /dev/null
++++ b/src/apps/neocam/NeoCam.h
+@@ -0,0 +1,79 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef NEOCAM_H
++#define NEOCAM_H
++
++
++#include <SupportDefs.h>
++
++
++class BMessage;
++
++
++#define kAppSignature "application/x-vnd.c2-NeoCam"
++
++// set in the environment of an sftp NeoCam runs: NeoCam started as its
++// SSH_ASKPASS program then prints this password (see Uploader.cpp)
++#define kAskPassVariable "NEOCAM_ASKPASS_SECRET"
++
++
++enum {
++	// from the controls and menus to the window
++	kMsgSnapshot			= 'snap',
++	kMsgRecord				= 'reco',
++	kMsgFrameSize			= 'fsiz',	// "index"
++	kMsgCameraSettings		= 'cset',
++	kMsgReconnect			= 'rcon',
++	kMsgOpenFolder			= 'ofld',
++	kMsgChooseFolder		= 'cfld',
++	kMsgFolderChosen		= 'fldc',
++	kMsgStillFormat			= 'sfmt',
++	kMsgSettingChanged		= 'setc',
++	kMsgUploadChanged		= 'upch',
++	kMsgTestUpload			= 'tstu',
++	kMsgPulse				= 'puls',
++
++	// from the camera controller to the window
++	kMsgCameraReady			= 'crdy',	// "size" (frame sizes), "current",
++										// "name"
++	kMsgCameraFailed		= 'cfai',	// "text"
++
++	kMsgRecordingStarted	= 'rsta',	// "status", "path", "trigger"
++
++	// from the camera node to the window
++	kMsgFrameStats			= 'fsts',	// "fps"
++	kMsgMotionLevel			= 'mlev',	// "level", "threshold", "motion"
++
++	// to the capture manager
++	kMsgSaveStill			= 'svst',	// "bitmap" (pointer), "trigger",
++										// "time"
++	kMsgFinishClip			= 'fclp',	// "recorder" (pointer), "trigger"
++	kMsgSetDestination		= 'sdst',	// the settings
++	kMsgUploadTest			= 'uptt',
++
++	// from the capture manager to the window
++	kMsgCaptureStatus		= 'csta'	// "text", "error" (bool)
++};
++
++
++// what took a capture, for its file name
++#define kTriggerManual		"snapshot"
++#define kTriggerClip		"clip"
++#define kTriggerSchedule	"scheduled"
++#define kTriggerMotion		"motion"
++
++
++enum upload_kind {
++	UPLOAD_NONE = 0,
++	UPLOAD_FTP,
++	UPLOAD_SFTP
++};
++
++
++status_t load_settings(BMessage& settings);
++status_t save_settings(const BMessage& settings);
++
++
++#endif	// NEOCAM_H
+diff --git a/src/apps/neocam/NeoCam.rdef b/src/apps/neocam/NeoCam.rdef
+new file mode 100644
+index 0000000000..b763d640e0
+--- /dev/null
++++ b/src/apps/neocam/NeoCam.rdef
+@@ -0,0 +1,64 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * The icon is made by tools/icons/neocam-icon.py in the project.
++ */
++
++resource app_signature "application/x-vnd.c2-NeoCam";
++
++resource app_name_catalog_entry "x-vnd.c2-NeoCam:System name:NeoCam";
++
++resource app_version {
++	major  = 1,
++	middle = 0,
++	minor  = 0,
++
++	variety = B_APPV_FINAL,
++	internal = 0,
++
++	short_info = "1.0",
++	long_info = "NeoCam 1.0 ©2026 haiku-odroid-c2 port authors"
++};
++
++resource app_flags B_SINGLE_LAUNCH;
++
++resource file_types message;
++
++resource vector_icon array {
++	$"6E6369660D020102023CC00000000000000038400049C0004BA000000000006E"
++	$"FF00000000020002023A0000390000B900003A000049C0004B600000BEC0C8FF"
++	$"FF5A5C66FF0116161CFF020002033C60003C0000BC00003C600049A00049C000"
++	$"00787C8AFF783E404CFFFF1E1F26FF0200020200000038C000B8C00000000049"
++	$"C00048900000FFFFFF50FFFFFFFF00020002023AC0003AC000BAC0003AC00049"
++	$"C00049C00000EBEEF5FFFF606470FF0112141CFF020102033A80000000000000"
++	$"003A80004970004970000078BEFFFF961E50AAFFFF0A1846FF02010202384000"
++	$"00000000000038400049C00049C00000283250FFFF04060EFF01FFFFFFBE0201"
++	$"020236CCCC00000000000036CCCC4AE33348A66600FFAA96FFFFC81010FF013C"
++	$"C85AFF013CC85AC80E02082C56B6E6562C5650565056C70156545A54C93A545A"
++	$"545A545A54CAFD505EC7015E505E2C5E2C5EB6E65E285A28CAFD285A285A285A"
++	$"28C93A0208BE5B4CBE064CBE5B4CBF8D4CBF8D4CBFE14C41C52141C4CC41C521"
++	$"41C7EB41C7EB41C83FBF8D56BFE156BF8D56BE5B56BE5B56BE06563BC7EB3BC8"
++	$"3F3BC7EB3BC5213BC5213BC4CC02083554BAB454355447544754C333544A574A"
++	$"C8404A574A574A574AC993475AC3335A475A355A355ABAB45A325732C9933257"
++	$"3257325732C8400208322DB74F2D322D4A2D4A2DC6982D573A57BA7F573A5742"
++	$"574257C3684A4FC6984F4A4F324F324FB74F4F254225C3682542253A253A25BA"
++	$"7F0208322EB7872E322E4A2E4A2EC6602E563A56BAB7563A5642564256C3304A"
++	$"4EC6604E4A4E324E324EB7874E264226C3302642263A263A26BAB7020833B90E"
++	$"B897B90E33B90E49B90E49B90EC550B90E52BCA452BAA952BCA45232523252BC"
++	$"26493BC5503B493B333B333BB8973B2A322ABC262A322ABCA42ABCA42ABAA902"
++	$"043EB9F9BC34B9F9C1B3B9F9C3EF3EC3EFBC34C3EFC1B33EC3EFC1B3C3EFBC34"
++	$"C3EFB9F93EB9F9C1B3B9F9BC3402043E34BCC034C12734483E48BCC048C1273E"
++	$"48C12748BCC048343E34C12734BCC002043E35BCF935C0EE35473E47BCF947C0"
++	$"EE3E47C0EE47BCF947353E35C0EE35BCF902043EBD47BE07BD47BFE0BD47C0A0"
++	$"3EC0A0BE07C0A0BFE03EC0A0BFE0C0A0BE07C0A0BD473EBD47BFE0BD47BE0702"
++	$"04BD84BCAEBD19BCAEBDEFBCAEBE46BD70BE46BD05BE46BDDBBD84BE32BDEFBE"
++	$"32BD19BE32BCC3BD70BCC3BDDBBCC3BD0502044FBAC5C52DBAC5C646BAC5C6B9"
++	$"36C6B9BB37C6B9BC504FBCC3C646BCC3C52DBCC3C4BB36C4BBBC50C4BBBB3702"
++	$"04C3FAB60EC3FAB60EC440B54EC598B470C4D8B4B6C598B470C5C6B4ECC5C6B4"
++	$"ECC52AB525C476B63CC4AFB5A0C476B63C0204C2AAB594C2AAB594C314B471C5"
++	$"1EB320C3FBB38AC51EB320C54BB39DC54BB39DC44CB3F9C327B5C1C383B4C2C3"
++	$"27B5C10D0A000100000A01020102000A020103000A030104000A040105000A05"
++	$"0106000A060107000A070108000A080109000A09010A000A0A010B000A0B010C"
++	$"000A0C010D00"
++};
+diff --git a/src/apps/neocam/PreviewView.cpp b/src/apps/neocam/PreviewView.cpp
+new file mode 100644
+index 0000000000..6a610504d5
+--- /dev/null
++++ b/src/apps/neocam/PreviewView.cpp
+@@ -0,0 +1,236 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "PreviewView.h"
++
++#include <math.h>
++#include <stdio.h>
++#include <string.h>
++
++#include <Bitmap.h>
++#include <Catalog.h>
++#include <OS.h>
++#include <Region.h>
++
++
++#undef B_TRANSLATION_CONTEXT
++#define B_TRANSLATION_CONTEXT "PreviewView"
++
++
++PreviewView::PreviewView()
++	:
++	BView("preview", B_WILL_DRAW | B_FULL_UPDATE_ON_RESIZE
++		| B_FRAME_EVENTS),
++	fBitmap(NULL),
++	fRecording(false),
++	fRecordingStarted(0),
++	fMotion(false),
++	fShowCells(false),
++	fClearBackground(true)
++{
++	SetViewColor(B_TRANSPARENT_COLOR);
++	SetExplicitMinSize(BSize(320, 180));
++	memset(fCells, 0, sizeof(fCells));
++}
++
++
++void
++PreviewView::Draw(BRect updateRect)
++{
++	fClearBackground = true;
++	_DrawPicture();
++}
++
++
++void
++PreviewView::FrameResized(float width, float height)
++{
++	fClearBackground = true;
++	Invalidate();
++}
++
++
++void
++PreviewView::DrawFrame(BBitmap* bitmap)
++{
++	if (bitmap != fBitmap) {
++		if (fBitmap == NULL || bitmap == NULL
++			|| fBitmap->Bounds() != bitmap->Bounds()) {
++			fClearBackground = true;
++		}
++		fBitmap = bitmap;
++	}
++	_DrawPicture();
++	Flush();
++}
++
++
++void
++PreviewView::ClearFrame()
++{
++	fBitmap = NULL;
++	fClearBackground = true;
++	Invalidate();
++}
++
++
++void
++PreviewView::SetMessage(const char* message)
++{
++	fMessage = message;
++	Invalidate();
++}
++
++
++void
++PreviewView::SetRecording(bool recording, bigtime_t started)
++{
++	fRecording = recording;
++	fRecordingStarted = started;
++	if (fBitmap == NULL)
++		Invalidate();
++}
++
++
++void
++PreviewView::SetMotion(const MotionDetector* detector, bool motion,
++	bool showCells)
++{
++	fMotion = motion;
++	fShowCells = showCells;
++	if (!showCells) {
++		memset(fCells, 0, sizeof(fCells));
++		return;
++	}
++	if (detector == NULL)
++		return;
++	for (int32 row = 0; row < MotionDetector::kRows; row++) {
++		for (int32 column = 0; column < MotionDetector::kColumns; column++) {
++			fCells[row * MotionDetector::kColumns + column]
++				= detector->Changed(column, row);
++		}
++	}
++}
++
++
++BRect
++PreviewView::_PictureRect(BBitmap* bitmap) const
++{
++	BRect bounds = Bounds();
++	float width = bounds.Width() + 1;
++	float height = bounds.Height() + 1;
++	float pictureWidth = bitmap->Bounds().Width() + 1;
++	float pictureHeight = bitmap->Bounds().Height() + 1;
++
++	float scale = width / pictureWidth;
++	if (pictureHeight * scale > height)
++		scale = height / pictureHeight;
++	float shownWidth = floorf(pictureWidth * scale);
++	float shownHeight = floorf(pictureHeight * scale);
++	float left = floorf((width - shownWidth) / 2);
++	float top = floorf((height - shownHeight) / 2);
++	return BRect(left, top, left + shownWidth - 1, top + shownHeight - 1);
++}
++
++
++void
++PreviewView::_DrawPicture()
++{
++	BRect bounds = Bounds();
++	if (fBitmap == NULL) {
++		SetHighColor(32, 32, 36);
++		FillRect(bounds);
++		SetHighColor(220, 220, 220);
++		SetLowColor(32, 32, 36);
++		const char* message = fMessage.Length() > 0 ? fMessage.String()
++			: B_TRANSLATE("Connecting to the camera" B_UTF8_ELLIPSIS);
++		font_height fontHeight;
++		GetFontHeight(&fontHeight);
++		float width = StringWidth(message);
++		DrawString(message, BPoint((bounds.Width() - width) / 2,
++			bounds.Height() / 2 + fontHeight.ascent / 2));
++		return;
++	}
++
++	BRect picture = _PictureRect(fBitmap);
++	if (fClearBackground) {
++		// the bars around the picture
++		SetHighColor(0, 0, 0);
++		BRegion bars(bounds);
++		bars.Exclude(picture);
++		FillRegion(&bars);
++		fClearBackground = false;
++	}
++
++	DrawBitmap(fBitmap, fBitmap->Bounds(), picture);
++	_DrawOverlays(picture);
++}
++
++
++void
++PreviewView::_DrawOverlays(BRect picture)
++{
++	if (fShowCells) {
++		SetDrawingMode(B_OP_ALPHA);
++		SetHighColor(255, 40, 40, 90);
++		float cellWidth = picture.Width() / MotionDetector::kColumns;
++		float cellHeight = picture.Height() / MotionDetector::kRows;
++		for (int32 row = 0; row < MotionDetector::kRows; row++) {
++			for (int32 column = 0; column < MotionDetector::kColumns;
++					column++) {
++				if (!fCells[row * MotionDetector::kColumns + column])
++					continue;
++				BRect cell(picture.left + column * cellWidth,
++					picture.top + row * cellHeight,
++					picture.left + (column + 1) * cellWidth - 1,
++					picture.top + (row + 1) * cellHeight - 1);
++				FillRect(cell);
++			}
++		}
++		SetDrawingMode(B_OP_COPY);
++	}
++
++	font_height fontHeight;
++	GetFontHeight(&fontHeight);
++	float lineHeight = ceilf(fontHeight.ascent + fontHeight.descent);
++	float x = picture.left + 8;
++	float y = picture.top + 8;
++
++	if (fRecording) {
++		int32 seconds = (system_time() - fRecordingStarted) / 1000000;
++		char text[32];
++		snprintf(text, sizeof(text), "REC %02" B_PRId32 ":%02" B_PRId32,
++			seconds / 60, seconds % 60);
++		float width = StringWidth(text);
++		SetDrawingMode(B_OP_ALPHA);
++		SetHighColor(0, 0, 0, 140);
++		FillRoundRect(BRect(x, y, x + lineHeight + width + 10,
++			y + lineHeight + 4), 4, 4);
++		SetDrawingMode(B_OP_COPY);
++		SetHighColor(230, 30, 30);
++		float radius = lineHeight / 2 - 2;
++		FillEllipse(BPoint(x + 4 + radius, y + 2 + lineHeight / 2), radius,
++			radius);
++		SetDrawingMode(B_OP_OVER);
++		SetHighColor(255, 255, 255);
++		DrawString(text, BPoint(x + lineHeight + 4,
++			y + 2 + fontHeight.ascent));
++		SetDrawingMode(B_OP_COPY);
++		y += lineHeight + 8;
++	}
++
++	if (fMotion) {
++		const char* text = B_TRANSLATE("Motion");
++		float width = StringWidth(text);
++		SetDrawingMode(B_OP_ALPHA);
++		SetHighColor(200, 120, 0, 200);
++		FillRoundRect(BRect(x, y, x + width + 8, y + lineHeight + 4), 4, 4);
++		SetDrawingMode(B_OP_OVER);
++		SetHighColor(255, 255, 255);
++		DrawString(text, BPoint(x + 4, y + 2 + fontHeight.ascent));
++		SetDrawingMode(B_OP_COPY);
++	}
++}
+diff --git a/src/apps/neocam/PreviewView.h b/src/apps/neocam/PreviewView.h
+new file mode 100644
+index 0000000000..64da753c8b
+--- /dev/null
++++ b/src/apps/neocam/PreviewView.h
+@@ -0,0 +1,57 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef PREVIEW_VIEW_H
++#define PREVIEW_VIEW_H
++
++
++#include <String.h>
++#include <View.h>
++
++#include "MotionDetector.h"
++
++
++class BBitmap;
++
++
++/*!	The camera's picture, scaled to fit with its proportions kept, with
++	what NeoCam is doing drawn over it. The camera node calls DrawFrame()
++	with the window locked; without frames a message is shown.
++*/
++class PreviewView : public BView {
++public:
++								PreviewView();
++
++	virtual	void				Draw(BRect updateRect);
++	virtual	void				FrameResized(float width, float height);
++
++			void				DrawFrame(BBitmap* bitmap);
++			void				SetMessage(const char* message);
++			void				SetRecording(bool recording,
++									bigtime_t started = 0);
++			void				SetMotion(const MotionDetector* detector,
++									bool motion, bool showCells);
++									// cells are copied from a detector,
++									// kept without
++			void				ClearFrame();
++
++private:
++			BRect				_PictureRect(BBitmap* bitmap) const;
++			void				_DrawPicture();
++			void				_DrawOverlays(BRect picture);
++
++			BBitmap*			fBitmap;
++				// the frame drawn last, in one of the node's buffers
++			BString				fMessage;
++			bool				fRecording;
++			bigtime_t			fRecordingStarted;
++			bool				fMotion;
++			bool				fShowCells;
++			bool				fCells[MotionDetector::kRows
++									* MotionDetector::kColumns];
++			bool				fClearBackground;
++};
++
++
++#endif	// PREVIEW_VIEW_H
+diff --git a/src/apps/neocam/Uploader.cpp b/src/apps/neocam/Uploader.cpp
+new file mode 100644
+index 0000000000..9a893e2926
+--- /dev/null
++++ b/src/apps/neocam/Uploader.cpp
+@@ -0,0 +1,647 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "Uploader.h"
++
++#include <arpa/inet.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <netdb.h>
++#include <netinet/in.h>
++#include <poll.h>
++#include <spawn.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++#include <Catalog.h>
++#include <FindDirectory.h>
++#include <Path.h>
++#include <StringList.h>
++
++
++#undef B_TRANSLATION_CONTEXT
++#define B_TRANSLATION_CONTEXT "Uploader"
++
++
++extern char** environ;
++
++static const int kTimeout = 15000;
++	// ms, for connecting and for each reply
++
++
++// #pragma mark - FTP
++
++
++namespace {
++
++
++class FtpSession {
++public:
++								FtpSession();
++								~FtpSession();
++
++			status_t			Upload(const UploadTarget& target,
++									const char* localPath,
++									const char* remoteName, BString& error);
++
++private:
++			status_t			_Connect(const char* host, const char* port,
++									int& socketFD, BString& error);
++			bool				_Command(const char* command, int& code,
++									BString* reply = NULL);
++			bool				_Reply(int& code, BString* reply);
++			bool				_ReadLine(BString& line);
++			int					_OpenDataConnection(BString& error);
++			bool				_ChangeFolder(const BString& folder);
++
++			int					fControl;
++			int					fListener;
++			bool				fPassive;
++			char				fBuffer[4096];
++			size_t				fBuffered;
++			BString				fLastReply;
++};
++
++
++FtpSession::FtpSession()
++	:
++	fControl(-1),
++	fListener(-1),
++	fPassive(true),
++	fBuffered(0)
++{
++}
++
++
++FtpSession::~FtpSession()
++{
++	if (fListener >= 0)
++		close(fListener);
++	if (fControl >= 0)
++		close(fControl);
++}
++
++
++status_t
++FtpSession::_Connect(const char* host, const char* port, int& socketFD,
++	BString& error)
++{
++	struct addrinfo hints;
++	memset(&hints, 0, sizeof(hints));
++	hints.ai_family = AF_INET;
++	hints.ai_socktype = SOCK_STREAM;
++	struct addrinfo* addresses;
++	int result = getaddrinfo(host, port, &hints, &addresses);
++	if (result != 0) {
++		error.SetToFormat(B_TRANSLATE("Server %s not found"), host);
++		return B_NAME_NOT_FOUND;
++	}
++
++	status_t status = B_ERROR;
++	for (struct addrinfo* address = addresses; address != NULL;
++			address = address->ai_next) {
++		int fd = socket(address->ai_family, address->ai_socktype,
++			address->ai_protocol);
++		if (fd < 0)
++			continue;
++		// connect without blocking, waiting at most the timeout
++		int flags = fcntl(fd, F_GETFL);
++		fcntl(fd, F_SETFL, flags | O_NONBLOCK);
++		result = connect(fd, address->ai_addr, address->ai_addrlen);
++		if (result < 0 && errno == EINPROGRESS) {
++			struct pollfd poller = { fd, POLLOUT, 0 };
++			if (poll(&poller, 1, kTimeout) == 1) {
++				int socketError = 0;
++				socklen_t length = sizeof(socketError);
++				getsockopt(fd, SOL_SOCKET, SO_ERROR, &socketError, &length);
++				result = socketError == 0 ? 0 : -1;
++				errno = socketError;
++			} else {
++				result = -1;
++				errno = ETIMEDOUT;
++			}
++		}
++		if (result == 0) {
++			fcntl(fd, F_SETFL, flags);
++			socketFD = fd;
++			status = B_OK;
++			break;
++		}
++		status = errno;
++		close(fd);
++	}
++	freeaddrinfo(addresses);
++	if (status != B_OK) {
++		error.SetToFormat(B_TRANSLATE("Couldn't connect to %s: %s"), host,
++			strerror(status));
++	}
++	return status;
++}
++
++
++bool
++FtpSession::_ReadLine(BString& line)
++{
++	line = "";
++	while (true) {
++		for (size_t i = 0; i < fBuffered; i++) {
++			if (fBuffer[i] == '\n') {
++				line.Append(fBuffer, i);
++				line.RemoveAll("\r");
++				memmove(fBuffer, fBuffer + i + 1, fBuffered - i - 1);
++				fBuffered -= i + 1;
++				return true;
++			}
++		}
++		if (fBuffered == sizeof(fBuffer)) {
++			line.Append(fBuffer, fBuffered);
++			fBuffered = 0;
++		}
++		struct pollfd poller = { fControl, POLLIN, 0 };
++		if (poll(&poller, 1, kTimeout) != 1)
++			return false;
++		ssize_t bytes = recv(fControl, fBuffer + fBuffered,
++			sizeof(fBuffer) - fBuffered, 0);
++		if (bytes <= 0)
++			return false;
++		fBuffered += bytes;
++	}
++}
++
++
++/*!	A reply, also one of several lines ("123-..." up to "123 ..."). */
++bool
++FtpSession::_Reply(int& code, BString* reply)
++{
++	BString line;
++	if (!_ReadLine(line) || line.Length() < 3)
++		return false;
++	code = atoi(line.String());
++	if (line.Length() > 3 && line[3] == '-') {
++		BString end;
++		end.SetToFormat("%03d ", code);
++		BString next;
++		do {
++			if (!_ReadLine(next))
++				return false;
++		} while (next.FindFirst(end) != 0);
++		line = next;
++	}
++	fLastReply = line;
++	if (reply != NULL)
++		*reply = line;
++	return true;
++}
++
++
++bool
++FtpSession::_Command(const char* command, int& code, BString* reply)
++{
++	BString line(command);
++	line << "\r\n";
++	if (send(fControl, line.String(), line.Length(), 0) != line.Length())
++		return false;
++	return _Reply(code, reply);
++}
++
++
++/*!	Passive: to the port the server gives, on the address the control
++	connection goes to (the address in the reply can be one behind a
++	router). Active: a port of ours the server connects to.
++*/
++int
++FtpSession::_OpenDataConnection(BString& error)
++{
++	int code;
++	BString reply;
++	if (fPassive) {
++		if (!_Command("PASV", code, &reply) || code != 227) {
++			error.SetToFormat(B_TRANSLATE("The server refused passive mode: "
++				"%s"), fLastReply.String());
++			return -1;
++		}
++		int32 open = reply.FindFirst('(');
++		unsigned int h1, h2, h3, h4, p1, p2;
++		if (open < 0 || sscanf(reply.String() + open + 1, "%u,%u,%u,%u,%u,%u",
++				&h1, &h2, &h3, &h4, &p1, &p2) != 6) {
++			error.SetToFormat(B_TRANSLATE("Unexpected reply: %s"),
++				reply.String());
++			return -1;
++		}
++		// the control connection's server: what the server says may be an
++		// address behind a router
++		struct sockaddr_in server;
++		socklen_t length = sizeof(server);
++		getpeername(fControl, (struct sockaddr*)&server, &length);
++		char host[INET_ADDRSTRLEN];
++		inet_ntop(AF_INET, &server.sin_addr, host, sizeof(host));
++		char port[8];
++		snprintf(port, sizeof(port), "%u", p1 * 256 + p2);
++		int fd;
++		if (_Connect(host, port, fd, error) != B_OK)
++			return -1;
++		return fd;
++	}
++
++	// active: listen where the control connection is ours
++	struct sockaddr_in local;
++	socklen_t length = sizeof(local);
++	getsockname(fControl, (struct sockaddr*)&local, &length);
++	fListener = socket(AF_INET, SOCK_STREAM, 0);
++	local.sin_port = 0;
++	if (fListener < 0
++		|| bind(fListener, (struct sockaddr*)&local, sizeof(local)) != 0
++		|| listen(fListener, 1) != 0) {
++		error = B_TRANSLATE("Couldn't open a port for active FTP");
++		return -1;
++	}
++	length = sizeof(local);
++	getsockname(fListener, (struct sockaddr*)&local, &length);
++	uint32 address = ntohl(local.sin_addr.s_addr);
++	uint16 port = ntohs(local.sin_port);
++	BString command;
++	command.SetToFormat("PORT %u,%u,%u,%u,%u,%u", (address >> 24) & 0xff,
++		(address >> 16) & 0xff, (address >> 8) & 0xff, address & 0xff,
++		port >> 8, port & 0xff);
++	if (!_Command(command, code) || code != 200) {
++		error.SetToFormat(B_TRANSLATE("The server refused active mode: %s"),
++			fLastReply.String());
++		return -1;
++	}
++	return fListener;
++		// accepted once the transfer command is sent
++}
++
++
++/*!	Into the folder, making it (and its parents) where they are missing. */
++bool
++FtpSession::_ChangeFolder(const BString& folder)
++{
++	int code;
++	if (folder.Length() == 0)
++		return true;
++	BString command("CWD ");
++	command << folder;
++	if (_Command(command, code) && code / 100 == 2)
++		return true;
++
++	// one level at a time
++	BString path(folder);
++	if (path[0] == '/') {
++		if (!_Command("CWD /", code) || code / 100 != 2)
++			return false;
++	}
++	int32 start = 0;
++	while (start < path.Length()) {
++		int32 end = path.FindFirst('/', start);
++		if (end < 0)
++			end = path.Length();
++		BString part;
++		path.CopyInto(part, start, end - start);
++		start = end + 1;
++		if (part.Length() == 0)
++			continue;
++		command = "CWD ";
++		command << part;
++		if (_Command(command, code) && code / 100 == 2)
++			continue;
++		command = "MKD ";
++		command << part;
++		_Command(command, code);
++		command = "CWD ";
++		command << part;
++		if (!_Command(command, code) || code / 100 != 2)
++			return false;
++	}
++	return true;
++}
++
++
++status_t
++FtpSession::Upload(const UploadTarget& target, const char* localPath,
++	const char* remoteName, BString& error)
++{
++	fPassive = target.passive;
++
++	BString host(target.server);
++	BString port("21");
++	int32 colon = host.FindLast(':');
++	if (colon > 0) {
++		host.CopyInto(port, colon + 1, host.Length() - colon - 1);
++		host.Truncate(colon);
++	}
++	status_t status = _Connect(host, port, fControl, error);
++	if (status != B_OK)
++		return status;
++
++	int code;
++	if (!_Reply(code, NULL) || code / 100 != 2) {
++		error.SetToFormat(B_TRANSLATE("The server refused the connection: "
++			"%s"), fLastReply.String());
++		return B_ERROR;
++	}
++
++	BString command("USER ");
++	command << (target.user.Length() > 0 ? target.user.String()
++		: "anonymous");
++	if (!_Command(command, code)) {
++		error = B_TRANSLATE("The server closed the connection");
++		return B_ERROR;
++	}
++	if (code == 331) {
++		command = "PASS ";
++		command << target.password;
++		if (!_Command(command, code)) {
++			error = B_TRANSLATE("The server closed the connection");
++			return B_ERROR;
++		}
++	}
++	if (code != 230 && code != 202) {
++		error.SetToFormat(B_TRANSLATE("Login refused: %s"),
++			fLastReply.String());
++		return B_PERMISSION_DENIED;
++	}
++
++	if (!_Command("TYPE I", code) || code / 100 != 2) {
++		error.SetToFormat(B_TRANSLATE("The server refused binary mode: %s"),
++			fLastReply.String());
++		return B_ERROR;
++	}
++	if (!_ChangeFolder(target.folder)) {
++		error.SetToFormat(B_TRANSLATE("Couldn't open or make the folder "
++			"%s: %s"), target.folder.String(), fLastReply.String());
++		return B_ENTRY_NOT_FOUND;
++	}
++
++	int file = open(localPath, O_RDONLY);
++	if (file < 0) {
++		error.SetToFormat(B_TRANSLATE("Couldn't read %s"), localPath);
++		return errno;
++	}
++
++	int data = _OpenDataConnection(error);
++	if (data < 0) {
++		close(file);
++		return B_ERROR;
++	}
++	command = "STOR ";
++	command << remoteName;
++	if (!_Command(command, code) || (code != 150 && code != 125)) {
++		error.SetToFormat(B_TRANSLATE("The server refused the file: %s"),
++			fLastReply.String());
++		close(file);
++		close(data);
++		fListener = -1;
++		return B_ERROR;
++	}
++	if (!fPassive) {
++		struct pollfd poller = { data, POLLIN, 0 };
++		int accepted = -1;
++		if (poll(&poller, 1, kTimeout) == 1)
++			accepted = accept(data, NULL, NULL);
++		close(data);
++		fListener = -1;
++		if (accepted < 0) {
++			error = B_TRANSLATE("The server didn't connect for active FTP");
++			close(file);
++			return B_TIMED_OUT;
++		}
++		data = accepted;
++	}
++
++	status = B_OK;
++	char buffer[65536];
++	ssize_t bytes;
++	while ((bytes = read(file, buffer, sizeof(buffer))) > 0) {
++		ssize_t sent = 0;
++		while (sent < bytes) {
++			ssize_t chunk = send(data, buffer + sent, bytes - sent, 0);
++			if (chunk <= 0) {
++				status = errno;
++				break;
++			}
++			sent += chunk;
++		}
++		if (status != B_OK)
++			break;
++	}
++	close(file);
++	close(data);
++
++	if (status != B_OK) {
++		error.SetToFormat(B_TRANSLATE("The transfer broke off: %s"),
++			strerror(status));
++		return status;
++	}
++	if (!_Reply(code, NULL) || code / 100 != 2) {
++		error.SetToFormat(B_TRANSLATE("The server didn't take the file: %s"),
++			fLastReply.String());
++		return B_ERROR;
++	}
++	_Command("QUIT", code);
++	return B_OK;
++}
++
++
++}	// namespace
++
++
++// #pragma mark - SFTP
++
++
++/*!	A name or path as one argument of an sftp batch command. */
++static BString
++sftp_quote(const char* text)
++{
++	BString quoted(text);
++	quoted.CharacterEscape("\\\"", '\\');
++	quoted.Prepend("\"");
++	quoted.Append("\"");
++	return quoted;
++}
++
++
++static status_t
++sftp_upload(const UploadTarget& target, const char* localPath,
++	const char* remoteName, BString& error)
++{
++	// the commands, in a file of their own
++	BPath batchPath;
++	find_directory(B_SYSTEM_TEMP_DIRECTORY, &batchPath);
++	BString batchName;
++	batchName.SetToFormat("neocam-sftp-%" B_PRId32, find_thread(NULL));
++	batchPath.Append(batchName);
++	FILE* batch = fopen(batchPath.Path(), "w");
++	if (batch == NULL) {
++		error = B_TRANSLATE("Couldn't write the sftp commands");
++		return errno;
++	}
++	if (target.folder.Length() > 0) {
++		// "-": a folder that is there already is no error; then each level
++		BString path(target.folder);
++		BString made;
++		if (path[0] == '/')
++			made = "/";
++		int32 start = 0;
++		while (start < path.Length()) {
++			int32 end = path.FindFirst('/', start);
++			if (end < 0)
++				end = path.Length();
++			BString part;
++			path.CopyInto(part, start, end - start);
++			start = end + 1;
++			if (part.Length() == 0)
++				continue;
++			if (made.Length() > 0 && made[made.Length() - 1] != '/')
++				made << "/";
++			made << part;
++			fprintf(batch, "-mkdir %s\n", sftp_quote(made).String());
++		}
++		fprintf(batch, "cd %s\n", sftp_quote(target.folder).String());
++	}
++	fprintf(batch, "put %s %s\n", sftp_quote(localPath).String(),
++		sftp_quote(remoteName).String());
++	fclose(batch);
++
++	BString host(target.server);
++	BString port;
++	int32 colon = host.FindLast(':');
++	if (colon > 0) {
++		host.CopyInto(port, colon + 1, host.Length() - colon - 1);
++		host.Truncate(colon);
++	}
++	BString destination;
++	if (target.user.Length() > 0)
++		destination << target.user << "@";
++	destination << host;
++
++	// sftp -b turns batch mode on in ssh, which would leave out the password
++	// prompt: the first value of an option counts, so it is turned off first
++	BString portOption("-oPort=");
++	portOption << (port.Length() > 0 ? port.String() : "22");
++	const char* arguments[] = {
++		"sftp",
++		"-oBatchMode=no",
++		"-oStrictHostKeyChecking=accept-new",
++		"-oConnectTimeout=15",
++		"-oNumberOfPasswordPrompts=1",
++		"-oServerAliveInterval=15",
++		portOption.String(),
++		"-b", batchPath.Path(),
++		destination.String(),
++		NULL
++	};
++
++	// the environment: ssh asks NeoCam (as SSH_ASKPASS) for the password
++	BStringList variables;
++	for (char** variable = environ; *variable != NULL; variable++) {
++		if (strncmp(*variable, "SSH_ASKPASS", 11) != 0
++			&& strncmp(*variable, kAskPassVariable "=",
++				strlen(kAskPassVariable) + 1) != 0) {
++			variables.Add(*variable);
++		}
++	}
++	BString variable;
++	variable.SetToFormat("SSH_ASKPASS=%s", target.askPassProgram.String());
++	variables.Add(variable);
++	variables.Add("SSH_ASKPASS_REQUIRE=force");
++	variable.SetToFormat("%s=%s", kAskPassVariable,
++		target.password.String());
++	variables.Add(variable);
++	const char** environment = new const char*[variables.CountStrings() + 1];
++	for (int32 i = 0; i < variables.CountStrings(); i++)
++		environment[i] = variables.StringAt(i).String();
++	environment[variables.CountStrings()] = NULL;
++
++	// what sftp says goes into a pipe, for the error
++	int output[2];
++	if (pipe(output) != 0) {
++		delete[] environment;
++		unlink(batchPath.Path());
++		error = B_TRANSLATE("Couldn't start sftp");
++		return errno;
++	}
++	posix_spawn_file_actions_t actions;
++	posix_spawn_file_actions_init(&actions);
++	posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0);
++	posix_spawn_file_actions_adddup2(&actions, output[1], 1);
++	posix_spawn_file_actions_adddup2(&actions, output[1], 2);
++	posix_spawn_file_actions_addclose(&actions, output[0]);
++	posix_spawn_file_actions_addclose(&actions, output[1]);
++
++	pid_t child;
++	int result = posix_spawnp(&child, "sftp", &actions, NULL,
++		(char* const*)arguments, (char* const*)environment);
++	posix_spawn_file_actions_destroy(&actions);
++	delete[] environment;
++	close(output[1]);
++	if (result != 0) {
++		close(output[0]);
++		unlink(batchPath.Path());
++		error = B_TRANSLATE("Couldn't start sftp");
++		return result;
++	}
++
++	BString said;
++	char buffer[1024];
++	ssize_t bytes;
++	while ((bytes = read(output[0], buffer, sizeof(buffer))) > 0)
++		said.Append(buffer, bytes);
++	close(output[0]);
++	int childStatus = 0;
++	waitpid(child, &childStatus, 0);
++	unlink(batchPath.Path());
++
++	if (WIFEXITED(childStatus) && WEXITSTATUS(childStatus) == 0)
++		return B_OK;
++
++	// the last line that isn't sftp's echo of a command
++	said.RemoveAll("\r");
++	BString reason;
++	int32 end = said.Length();
++	while (end > 0 && reason.Length() == 0) {
++		int32 start = said.FindLast('\n', end - 1) + 1;
++		BString line;
++		said.CopyInto(line, start, end - start);
++		line.Trim();
++		if (line.Length() > 0 && line.FindFirst("sftp>") != 0)
++			reason = line;
++		end = start - 1;
++	}
++	if (reason.Length() == 0)
++		reason = B_TRANSLATE("sftp failed");
++	error = reason;
++	return B_ERROR;
++}
++
++
++// #pragma mark -
++
++
++status_t
++upload_file(const UploadTarget& target, const char* localPath,
++	const char* remoteName, BString& error)
++{
++	if (target.server.Length() == 0) {
++		error = B_TRANSLATE("No server given");
++		return B_BAD_VALUE;
++	}
++	switch (target.kind) {
++		case UPLOAD_FTP:
++		{
++			FtpSession session;
++			return session.Upload(target, localPath, remoteName, error);
++		}
++		case UPLOAD_SFTP:
++			return sftp_upload(target, localPath, remoteName, error);
++		default:
++			return B_BAD_VALUE;
++	}
++}
+diff --git a/src/apps/neocam/Uploader.h b/src/apps/neocam/Uploader.h
+new file mode 100644
+index 0000000000..d88a7c3d0b
+--- /dev/null
++++ b/src/apps/neocam/Uploader.h
+@@ -0,0 +1,35 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef UPLOADER_H
++#define UPLOADER_H
++
++
++#include <String.h>
++
++#include "NeoCam.h"
++
++
++struct UploadTarget {
++			upload_kind			kind;
++			BString				server;		// host or host:port
++			BString				user;
++			BString				password;
++			BString				folder;		// on the server; made if missing
++			bool				passive;	// FTP
++			BString				askPassProgram;
++				// SFTP: NeoCam's own path (it answers ssh's password prompt)
++};
++
++
++/*!	Puts a file on a server, by FTP (NeoCam's own client) or SFTP (the sftp
++	command in batch mode, the password through SSH_ASKPASS). On failure
++	\a error says what went wrong. Blocks; several seconds at most when the
++	server doesn't answer.
++*/
++status_t upload_file(const UploadTarget& target, const char* localPath,
++	const char* remoteName, BString& error);
++
++
++#endif	// UPLOADER_H

@@ -1,0 +1,200 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 14:19:41 -0500
+Subject: [PATCH 223/342] ffmpeg plugin: video and sound interleaved in the
+ files it writes
+
+With more than one stream the writer interleaves the packets by time
+(av_interleaved_write_frame, the old TODO), with a copy of each chunk,
+which libavformat keeps and frees. While the header waits for an H.264
+stream's parameter sets, other streams' chunks wait too: their times
+need the time base the header sets.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../media/plugins/ffmpeg/AVFormatWriter.cpp   | 108 +++++++++++++++---
+ .../media/plugins/ffmpeg/AVFormatWriter.h     |   3 +
+ 2 files changed, 94 insertions(+), 17 deletions(-)
+
+diff --git a/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.cpp b/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.cpp
+index 41c6ba592c..b30cfbd262 100644
+--- a/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.cpp
++++ b/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.cpp
+@@ -71,6 +71,11 @@ public:
+ 
+ 			void				TakeParameterSets(const void* chunkBuffer,
+ 									size_t chunkSize);
++			bool				WaitsForParameterSets() const
++									{ return fStream->codecpar->codec_id
++										== AV_CODEC_ID_H264
++										&& fStream->codecpar->extradata_size
++											== 0; }
+ 
+ private:
+ 			AVFormatContext*	fFormatContext;
+@@ -346,20 +351,31 @@ AVFormatWriter::StreamCookie::WriteChunk(const void* chunkBuffer,
+ 	TRACE_PACKET("  PTS: %" PRId64 " (stream->time_base: (%d/%d)\n", fPacket->pts,
+ 		fStream->time_base.num, fStream->time_base.den);
+ 
+-#if 0
+-	// TODO: Eventually, we need to write interleaved packets, but
+-	// maybe we are only supposed to use this if we have actually
+-	// more than one stream. For the moment, this crashes in AVPacket
+-	// shuffling inside libavformat. Maybe if we want to use this, we
+-	// need to allocate a separate AVPacket and copy the chunk buffer.
+-	int result = av_interleaved_write_frame(fFormatContext, fPacket);
+-	if (result < 0)
+-		TRACE("  av_interleaved_write_frame(): %d\n", result);
+-#else
+-	int result = av_write_frame(fFormatContext, fPacket);
+-	if (result < 0)
+-		TRACE("  av_write_frame(): %d\n", result);
+-#endif
++	int result;
++	if (fFormatContext->nb_streams > 1) {
++		// Several streams (video and sound) are interleaved by their times,
++		// as players expect them. libavformat keeps packets for that, so
++		// it gets a copy of the chunk, which it frees.
++		AVPacket* packet = av_packet_alloc();
++		if (packet == NULL)
++			return B_NO_MEMORY;
++		result = av_new_packet(packet, chunkSize);
++		if (result == 0) {
++			memcpy(packet->data, chunkBuffer, chunkSize);
++			packet->stream_index = fPacket->stream_index;
++			packet->pts = fPacket->pts;
++			packet->dts = fPacket->dts;
++			packet->flags = fPacket->flags;
++			result = av_interleaved_write_frame(fFormatContext, packet);
++			if (result < 0)
++				TRACE("  av_interleaved_write_frame(): %d\n", result);
++		}
++		av_packet_free(&packet);
++	} else {
++		result = av_write_frame(fFormatContext, fPacket);
++		if (result < 0)
++			TRACE("  av_write_frame(): %d\n", result);
++	}
+ 
+ 	return result == 0 ? B_OK : B_ERROR;
+ }
+@@ -442,12 +458,26 @@ AVFormatWriter::StreamCookie::TakeParameterSets(const void* chunkBuffer,
+ // #pragma mark - AVFormatWriter
+ 
+ 
++/*!	A chunk of another stream that came while the header waited for an
++	H.264 stream's first chunk: its time can't be put into the stream's time
++	base before the header sets that.
++*/
++struct AVFormatWriter::PendingChunk {
++	PendingChunk*		next;
++	StreamCookie*		cookie;
++	media_encode_info	info;
++	size_t				size;
++	uint8				data[0];
++};
++
++
+ AVFormatWriter::AVFormatWriter()
+ 	:
+ 	fFormatContext(avformat_alloc_context()),
+ 	fCodecOpened(false),
+ 	fHeaderError(-1),
+ 	fHeaderDeferred(false),
++	fPendingChunks(NULL),
+ 	fIOContext(NULL),
+ 	fStreamLock("stream lock")
+ {
+@@ -459,6 +489,12 @@ AVFormatWriter::~AVFormatWriter()
+ {
+ 	TRACE("AVFormatWriter::~AVFormatWriter\n");
+ 
++	while (fPendingChunks != NULL) {
++		PendingChunk* chunk = fPendingChunks;
++		fPendingChunks = chunk->next;
++		free(chunk);
++	}
++
+ 	// Free the streams and close the AVCodecContexts
+ 	if (fFormatContext != NULL)
+ 		avformat_free_context(fFormatContext);
+@@ -597,9 +633,18 @@ AVFormatWriter::Close()
+ 	if (!fCodecOpened)
+ 		return B_NOT_ALLOWED;
+ 
+-	// a file without any chunk still gets its header
+-	if (fHeaderDeferred)
++	// a file without any H.264 chunk still gets its header, and the chunks
++	// that waited for it are written
++	if (fHeaderDeferred) {
+ 		_WriteHeader();
++		while (fPendingChunks != NULL) {
++			PendingChunk* chunk = fPendingChunks;
++			fPendingChunks = chunk->next;
++			if (fHeaderError == 0)
++				chunk->cookie->WriteChunk(chunk->data, chunk->size, &chunk->info);
++			free(chunk);
++		}
++	}
+ 
+ 	// From ffmpeg documentation: [av_write_trailer] may only be called
+ 	// after a successful call to avformat_write_header.
+@@ -692,6 +737,23 @@ AVFormatWriter::WriteChunk(void* _cookie, const void* chunkBuffer,
+ 
+ 	StreamCookie* cookie = reinterpret_cast<StreamCookie*>(_cookie);
+ 	if (fHeaderDeferred) {
++		if (!cookie->WaitsForParameterSets()) {
++			// another stream's chunk: it waits for the header too
++			PendingChunk* chunk = (PendingChunk*)malloc(sizeof(PendingChunk)
++				+ chunkSize);
++			if (chunk == NULL)
++				return B_NO_MEMORY;
++			chunk->next = NULL;
++			chunk->cookie = cookie;
++			chunk->info = *encodeInfo;
++			chunk->size = chunkSize;
++			memcpy(chunk->data, chunkBuffer, chunkSize);
++			PendingChunk** last = &fPendingChunks;
++			while (*last != NULL)
++				last = &(*last)->next;
++			*last = chunk;
++			return B_OK;
++		}
+ 		cookie->TakeParameterSets(chunkBuffer, chunkSize);
+ 		_WriteHeader();
+ 	}
+@@ -699,7 +761,19 @@ AVFormatWriter::WriteChunk(void* _cookie, const void* chunkBuffer,
+ 	if (fHeaderError != 0)
+ 		return B_ERROR;
+ 
+-	return cookie->WriteChunk(chunkBuffer, chunkSize, encodeInfo);
++	status_t status = cookie->WriteChunk(chunkBuffer, chunkSize, encodeInfo);
++
++	// what waited for the header
++	while (fPendingChunks != NULL) {
++		PendingChunk* chunk = fPendingChunks;
++		fPendingChunks = chunk->next;
++		if (status == B_OK) {
++			status = chunk->cookie->WriteChunk(chunk->data, chunk->size,
++				&chunk->info);
++		}
++		free(chunk);
++	}
++	return status;
+ }
+ 
+ 
+diff --git a/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.h b/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.h
+index 5b56214ef1..b686928985 100644
+--- a/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.h
++++ b/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.h
+@@ -58,6 +58,9 @@ private:
+ 			int					fHeaderError;
+ 			bool				fHeaderDeferred;
+ 				// until an H.264 stream's parameter sets came
++			struct PendingChunk;
++			PendingChunk*		fPendingChunks;
++				// other streams' chunks, while the header waits
+ 
+ 			AVIOContext*		fIOContext;
+ 

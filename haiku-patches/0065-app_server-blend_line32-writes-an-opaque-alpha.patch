@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 17:28:56 -0400
+Subject: [PATCH 065/342] app_server: blend_line32() writes an opaque alpha
+
+The fast path of FillRect() in B_OP_ALPHA with B_ALPHA_OVERLAY blended
+the colour channels into a temporary line and copied it back with the
+alpha byte left as whatever was on the stack. meson_hdmi keys its video
+overlay by the frame buffer's alpha, so while a video played, the icon
+stripe of every notification showed garbage stripes through it. The
+other B_ALPHA_OVERLAY paths write 255, and so does this one now.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/servers/app/drawing/drawing_support.h | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/servers/app/drawing/drawing_support.h b/src/servers/app/drawing/drawing_support.h
+index e387bf65d6..5895ba102d 100644
+--- a/src/servers/app/drawing/drawing_support.h
++++ b/src/servers/app/drawing/drawing_support.h
+@@ -58,6 +58,10 @@ blend_line32(uint8* buffer, int32 pixels, uint8 r, uint8 g, uint8 b, uint8 a)
+ 		t[0] = ((p.data8[0] * a) >> 8) + b;
+ 		t[1] = ((p.data8[1] * a) >> 8) + g;
+ 		t[2] = ((p.data8[2] * a) >> 8) + r;
++		t[3] = 255;
++			// opaque, as the other B_ALPHA_OVERLAY paths leave it; the
++			// stack's garbage showed a video overlay through (meson_hdmi
++			// keys it by the frame buffer's alpha)
+ 
+ 		t += 4;
+ 		s += 4;

@@ -1,0 +1,245 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 07:41:40 -0500
+Subject: [PATCH 204/342] usb_webcam: UVC parameters are remembered per camera
+ model (M45)
+
+A camera forgets its settings when it loses power (a reboot, a replug),
+and the Media Kit's node configuration is not saved here
+(LoadNodeConfiguration() only says it should). A value set through the
+node's parameters is now kept in ~/config/settings/Media/usb_webcam,
+under the camera's vendor:product, and set again when such a camera
+comes (node registration, a replug, a camera plugged in later): the
+"Auto" switches and the constant frame rate first, as a camera refuses
+a value its automatic control owns, then the values.
+
+_SetParameterValue() gave the comparison itself as its status: 1 for a
+request done, 0 (B_OK) for one that failed. It now gives B_OK or
+B_ERROR.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../usb_webcam/addons/uvc/UVCCamDevice.cpp    | 151 +++++++++++++++++-
+ .../usb_webcam/addons/uvc/UVCCamDevice.h      |   7 +
+ 2 files changed, 154 insertions(+), 4 deletions(-)
+
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+index ca6654cf33..19fb7cf5c2 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+@@ -12,7 +12,12 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <Directory.h>
++#include <File.h>
++#include <FindDirectory.h>
+ #include <ParameterWeb.h>
++#include <Path.h>
++#include <String.h>
+ #include <media/Buffer.h>
+ 
+ #ifdef HAVE_TURBOJPEG
+@@ -1193,6 +1198,127 @@ UVCCamDevice::AddParameters(BParameterGroup* group, int32& index)
+ 		subgroup->MakeDiscreteParameter(index + 14, B_MEDIA_RAW_VIDEO,
+ 			"Constant frame rate", B_ENABLE);
+ 	}
++
++	_RestoreParameters();
++}
++
++
++static const char* kSettingsName = "usb_webcam";
++	// in the user's Media settings: a message per camera model
++
++
++static status_t
++load_settings(BMessage& settings)
++{
++	BPath path;
++	status_t status = find_directory(B_USER_SETTINGS_DIRECTORY, &path);
++	if (status == B_OK)
++		status = path.Append("Media");
++	if (status == B_OK)
++		status = path.Append(kSettingsName);
++	if (status != B_OK)
++		return status;
++	BFile file(path.Path(), B_READ_ONLY);
++	status = file.InitCheck();
++	if (status != B_OK)
++		return status;
++	return settings.Unflatten(&file);
++}
++
++
++static status_t
++save_settings(const BMessage& settings)
++{
++	BPath path;
++	status_t status = find_directory(B_USER_SETTINGS_DIRECTORY, &path, true);
++	if (status == B_OK)
++		status = path.Append("Media");
++	if (status != B_OK)
++		return status;
++	create_directory(path.Path(), 0755);
++	if ((status = path.Append(kSettingsName)) != B_OK)
++		return status;
++	BFile file(path.Path(), B_WRITE_ONLY | B_CREATE_FILE | B_ERASE_FILE);
++	status = file.InitCheck();
++	if (status != B_OK)
++		return status;
++	return settings.Flatten(&file);
++}
++
++
++BString
++UVCCamDevice::_SettingsKey() const
++{
++	BString key;
++	if (fDevice != NULL) {
++		key.SetToFormat("%04x:%04x", fDevice->VendorID(),
++			fDevice->ProductID());
++	}
++	return key;
++}
++
++
++/*!	The parameter values set for cameras of this model, set again: first
++	the switches (the "Auto"s, the constant frame rate), as a camera refuses
++	a value its automatic control owns, then the values.
++*/
++void
++UVCCamDevice::_RestoreParameters()
++{
++	BMessage settings;
++	BMessage camera;
++	BString key = _SettingsKey();
++	if (key.IsEmpty() || load_settings(settings) != B_OK
++		|| settings.FindMessage(key, &camera) != B_OK) {
++		return;
++	}
++
++	static const int32 kSwitches[] = { 3, 8, 10, 14 };
++	for (int pass = 0; pass < 2; pass++) {
++		char* name;
++		type_code type;
++		for (int32 i = 0; camera.GetInfo(B_RAW_TYPE, i, &name, &type) == B_OK;
++				i++) {
++			int32 offset = atoi(name);
++			bool isSwitch = false;
++			for (size_t k = 0; k < sizeof(kSwitches) / sizeof(kSwitches[0]);
++					k++) {
++				if (kSwitches[k] == offset)
++					isSwitch = true;
++			}
++			if (isSwitch != (pass == 0))
++				continue;
++			const void* data;
++			ssize_t size;
++			if (camera.FindData(name, B_RAW_TYPE, &data, &size) != B_OK)
++				continue;
++			status_t status = _SetParameter(fFirstParameterID + offset,
++				system_time(), data, size);
++			printf("UVCCamDevice: restored parameter %" B_PRId32 ": %s\n",
++				offset, strerror(status));
++		}
++	}
++}
++
++
++void
++UVCCamDevice::_RememberParameter(int32 offset, const void* value, size_t size)
++{
++	BString key = _SettingsKey();
++	if (key.IsEmpty())
++		return;
++	BMessage settings;
++	BMessage camera;
++	load_settings(settings);
++	settings.FindMessage(key, &camera);
++
++	BString name;
++	name << offset;
++	camera.RemoveName(name);
++	camera.AddData(name, B_RAW_TYPE, value, size);
++	if (settings.ReplaceMessage(key, &camera) != B_OK)
++		settings.AddMessage(key, &camera);
++	save_settings(settings);
+ }
+ 
+ 
+@@ -1323,9 +1449,24 @@ UVCCamDevice::GetParameterValue(int32 id, bigtime_t* last_change, void* value,
+ }
+ 
+ 
++/*!	A value set is also remembered for the camera's model, and set again
++	when such a camera comes (_RestoreParameters()): the camera itself
++	forgets it when it loses power.
++*/
+ status_t
+ UVCCamDevice::SetParameterValue(int32 id, bigtime_t when, const void* value,
+ 	size_t size)
++{
++	status_t status = _SetParameter(id, when, value, size);
++	if (status == B_OK && value != NULL)
++		_RememberParameter(id - fFirstParameterID, value, size);
++	return status;
++}
++
++
++status_t
++UVCCamDevice::_SetParameter(int32 id, bigtime_t when, const void* value,
++	size_t size)
+ {
+ 	printf("UVCCamDevice::SetParameterValue(%" B_PRId32 ")\n", id - fFirstParameterID);
+ 	if (fDevice == NULL)
+@@ -1445,18 +1586,20 @@ UVCCamDevice::SetParameterValue(int32 id, bigtime_t when, const void* value,
+ status_t
+ UVCCamDevice::_SetParameterValue(uint16 wValue, int16 setValue)
+ {
+-	return (fDevice->ControlTransfer(USB_REQTYPE_CLASS
++	// (it gave the comparison itself: 1 for done, 0, B_OK, for failed)
++	return fDevice->ControlTransfer(USB_REQTYPE_CLASS
+ 		| USB_REQTYPE_INTERFACE_OUT, USB_VIDEO_RC_SET_CUR, wValue << 8, fControlRequestIndex,
+-		sizeof(setValue), &setValue)) == sizeof(setValue);
++		sizeof(setValue), &setValue) == sizeof(setValue) ? B_OK : B_ERROR;
+ }
+ 
+ 
+ status_t
+ UVCCamDevice::_SetParameterValue(uint16 wValue, int8 setValue)
+ {
+-	return (fDevice->ControlTransfer(USB_REQTYPE_CLASS
++	// (it gave the comparison itself: 1 for done, 0, B_OK, for failed)
++	return fDevice->ControlTransfer(USB_REQTYPE_CLASS
+ 		| USB_REQTYPE_INTERFACE_OUT, USB_VIDEO_RC_SET_CUR, wValue << 8, fControlRequestIndex,
+-		sizeof(setValue), &setValue)) == sizeof(setValue);
++		sizeof(setValue), &setValue) == sizeof(setValue) ? B_OK : B_ERROR;
+ }
+ 
+ 
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+index 92b5b219e6..af327b8417 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+@@ -13,6 +13,7 @@
+ #include <usb/USB_video.h>
+ 
+ #include <Locker.h>
++#include <String.h>
+ 
+ 
+ class UVCCamDevice : public CamDevice {
+@@ -59,6 +60,12 @@ private:
+ 	static	status_t			_DecoderEntry(void* data);
+ 			status_t			_FillFromDecoder(BBuffer* buffer,
+ 									bigtime_t* stamp);
++			status_t			_SetParameter(int32 id, bigtime_t when,
++									const void* value, size_t size);
++			BString				_SettingsKey() const;
++			void				_RestoreParameters();
++			void				_RememberParameter(int32 offset,
++									const void* value, size_t size);
+ 
+ 			void				_ParseVideoControl(
+ 									const usbvc_class_descriptor* descriptor,

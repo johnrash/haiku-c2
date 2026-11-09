@@ -1,0 +1,172 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Tue, 3 Nov 2026 14:54:39 -0500
+Subject: [PATCH 268/342] dwc2: two isochronous OUT streams behind a hub
+
+All OUT streams started in microframe 0. A 48 kHz stereo packet is two
+start-splits in a row, and a translator takes those with nothing between them:
+of two adapters playing behind one hub (these hubs run one translator for all
+their ports), both lost their packets. A tone on one of them came back through
+a cable with half of its time silent. The second OUT stream on a hub now starts
+in microframe 4, clear of the first and of the IN start-splits of microframe 2.
+A third is refused with B_BUSY: it would break the other two.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/busses/usb/dwc2.cpp        |  3 +-
+ src/add-ons/kernel/busses/usb/dwc2.h          |  4 ++
+ .../kernel/busses/usb/dwc2_isochronous.cpp    | 56 +++++++++++++++++--
+ 3 files changed, 58 insertions(+), 5 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.cpp b/src/add-ons/kernel/busses/usb/dwc2.cpp
+index 240528a732..f4afbfcfa4 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2.cpp
+@@ -183,7 +183,8 @@ DWC2::DWC2(Stack* stack, device_node* node, phys_addr_t registers,
+ 	fIsoSemaphore(-1),
+ 	fIsoThread(-1),
+ 	fIsoAvailable(false),
+-	fWarnedIso(false)
++	fWarnedIso(false),
++	fWarnedIsoPlace(false)
+ {
+ 	mutex_init(&fQueueLock, "dwc2 queue");
+ 	B_INITIALIZE_SPINLOCK(&fIsoLock);
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.h b/src/add-ons/kernel/busses/usb/dwc2.h
+index 88e612dd5f..f8d234317d 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.h
++++ b/src/add-ons/kernel/busses/usb/dwc2.h
+@@ -109,6 +109,8 @@ struct dwc2_iso_stream {
+ 	uint32					channel;
+ 	bool					in;
+ 	bool					highSpeed;
++	uint32					startFrame;		// full speed: the microframe its
++											// packets start in
+ 	uint32					mult;			// high speed: transactions per
+ 											// microframe
+ 	uint32					targetFrame;	// high speed: of the running
+@@ -239,6 +241,7 @@ private:
+ 			status_t			_SubmitIsochronous(Transfer* transfer);
+ 			void				_CancelIsochronous(Pipe* pipe, bool force);
+ 			dwc2_iso_stream*	_IsoStreamFor(Pipe* pipe, bool create);
++			status_t			_IsoPlace(dwc2_iso_stream* stream);
+ 			void				_IsoArm(dwc2_iso_stream* stream);
+ 			void				_IsoStartPart(dwc2_iso_stream* stream,
+ 										bool oddFrame);
+@@ -302,6 +305,7 @@ private:
+ 			thread_id			fIsoThread;
+ 			bool				fIsoAvailable;
+ 			bool				fWarnedIso;
++			bool				fWarnedIsoPlace;
+ };
+ 
+ 
+diff --git a/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp b/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
+index baf40efe9e..6ad3598be9 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
+@@ -22,7 +22,11 @@
+  * after. OUT packets start in microframe 0. IN packets start in microframe
+  * 2: a device prepares its packet when the full speed frame begins, and an
+  * IN token right at its start may find nothing ready yet (an audio device's
+- * microphone answered a third of them with zero-length packets). A packet
++ * microphone answered a third of them with zero-length packets). A translator
++ * takes an OUT packet's parts one right after the other, with nothing between
++ * them, and a hub here has one translator for all its ports: a second OUT
++ * stream behind a hub starts in microframe 4, clear of the first and of the
++ * IN start-splits, and a third has no place (two adapters per hub). A packet
+  * that cannot start in time is skipped, so every packet keeps its frame;
+  * all start-splits go out by microframe 5, where the translator runs them
+  * within the same full speed frame.
+@@ -76,7 +80,7 @@ static const bigtime_t kIsoArmDelay = 30;
+ static uint32
+ start_microframe(dwc2_iso_stream* stream)
+ {
+-	return stream->in ? 2 : 0;
++	return stream->startFrame;
+ }
+ 
+ 
+@@ -85,7 +89,7 @@ arm_window(dwc2_iso_stream* stream)
+ {
+ 	// OUT: start-splits up to microframe 5 for two parts; IN: complete-splits
+ 	// within the frame
+-	return stream->in ? 2 : 4;
++	return stream->in ? 2 : 4 - stream->startFrame;
+ }
+ 
+ 
+@@ -106,6 +110,7 @@ DWC2::_InitIsochronous(uint8* bounce, phys_addr_t physical)
+ 		stream.channel = kLaneCount + i;
+ 		stream.in = false;
+ 		stream.highSpeed = i >= kIsoFirstHighSpeedStream;
++		stream.startFrame = 0;
+ 		stream.mult = 1;
+ 		stream.targetFrame = UINT32_MAX;
+ 		stream.pendingFrame = UINT32_MAX;
+@@ -152,6 +157,8 @@ DWC2::_IsoStreamFor(Pipe* pipe, bool create)
+ 		return NULL;
+ 
+ 	unused->pipe = pipe;
++	unused->released = true;
++		// _SubmitIsochronous gives it its place
+ 	unused->in = pipe->Direction() == Pipe::In;
+ 	unused->mult = highSpeed ? pipe->MaxBurst() + 1 : 1;
+ 	unused->targetFrame = UINT32_MAX;
+@@ -167,6 +174,37 @@ DWC2::_IsoStreamFor(Pipe* pipe, bool create)
+ }
+ 
+ 
++/*!	Gives a stream coming into use the microframe its packets start in, see
++	above; B_BUSY if there is none. Called with fIsoLock held.
++*/
++status_t
++DWC2::_IsoPlace(dwc2_iso_stream* stream)
++{
++	stream->startFrame = stream->in ? 2 : 0;
++	if (stream->highSpeed || stream->in)
++		return B_OK;
++
++	bool first = true;
++	bool second = true;
++	for (uint32 i = 0; i < kIsoFirstHighSpeedStream; i++) {
++		dwc2_iso_stream& other = fIsoStreams[i];
++		if (&other == stream || other.pipe == NULL || other.released
++			|| other.in
++			|| other.pipe->HubAddress() != stream->pipe->HubAddress()) {
++			continue;
++		}
++		if (other.startFrame == 0)
++			first = false;
++		else
++			second = false;
++	}
++	if (!first && !second)
++		return B_BUSY;
++	stream->startFrame = first ? 0 : 4;
++	return B_OK;
++}
++
++
+ status_t
+ DWC2::_SubmitIsochronous(Transfer* transfer)
+ {
+@@ -242,7 +280,17 @@ DWC2::_SubmitIsochronous(Transfer* transfer)
+ 	dwc2_iso_stream* stream = _IsoStreamFor(pipe, true);
+ 	if (stream == NULL || stream->freeSlots == 0)
+ 		return B_BUSY;
+-	stream->released = false;
++	if (stream->released) {
++		if (_IsoPlace(stream) != B_OK) {
++			if (!fWarnedIsoPlace) {
++				INFO("no room for a third isochronous OUT stream behind hub "
++					"%d\n", pipe->HubAddress());
++				fWarnedIsoPlace = true;
++			}
++			return B_BUSY;
++		}
++		stream->released = false;
++	}
+ 	entry->stream = stream;
+ 	entry->slot = 0;
+ 	while ((stream->freeSlots & (1 << entry->slot)) == 0)

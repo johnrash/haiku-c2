@@ -1,0 +1,364 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 10:07:24 -0400
+Subject: [PATCH 169/342] Remote Control preferences: an icon; modifiers and
+ every key by mouse
+
+- An icon: Haiku's icon set has no remote control; this one is drawn by
+  the project's tools/icons/remote-control-icon.py in Haiku's style.
+- Alt, Ctrl, Shift and Win checkboxes (Command, Control, Shift and
+  Option) next to the keystroke, and the keys the keymap types (letters,
+  digits, punctuation) in the key menu: a keystroke like a music player's Alt+M
+  can be made without a keyboard at the board. Picking a key keeps the
+  ticked modifiers. Keystrokes are named the PC keyboard's way ("Alt+",
+  "Ctrl+", "Win+").
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/preferences/remotecontrol/KeyNames.cpp    | 55 ++++++++++++-
+ src/preferences/remotecontrol/KeyNames.h      | 13 +++-
+ .../remotecontrol/RemoteControl.rdef          | 60 +++++++++++++++
+ .../remotecontrol/RemoteWindow.cpp            | 77 ++++++++++++++++++-
+ src/preferences/remotecontrol/RemoteWindow.h  |  5 ++
+ 5 files changed, 203 insertions(+), 7 deletions(-)
+
+diff --git a/src/preferences/remotecontrol/KeyNames.cpp b/src/preferences/remotecontrol/KeyNames.cpp
+index 50027d7ae5..16de55cf24 100644
+--- a/src/preferences/remotecontrol/KeyNames.cpp
++++ b/src/preferences/remotecontrol/KeyNames.cpp
+@@ -7,7 +7,9 @@
+ #include "KeyNames.h"
+ 
+ #include <ctype.h>
++#include <new>
+ #include <stdio.h>
++#include <string.h>
+ 
+ #include <InterfaceDefs.h>
+ 
+@@ -57,13 +59,14 @@ KeystrokeName(uint32 key, uint32 modifiers)
+ 	if (key == 0)
+ 		return BString("None");
+ 
++	// the PC keyboard's names: Command is Alt, Option the Windows key
+ 	BString name;
+-	if ((modifiers & B_COMMAND_KEY) != 0)
+-		name << "Command+";
+ 	if ((modifiers & B_CONTROL_KEY) != 0)
+-		name << "Control+";
++		name << "Ctrl+";
++	if ((modifiers & B_COMMAND_KEY) != 0)
++		name << "Alt+";
+ 	if ((modifiers & B_OPTION_KEY) != 0)
+-		name << "Option+";
++		name << "Win+";
+ 	if ((modifiers & B_SHIFT_KEY) != 0)
+ 		name << "Shift+";
+ 
+@@ -90,3 +93,47 @@ KeystrokeName(uint32 key, uint32 modifiers)
+ 	snprintf(code, sizeof(code), "Key 0x%" B_PRIx32, key);
+ 	return name << code;
+ }
++
++
++static int
++CompareCharacterKeys(const CharacterKey* a, const CharacterKey* b)
++{
++	// letters, then digits, then the rest; by character within each
++	int classA = isalpha((uint8)a->name[0]) ? 0 : isdigit((uint8)a->name[0])
++		? 1 : 2;
++	int classB = isalpha((uint8)b->name[0]) ? 0 : isdigit((uint8)b->name[0])
++		? 1 : 2;
++	if (classA != classB)
++		return classA - classB;
++	return strcmp(a->name.String(), b->name.String());
++}
++
++
++void
++GetCharacterKeys(BObjectList<CharacterKey, true>& keys)
++{
++	BKeymap keymap;
++	if (keymap.SetToCurrent() != B_OK)
++		return;
++	for (uint32 key = 1; key < 128; key++) {
++		char* chars = NULL;
++		int32 count = 0;
++		keymap.GetChars(key, 0, 0, &chars, &count);
++		ArrayDeleter<char> charsDeleter(chars);
++		// printable, and not a key with a name of its own (Space)
++		if (count != 1 || !isgraph((uint8)chars[0]))
++			continue;
++		CharacterKey* character = new(std::nothrow) CharacterKey;
++		if (character == NULL)
++			return;
++		character->key = key;
++		character->name.SetTo((char)toupper((uint8)chars[0]), 1);
++		// the keypad repeats the digits and some punctuation: one of each
++		bool known = false;
++		for (int32 i = 0; i < keys.CountItems() && !known; i++)
++			known = keys.ItemAt(i)->name == character->name;
++		if (known || !keys.AddItem(character))
++			delete character;
++	}
++	keys.SortItems(&CompareCharacterKeys);
++}
+diff --git a/src/preferences/remotecontrol/KeyNames.h b/src/preferences/remotecontrol/KeyNames.h
+index d74624a04d..19344b2771 100644
+--- a/src/preferences/remotecontrol/KeyNames.h
++++ b/src/preferences/remotecontrol/KeyNames.h
+@@ -6,6 +6,7 @@
+ #define KEY_NAMES_H
+ 
+ 
++#include <ObjectList.h>
+ #include <String.h>
+ #include <SupportDefs.h>
+ 
+@@ -53,9 +54,19 @@ extern const NamedKey kNamedKeys[];
+ extern const int32 kNamedKeyCount;
+ 
+ 
+-// "Command+Shift+Right arrow", "Space", "Volume up", "None"
++// "Alt+Shift+Right arrow", "Space", "Volume up", "None"
+ BString KeystrokeName(uint32 key, uint32 modifiers);
+ bool IsModifierKey(uint32 key);
+ 
+ 
++// a key the keymap gives a character (letters, digits, punctuation)
++struct CharacterKey {
++	uint32		key;
++	BString		name;		// what it types, a letter in upper case
++};
++
++// every such key, letters first, then digits, then the rest
++void GetCharacterKeys(BObjectList<CharacterKey, true>& keys);
++
++
+ #endif	// KEY_NAMES_H
+diff --git a/src/preferences/remotecontrol/RemoteControl.rdef b/src/preferences/remotecontrol/RemoteControl.rdef
+index 47cd34d030..994f6fd78b 100644
+--- a/src/preferences/remotecontrol/RemoteControl.rdef
++++ b/src/preferences/remotecontrol/RemoteControl.rdef
+@@ -22,3 +22,63 @@ resource app_version {
+ resource file_types message {
+ 	"types" = "application/x-vnd.Be-elfexecutable"
+ };
++
++/* drawn by tools/icons/remote-control-icon.py (the project's) */
++resource vector_icon array {
++	$"6E6369660C020102023CC00000000000000038800049C0004B9800000000006E"
++	$"FF000000000118181EFF020002033A00003CC000BCC0003A00004A00004A2000"
++	$"0080828EFF6E4E505CFFFF282932FF02000202000000394000B940000000004A"
++	$"000048300000FFFFFF5AFFFFFFFF0002000202000000349999B499990000004A"
++	$"00004779990096141EFFFF280008FF0201020237333300000000000037333349"
++	$"E66648733300FF8C78FFFFBE1414FF02000202388000390000B900003880004A"
++	$"000049E00000AAC8F0FFFF285096FF02000202360000360000B600003600004A"
++	$"000049E000003C64AAFFFFC8DCFAFF02000202000000390000B900000000004A"
++	$"00004AE00000EBECF0FFFF9698A2FF01FFB000FF01FFB000BE01FFB000781102"
++	$"082DC7EBB714C7EB2DC7EB4FC7EB4FC7EBC6D3C7EB54C9E954C8CF54C9E954C9"
++	$"E954C9E954CB024FCBE7C6D3CBE74FCBE72DCBE72DCBE7B714CBE728C9E928CB"
++	$"0228C9E928C9E928C9E928C8CF02083DB6C9BD3CB6C93DB6C943B6C943B6C9C2"
++	$"43B6C949B92D49B7DB49B92D49C7EB49C7EB49C93C43CA4FC243CA4F43CA4F3D"
++	$"CA4F3DCA4FBD3CCA4F37C7EB37C93C37C7EB37B92D37B92D37B7DB02083DB72F"
++	$"BD74B72F3DB72F43B72F43B72FC20BB72F48B92D48B81348B92D48C7EB48C7EB"
++	$"48C90443C9E9C20BC9E943C9E93DC9E93DC9E9BD74C9E938C7EB38C90438C7EB"
++	$"38B92D38B92D38B8130208BEA2B79FBDC0B79FBEA2B79FC0DDB79FC0DDB79FC1"
++	$"BFB79FC275B937C275B855C275B937C27534C27534C275BBD9C0DD38C1BF38C0"
++	$"DD38BEA238BEA238BDC038BD0A34BD0ABBD9BD0A34BD0AB937BD0AB937BD0AB8"
++	$"550208BEDFB805BE9CB805BEDFB805C0A0B805C0A0B805C0E3B805C11AB87FC1"
++	$"1AB83CC11AB87FC11A2EC11A2EC11AB8D7C0A0B90EC0E3B90EC0A0B90EBEDFB9"
++	$"0EBEDFB90EBE9CB90EBE652EBE65B8D7BE652EBE65B87FBE65B87FBE65B83C02"
++	$"0440BA17BF38BA17C047BA17C0B4BB0CC0B4BA84C0B4BB9440BC01C047BC01BF"
++	$"38BC01BECBBB0CBECBBB94BECBBA84020440BD1EBE84BD1EC0FBBD1EC1FB3FC1"
++	$"FBBE1EC1FBC09540C195C0FBC195BE84C195BD843FBD84C095BD84BE1E020440"
++	$"BE6FBF3EBE6FC041BE6FC0AA3FC0AABED8C0AABFDB40C044C041C044BF3EC044"
++	$"BED53FBED5BFDBBED5BED80208BD84C323BD51C323BD84C323BE3CC323BE3CC3"
++	$"23BE6FC323BE98C37EBE98C34BBE98C37EBE98C3E4BE98C3E4BE98C417BE3CC4"
++	$"40BE6FC440BE3CC440BD84C440BD84C440BD51C440BD29C3E4BD29C417BD29C3"
++	$"E4BD29C37EBD29C37EBD29C34B0208BF64C323BF31C323BF64C323C01BC323C0"
++	$"1BC323C04EC323C077C37EC077C34BC077C37EC077C3E4C077C3E4C077C417C0"
++	$"1BC440C04EC440C01BC440BF64C440BF64C440BF31C440BF08C3E4BF08C417BF"
++	$"08C3E4BF08C37EBF08C37EBF08C34B0208C143C323C110C323C143C323C1FBC3"
++	$"23C1FBC323C22EC323C257C37EC257C34BC257C37EC257C3E4C257C3E4C257C4"
++	$"17C1FBC440C22EC440C1FBC440C143C440C143C440C110C440C0E7C3E4C0E7C4"
++	$"17C0E7C3E4C0E7C37EC0E7C37EC0E7C34B0208BD84C587BD51C587BD84C587BE"
++	$"3CC587BE3CC587BE6FC587BE98C5E2BE98C5AFBE98C5E2BE98C648BE98C648BE"
++	$"98C67BBE3CC6A4BE6FC6A4BE3CC6A4BD84C6A4BD84C6A4BD51C6A4BD29C648BD"
++	$"29C67BBD29C648BD29C5E2BD29C5E2BD29C5AF0208BF64C587BF31C587BF64C5"
++	$"87C01BC587C01BC587C04EC587C077C5E2C077C5AFC077C5E2C077C648C077C6"
++	$"48C077C67BC01BC6A4C04EC6A4C01BC6A4BF64C6A4BF64C6A4BF31C6A4BF08C6"
++	$"48BF08C67BBF08C648BF08C5E2BF08C5E2BF08C5AF0208C143C587C110C587C1"
++	$"43C587C1FBC587C1FBC587C22EC587C257C5E2C257C5AFC257C5E2C257C648C2"
++	$"57C648C257C67BC1FBC6A4C22EC6A4C1FBC6A4C143C6A4C143C6A4C110C6A4C0"
++	$"E7C648C0E7C67BC0E7C648C0E7C5E2C0E7C5E2C0E7C5AF0204C377B6DEC377B6"
++	$"DEC4A9B6B3C645B87CC5D1B75DC645B87CC5DDB8A7C5DDB8A7C57CB7B7C386B7"
++	$"4DC486B729C386B74D0204C33EB54AC33EB54AC52AB505C7C0B7E4C706B617C7"
++	$"C0B7E4C758B80EC758B80EC6B0B671C34EB5B9C507B57BC34EB5B90204C306B3"
++	$"B6C306B3B6C5ABB357C93AB74BC83AB4D1C93AB74BC8D2B775C8D2B775C7E5B5"
++	$"2AC315B425C588B3CEC315B4250C0A000100000A010101023F76CF3E0000BE00"
++	$"003F76CF48A930C6DC780A020102023F76CF3E0000BE00003F76CF48A930C6DC"
++	$"780A030103023F76CF3E0000BE00003F76CF48A930C6DC780A040104023F76CF"
++	$"3E0000BE00003F76CF48A930C6DC780A050105023F76CF3E0000BE00003F76CF"
++	$"48A930C6DC780A060106023F76CF3E0000BE00003F76CF48A930C6DC780A0701"
++	$"07023F76CF3E0000BE00003F76CF48A930C6DC780A080608090A0B0C0D023F76"
++	$"CF3E0000BE00003F76CF48A930C6DC780A09010E000A0A010F000A0B011000"
++};
+diff --git a/src/preferences/remotecontrol/RemoteWindow.cpp b/src/preferences/remotecontrol/RemoteWindow.cpp
+index 420e40e22d..812700d34e 100644
+--- a/src/preferences/remotecontrol/RemoteWindow.cpp
++++ b/src/preferences/remotecontrol/RemoteWindow.cpp
+@@ -15,6 +15,7 @@
+ 
+ #include "RemoteWindow.h"
+ 
++#include <ctype.h>
+ #include <stdio.h>
+ 
+ #include <Alert.h>
+@@ -71,6 +72,7 @@ enum {
+ 	kMsgMoveUp				= 'bUp ',
+ 	kMsgMoveDown			= 'bDn ',
+ 	kMsgNamedKey			= 'bKey',
++	kMsgModifier			= 'bMod',
+ 	kMsgLearn				= 'lrn ',
+ 	kMsgTemplate			= 'tmpl'
+ };
+@@ -302,9 +304,36 @@ RemoteWindow::RemoteWindow()
+ 			message->AddInt32("key", kNamedKeys[i].key);
+ 			keyMenu->AddItem(new BMenuItem(kNamedKeys[i].name, message));
+ 		}
++		// everything else the keymap types, for a keystroke made with the
++		// mouse alone (Alt+M, say)
++		keyMenu->AddSeparatorItem();
++		BMenu* letters = new BMenu("Letters");
++		BMenu* digits = new BMenu("Digits");
++		BMenu* others = new BMenu("Punctuation");
++		BObjectList<CharacterKey, true> keys(64);
++		GetCharacterKeys(keys);
++		for (int32 i = 0; i < keys.CountItems(); i++) {
++			const CharacterKey* key = keys.ItemAt(i);
++			BMessage* message = new BMessage(kMsgNamedKey);
++			message->AddInt32("key", key->key);
++			BMenu* menu = isalpha((uint8)key->name[0]) ? letters
++				: isdigit((uint8)key->name[0]) ? digits : others;
++			menu->AddItem(new BMenuItem(key->name, message));
++		}
++		keyMenu->AddItem(letters);
++		keyMenu->AddItem(digits);
++		keyMenu->AddItem(others);
+ 	}
+ 	keyMenu->SetRadioMode(false);
+ 	fKeyMenuField = new BMenuField("keys", NULL, keyMenu);
++	// the modifiers by their PC keyboard names: Command is Alt, Option the
++	// Windows key
++	fAltBox = new BCheckBox("Alt", new BMessage(kMsgModifier));
++	fAltBox->SetToolTip("The Command key: Alt on most keyboards");
++	fCtrlBox = new BCheckBox("Ctrl", new BMessage(kMsgModifier));
++	fShiftBox = new BCheckBox("Shift", new BMessage(kMsgModifier));
++	fWinBox = new BCheckBox("Win", new BMessage(kMsgModifier));
++	fWinBox->SetToolTip("The Option key: the Windows key on PC keyboards");
+ 	fRepeatBox = new BCheckBox("Repeats when held", new BMessage(kMsgRepeat));
+ 	fRemoveButton = new BButton("Remove", new BMessage(kMsgRemoveButton));
+ 	fUpButton = new BButton("Up", new BMessage(kMsgMoveUp));
+@@ -359,7 +388,14 @@ RemoteWindow::RemoteWindow()
+ 						.Add(fKeystrokeView)
+ 						.Add(fKeyMenuField)
+ 					.End()
+-					.Add(fRepeatBox, 1, 2)
++					.AddGroup(B_HORIZONTAL, B_USE_SMALL_SPACING, 1, 2)
++						.Add(fAltBox)
++						.Add(fCtrlBox)
++						.Add(fShiftBox)
++						.Add(fWinBox)
++						.AddGlue()
++						.Add(fRepeatBox)
++					.End()
+ 				.End()
+ 				.AddGroup(B_HORIZONTAL)
+ 					.Add(fLearnButton)
+@@ -544,9 +580,20 @@ RemoteWindow::MessageReceived(BMessage* message)
+ 		}
+ 
+ 		case kMsgNamedKey:
+-			KeystrokeChanged((uint32)message->GetInt32("key", 0), 0);
++			// the ticked modifiers stay
++			KeystrokeChanged((uint32)message->GetInt32("key", 0),
++				_CheckedModifiers());
+ 			break;
+ 
++		case kMsgModifier:
++		{
++			Button* button = _CurrentButton();
++			if (button == NULL)
++				break;
++			KeystrokeChanged(button->key, _CheckedModifiers());
++			break;
++		}
++
+ 		case kMsgRemoveButton:
+ 		{
+ 			Profile* profile = _CurrentProfile();
+@@ -724,6 +771,15 @@ RemoteWindow::_UpdateEditor()
+ 	fKeyMenuField->SetEnabled(enabled);
+ 	fRepeatBox->SetValue(enabled && button->repeat);
+ 	fRepeatBox->SetEnabled(enabled);
++	uint32 modifiers = enabled ? button->modifiers : 0;
++	fAltBox->SetValue((modifiers & B_COMMAND_KEY) != 0);
++	fCtrlBox->SetValue((modifiers & B_CONTROL_KEY) != 0);
++	fShiftBox->SetValue((modifiers & B_SHIFT_KEY) != 0);
++	fWinBox->SetValue((modifiers & B_OPTION_KEY) != 0);
++	fAltBox->SetEnabled(enabled);
++	fCtrlBox->SetEnabled(enabled);
++	fShiftBox->SetEnabled(enabled);
++	fWinBox->SetEnabled(enabled);
+ 	fRemoveButton->SetEnabled(enabled);
+ 	int32 index = _CurrentButtonIndex();
+ 	Profile* profile = _CurrentProfile();
+@@ -733,6 +789,23 @@ RemoteWindow::_UpdateEditor()
+ }
+ 
+ 
++/*!	The modifiers ticked, as a key on the keyboard's left side gives them. */
++uint32
++RemoteWindow::_CheckedModifiers() const
++{
++	uint32 modifiers = 0;
++	if (fAltBox->Value() == B_CONTROL_ON)
++		modifiers |= B_COMMAND_KEY | B_LEFT_COMMAND_KEY;
++	if (fCtrlBox->Value() == B_CONTROL_ON)
++		modifiers |= B_CONTROL_KEY | B_LEFT_CONTROL_KEY;
++	if (fShiftBox->Value() == B_CONTROL_ON)
++		modifiers |= B_SHIFT_KEY | B_LEFT_SHIFT_KEY;
++	if (fWinBox->Value() == B_CONTROL_ON)
++		modifiers |= B_OPTION_KEY | B_LEFT_OPTION_KEY;
++	return modifiers;
++}
++
++
+ void
+ RemoteWindow::_UpdateStatus()
+ {
+diff --git a/src/preferences/remotecontrol/RemoteWindow.h b/src/preferences/remotecontrol/RemoteWindow.h
+index 8cc3c4bcdf..6dfbe1df51 100644
+--- a/src/preferences/remotecontrol/RemoteWindow.h
++++ b/src/preferences/remotecontrol/RemoteWindow.h
+@@ -44,6 +44,7 @@ private:
+ 			void				_UpdateProfile();
+ 			void				_UpdateButtons(int32 select);
+ 			void				_UpdateEditor();
++			uint32				_CheckedModifiers() const;
+ 			void				_UpdateStatus();
+ 			void				_SetStatus(const char* text);
+ 			void				_Prompt();
+@@ -77,6 +78,10 @@ private:
+ 			BTextControl*		fLabelControl;
+ 			KeystrokeView*		fKeystrokeView;
+ 			BMenuField*			fKeyMenuField;
++			BCheckBox*			fAltBox;
++			BCheckBox*			fCtrlBox;
++			BCheckBox*			fShiftBox;
++			BCheckBox*			fWinBox;
+ 			BCheckBox*			fRepeatBox;
+ 			BButton*			fRemoveButton;
+ 			BButton*			fUpButton;

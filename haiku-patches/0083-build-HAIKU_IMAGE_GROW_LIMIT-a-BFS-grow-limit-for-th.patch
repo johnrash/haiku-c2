@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 02:15:04 -0400
+Subject: [PATCH 083/342] build: HAIKU_IMAGE_GROW_LIMIT, a BFS grow limit for
+ the image
+
+When set (e.g. 256G), the image's BFS volume is initialized with
+"grow_limit": laid out to grow to that size without moving anything.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/jam/images/definitions/common-tail | 1 +
+ build/scripts/build_haiku_image          | 7 ++++++-
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/build/jam/images/definitions/common-tail b/build/jam/images/definitions/common-tail
+index c0c484e480..0c18fed35f 100644
+--- a/build/jam/images/definitions/common-tail
++++ b/build/jam/images/definitions/common-tail
+@@ -115,6 +115,7 @@ AddVariableToScript $(script) : installDir : $(HAIKU_INSTALL_DIR) ;
+ #AddVariableToScript $(script) : isImage : 1 ;
+ AddVariableToScript $(script) : imageSize : $(HAIKU_IMAGE_SIZE) ;
+ AddVariableToScript $(script) : imageLabel : $(HAIKU_IMAGE_LABEL) ;
++AddVariableToScript $(script) : imageGrowLimit : $(HAIKU_IMAGE_GROW_LIMIT) ;
+ AddVariableToScript $(script) : addBuildCompatibilityLibDir
+ 	: "export $(HOST_ADD_BUILD_COMPATIBILITY_LIB_DIR)" ;
+ AddVariableToScript $(script) : dontClearImage : $(HAIKU_DONT_CLEAR_IMAGE) ;
+diff --git a/build/scripts/build_haiku_image b/build/scripts/build_haiku_image
+index af227dbe6c..f7664f171c 100755
+--- a/build/scripts/build_haiku_image
++++ b/build/scripts/build_haiku_image
+@@ -266,8 +266,13 @@ if [ $isImage ]; then
+ 			$createImage $imageFlags "$imagePath"
+ 		fi
+ 
++		# HAIKU_IMAGE_GROW_LIMIT: laid out to grow up to that size in place
++		initParameters="block_size 2048"
++		if [ -n "$imageGrowLimit" ]; then
++			initParameters="$initParameters; grow_limit $imageGrowLimit"
++		fi
+ 		$bfsShell --initialize $imageOffsetFlags "$imagePath" \
+-			"$imageLabel" "block_size 2048"
++			"$imageLabel" "$initParameters"
+ 		$makebootable $imageOffsetFlags "$imagePath"
+ 	fi
+ 

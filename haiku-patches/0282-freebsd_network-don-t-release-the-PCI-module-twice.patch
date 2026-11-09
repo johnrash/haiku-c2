@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 4 Nov 2026 00:16:48 -0500
+Subject: [PATCH 282/342] freebsd_network: don't release the PCI module twice
+
+A USB driver's PCI scan finds nothing and calls uninit_pci(), and unloading the
+driver calls it again, with gPci still set. On x86 others hold the module, so
+nothing happens. On the ODROID-C2 nobody else does: the reference count of this
+B_KEEP_LOADED module dropped to 0 and the kernel panicked, when a realtekwifi
+that was in use was deleted from the non-packaged folder.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/libs/compat/freebsd_network/pci.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/libs/compat/freebsd_network/pci.cpp b/src/libs/compat/freebsd_network/pci.cpp
+index 774b8b378a..be17519d5d 100644
+--- a/src/libs/compat/freebsd_network/pci.cpp
++++ b/src/libs/compat/freebsd_network/pci.cpp
+@@ -42,8 +42,10 @@ init_pci()
+ void
+ uninit_pci()
+ {
+-	if (gPci != NULL)
++	if (gPci != NULL) {
+ 		put_module(B_PCI_MODULE_NAME);
++		gPci = NULL;
++	}
+ }
+ 
+ 

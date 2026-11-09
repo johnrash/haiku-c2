@@ -1,0 +1,178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 7 Nov 2026 01:12:54 -0500
+Subject: [PATCH 333/342] multi_audio: queue the producer's buffers instead of
+ dropping one that comes early
+
+The node kept one buffer from its producer (the system mixer) for the
+output thread, which copies it into the device's next slot after each
+buffer exchange. A buffer that came while the one before was still
+waiting was dropped after a 100 us snooze ("a very fragile mechanism",
+the old comment said): 42 ms of sound gone. The mixer's buffers come
+within tens of microseconds of the exchange, so a little lateness of the
+output thread did it; on a C2 on Wi-Fi, used over VNC, a few times a
+song.
+
+The buffers now wait in a queue of three, oldest first, and the output
+thread takes the oldest; only a fourth drops the oldest, logged. Buffers
+still waiting are recycled on stop and when the input goes.
+
+Test board, MediaPlayer playing a 44.1 kHz tone into an AB13X at 48 kHz
+while a VNC viewer pulled full screen updates (tools/vnc-load.py), recorded
+on the laptop: +341 dropped 12 buffers and the recording had 14 phase slips
+in 160 s; +342 dropped none, 0 slips in 195 s and 145 s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../multi_audio/MultiAudioNode.cpp            | 95 +++++++++++++------
+ 1 file changed, 66 insertions(+), 29 deletions(-)
+
+diff --git a/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp b/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp
+index 14349b29e6..262dd09358 100644
+--- a/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp
++++ b/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp
+@@ -14,6 +14,7 @@
+ #include <syslog.h>
+ 
+ #include <Autolock.h>
++#include <Locker.h>
+ #include <Buffer.h>
+ #include <BufferGroup.h>
+ #include <Catalog.h>
+@@ -51,8 +52,22 @@ public:
+ 	int32				fOldBufferCycle;
+ 	int32				fMissed;
+ 	bigtime_t			fMissedLogged;
+-	BBuffer*			fBuffer;
+ 	Resampler			*fResampler;
++
++	// The producer's buffers wait here, oldest first, for the output thread
++	// to copy one into the device's next slot after each exchange. A single
++	// place used to drop a buffer that came while the one before was still
++	// waiting, 42 ms of sound at a time, whenever the output thread was a
++	// little late (on a C2 used over VNC: a few times a song).
++	static const int32	kMaxPending = 3;
++
++			void		PushPending(BBuffer* buffer, BBuffer** _dropped);
++			BBuffer*	PopPending();
++			void		RecyclePending();
++
++	BLocker				fPendingLock;
++	BBuffer*			fPending[kMaxPending];
++	int32				fPendingCount;
+ };
+ 
+ 
+@@ -137,7 +152,7 @@ node_input::node_input(media_input& input, media_format preferredFormat)
+ 	fOldBufferCycle = -1;
+ 	fMissed = 0;
+ 	fMissedLogged = 0;
+-	fBuffer = NULL;
++	fPendingCount = 0;
+ 	fResampler = NULL;
+ }
+ 
+@@ -145,6 +160,44 @@ node_input::node_input(media_input& input, media_format preferredFormat)
+ node_input::~node_input()
+ {
+ 	CALLED();
++	RecyclePending();
++}
++
++
++void
++node_input::PushPending(BBuffer* buffer, BBuffer** _dropped)
++{
++	BAutolock _(fPendingLock);
++	*_dropped = NULL;
++	if (fPendingCount == kMaxPending) {
++		*_dropped = fPending[0];
++		memmove(&fPending[0], &fPending[1],
++			(kMaxPending - 1) * sizeof(BBuffer*));
++		fPendingCount--;
++	}
++	fPending[fPendingCount++] = buffer;
++}
++
++
++BBuffer*
++node_input::PopPending()
++{
++	BAutolock _(fPendingLock);
++	if (fPendingCount == 0)
++		return NULL;
++	BBuffer* buffer = fPending[0];
++	memmove(&fPending[0], &fPending[1], (fPendingCount - 1) * sizeof(BBuffer*));
++	fPendingCount--;
++	return buffer;
++}
++
++
++void
++node_input::RecyclePending()
++{
++	BBuffer* buffer;
++	while ((buffer = PopPending()) != NULL)
++		buffer->Recycle();
+ }
+ 
+ 
+@@ -1188,25 +1241,12 @@ MultiAudioNode::_HandleBuffer(const media_timed_event* event,
+ 			" us late\n", Name(), lateness);
+ 		buffer->Recycle();
+ 	} else {
+-		//WriteBuffer(buffer, *channel);
+-		// TODO: This seems like a very fragile mechanism to wait until
+-		// the previous buffer for this channel has been processed...
+-		if (channel->fBuffer != NULL) {
+-			PRINT(("MultiAudioNode::HandleBuffer snoozing recycling channelId: "
+-				"%" B_PRIi32 ", lateness:%" B_PRIdBIGTIME "\n",
+-				channel->fChannelId, lateness));
+-			//channel->fBuffer->Recycle();
+-			snooze(100);
+-			if (channel->fBuffer != NULL) {
+-				syslog(LOG_WARNING, "multi_audio %s: dropped a buffer, the one"
+-					" before it not played yet (%" B_PRIdBIGTIME " us early)\n",
+-					Name(), -lateness);
+-				buffer->Recycle();
+-			} else
+-				channel->fBuffer = buffer;
+-		} else {
+-			//PRINT(("MultiAudioNode::HandleBuffer writing channelId: %li, how_early:%lld\n", channel->fChannelId, howEarly));
+-			channel->fBuffer = buffer;
++		BBuffer* dropped;
++		channel->PushPending(buffer, &dropped);
++		if (dropped != NULL) {
++			syslog(LOG_WARNING, "multi_audio %s: %" B_PRId32 " buffers waiting,"
++				" dropped the oldest\n", Name(), node_input::kMaxPending);
++			dropped->Recycle();
+ 		}
+ 	}
+ 	return B_OK;
+@@ -1823,10 +1863,10 @@ MultiAudioNode::_OutputThread()
+ 
+ 				input->fOldBufferCycle = bufferInfo.playback_buffer_cycle;
+ 
+-				if (input->fBuffer != NULL) {
+-					_FillNextBuffer(*input, input->fBuffer);
+-					input->fBuffer->Recycle();
+-					input->fBuffer = NULL;
++				BBuffer* buffer = input->PopPending();
++				if (buffer != NULL) {
++					_FillNextBuffer(*input, buffer);
++					buffer->Recycle();
+ 				} else {
+ 					// put zeros in current buffer
+ 					if (input->fInput.source != media_source::null) {
+@@ -2082,10 +2122,7 @@ MultiAudioNode::_StopOutputThread()
+ 
+ 	for (int32 i = 0; i < fInputs.CountItems(); i++) {
+ 		node_input* input = (node_input*)fInputs.ItemAt(i);
+-		if (input->fBuffer != NULL) {
+-			input->fBuffer->Recycle();
+-			input->fBuffer = NULL;
+-		}
++		input->RecyclePending();
+ 		if (fDevice->BufferList().playback_buffers[0][input->fChannelId].base != NULL)
+ 			_FillWithZeros(*input);
+ 	}

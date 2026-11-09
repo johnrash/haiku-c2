@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 14:41:03 -0500
+Subject: [PATCH 227/342] media kit: BMediaRecorder starts a sound card's node
+ as a node too
+
+A producer that is a time source as well (a sound card's multi_audio
+node) was only started as a time source, which sends nothing: the node
+delivers buffers once it is started as a node. That went unseen where the
+card's node is the system's sound output as well, which the media server
+starts; a USB microphone's node, input only, recorded nothing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kits/media/MediaRecorder.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/kits/media/MediaRecorder.cpp b/src/kits/media/MediaRecorder.cpp
+index b4227875a1..e68ff37407 100644
+--- a/src/kits/media/MediaRecorder.cpp
++++ b/src/kits/media/MediaRecorder.cpp
+@@ -265,10 +265,13 @@ BMediaRecorder::Start(bool force)
+ 	// start node here
+ 	status_t err = B_OK;
+ 
++	// a sound card's node is a time source as well: as one alone it sends
++	// nothing, so the node is started too (an input that no output shares
++	// the node with, a USB microphone, isn't started by anything else)
+ 	if ((fOutputNode.kind & B_TIME_SOURCE) != 0)
+ 		err = BMediaRoster::CurrentRoster()->StartTimeSource(
+ 			fOutputNode, BTimeSource::RealTime());
+-	else
++	if (err == B_OK)
+ 		err = BMediaRoster::CurrentRoster()->StartNode(
+ 			fOutputNode, fNode->TimeSource()->Now());
+ 

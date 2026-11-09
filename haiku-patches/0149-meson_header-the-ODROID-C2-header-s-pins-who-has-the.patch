@@ -1,0 +1,440 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 01:45:41 -0400
+Subject: [PATCH 149/342] meson_header: the ODROID-C2 header's pins, who has
+ them, their mux
+
+A kernel module for the drivers that use pins of the 40-pin header
+(meson_gpio, meson_i2c, the serial port's): the table of the header's
+pins with a SoC pad, their alternate functions and the pin controller's
+mux bits for them; claims, so that a pin has one user at a time (a
+driver, or a program through meson_gpio), with a name and a team to show
+who has it; and function selection under one lock, as the mux words are
+shared. Pins 3 and 5 (I2C A, the RTC shield) aren't offered to
+programs, nor pin 33's PWM (its controller's other channel sets a core
+voltage). A boot module: meson_i2c needs it for the clock at boot.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/jam/packages/Haiku                      |   2 +
+ headers/private/drivers/meson_header.h        |  74 +++++
+ src/add-ons/kernel/generic/Jamfile            |   1 +
+ .../kernel/generic/meson_header/Jamfile       |  10 +
+ .../generic/meson_header/meson_header.cpp     | 278 ++++++++++++++++++
+ 5 files changed, 365 insertions(+)
+ create mode 100644 headers/private/drivers/meson_header.h
+ create mode 100644 src/add-ons/kernel/generic/meson_header/Jamfile
+ create mode 100644 src/add-ons/kernel/generic/meson_header/meson_header.cpp
+
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index 5ac6657661..02076ea96e 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -89,6 +89,7 @@ AddFilesToPackage add-ons kernel generic :
+ 	bios@x86,x86_64
+ 	dpc
+ 	meson_canvas@arm64
++	meson_header@arm64
+ 	mpu401
+ 	scsi_periph
+ 	smbios@x86,x86_64
+@@ -363,6 +364,7 @@ AddBootModuleSymlinksToPackage
+ 	sdhci
+ 	meson_gx_mmc@arm64
+ 	i2c@arm64
++	meson_header@arm64
+ 	meson_i2c@arm64
+ 	pcf8563@arm64
+ 	ufshci
+diff --git a/headers/private/drivers/meson_header.h b/headers/private/drivers/meson_header.h
+new file mode 100644
+index 0000000000..948db7cb40
+--- /dev/null
++++ b/headers/private/drivers/meson_header.h
+@@ -0,0 +1,74 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef _MESON_HEADER_H
++#define _MESON_HEADER_H
++
++
++#include <module.h>
++#include <OS.h>
++
++
++/*!	The ODROID-C2's 40-pin header (J2): its pins with a SoC pad, who has
++	each one, and the pin controller's mux for them. The drivers that use
++	header pins (meson_gpio for GPIO and PWM, meson_i2c, the serial port's)
++	claim them here, so that a pin has one user at a time, and select their
++	functions here, under one lock (the mux words are shared).
++*/
++
++
++#define MESON_HEADER_MODULE_NAME	"generic/meson_header/v1"
++
++
++typedef struct meson_header_function {
++	uint8		word;			// PERIPHS_PIN_MUX_<word>
++	uint8		bit;
++	const char*	name;			// "PWM E", "UART A", "I2C B"; NULL: none
++} meson_header_function;
++
++
++typedef struct meson_header_pin {
++	uint8		pin;			// header pin number
++	uint8		bank;			// MESON_HEADER_BANK_*
++	uint8		offset;			// the pad in its bank
++	bool		programs;		// offered to programs as GPIO
++	meson_header_function functions[3];
++		// the alternate functions; none selected: GPIO
++} meson_header_pin;
++
++
++enum {
++	MESON_HEADER_BANK_X,
++	MESON_HEADER_BANK_Y,
++	MESON_HEADER_BANK_DV,
++};
++
++
++typedef struct meson_header_module_info {
++	module_info	info;
++
++	uint32		(*count_pins)(void);
++	const meson_header_pin* (*pin_at)(uint32 index);
++	int32		(*find_pin)(const char* name);
++		// "7", "Pin7" or "GPIOX_21": an index, or -1
++	void		(*pad_name)(uint32 index, char* buffer, size_t size);
++		// "GPIOX_21"
++
++	status_t	(*claim)(uint32 index, void* owner, const char* use);
++		// B_BUSY if another owner has the pin; \a use ("program",
++		// "I2C A") and the calling team are kept for user()
++	void		(*release)(uint32 index, void* owner);
++	bool		(*user)(uint32 index, void** _owner, char* use,
++					size_t useSize, team_id* _team);
++		// false: nobody has the pin
++
++	status_t	(*select)(uint32 index, const char* function);
++		// the alternate function with that name, the others off; NULL:
++		// GPIO (all off)
++	const char*	(*selected)(uint32 index);
++		// the alternate function the mux selects, or NULL (GPIO)
++} meson_header_module_info;
++
++
++#endif	// _MESON_HEADER_H
+diff --git a/src/add-ons/kernel/generic/Jamfile b/src/add-ons/kernel/generic/Jamfile
+index f3f713d903..4de27746fd 100644
+--- a/src/add-ons/kernel/generic/Jamfile
++++ b/src/add-ons/kernel/generic/Jamfile
+@@ -4,6 +4,7 @@ SubInclude HAIKU_TOP src add-ons kernel generic ata_adapter ;
+ SubInclude HAIKU_TOP src add-ons kernel generic bios ;
+ SubInclude HAIKU_TOP src add-ons kernel generic dpc ;
+ SubInclude HAIKU_TOP src add-ons kernel generic meson_canvas ;
++SubInclude HAIKU_TOP src add-ons kernel generic meson_header ;
+ SubInclude HAIKU_TOP src add-ons kernel generic scsi_periph ;
+ SubInclude HAIKU_TOP src add-ons kernel generic smbios ;
+ SubInclude HAIKU_TOP src add-ons kernel generic tty ;
+diff --git a/src/add-ons/kernel/generic/meson_header/Jamfile b/src/add-ons/kernel/generic/meson_header/Jamfile
+new file mode 100644
+index 0000000000..b2f4536b29
+--- /dev/null
++++ b/src/add-ons/kernel/generic/meson_header/Jamfile
+@@ -0,0 +1,10 @@
++SubDir HAIKU_TOP src add-ons kernel generic meson_header ;
++
++UsePrivateKernelHeaders ;
++UsePrivateHeaders drivers ;
++
++if $(TARGET_ARCH) = arm64 {
++	KernelAddon meson_header :
++		meson_header.cpp
++	;
++}
+diff --git a/src/add-ons/kernel/generic/meson_header/meson_header.cpp b/src/add-ons/kernel/generic/meson_header/meson_header.cpp
+new file mode 100644
+index 0000000000..89c3e77d90
+--- /dev/null
++++ b/src/add-ons/kernel/generic/meson_header/meson_header.cpp
+@@ -0,0 +1,278 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * The ODROID-C2's 40-pin header (headers/private/drivers/meson_header.h):
++ * the pins with a SoC pad, who has each one, and their pin mux, written
++ * under one lock for all the drivers that use the header.
++ *
++ * The pin map comes from the device tree's gpio-line-names, the mux bits
++ * from Linux's GXBB pin tables (facts only), as in meson_gpio before.
++ */
++
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <KernelExport.h>
++#include <kernel.h>
++#include <team.h>
++#include <util/AutoLock.h>
++
++#include <meson_header.h>
++
++
++static const phys_addr_t kMuxBase = 0xc88344b0;		// PERIPHS_PIN_MUX_0
++
++static const char* const kBankPrefixes[] = { "GPIOX_", "GPIOY_", "GPIODV_" };
++
++#define X	MESON_HEADER_BANK_X
++#define Y	MESON_HEADER_BANK_Y
++#define DV	MESON_HEADER_BANK_DV
++
++static const meson_header_pin kPins[] = {
++	// pins 3 and 5 carry I2C A (the RTC shield): not for programs
++	{ 3, DV, 24, false, { { 7, 26, "I2C A" }, { 2, 29, "UART B" } } },
++	{ 5, DV, 25, false, { { 7, 27, "I2C A" }, { 2, 28, "UART B" } } },
++	{ 7, X, 21, true, {} },
++	{ 8, X, 12, true, { { 4, 13, "UART A" } } },
++	{ 10, X, 13, true, { { 4, 12, "UART A" } } },
++	{ 11, X, 19, true, { { 2, 30, "PWM E" } } },
++	{ 12, X, 10, true, {} },
++	{ 13, X, 11, true, {} },
++	{ 15, X, 9, true, { { 3, 7, "TS B" } } },
++	{ 16, X, 8, true, { { 3, 10, "TS B" } } },
++	{ 18, X, 5, true, { { 8, 0, "SDIO" } } },
++	{ 19, X, 7, true, { { 8, 11, "SDIO" }, { 3, 18, "PWM F" },
++		{ 3, 8, "TS B" } } },
++	{ 21, X, 4, true, { { 8, 1, "SDIO" } } },
++	{ 22, X, 3, true, { { 8, 2, "SDIO" } } },
++	{ 23, X, 2, true, { { 8, 3, "SDIO" } } },
++	{ 24, X, 1, true, { { 8, 4, "SDIO" } } },
++	{ 26, Y, 14, true, { { 1, 18, "UART C" } } },
++	{ 27, DV, 26, true, { { 7, 24, "I2C B" }, { 2, 27, "UART B" } } },
++	{ 28, DV, 27, true, { { 7, 25, "I2C B" }, { 2, 26, "UART B" } } },
++	{ 29, X, 0, true, { { 8, 5, "SDIO" } } },
++	{ 31, Y, 8, true, { { 3, 5, "TS A" }, { 1, 5, "I2S" } } },
++	{ 32, Y, 13, true, { { 1, 19, "UART C" } } },
++	// pin 33's PWM A is left out: its controller's other channel sets a
++	// core voltage regulator
++	{ 33, X, 6, true, { { 3, 9, "TS B" } } },
++	{ 35, Y, 3, true, { { 3, 4, "TS A" } } },
++	{ 36, Y, 7, true, { { 3, 5, "TS A" } } },
++};
++static const uint32 kPinCount = B_COUNT_OF(kPins);
++
++#undef X
++#undef Y
++#undef DV
++
++
++struct pin_user {
++	void*		owner;
++	team_id		team;
++	char		use[32];
++};
++
++static area_id sMuxArea = -1;
++static volatile uint32* sMux;
++static spinlock sLock = B_SPINLOCK_INITIALIZER;
++static pin_user sUsers[kPinCount];
++
++
++static uint32
++count_pins(void)
++{
++	return kPinCount;
++}
++
++
++static const meson_header_pin*
++pin_at(uint32 index)
++{
++	return index < kPinCount ? &kPins[index] : NULL;
++}
++
++
++static void
++pad_name(uint32 index, char* buffer, size_t size)
++{
++	if (index >= kPinCount) {
++		strlcpy(buffer, "", size);
++		return;
++	}
++	snprintf(buffer, size, "%s%u", kBankPrefixes[kPins[index].bank],
++		kPins[index].offset);
++}
++
++
++static int32
++find_pin(const char* name)
++{
++	if (name == NULL)
++		return -1;
++	const char* number = name;
++	if (strncasecmp(name, "pin", 3) == 0)
++		number = name + 3;
++	char* end;
++	long value = strtol(number, &end, 10);
++	bool isNumber = *number != '\0' && *end == '\0';
++	for (uint32 i = 0; i < kPinCount; i++) {
++		char pad[16];
++		pad_name(i, pad, sizeof(pad));
++		if ((isNumber && kPins[i].pin == value)
++			|| strcasecmp(name, pad) == 0) {
++			return i;
++		}
++	}
++	return -1;
++}
++
++
++static status_t
++claim(uint32 index, void* owner, const char* use)
++{
++	if (index >= kPinCount || owner == NULL)
++		return B_BAD_VALUE;
++	team_id team = team_get_current_team_id();
++	InterruptsSpinLocker locker(sLock);
++	pin_user& user = sUsers[index];
++	if (user.owner != NULL && user.owner != owner)
++		return B_BUSY;
++	user.owner = owner;
++	user.team = team;
++	strlcpy(user.use, use != NULL ? use : "", sizeof(user.use));
++	return B_OK;
++}
++
++
++static void
++release(uint32 index, void* owner)
++{
++	if (index >= kPinCount)
++		return;
++	InterruptsSpinLocker locker(sLock);
++	if (sUsers[index].owner == owner)
++		sUsers[index].owner = NULL;
++}
++
++
++static bool
++user(uint32 index, void** _owner, char* use, size_t useSize, team_id* _team)
++{
++	if (index >= kPinCount)
++		return false;
++	InterruptsSpinLocker locker(sLock);
++	const pin_user& user = sUsers[index];
++	if (user.owner == NULL)
++		return false;
++	if (_owner != NULL)
++		*_owner = user.owner;
++	if (use != NULL)
++		strlcpy(use, user.use, useSize);
++	if (_team != NULL)
++		*_team = user.team;
++	return true;
++}
++
++
++static status_t
++select_function(uint32 index, const char* function)
++{
++	if (index >= kPinCount)
++		return B_BAD_VALUE;
++	const meson_header_pin& pin = kPins[index];
++	bool found = function == NULL;
++	for (size_t i = 0; i < B_COUNT_OF(pin.functions); i++) {
++		if (pin.functions[i].name != NULL && function != NULL
++			&& strcmp(pin.functions[i].name, function) == 0) {
++			found = true;
++		}
++	}
++	if (!found)
++		return B_NOT_SUPPORTED;
++
++	InterruptsSpinLocker locker(sLock);
++	// the others off first, then the one wanted
++	for (int32 pass = 0; pass < 2; pass++) {
++		for (size_t i = 0; i < B_COUNT_OF(pin.functions); i++) {
++			const meson_header_function& mux = pin.functions[i];
++			if (mux.name == NULL)
++				continue;
++			bool wanted = function != NULL && strcmp(mux.name, function) == 0;
++			if (pass == 0 && !wanted)
++				sMux[mux.word] &= ~(1u << mux.bit);
++			else if (pass == 1 && wanted)
++				sMux[mux.word] |= 1u << mux.bit;
++		}
++	}
++	return B_OK;
++}
++
++
++static const char*
++selected_function(uint32 index)
++{
++	if (index >= kPinCount)
++		return NULL;
++	const meson_header_pin& pin = kPins[index];
++	for (size_t i = 0; i < B_COUNT_OF(pin.functions); i++) {
++		const meson_header_function& mux = pin.functions[i];
++		if (mux.name != NULL && (sMux[mux.word] & (1u << mux.bit)) != 0)
++			return mux.name;
++	}
++	return NULL;
++}
++
++
++static status_t
++std_ops(int32 op, ...)
++{
++	switch (op) {
++		case B_MODULE_INIT:
++		{
++			phys_addr_t page = ROUNDDOWN(kMuxBase, B_PAGE_SIZE);
++			void* address;
++			sMuxArea = map_physical_memory("meson_header pin mux", page,
++				B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++				B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++			if (sMuxArea < 0)
++				return sMuxArea;
++			sMux = (volatile uint32*)((addr_t)address + (kMuxBase - page));
++			memset(sUsers, 0, sizeof(sUsers));
++			return B_OK;
++		}
++
++		case B_MODULE_UNINIT:
++			delete_area(sMuxArea);
++			sMuxArea = -1;
++			sMux = NULL;
++			return B_OK;
++	}
++	return B_ERROR;
++}
++
++
++static meson_header_module_info sMesonHeaderModule = {
++	{
++		MESON_HEADER_MODULE_NAME,
++		B_KEEP_LOADED,
++		std_ops
++	},
++	count_pins,
++	pin_at,
++	find_pin,
++	pad_name,
++	claim,
++	release,
++	user,
++	select_function,
++	selected_function
++};
++
++
++module_info* modules[] = {
++	(module_info*)&sMesonHeaderModule,
++	NULL
++};

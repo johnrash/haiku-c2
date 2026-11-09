@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Tue, 27 Oct 2026 23:07:17 -0400
+Subject: [PATCH 002/342] arm64: map debug UART registers that do not start on
+ a page boundary
+
+The loader mapped the UART with its exact physical address and replaced
+uart.regs.start with the page-aligned virtual base, losing the offset
+within the page; map_range() also ORs the unaligned address into the
+descriptor, setting attribute bits. The kernel then created its
+B_EXACT_ADDRESS area at the unaligned address, which fails.
+
+Map whole pages and keep the offset, in the loader and in the kernel.
+Needed for the Amlogic uart_AO at 0xc81004c0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/boot/platform/efi/arch/arm64/arch_mmu.cpp  | 11 ++++++++---
+ .../kernel/arch/arm64/arch_vm_translation_map.cpp     |  8 +++++---
+ 2 files changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/src/system/boot/platform/efi/arch/arm64/arch_mmu.cpp b/src/system/boot/platform/efi/arch/arm64/arch_mmu.cpp
+index 8aacf3df9f..3e49288701 100644
+--- a/src/system/boot/platform/efi/arch/arm64/arch_mmu.cpp
++++ b/src/system/boot/platform/efi/arch/arm64/arch_mmu.cpp
+@@ -344,8 +344,13 @@ arch_mmu_generate_post_efi_page_tables(size_t memory_map_size,
+ 
+ 	if (gKernelArgs.arch_args.uart.kind[0] != 0) {
+ 		// Map uart because we want to use it during early boot.
+-		uint64 regs_start = gKernelArgs.arch_args.uart.regs.start;
+-		uint64 regs_size = ROUNDUP(gKernelArgs.arch_args.uart.regs.size, B_PAGE_SIZE);
++		// The registers need not start on a page boundary (Amlogic uart_AO
++		// is at 0xc81004c0): map whole pages and keep the offset.
++		uint64 regs_offset = gKernelArgs.arch_args.uart.regs.start
++			& (B_PAGE_SIZE - 1);
++		uint64 regs_start = gKernelArgs.arch_args.uart.regs.start - regs_offset;
++		uint64 regs_size = ROUNDUP(regs_offset
++			+ gKernelArgs.arch_args.uart.regs.size, B_PAGE_SIZE);
+ 		uint64 base = get_next_virtual_address(regs_size);
+ 
+ 		map_range(regs_start, regs_start, regs_size,
+@@ -355,7 +360,7 @@ arch_mmu_generate_post_efi_page_tables(size_t memory_map_size,
+ 			ARMv8TranslationTableDescriptor::DefaultPeripheralAttribute |
+ 			currentMair.MaskOf(MAIR_DEVICE_nGnRnE));
+ 
+-		gKernelArgs.arch_args.uart.regs.start = base;
++		gKernelArgs.arch_args.uart.regs.start = base + regs_offset;
+ 	}
+ 
+ 	sort_address_ranges(gKernelArgs.virtual_allocated_range,
+diff --git a/src/system/kernel/arch/arm64/arch_vm_translation_map.cpp b/src/system/kernel/arch/arm64/arch_vm_translation_map.cpp
+index e73c41a372..2c2d302b7f 100644
+--- a/src/system/kernel/arch/arm64/arch_vm_translation_map.cpp
++++ b/src/system/kernel/arch/arm64/arch_vm_translation_map.cpp
+@@ -102,11 +102,13 @@ arch_vm_translation_map_init_post_area(kernel_args* args)
+ 		B_EXACT_ADDRESS, KERNEL_PMAP_SIZE, 0);
+ 
+ 	if (args->arch_args.uart.kind[0] != 0) {
+-		// debug uart is already mapped by the efi loader
+-		address = (void*)args->arch_args.uart.regs.start;
++		// debug uart is already mapped by the efi loader, in whole pages
++		// (its registers need not start on a page boundary)
++		addr_t regsOffset = args->arch_args.uart.regs.start & (B_PAGE_SIZE - 1);
++		address = (void*)(args->arch_args.uart.regs.start - regsOffset);
+ 		area_id area = vm_create_null_area(VMAddressSpace::KernelID(),
+ 			"debug uart map area", &address, B_EXACT_ADDRESS,
+-			ROUNDUP(args->arch_args.uart.regs.size, B_PAGE_SIZE), 0);
++			ROUNDUP(regsOffset + args->arch_args.uart.regs.size, B_PAGE_SIZE), 0);
+ 	}
+ 
+ 	return B_OK;

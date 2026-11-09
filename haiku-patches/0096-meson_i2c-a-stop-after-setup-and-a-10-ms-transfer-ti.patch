@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 12:22:07 -0400
+Subject: [PATCH 096/342] meson_i2c: a stop after setup, and a 10 ms transfer
+ timeout
+
+The first token list after the pins are muxed never finished at boot (a
+50 ms timeout before the RTC probe's retry). Run a stop then, and give
+a transfer 10 ms: a list of 8 data bytes takes about 1 ms at 100 kHz.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp b/src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp
+index 43dcab14a1..3293707566 100644
+--- a/src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp
++++ b/src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp
+@@ -86,7 +86,8 @@ enum {
+ 
+ static const size_t kMaxTokens = 16;
+ static const size_t kMaxDataBytes = 8;
+-static const bigtime_t kTransferTimeout = 50000;
++static const bigtime_t kTransferTimeout = 10000;
++	// a list of 8 data bytes takes about 1 ms at 100 kHz
+ 
+ static const uint32 kBusSpeed = 100000;
+ static const uint32 kDividerFactor = 4;
+@@ -413,6 +414,13 @@ MesonI2c::_SetupPinsAndClock(phys_addr_t base)
+ 	INFO("controller at %#" B_PRIx64 ": clk81 %" B_PRIu32 " Hz, divider %"
+ 		B_PRIu32 ", %" B_PRIu32 " Hz\n", (uint64)base, clk81, divider,
+ 		clk81 / (divider * kDividerFactor));
++
++	// the first token list after the pins are muxed doesn't finish (seen at
++	// boot on the ODROID-C2): run a stop
++	_AddToken(kTokenStop);
++	status_t status = _Run();
++	if (status != B_OK)
++		INFO("first stop after setup: %s\n", strerror(status));
+ }
+ 
+ 

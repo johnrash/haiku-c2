@@ -1,0 +1,271 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 18:09:08 -0400
+Subject: [PATCH 128/342] meson_canvas: the S905's canvas table under one lock
+
+An entry is written through three DMC registers in turn; meson_hdmi and
+meson_vdec both write entries. meson_hdmi uses the module when it loads and
+writes the registers itself otherwise.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/jam/packages/Haiku                      |  1 +
+ headers/private/drivers/meson_canvas.h        | 35 ++++++++
+ .../drivers/graphics/meson_hdmi/Jamfile       |  2 +-
+ .../graphics/meson_hdmi/meson_hdmi.cpp        | 14 +++
+ src/add-ons/kernel/generic/Jamfile            |  1 +
+ .../kernel/generic/meson_canvas/Jamfile       |  9 ++
+ .../generic/meson_canvas/meson_canvas.cpp     | 89 +++++++++++++++++++
+ 7 files changed, 150 insertions(+), 1 deletion(-)
+ create mode 100644 headers/private/drivers/meson_canvas.h
+ create mode 100644 src/add-ons/kernel/generic/meson_canvas/Jamfile
+ create mode 100644 src/add-ons/kernel/generic/meson_canvas/meson_canvas.cpp
+
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index fd10fa268e..277b9596d2 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -88,6 +88,7 @@ AddFilesToPackage add-ons kernel generic :
+ 	ata_adapter
+ 	bios@x86,x86_64
+ 	dpc
++	meson_canvas@arm64
+ 	mpu401
+ 	scsi_periph
+ 	smbios@x86,x86_64
+diff --git a/headers/private/drivers/meson_canvas.h b/headers/private/drivers/meson_canvas.h
+new file mode 100644
+index 0000000000..df4586e04e
+--- /dev/null
++++ b/headers/private/drivers/meson_canvas.h
+@@ -0,0 +1,35 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef _MESON_CANVAS_H
++#define _MESON_CANVAS_H
++
++
++#include <module.h>
++
++
++/*!	The Amlogic S905's canvas lookup table (in the DMC): the video blocks
++	address their pictures by a canvas index, an entry giving the address,
++	the row length, the height and the byte order. An entry is written
++	through three registers in turn, so the drivers that use canvases write
++	them through this module, which does it under one lock.
++
++	The indexes in use: 0x4e (the frame buffer, U-Boot's choice) and 0x60,
++	0x61 (the video layer) by meson_hdmi; 0x80-0xbf by meson_vdec.
++*/
++
++#define MESON_CANVAS_MODULE_NAME	"generic/meson_canvas/v1"
++
++#define MESON_CANVAS_SWAP_64		7	// byte order within 64 bits
++
++typedef struct meson_canvas_module_info {
++	module_info	info;
++
++	void		(*write)(uint32 index, phys_addr_t address,
++					uint32 bytesPerRow, uint32 height, uint32 endian);
++		// address and bytesPerRow: multiples of 8
++} meson_canvas_module_info;
++
++
++#endif	// _MESON_CANVAS_H
+diff --git a/src/add-ons/kernel/drivers/graphics/meson_hdmi/Jamfile b/src/add-ons/kernel/drivers/graphics/meson_hdmi/Jamfile
+index 2fe35011d7..a19b53c04a 100644
+--- a/src/add-ons/kernel/drivers/graphics/meson_hdmi/Jamfile
++++ b/src/add-ons/kernel/drivers/graphics/meson_hdmi/Jamfile
+@@ -2,7 +2,7 @@ SubDir HAIKU_TOP src add-ons kernel drivers graphics meson_hdmi ;
+ 
+ UsePrivateKernelHeaders ;
+ UsePrivateHeaders [ FDirName graphics meson_hdmi ] ;
+-UsePrivateHeaders audio ;
++UsePrivateHeaders audio drivers ;
+ 
+ # the multi_audio drivers' generic ioctl dispatcher
+ SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src add-ons kernel drivers audio
+diff --git a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+index ce4da97680..91c745a237 100644
+--- a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
++++ b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+@@ -54,6 +54,8 @@
+ #include <vm/vm.h>
+ #include <arch/arm64/arch_kernel.h>
+ 
++#include <meson_canvas.h>
++
+ #include "meson_hdmi_audio.h"
+ #include "meson_hdmi_info.h"
+ 
+@@ -677,6 +679,9 @@ private:
+ 			volatile uint32*	fHdmiTx;
+ 			area_id				fDmcArea;
+ 			volatile uint32*	fDmc;
++			meson_canvas_module_info* fCanvas;
++				// shares the canvas table with meson_vdec; without it, the
++				// canvases are written here
+ 			spinlock			fPortLock;
+ 			mutex				fModeLock;
+ 			bool				fPublish;
+@@ -773,6 +778,7 @@ MesonHdmi::MesonHdmi(device_node* node)
+ 	fHdmiTx(NULL),
+ 	fDmcArea(-1),
+ 	fDmc(NULL),
++	fCanvas(NULL),
+ 	fPublish(true),
+ 	fAudio(NULL),
+ 	fFrameBufferArea(-1),
+@@ -826,6 +832,8 @@ MesonHdmi::~MesonHdmi()
+ 		delete_area(fHdmiTxArea);
+ 	if (fDmcArea >= 0)
+ 		delete_area(fDmcArea);
++	if (fCanvas != NULL)
++		put_module(MESON_CANVAS_MODULE_NAME);
+ 	if (fSharedArea >= 0)
+ 		delete_area(fSharedArea);
+ 	// the frame buffer stays: the kernel console may still draw into it
+@@ -861,6 +869,8 @@ MesonHdmi::Init()
+ 	if (fDmcArea < 0)
+ 		return fDmcArea;
+ 	fDmc = (volatile uint32*)address;
++	if (get_module(MESON_CANVAS_MODULE_NAME, (module_info**)&fCanvas) != B_OK)
++		fCanvas = NULL;
+ 
+ 	void* settings = load_driver_settings("meson_hdmi");
+ 	if (settings != NULL) {
+@@ -1283,6 +1293,10 @@ void
+ MesonHdmi::_WriteCanvas(uint32 index, phys_addr_t address, uint32 bytesPerRow,
+ 	uint32 height, uint32 endian)
+ {
++	if (fCanvas != NULL) {
++		fCanvas->write(index, address, bytesPerRow, height, endian);
++		return;
++	}
+ 	uint32 width = (bytesPerRow + 7) / 8;
+ 	fDmc[DMC_CAV_LUT_DATAL / 4] = ((address + 7) / 8) | (width << 29);
+ 	fDmc[DMC_CAV_LUT_DATAH / 4] = (width >> 3) | (height << 9)
+diff --git a/src/add-ons/kernel/generic/Jamfile b/src/add-ons/kernel/generic/Jamfile
+index 188e7be6ba..f3f713d903 100644
+--- a/src/add-ons/kernel/generic/Jamfile
++++ b/src/add-ons/kernel/generic/Jamfile
+@@ -3,6 +3,7 @@ SubDir HAIKU_TOP src add-ons kernel generic ;
+ SubInclude HAIKU_TOP src add-ons kernel generic ata_adapter ;
+ SubInclude HAIKU_TOP src add-ons kernel generic bios ;
+ SubInclude HAIKU_TOP src add-ons kernel generic dpc ;
++SubInclude HAIKU_TOP src add-ons kernel generic meson_canvas ;
+ SubInclude HAIKU_TOP src add-ons kernel generic scsi_periph ;
+ SubInclude HAIKU_TOP src add-ons kernel generic smbios ;
+ SubInclude HAIKU_TOP src add-ons kernel generic tty ;
+diff --git a/src/add-ons/kernel/generic/meson_canvas/Jamfile b/src/add-ons/kernel/generic/meson_canvas/Jamfile
+new file mode 100644
+index 0000000000..d70661a56f
+--- /dev/null
++++ b/src/add-ons/kernel/generic/meson_canvas/Jamfile
+@@ -0,0 +1,9 @@
++SubDir HAIKU_TOP src add-ons kernel generic meson_canvas ;
++
++UsePrivateHeaders drivers ;
++
++if $(TARGET_ARCH) = arm64 {
++	KernelAddon meson_canvas :
++		meson_canvas.cpp
++	;
++}
+diff --git a/src/add-ons/kernel/generic/meson_canvas/meson_canvas.cpp b/src/add-ons/kernel/generic/meson_canvas/meson_canvas.cpp
+new file mode 100644
+index 0000000000..23ed3435fa
+--- /dev/null
++++ b/src/add-ons/kernel/generic/meson_canvas/meson_canvas.cpp
+@@ -0,0 +1,89 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * meson_canvas: writes the S905's canvas lookup table for meson_hdmi and
++ * meson_vdec under one lock (headers/private/drivers/meson_canvas.h).
++ */
++
++
++#include <KernelExport.h>
++
++#include <meson_canvas.h>
++
++
++static const phys_addr_t kDmcBase = 0xc8838000;
++
++// DMC (byte offsets)
++enum {
++	DMC_CAV_LUT_DATAL			= 0x48,
++	DMC_CAV_LUT_DATAH			= 0x4c,
++	DMC_CAV_LUT_ADDR			= 0x50,
++};
++#define CANVAS_LUT_WRITE			(1 << 9)
++#define CANVAS_ENDIAN_SHIFT			26
++
++
++static area_id sDmcArea = -1;
++static volatile uint32* sDmc;
++static spinlock sLock = B_SPINLOCK_INITIALIZER;
++
++
++static void
++canvas_write(uint32 index, phys_addr_t address, uint32 bytesPerRow,
++	uint32 height, uint32 endian)
++{
++	uint32 width = (bytesPerRow + 7) / 8;
++	cpu_status state = disable_interrupts();
++	acquire_spinlock(&sLock);
++	sDmc[DMC_CAV_LUT_DATAL / 4] = ((address + 7) / 8) | (width << 29);
++	sDmc[DMC_CAV_LUT_DATAH / 4] = (width >> 3) | (height << 9)
++		| (endian << CANVAS_ENDIAN_SHIFT);
++	sDmc[DMC_CAV_LUT_ADDR / 4] = CANVAS_LUT_WRITE | (index & 0xff);
++	(void)sDmc[DMC_CAV_LUT_DATAH / 4];
++		// the write has reached the table before the next one starts
++	release_spinlock(&sLock);
++	restore_interrupts(state);
++}
++
++
++static status_t
++std_ops(int32 op, ...)
++{
++	switch (op) {
++		case B_MODULE_INIT:
++		{
++			void* address;
++			sDmcArea = map_physical_memory("meson_canvas dmc", kDmcBase,
++				B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++				B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++			if (sDmcArea < 0)
++				return sDmcArea;
++			sDmc = (volatile uint32*)address;
++			return B_OK;
++		}
++
++		case B_MODULE_UNINIT:
++			delete_area(sDmcArea);
++			sDmcArea = -1;
++			sDmc = NULL;
++			return B_OK;
++	}
++	return B_ERROR;
++}
++
++
++static meson_canvas_module_info sMesonCanvasModule = {
++	{
++		MESON_CANVAS_MODULE_NAME,
++		0,
++		std_ops
++	},
++	canvas_write
++};
++
++
++module_info* modules[] = {
++	(module_info*)&sMesonCanvasModule,
++	NULL
++};

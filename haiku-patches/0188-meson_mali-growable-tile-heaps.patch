@@ -1,0 +1,522 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 23:19:49 -0400
+Subject: [PATCH 188/342] meson_mali: growable tile heaps
+
+A heap buffer (MALI_BO_FLAG_HEAP, the GP's tile heap) now reserves GPU
+addresses for its whole size but starts with 64 KiB of memory. When the
+GP runs out (PLBU_OUT_OF_MEM), the job thread doubles the heap, maps the
+new pages after the old, and the GP goes on from where its memory ended.
+A heap's area isn't cloneable, and its lines aren't cleaned for jobs:
+the CPU never touches it after making it.
+
+With lima's fixed 1 MiB heaps, busy frames failed (GP error 0x4) and the
+PP jobs after them failed too. The libdrm stand-in now says version 1.1,
+so lima makes heap buffers of 16 MiB.
+
+Also: a buffer whose mapping fails gives its GPU addresses back; the KDL
+"mali" command counts heap growths.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../drivers/misc/meson_mali/meson_mali.cpp    |   8 +-
+ .../misc/meson_mali/meson_mali_jobs.cpp       | 249 +++++++++++++-----
+ .../misc/meson_mali/meson_mali_private.h      |  24 +-
+ 3 files changed, 213 insertions(+), 68 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali.cpp b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali.cpp
+index 1bd0deead5..202c912abd 100644
+--- a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali.cpp
++++ b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali.cpp
+@@ -129,7 +129,8 @@ MesonMali::MesonMali(device_node* node)
+ 	fPpDone(0),
+ 	fPpCount(0),
+ 	fJobs(0),
+-	fFailedJobs(0)
++	fFailedJobs(0),
++	fHeapGrowths(0)
+ {
+ 	mutex_init(&fLock, "meson_mali");
+ 	mutex_init(&fQueueLock, "meson_mali queue");
+@@ -841,8 +842,9 @@ MesonMali::Dump()
+ 		_Read(kGpL2 + L2_STATUS), _Read(kGpL2 + L2_ENABLE),
+ 		_Read(kPpL2 + L2_STATUS), _Read(kPpL2 + L2_ENABLE));
+ 	kprintf("  jobs: %" B_PRIu32 " (%" B_PRIu32 " failed), sequence %"
+-		B_PRIu64 " done of %" B_PRIu64 ", running pipe %" B_PRId32 "\n",
+-		fJobs, fFailedJobs, fCompleted, fNextSequence - 1, fRunningPipe);
++		B_PRIu64 " done of %" B_PRIu64 ", running pipe %" B_PRId32
++		", heaps grown %" B_PRIu32 " times\n", fJobs, fFailedJobs,
++		fCompleted, fNextSequence - 1, fRunningPipe, fHeapGrowths);
+ 	kprintf("  interrupts:");
+ 	for (int32 i = 0; i < kIrqCount; i++) {
+ 		kprintf(" %s(%" B_PRId32 ") %" B_PRId32, kInterruptNames[i],
+diff --git a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_jobs.cpp b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_jobs.cpp
+index 8f6827a77f..97ee331a13 100644
+--- a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_jobs.cpp
++++ b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_jobs.cpp
+@@ -15,7 +15,10 @@
+  *   lines are written back and invalidated before a job, and those of the
+  *   buffers it writes again after it;
+  * - sync objects hold the sequence number of the job they wait for;
+- * - no heap buffers that grow (the driver says version 1.0).
++ * - a heap buffer (the GP's tile heap) starts with kHeapInitialSize bytes
++ *   of memory; when the GP runs out, the job thread doubles it and the GP
++ *   goes on (docs/m43-mali-facts.md §4.3). The CPU never touches a heap
++ *   after making it, so its lines aren't cleaned for jobs.
+  */
+ 
+ 
+@@ -37,8 +40,43 @@ static const uint32 kMaxWaitHandles = 64;
+ //	#pragma mark - buffers and the address space
+ 
+ 
++/*!	Writes back and invalidates the CPU's lines of \a count pages, by
++	physical runs.
++*/
++static void
++clean_pages(const phys_addr_t* pages, uint32 count)
++{
++	uint32 first = 0;
++	for (uint32 i = 1; i <= count; i++) {
++		if (i < count && pages[i] == pages[i - 1] + B_PAGE_SIZE)
++			continue;
++		flush_cache_range(pages[first], (size_t)(i - first) * B_PAGE_SIZE);
++		first = i;
++	}
++}
++
++
++/*!	A buffer's memory and the buffer itself: once its pages are unmapped
++	and its addresses free, or were never had.
++*/
++static void
++free_buffer(mali_buffer* buffer)
++{
++	if (buffer->area >= 0)
++		delete_area(buffer->area);
++			// clones in userland keep the pages until they go
++	for (uint32 i = 0; i < buffer->heapAreaCount; i++)
++		delete_area(buffer->heapAreas[i]);
++	free(buffer->pages);
++	delete buffer;
++}
++
++
++/*!	A new buffer of \a size bytes, zeroed, mapped at addresses of its own.
++	A heap buffer gets memory for its first kHeapInitialSize bytes only.
++*/
+ status_t
+-MesonMali::_CreateBuffer(size_t size, mali_buffer** _buffer)
++MesonMali::_CreateBuffer(size_t size, bool heap, mali_buffer** _buffer)
+ {
+ 	size = ROUNDUP(size, B_PAGE_SIZE);
+ 	mali_buffer* buffer = new(std::nothrow) mali_buffer;
+@@ -46,8 +84,10 @@ MesonMali::_CreateBuffer(size_t size, mali_buffer** _buffer)
+ 		return B_NO_MEMORY;
+ 	memset(buffer, 0, sizeof(*buffer));
+ 	buffer->refCount = 1;
++	buffer->area = -1;
+ 	buffer->size = size;
+ 	buffer->pageCount = size / B_PAGE_SIZE;
++	buffer->heap = heap;
+ 	buffer->pages = (phys_addr_t*)malloc(buffer->pageCount
+ 		* sizeof(phys_addr_t));
+ 	if (buffer->pages == NULL) {
+@@ -55,35 +95,29 @@ MesonMali::_CreateBuffer(size_t size, mali_buffer** _buffer)
+ 		return B_NO_MEMORY;
+ 	}
+ 
+-	// all of the C2's memory is below 4 GB, as the GPU's MMU needs
+-	void* address;
+-	buffer->area = create_area("meson_mali buffer", &address,
+-		B_ANY_KERNEL_ADDRESS, size, B_FULL_LOCK,
+-		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA | B_READ_AREA | B_WRITE_AREA
+-			| B_CLONEABLE_AREA);
+-	if (buffer->area < 0) {
+-		status_t status = buffer->area;
+-		free(buffer->pages);
+-		delete buffer;
++	// userland can clone all but a heap buffer's area
++	uint32 count = buffer->pageCount;
++	if (heap)
++		count = min_c(count, kHeapInitialSize / B_PAGE_SIZE);
++	status_t status = _BackPages(buffer, count,
++		heap ? 0 : B_READ_AREA | B_WRITE_AREA | B_CLONEABLE_AREA);
++	if (status != B_OK) {
++		free_buffer(buffer);
+ 		return status;
+ 	}
+-	for (uint32 i = 0; i < buffer->pageCount; i++) {
+-		physical_entry entry;
+-		get_memory_map((uint8*)address + i * B_PAGE_SIZE, B_PAGE_SIZE,
+-			&entry, 1);
+-		buffer->pages[i] = entry.address;
+-	}
+-	memset(address, 0, size);
+-	_CleanBuffer(buffer);
+ 
+ 	MutexLocker locker(fLock);
+-	status_t status = _AllocateAddress(size, &buffer->va);
+-	if (status == B_OK)
+-		status = _MapPages(buffer);
++	status = _AllocateAddress(size, &buffer->va);
++	if (status == B_OK) {
++		status = _MapPages(buffer, 0, buffer->backedPages);
++		if (status != B_OK) {
++			_UnmapPages(buffer);
++			_FreeAddress(buffer->va, size);
++		}
++	}
++	locker.Unlock();
+ 	if (status != B_OK) {
+-		delete_area(buffer->area);
+-		free(buffer->pages);
+-		delete buffer;
++		free_buffer(buffer);
+ 		return status;
+ 	}
+ 	*_buffer = buffer;
+@@ -91,6 +125,67 @@ MesonMali::_CreateBuffer(size_t size, mali_buffer** _buffer)
+ }
+ 
+ 
++/*!	Memory for the buffer's pages from \c backedPages up to \a count: its
++	first area, or a heap's next one. Zeroed and written back from the
++	CPU's cache; not mapped for the GPU yet.
++*/
++status_t
++MesonMali::_BackPages(mali_buffer* buffer, uint32 count, uint32 protection)
++{
++	uint32 first = buffer->backedPages;
++	if (first > 0 && buffer->heapAreaCount == kMaxHeapAreas)
++		return B_NO_MEMORY;
++
++	// all of the C2's memory is below 4 GB, as the GPU's MMU needs
++	size_t size = (size_t)(count - first) * B_PAGE_SIZE;
++	void* address;
++	area_id area = create_area(
++		buffer->heap ? "meson_mali heap" : "meson_mali buffer", &address,
++		B_ANY_KERNEL_ADDRESS, size, B_FULL_LOCK,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA | protection);
++	if (area < 0)
++		return area;
++	for (uint32 i = first; i < count; i++) {
++		physical_entry entry;
++		get_memory_map((uint8*)address + (i - first) * B_PAGE_SIZE,
++			B_PAGE_SIZE, &entry, 1);
++		buffer->pages[i] = entry.address;
++	}
++	memset(address, 0, size);
++	clean_pages(buffer->pages + first, count - first);
++
++	if (first == 0)
++		buffer->area = area;
++	else
++		buffer->heapAreas[buffer->heapAreaCount++] = area;
++	buffer->backedPages = count;
++	return B_OK;
++}
++
++
++/*!	Doubles a heap buffer's memory, up to its size, mapped right after
++	what it had. From the job thread, while the GP waits for it.
++*/
++status_t
++MesonMali::_GrowHeap(mali_buffer* buffer)
++{
++	uint32 first = buffer->backedPages;
++	if (first == buffer->pageCount)
++		return B_DEVICE_FULL;
++	status_t status = _BackPages(buffer,
++		min_c(first * 2, buffer->pageCount), 0);
++	if (status != B_OK)
++		return status;
++
++	MutexLocker locker(fLock);
++	status = _MapPages(buffer, first, buffer->backedPages);
++	if (status != B_OK)
++		buffer->backedPages = first;
++			// the area goes with the buffer
++	return status;
++}
++
++
+ void
+ MesonMali::_AcquireBuffer(mali_buffer* buffer)
+ {
+@@ -107,30 +202,18 @@ MesonMali::_ReleaseBuffer(mali_buffer* buffer)
+ 	_UnmapPages(buffer);
+ 	_FreeAddress(buffer->va, buffer->size);
+ 	locker.Unlock();
+-	delete_area(buffer->area);
+-		// clones in userland keep the pages until they go
+-	free(buffer->pages);
+-	delete buffer;
++	free_buffer(buffer);
+ }
+ 
+ 
+ /*!	Writes back and invalidates the CPU's lines of the buffer: before a job
+ 	(what the CPU wrote reaches memory) and after one that wrote it (what
+-	the CPU reads next comes from memory). By physical runs.
++	the CPU reads next comes from memory).
+ */
+ void
+ MesonMali::_CleanBuffer(mali_buffer* buffer)
+ {
+-	uint32 first = 0;
+-	for (uint32 i = 1; i <= buffer->pageCount; i++) {
+-		if (i < buffer->pageCount
+-			&& buffer->pages[i] == buffer->pages[i - 1] + B_PAGE_SIZE) {
+-			continue;
+-		}
+-		flush_cache_range(buffer->pages[first],
+-			(size_t)(i - first) * B_PAGE_SIZE);
+-		first = i;
+-	}
++	clean_pages(buffer->pages, buffer->backedPages);
+ }
+ 
+ 
+@@ -183,15 +266,15 @@ MesonMali::_FreeAddress(uint32 address, size_t size)
+ }
+ 
+ 
+-/*!	The buffer's pages into the page tables at its address (page tables
+-	made as needed). The MMUs forget old translations when the next job
+-	starts. With fLock held.
++/*!	The buffer's pages from \a first to \a end into the page tables at
++	its addresses (page tables made as needed). The MMUs forget old
++	translations when the next job starts. With fLock held.
+ */
+ status_t
+-MesonMali::_MapPages(mali_buffer* buffer)
++MesonMali::_MapPages(mali_buffer* buffer, uint32 first, uint32 end)
+ {
+-	uint32 i = 0;
+-	while (i < buffer->pageCount) {
++	uint32 i = first;
++	while (i < end) {
+ 		uint32 address = buffer->va + i * B_PAGE_SIZE;
+ 		uint32 directoryIndex = address >> 22;
+ 		dma_buffer& table = fPageTables[directoryIndex];
+@@ -204,16 +287,20 @@ MesonMali::_MapPages(mali_buffer* buffer)
+ 			flush_cache_range(fPageDirectory.physical + directoryIndex * 4,
+ 				4);
+ 		}
+-		uint32 first = (address >> 12) & 0x3ff;
+-		uint32 entry = first;
+-		for (; entry < 1024 && i < buffer->pageCount; entry++, i++)
++		uint32 firstEntry = (address >> 12) & 0x3ff;
++		uint32 entry = firstEntry;
++		for (; entry < 1024 && i < end; entry++, i++)
+ 			table.address[entry] = (uint32)buffer->pages[i] | kPageFlags;
+-		flush_cache_range(table.physical + first * 4, (entry - first) * 4);
++		flush_cache_range(table.physical + firstEntry * 4,
++			(entry - firstEntry) * 4);
+ 	}
+ 	return B_OK;
+ }
+ 
+ 
++/*!	All of the buffer's addresses out of the page tables (a heap's,
++	whatever it had). With fLock held.
++*/
+ void
+ MesonMali::_UnmapPages(mali_buffer* buffer)
+ {
+@@ -361,14 +448,14 @@ MesonMali::_GemCreate(mali_file* file, void* buffer)
+ 	mali_gem_create create;
+ 	if (user_memcpy(&create, buffer, sizeof(create)) != B_OK)
+ 		return B_BAD_ADDRESS;
+-	// a heap buffer is backed in full: they don't grow here
+ 	if (create.pad != 0 || (create.flags & ~MALI_BO_FLAG_HEAP) != 0
+ 		|| create.size == 0) {
+ 		return B_BAD_VALUE;
+ 	}
+ 
+ 	mali_buffer* object;
+-	status_t status = _CreateBuffer(create.size, &object);
++	status_t status = _CreateBuffer(create.size,
++		(create.flags & MALI_BO_FLAG_HEAP) != 0, &object);
+ 	if (status != B_OK)
+ 		return status;
+ 
+@@ -655,6 +742,11 @@ MesonMali::_GemSubmit(mali_file* file, void* buffer)
+ 			status = B_ENTRY_NOT_FOUND;
+ 		task->bufferFlags[i] = objects[i].flags;
+ 		task->bufferCount = i + 1;
++		// a GP job's tile heap: its end is where its memory ends
++		if (submit.pipe == MALI_PIPE_GP && task->buffers[i]->heap
++			&& task->buffers[i]->va == task->frame.gp.frame[4]) {
++			task->heap = task->buffers[i];
++		}
+ 	}
+ 	free(objects);
+ 	if (status != B_OK) {
+@@ -742,8 +834,10 @@ MesonMali::_JobThread(void* data)
+ void
+ MesonMali::_RunTask(mali_task* task)
+ {
+-	for (uint32 i = 0; i < task->bufferCount; i++)
+-		_CleanBuffer(task->buffers[i]);
++	for (uint32 i = 0; i < task->bufferCount; i++) {
++		if (!task->buffers[i]->heap)
++			_CleanBuffer(task->buffers[i]);
++	}
+ 
+ 	bool done = task->pipe == MALI_PIPE_GP ? _RunGp(task) : _RunPp(task);
+ 	fJobs++;
+@@ -751,8 +845,10 @@ MesonMali::_RunTask(mali_task* task)
+ 		fFailedJobs++;
+ 
+ 	for (uint32 i = 0; i < task->bufferCount; i++) {
+-		if ((task->bufferFlags[i] & MALI_SUBMIT_BO_WRITE) != 0)
++		if ((task->bufferFlags[i] & MALI_SUBMIT_BO_WRITE) != 0
++			&& !task->buffers[i]->heap) {
+ 			_CleanBuffer(task->buffers[i]);
++		}
+ 	}
+ }
+ 
+@@ -760,7 +856,10 @@ MesonMali::_RunTask(mali_task* task)
+ bool
+ MesonMali::_RunGp(mali_task* task)
+ {
+-	const uint32* frame = task->frame.gp.frame;
++	uint32* frame = task->frame.gp.frame;
++	mali_buffer* heap = task->heap;
++	if (heap != NULL)
++		frame[5] = heap->va + heap->backedPages * B_PAGE_SIZE;
+ 	uint32 command = 0;
+ 	if (frame[0] != frame[1])
+ 		command |= kGpStartVs;
+@@ -782,12 +881,36 @@ MesonMali::_RunGp(mali_task* task)
+ 	_Write(kGp + GP_CMD, command);
+ 	locker.Unlock();
+ 
+-	status_t status = acquire_sem_etc(fJobDone, 1, B_RELATIVE_TIMEOUT,
+-		kJobTimeout);
+-	locker.Lock();
+-	uint32 error = fJobError;
+-	fRunningPipe = -1;
+-	locker.Unlock();
++	status_t status;
++	uint32 error;
++	while (true) {
++		status = acquire_sem_etc(fJobDone, 1, B_RELATIVE_TIMEOUT,
++			kJobTimeout);
++		locker.Lock();
++		error = fJobError;
++		fRunningPipe = -1;
++		locker.Unlock();
++
++		// out of heap memory, and nothing else: more, and the GP goes on
++		// from where its memory ended
++		if (status != B_OK || (error & 0x80000000) != 0
++			|| (error & kGpInterruptsError) != kGpPlbuOutOfMemory
++			|| heap == NULL || _GrowHeap(heap) != B_OK) {
++			break;
++		}
++		fHeapGrowths++;
++		_FlushL2(kGpL2);
++		_ZapMmu(kGpMmu);
++		locker.Lock();
++		fJobError = 0;
++		fRunningPipe = MALI_PIPE_GP;
++		_Write(kGp + GP_INT_MASK, kGpInterruptsUsed);
++		_Write(kGp + GP_PLBU_ALLOC_START, frame[5]);
++		frame[5] = heap->va + heap->backedPages * B_PAGE_SIZE;
++		_Write(kGp + GP_PLBU_ALLOC_END, frame[5]);
++		_Write(kGp + GP_CMD, kGpUpdatePlbuAlloc);
++		locker.Unlock();
++	}
+ 	if (status == B_OK && error == 0)
+ 		return true;
+ 
+diff --git a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_private.h b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_private.h
+index 9c8a3d973a..fbe7f88728 100644
+--- a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_private.h
++++ b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_private.h
+@@ -33,6 +33,8 @@ static const uint32 kPpCount = 3;
+ 
+ // GP
+ enum {
++	GP_PLBU_ALLOC_START	= 0x10,		// frame words 4 and 5
++	GP_PLBU_ALLOC_END	= 0x14,
+ 	GP_CMD				= 0x20,
+ 	GP_INT_RAWSTAT		= 0x24,
+ 	GP_INT_CLEAR		= 0x28,
+@@ -147,6 +149,8 @@ static const uint32 kFirstBufferAddress = 0x00100000;
+ 	// buffers between it and the DLBU page (VA 0 stays unused)
+ 
+ static const bigtime_t kJobTimeout = 10000000;
++static const size_t kHeapInitialSize = 64 * 1024;
++	// a heap buffer's memory at first: doubled when the GP runs out
+ 
+ 
+ enum {
+@@ -179,16 +183,26 @@ struct interrupt_line {
+ };
+ 
+ 
++static const uint32 kMaxHeapAreas = 16;
++
++
+ /*!	A buffer (a GEM object): an area of its own, cloneable so that
+ 	userland can map it; its pages mapped at \c va for the GPU.
++	A heap buffer (the GP's tile heap) is the GPU's alone: its addresses
++	are reserved for its whole size, but only the first \c backedPages
++	have memory, more areas added as the GP runs out (meson_mali_jobs.cpp).
+ */
+ struct mali_buffer {
+ 	int32		refCount;
+ 	area_id		area;
+ 	size_t		size;
+ 	uint32		pageCount;
++	uint32		backedPages;	// mapped from the start: all but a heap's
+ 	phys_addr_t* pages;
+ 	uint32		va;
++	bool		heap;
++	uint32		heapAreaCount;	// the areas after the first
++	area_id		heapAreas[kMaxHeapAreas];
+ 	uint64		lastRead;	// the last tasks that use it (sequence numbers)
+ 	uint64		lastWrite;
+ };
+@@ -217,6 +231,7 @@ struct mali_task {
+ 	uint32			bufferCount;
+ 	mali_buffer**	buffers;
+ 	uint32*			bufferFlags;
++	mali_buffer*	heap;		// a GP job's tile heap, if a heap buffer
+ 	uint64			sequence;
+ };
+ 
+@@ -274,14 +289,18 @@ private:
+ 			int32				_PpJobInterrupt();
+ 
+ 			// buffers and the GPU's address space (meson_mali_jobs.cpp)
+-			status_t			_CreateBuffer(size_t size,
++			status_t			_CreateBuffer(size_t size, bool heap,
+ 									mali_buffer** _buffer);
++			status_t			_BackPages(mali_buffer* buffer,
++									uint32 count, uint32 protection);
++			status_t			_GrowHeap(mali_buffer* buffer);
+ 			void				_AcquireBuffer(mali_buffer* buffer);
+ 			void				_ReleaseBuffer(mali_buffer* buffer);
+ 			status_t			_AllocateAddress(size_t size,
+ 									uint32* _address);
+ 			void				_FreeAddress(uint32 address, size_t size);
+-			status_t			_MapPages(mali_buffer* buffer);
++			status_t			_MapPages(mali_buffer* buffer,
++									uint32 first, uint32 end);
+ 			void				_UnmapPages(mali_buffer* buffer);
+ 			void				_CleanBuffer(mali_buffer* buffer);
+ 
+@@ -351,6 +370,7 @@ private:
+ 			uint32				fPpCount;		// of the running job
+ 			uint32				fJobs;
+ 			uint32				fFailedJobs;
++			uint32				fHeapGrowths;
+ };
+ 
+ 

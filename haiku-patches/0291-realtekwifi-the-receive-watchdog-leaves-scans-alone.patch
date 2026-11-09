@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 4 Nov 2026 14:27:23 -0500
+Subject: [PATCH 291/342] realtekwifi: the receive watchdog leaves scans alone
+
+A scan spends seconds on empty channels, and after frames had come that counted as
+a chip that stopped receiving. The restart only began the scan again: with the 4 s
+limit, on a 5 GHz band with few access points, a join by address looped through
+scan and restart without end. The 2 minute limit applies during a scan now.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn.c    | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn.c
+index d62388bcaf..3f9e36e46b 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn.c
+@@ -1479,7 +1479,9 @@ rtwn_watchdog(void *arg)
+ 	/*
+ 	 * A chip that has stopped receiving (see rx_silence_limit): after frames
+ 	 * came and then none for the limit, or every 2 minutes if a restart
+-	 * didn't bring any, as there may simply be nothing around.
++	 * didn't bring any, as there may simply be nothing around.  A scan spends
++	 * seconds on empty channels, and a restart would only start it again:
++	 * the 2 minutes there too.
+ 	 */
+ 	if (sc->rx_silence_limit != 0) {
+ 		if (sc->sc_rx_transfers != sc->sc_rx_seen) {
+@@ -1487,7 +1489,8 @@ rtwn_watchdog(void *arg)
+ 			sc->sc_rx_silence = 0;
+ 			sc->sc_rx_flowing = 1;
+ 		} else if (++sc->sc_rx_silence
+-		    >= (sc->sc_rx_flowing ? sc->rx_silence_limit : 120)) {
++		    >= (sc->sc_rx_flowing && (ic->ic_flags & IEEE80211_F_SCAN) == 0 ?
++		    sc->rx_silence_limit : 120)) {
+ 			ic_printf(ic, "nothing received for %d s, restarting\n",
+ 			    sc->sc_rx_silence);
+ 			sc->sc_rx_silence = 0;

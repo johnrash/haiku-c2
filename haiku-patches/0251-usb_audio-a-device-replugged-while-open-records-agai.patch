@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Mon, 2 Nov 2026 01:18:17 -0500
+Subject: [PATCH 251/342] usb_audio: a device replugged while open records
+ again
+
+The C920's microphone, open by the media node through an unplug and a
+replug (all the hub's ports powered off and on, tools/probes/usbport.cpp
+in the port's project), came back as a device but never sent a buffer:
+the node got "no buffers for 500 ms: the device stopped answering" and
+kept time on the old buffers from then on. The adapter's streams, on the
+same hub, came back.
+
+- A stream whose transfers can't be queued says so, cancels those it
+  queued and stays stopped, so the next exchange tries again; before,
+  it could count as running with fewer or none in flight.
+- The replugged device is no longer "removed" before its new pipes are
+  set up: a client exchanging meanwhile could start the streams on the
+  old ones.
+- A device with no buffers for a second, though not removed, has its
+  streams stopped and started again, every second until buffers come
+  (the first three restarts logged, and the return of buffers).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/drivers/audio/usb/Device.cpp       | 47 +++++++++++++------
+ src/add-ons/kernel/drivers/audio/usb/Device.h |  3 ++
+ .../kernel/drivers/audio/usb/Stream.cpp       | 11 ++++-
+ 3 files changed, 46 insertions(+), 15 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Device.cpp b/src/add-ons/kernel/drivers/audio/usb/Device.cpp
+index 6f73250cba..8fe6d0fa2b 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Device.cpp
++++ b/src/add-ons/kernel/drivers/audio/usb/Device.cpp
+@@ -26,7 +26,9 @@ Device::Device(usb_device device)
+ 	fBuffersReadySem(-1),
+ 	fRemovedExchanges(0),
+ 	fStalled(false),
+-	fStalledExchanges(0)
++	fStalledExchanges(0),
++	fStalledSince(0),
++	fRestarts(0)
+ {
+ 	const usb_device_descriptor* deviceDescriptor
+ 		= gUSBModule->get_device_descriptor(device);
+@@ -436,22 +438,22 @@ Device::CompareAndReattach(usb_device device)
+ 		// this certainly isn't the same device
+ 		return B_BAD_VALUE;
+ 
+-	// this is the same device that was replugged - clear the removed state,
+-	// re- setup the endpoints and transfers and open the device if it was
+-	// previously opened
++	// this is the same device that was replugged - re- setup the endpoints
++	// and transfers, clear the removed state and open the device if it was
++	// previously opened. A client exchanging buffers meanwhile starts the
++	// streams once the device isn't removed: only with their new pipes.
+ 	fDevice = device;
+-	fRemoved = false;
+ 	status_t result = _SetupEndpoints();
+-	if (result != B_OK) {
+-		fRemoved = true;
++	if (result != B_OK)
+ 		return result;
+-	}
+ 
+ 	// we need to setup hardware on device replug
+ 	result = SetupDevice(true);
+ 	if (result != B_OK)
+ 		return result;
+ 
++	fRemoved = false;
++
+ 	if (fOpen) {
+ 		fOpen = false;
+ 		result = Open(fNonBlocking ? O_NONBLOCK : 0);
+@@ -734,21 +736,38 @@ Device::_MultiBufferExchange(multi_buffer_info* multiInfo)
+ 		return _ExchangeWhileRemoved(&Info, multiInfo);
+ 	if (status == B_TIMED_OUT) {
+ 		if (!fStalled) {
+-			TRACE(ERR, "no buffers for %" B_PRIdBIGTIME " ms: the device "
+-				"stopped answering, keeping time without it\n",
+-				timeout / 1000);
++			if (fRestarts == 0) {
++				TRACE(ERR, "no buffers for %" B_PRIdBIGTIME " ms: the device "
++					"stopped answering, keeping time without it\n",
++					timeout / 1000);
++			}
++			fStalledSince = system_time();
+ 		}
+ 		fStalled = true;
+ 		fStalledExchanges++;
++		// Streams may run without transfers in flight (lost when a device
++		// was replugged while open): started again every second until
++		// buffers come (which clears fStalled, a restart included).
++		if (system_time() - fStalledSince >= 1000000) {
++			if (fRestarts < 3) {
++				TRACE(ERR, "still no buffers: starting the streams "
++					"again\n");
++			}
++			fRestarts++;
++			for (int i = 0; i < fStreams.Count(); i++)
++				fStreams[i]->Stop();
++			fStalledSince = system_time();
++		}
+ 		return _ExchangeWhileRemoved(&Info, multiInfo, false);
+ 	}
+ 	if (status != B_OK)
+ 		return status;
+-	if (fStalled) {
+-		TRACE(ERR, "buffers again, after %" B_PRIu32 " without\n",
+-			fStalledExchanges);
++	if (fStalled || fRestarts > 0) {
++		TRACE(ERR, "buffers again, after %" B_PRIu32 " exchanges without "
++			"and %" B_PRIu32 " restarts\n", fStalledExchanges, fRestarts);
+ 		fStalled = false;
+ 		fStalledExchanges = 0;
++		fRestarts = 0;
+ 	}
+ 
+ 	status = B_ERROR;
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Device.h b/src/add-ons/kernel/drivers/audio/usb/Device.h
+index 18836d4fd7..b40a2187ad 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Device.h
++++ b/src/add-ons/kernel/drivers/audio/usb/Device.h
+@@ -86,6 +86,9 @@ private:
+ 			uint32			fRemovedExchanges;
+ 			bool			fStalled;
+ 			uint32			fStalledExchanges;
++			bigtime_t		fStalledSince;
++			uint32			fRestarts;
++				// the streams started again in this stall
+ };
+ 
+ 
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Stream.cpp b/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
+index f0ca1fbeb2..26b137deda 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
++++ b/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
+@@ -320,8 +320,17 @@ Stream::Start()
+ 		fProcessedBuffers = 0;
+ 		fCompletedFirst = 0;
+ 		fCompletedCount = 0;
+-		for (size_t i = 0; i < fBufferCount; i++)
++		for (size_t i = 0; i < fBufferCount; i++) {
+ 			result = _QueueNextTransfer(i, i == 0);
++			if (result != B_OK) {
++				// not running: the next exchange tries again, from nothing
++				TRACE(ERR, "%s stream: queueing buffer %" B_PRIuSIZE
++					" failed: %s\n", fIsInput ? "input" : "output", i,
++					strerror(result));
++				gUSBModule->cancel_queued_transfers(fStreamEndpoint);
++				break;
++			}
++		}
+ 		fIsRunning = result == B_OK;
+ 	}
+ 	return result;

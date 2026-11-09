@@ -1,0 +1,205 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 22:35:08 -0400
+Subject: [PATCH 143/342] meson_decoder, ffmpeg: B_NV12 output
+
+Both decoder plugins give B_NV12 when asked for it: meson_decoder copies
+the hardware decoder's planes, FFmpeg's swscale interleaves the chroma
+of its planar output. Through the Media Kit, both match FFmpeg's own
+NV12 output bit for bit on the ODROID-C2 (HEVC and H.264 in hardware,
+H.264 in FFmpeg).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../media/plugins/ffmpeg/AVCodecDecoder.cpp   | 27 ++++++++--
+ src/add-ons/media/plugins/ffmpeg/gfx_util.cpp |  4 ++
+ .../meson_decoder/MesonVdecDecoder.cpp        | 53 ++++++++++++++++---
+ .../plugins/meson_decoder/MesonVdecDecoder.h  |  4 ++
+ 4 files changed, 78 insertions(+), 10 deletions(-)
+
+diff --git a/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.cpp b/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.cpp
+index b1c57d899f..2d8a219bad 100644
+--- a/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.cpp
++++ b/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.cpp
+@@ -505,10 +505,11 @@ AVCodecDecoder::_NegotiateVideoOutputFormat(media_format* inOutFormat)
+ 
+ 	// Make MediaPlayer happy (if not in rgb32 screen depth and no overlay,
+ 	// it will only ask for YCbCr, which DrawBitmap doesn't handle, so the
+-	// default colordepth is RGB32). B_YCbCr422 when asked for: overlays that
+-	// cannot show B_RGB32 take it.
+-	if (inOutFormat->u.raw_video.display.format == B_YCbCr422)
+-		fOutputColorSpace = B_YCbCr422;
++	// default colordepth is RGB32). B_NV12 or B_YCbCr422 when asked for:
++	// overlays that cannot show B_RGB32 take them.
++	color_space requested = inOutFormat->u.raw_video.display.format;
++	if (requested == B_YCbCr422 || requested == B_NV12)
++		fOutputColorSpace = requested;
+ 	else
+ 		fOutputColorSpace = B_RGB32;
+ 	// a larger row stride when asked for, as an overlay may need
+@@ -1603,11 +1604,22 @@ AVCodecDecoder::_UpdateMediaHeaderForVideoFrame()
+ 	fHeader.u.raw_video.bytes_per_row
+ 		= CalculateBytesPerRowWithColorSpaceAndVideoWidth(fOutputColorSpace,
+ 			fRawDecodedPicture->width);
++	if (fOutputColorSpace == B_NV12) {
++		// the Y plane's rows; the CbCr plane's are as long
++		fHeader.u.raw_video.bytes_per_row
++			= (fRawDecodedPicture->width + 3) & ~3;
++	}
+ 	if (fOutputBytesPerRow > fHeader.u.raw_video.bytes_per_row) {
+ 		fHeader.u.raw_video.bytes_per_row = fOutputBytesPerRow;
+ 		fHeader.size_used = (size_t)fOutputBytesPerRow
+ 			* fRawDecodedPicture->height;
+ 	}
++	if (fOutputColorSpace == B_NV12) {
++		// the CbCr plane follows the Y plane (BBitmap's B_NV12)
++		int height = fRawDecodedPicture->height;
++		fHeader.size_used = (size_t)fHeader.u.raw_video.bytes_per_row
++			* (height + (height + 1) / 2);
++	}
+ 	fHeader.u.raw_video.field_gamma = 1.0;
+ 	fHeader.u.raw_video.field_sequence = fFrame;
+ 	fHeader.u.raw_video.field_number = 0;
+@@ -1711,6 +1723,13 @@ AVCodecDecoder::_DeinterlaceAndColorConvertVideoFrame()
+ 	fPostProcessedDecodedPicture->data[0] = fDecodedData;
+ 	fPostProcessedDecodedPicture->linesize[0]
+ 		= fHeader.u.raw_video.bytes_per_row;
++	if (fOutputColorSpace == B_NV12) {
++		// the CbCr plane after the Y plane
++		fPostProcessedDecodedPicture->data[1] = fDecodedData
++			+ (size_t)fHeader.u.raw_video.bytes_per_row * displayHeight;
++		fPostProcessedDecodedPicture->linesize[1]
++			= fHeader.u.raw_video.bytes_per_row;
++	}
+ 
+ #if defined(__aarch64__)
+ 	if (fOutputColorSpace == B_YCbCr422
+diff --git a/src/add-ons/media/plugins/ffmpeg/gfx_util.cpp b/src/add-ons/media/plugins/ffmpeg/gfx_util.cpp
+index 07c7acb22e..09687d43c7 100644
+--- a/src/add-ons/media/plugins/ffmpeg/gfx_util.cpp
++++ b/src/add-ons/media/plugins/ffmpeg/gfx_util.cpp
+@@ -208,6 +208,8 @@ pixfmt_to_colorspace(int pixFormat)
+ 		// TODO: more YCbCr color spaces! These are not the same as YUV!
+ 		case AV_PIX_FMT_YUYV422:
+ 			return B_YCbCr422;
++		case AV_PIX_FMT_NV12:
++			return B_NV12;
+ 
+ 	}
+ }
+@@ -259,6 +261,8 @@ colorspace_to_pixfmt(color_space format)
+ 		// TODO: more YCbCr color spaces! These are not the same as YUV!
+ 		case B_YCbCr422:
+ 			return AV_PIX_FMT_YUYV422;
++		case B_NV12:
++			return AV_PIX_FMT_NV12;
+ 	}
+ }
+ 
+diff --git a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
+index 7966858f01..8d1eabc43f 100644
+--- a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
++++ b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
+@@ -6,7 +6,8 @@
+  * meson_vdec driver (headers/private/drivers/meson_vdec.h): the chunks go
+  * to the driver as an Annex B stream, the decoded NV12 frames (8 bits, also
+  * for 10-bit HEVC) come back in display order and are written to the
+- * caller's buffer as B_YCbCr422 (for the video overlay) or B_RGB32.
++ * caller's buffer as B_NV12 (a copy, for the video overlay), B_YCbCr422 (for
++ * an overlay without NV12) or B_RGB32.
+  *
+  * Setup() fails when the decoder is in use, the firmware is missing or the
+  * stream is one the hardware can't decode (beyond 1920x1088, not 4:2:0;
+@@ -560,11 +561,21 @@ MesonVdecDecoder::NegotiateOutputFormat(media_format* ioDecodedFormat)
+ 		ioDecodedFormat->u.raw_video.display.format,
+ 		ioDecodedFormat->u.raw_video.display.bytes_per_row);
+ 
+-	fOutputColorSpace
+-		= ioDecodedFormat->u.raw_video.display.format == B_YCbCr422
+-			? B_YCbCr422 : B_RGB32;
+-	uint32 bytesPerRow = fOutputColorSpace == B_YCbCr422
+-		? (fWidth + 1) / 2 * 4 : fWidth * 4;
++	color_space requested = ioDecodedFormat->u.raw_video.display.format;
++	fOutputColorSpace = requested == B_NV12 || requested == B_YCbCr422
++		? requested : B_RGB32;
++	uint32 bytesPerRow;
++	switch (fOutputColorSpace) {
++		case B_NV12:
++			bytesPerRow = (fWidth + 1) & ~1u;
++			break;
++		case B_YCbCr422:
++			bytesPerRow = (fWidth + 1) / 2 * 4;
++			break;
++		default:
++			bytesPerRow = fWidth * 4;
++			break;
++	}
+ 	if (ioDecodedFormat->u.raw_video.display.bytes_per_row > bytesPerRow)
+ 		bytesPerRow = ioDecodedFormat->u.raw_video.display.bytes_per_row;
+ 	fOutputBytesPerRow = bytesPerRow;
+@@ -631,6 +642,18 @@ MesonVdecDecoder::_Convert(void* buffer)
+ 	uint32 width = min_c(fFrame.width, fWidth);
+ 	uint32 height = min_c(fFrame.height, fHeight);
+ 
++	if (fOutputColorSpace == B_NV12) {
++		// the planes as they are: the Y plane, then the CbCr plane
++		// fOutputBytesPerRow * fHeight bytes in (BBitmap's B_NV12)
++		uint8* target = (uint8*)buffer;
++		_CopyPlane(luma, fFrame.bytes_per_row, target, fOutputBytesPerRow,
++			width, height);
++		_CopyPlane(chroma, fFrame.bytes_per_row,
++			target + (size_t)fOutputBytesPerRow * fHeight, fOutputBytesPerRow,
++			(width + 1) & ~1u, (height + 1) / 2);
++		return B_OK;
++	}
++
+ 	if (fOutputColorSpace == B_YCbCr422) {
+ 		nv12_to_ycbcr422_neon(luma, chroma, fFrame.bytes_per_row,
+ 			(uint8*)buffer, fOutputBytesPerRow, width, height);
+@@ -653,6 +676,22 @@ MesonVdecDecoder::_Convert(void* buffer)
+ }
+ 
+ 
++/*static*/ void
++MesonVdecDecoder::_CopyPlane(const uint8* source, uint32 sourceBytesPerRow,
++	uint8* target, uint32 targetBytesPerRow, uint32 width, uint32 rows)
++{
++	if (sourceBytesPerRow == targetBytesPerRow) {
++		memcpy(target, source, (size_t)targetBytesPerRow * rows);
++		return;
++	}
++	for (uint32 row = 0; row < rows; row++) {
++		memcpy(target, source, width);
++		source += sourceBytesPerRow;
++		target += targetBytesPerRow;
++	}
++}
++
++
+ void
+ MesonVdecDecoder::_FillHeader(media_header* header)
+ {
+@@ -660,6 +699,8 @@ MesonVdecDecoder::_FillHeader(media_header* header)
+ 	header->type = B_MEDIA_RAW_VIDEO;
+ 	header->start_time = _TakeTime(fFrame.stream_offset);
+ 	header->size_used = (size_t)fOutputBytesPerRow * fHeight;
++	if (fOutputColorSpace == B_NV12)
++		header->size_used += (size_t)fOutputBytesPerRow * ((fHeight + 1) / 2);
+ 	header->u.raw_video.display_line_width = fWidth;
+ 	header->u.raw_video.display_line_count = fHeight;
+ 	header->u.raw_video.bytes_per_row = fOutputBytesPerRow;
+diff --git a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h
+index 45895be563..1383ae4daa 100644
+--- a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h
++++ b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h
+@@ -46,6 +46,10 @@ private:
+ 			void				_UnmapFrames();
+ 			void				_ReleaseFrame();
+ 			status_t			_Convert(void* buffer);
++	static	void				_CopyPlane(const uint8* source,
++									uint32 sourceBytesPerRow, uint8* target,
++									uint32 targetBytesPerRow, uint32 width,
++									uint32 rows);
+ 			void				_FillHeader(media_header* header);
+ 
+ 			void				_AddTime(uint32 offset, bigtime_t time);

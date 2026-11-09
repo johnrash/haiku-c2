@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 01:38:36 -0400
+Subject: [PATCH 077/342] Tracker: names in mini icon view no longer cover
+ their neighbors
+
+A name in mini icon view took up to 30 em, on a grid 96 pixels wide. It
+is now shortened in the middle to the label width of icon view (9 em),
+and the mini icon grid is wide enough for that label.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kits/tracker/PoseView.cpp            | 29 ++++++++++++++++++------
+ src/kits/tracker/PoseView.h              |  3 ++-
+ src/kits/tracker/WidgetAttributeText.cpp |  9 ++++----
+ 3 files changed, 29 insertions(+), 12 deletions(-)
+
+diff --git a/src/kits/tracker/PoseView.cpp b/src/kits/tracker/PoseView.cpp
+index b172693a83..ebc871c413 100644
+--- a/src/kits/tracker/PoseView.cpp
++++ b/src/kits/tracker/PoseView.cpp
+@@ -1062,13 +1062,24 @@ BPoseView::SetIconPoseHeight()
+ }
+ 
+ 
++static float
++LabelWidth(const BPoseView* view, uint32 mode)
++{
++	// 9 em, in icon mode as wide as the grid allows
++	float minimum = ceilf(view->StringWidth("M") * 9);
++	if (mode != kIconMode)
++		return minimum;
++
++	const float gridWidth = view->IconSizeInt()
++		+ ceilf(view->IconSizeInt() * 0.875f);
++	return std::max(gridWidth - kIconLabelSpacing, minimum);
++}
++
++
+ float
+ BPoseView::IconLabelWidth() const
+ {
+-	// as wide as the grid allows, but at least 9 em
+-	const float gridWidth = IconSizeInt() + ceilf(IconSizeInt() * 0.875f);
+-	return std::max(gridWidth - kIconLabelSpacing,
+-		ceilf(StringWidth("M") * 9));
++	return LabelWidth(this, ViewMode());
+ }
+ 
+ 
+@@ -1077,7 +1088,11 @@ BPoseView::GetLayoutInfo(uint32 mode, BPoint* grid, BPoint* offset) const
+ {
+ 	switch (mode) {
+ 		case kMiniIconMode:
+-			grid->Set(IconSizeInt() * 6, ceilf(IconSizeInt() * 1.25f));
++			// wide enough for a label of the full width
++			grid->Set(std::max((float)IconSizeInt() * 6, IconSizeInt()
++					+ kMiniIconSeparator + LabelWidth(this, mode)
++					+ kIconLabelSpacing),
++				ceilf(IconSizeInt() * 1.25f));
+ 			offset->Set(ceilf(IconSizeInt() * 0.6f), ceilf(IconSizeInt() * 0.3f));
+ 			break;
+ 
+@@ -1090,11 +1105,11 @@ BPoseView::GetLayoutInfo(uint32 mode, BPoint* grid, BPoint* offset) const
+ 			const float labelHeight = ceilf(IconSizeInt()
+ 				+ kIconLabelLines * sFontHeight) + 4;
+ 			grid->Set(std::max(IconSizeInt() + gridOffset,
+-					IconLabelWidth() + kIconLabelSpacing),
++					LabelWidth(this, mode) + kIconLabelSpacing),
+ 				std::max(IconSizeInt() + gridOffset,
+ 					labelHeight + kIconLabelSpacing / 2));
+ 			// the first column's labels within the view
+-			offset->Set(std::max(offsetValue, ceilf((IconLabelWidth()
++			offset->Set(std::max(offsetValue, ceilf((LabelWidth(this, mode)
+ 					- IconSizeInt()) / 2) + kIconLabelSpacing / 2),
+ 				offsetValue);
+ 			break;
+diff --git a/src/kits/tracker/PoseView.h b/src/kits/tracker/PoseView.h
+index 93026aaace..661648e908 100644
+--- a/src/kits/tracker/PoseView.h
++++ b/src/kits/tracker/PoseView.h
+@@ -211,7 +211,8 @@ public:
+ 	void SetIconPoseHeight();
+ 	float IconPoseHeight() const;
+ 	float IconLabelWidth() const;
+-		// the width names wrap at in icon mode
++		// the width names wrap at in icon mode, and are shortened to in
++		// mini icon mode
+ 	uint32 UnscaledIconSizeInt() const;
+ 	uint32 IconSizeInt() const;
+ 	BSize IconSize() const;
+diff --git a/src/kits/tracker/WidgetAttributeText.cpp b/src/kits/tracker/WidgetAttributeText.cpp
+index 4d874369c9..52ee1e5cdb 100644
+--- a/src/kits/tracker/WidgetAttributeText.cpp
++++ b/src/kits/tracker/WidgetAttributeText.cpp
+@@ -309,7 +309,7 @@ WidgetAttributeText::FittingText(const BPoseView* view)
+ 	bool widthChanged = view->ViewMode() != fFittedViewMode;
+ 	if (view->ViewMode() == kListMode)
+ 		widthChanged |= fColumn->Width() != fOldWidth;
+-	else if (view->ViewMode() == kIconMode)
++	else
+ 		widthChanged |= view->IconLabelWidth() != fFittedLabelWidth;
+ 	if (fDirty || widthChanged || CheckSettingsChanged())
+ 		CheckViewChanged(view);
+@@ -862,9 +862,10 @@ NameAttributeText::FitValue(BString* outString, const BPoseView* view)
+ 	}
+ 
+ 	fSecondLine.Truncate(0);
+-	if (view->ViewMode() != kListMode)
+-		fOldWidth = view->StringWidth("M") * 30;
+-	else
++	if (view->ViewMode() != kListMode) {
++		// mini icon mode: one line, as wide as the grid has room for
++		fOldWidth = view->IconLabelWidth();
++	} else
+ 		fOldWidth = fColumn->Width();
+ 
+ 	fTruncatedWidth = TruncString(outString, fFullValueText.String(),

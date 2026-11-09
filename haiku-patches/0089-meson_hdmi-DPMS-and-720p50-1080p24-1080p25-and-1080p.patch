@@ -1,0 +1,239 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 10:05:03 -0400
+Subject: [PATCH 089/342] meson_hdmi: DPMS, and 720p50, 1080p24, 1080p25 and
+ 1080p50
+
+DPMS: anything but on stops the encoder and switches the PHY's TMDS
+output off, as Linux's meson_dw_hdmi does, so the display sees no signal
+and can sleep; on gives the PHY its setting back and programs the mode
+again, as a mode switch does. The accelerant reports standby, suspend
+and off, so the screen saver's "Turn off screen" now works.
+
+Modes: the ones U-Boot's two pixel clocks (74.25 and 148.5 MHz) give
+with longer lines: 720p50, 1080p24, 1080p25 and 1080p50. As before, a
+mode is offered when the display's EDID lists it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../graphics/meson_hdmi/meson_hdmi_info.h     |  4 +
+ .../accelerants/meson_hdmi/accelerant.cpp     | 35 +++++++++
+ .../graphics/meson_hdmi/meson_hdmi.cpp        | 74 ++++++++++++++++++-
+ 3 files changed, 109 insertions(+), 4 deletions(-)
+
+diff --git a/headers/private/graphics/meson_hdmi/meson_hdmi_info.h b/headers/private/graphics/meson_hdmi/meson_hdmi_info.h
+index 94db0e0c2f..1611e02cda 100644
+--- a/headers/private/graphics/meson_hdmi/meson_hdmi_info.h
++++ b/headers/private/graphics/meson_hdmi/meson_hdmi_info.h
+@@ -31,6 +31,8 @@ enum {
+ 		// area_id of an overlay buffer
+ 	MESON_HDMI_CONFIGURE_OVERLAY,
+ 		// meson_hdmi_overlay_config
++	MESON_HDMI_SET_DPMS_MODE,
++		// uint32: B_DPMS_ON, B_DPMS_STAND_BY, B_DPMS_SUSPEND or B_DPMS_OFF
+ };
+ 
+ 
+@@ -80,6 +82,8 @@ struct meson_hdmi_shared_info {
+ 	uint32			edid_size;			// 0: no EDID
+ 	uint8			edid[MESON_HDMI_EDID_SIZE];
+ 		// raw: the base block and the first extension
++
++	uint32			dpms_mode;
+ };
+ 
+ 
+diff --git a/src/add-ons/accelerants/meson_hdmi/accelerant.cpp b/src/add-ons/accelerants/meson_hdmi/accelerant.cpp
+index a55751c050..096c3988cd 100644
+--- a/src/add-ons/accelerants/meson_hdmi/accelerant.cpp
++++ b/src/add-ons/accelerants/meson_hdmi/accelerant.cpp
+@@ -458,6 +458,34 @@ meson_configure_overlay(overlay_token token, const overlay_buffer* buffer,
+ }
+ 
+ 
++// #pragma mark - display power management
++
++
++static uint32
++meson_dpms_capabilities(void)
++{
++	return B_DPMS_ON | B_DPMS_STAND_BY | B_DPMS_SUSPEND | B_DPMS_OFF;
++}
++
++
++static uint32
++meson_dpms_mode(void)
++{
++	return sInfo.shared->dpms_mode;
++}
++
++
++static status_t
++meson_set_dpms_mode(uint32 mode)
++{
++	if (ioctl(sInfo.device, MESON_HDMI_SET_DPMS_MODE, &mode, sizeof(mode))
++			!= 0) {
++		return errno;
++	}
++	return B_OK;
++}
++
++
+ extern "C" void*
+ get_accelerant_hook(uint32 feature, void* data)
+ {
+@@ -496,6 +524,13 @@ get_accelerant_hook(uint32 feature, void* data)
+ 		case B_GET_PIXEL_CLOCK_LIMITS:
+ 			return (void*)meson_get_pixel_clock_limits;
+ 
++		case B_DPMS_CAPABILITIES:
++			return (void*)meson_dpms_capabilities;
++		case B_DPMS_MODE:
++			return (void*)meson_dpms_mode;
++		case B_SET_DPMS_MODE:
++			return (void*)meson_set_dpms_mode;
++
+ 		case B_OVERLAY_COUNT:
+ 			return (void*)meson_overlay_count;
+ 		case B_OVERLAY_SUPPORTED_SPACES:
+diff --git a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+index 28db4513af..2b1d173a36 100644
+--- a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
++++ b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+@@ -291,11 +291,15 @@ struct meson_mode {
+ 
+ // U-Boot's HDMI PLL runs the VCO at 5940 MHz: OD2 /2 gives a 74.25 MHz
+ // pixel clock, /1 148.5 MHz. These modes need nothing else from the clock
+-// tree.
++// tree; the 50, 25 and 24 Hz ones only have longer lines (CEA-861 timings).
+ static const meson_mode kModes[] = {
+-	{ 74250, 1280, 110, 40, 220, 720, 5, 5, 20, true, true, 4 },
+-	{ 74250, 1920, 88, 44, 148, 1080, 4, 5, 36, true, true, 34 },
+-	{ 148500, 1920, 88, 44, 148, 1080, 4, 5, 36, true, true, 16 },
++	{ 74250, 1280, 110, 40, 220, 720, 5, 5, 20, true, true, 4 },		// 720p60
++	{ 74250, 1280, 440, 40, 220, 720, 5, 5, 20, true, true, 19 },		// 720p50
++	{ 74250, 1920, 88, 44, 148, 1080, 4, 5, 36, true, true, 34 },		// 1080p30
++	{ 74250, 1920, 528, 44, 148, 1080, 4, 5, 36, true, true, 33 },		// 1080p25
++	{ 74250, 1920, 638, 44, 148, 1080, 4, 5, 36, true, true, 32 },		// 1080p24
++	{ 148500, 1920, 88, 44, 148, 1080, 4, 5, 36, true, true, 16 },		// 1080p60
++	{ 148500, 1920, 528, 44, 148, 1080, 4, 5, 36, true, true, 31 },	// 1080p50
+ };
+ static const uint8 kPreferredVic = 16;
+ 
+@@ -408,6 +412,7 @@ public:
+ 			area_id				FrameBufferArea() const
+ 									{ return fFrameBufferMapArea; }
+ 			status_t			SetDisplayMode(const display_mode& mode);
++			status_t			SetDpmsMode(uint32 mode);
+ 			void				RestoreBootMode();
+ 			void				DumpState();
+ 
+@@ -506,6 +511,10 @@ private:
+ 			uint32				fBootPllCntl2;
+ 			uint8				fBootComposer[14];
+ 			bool				fBootStateSaved;
++			const meson_mode*	fMode;
++				// set by SetDisplayMode(); NULL: U-Boot's
++			uint32				fPhyControl0;
++				// while the output is off (DPMS)
+ 
+ 			struct overlay_buffer_info {
+ 				area_id			pagesArea;		// -1: unused slot
+@@ -572,6 +581,8 @@ MesonHdmi::MesonHdmi(device_node* node)
+ 	fBootVpuCount(0),
+ 	fBootPllCntl2(0),
+ 	fBootStateSaved(false),
++	fMode(NULL),
++	fPhyControl0(0),
+ 	fOverlayPhysical(0),
+ 	fOverlayCanvas(0),
+ 	fOverlayEndian(CANVAS_SWAP_64)
+@@ -688,6 +699,7 @@ MesonHdmi::Init()
+ 		return fSharedArea;
+ 	memset(fShared, 0, sizeof(meson_hdmi_shared_info));
+ 	fShared->edid_size = fEdidSize;
++	fShared->dpms_mode = B_DPMS_ON;
+ 	memcpy(fShared->edid, fEdid, fEdidSize);
+ 	_BuildModeList();
+ 
+@@ -1004,6 +1016,7 @@ MesonHdmi::SetDisplayMode(const display_mode& displayMode)
+ 	}
+ 
+ 	mode_to_display_mode(*mode, fShared->current_mode);
++	fMode = mode;
+ 	fShared->bytes_per_row = bytesPerRow;
+ 	frame_buffer_update((addr_t)fFrameBuffer, mode->hActive, mode->vActive,
+ 		32, bytesPerRow);
+@@ -1018,12 +1031,58 @@ MesonHdmi::SetDisplayMode(const display_mode& displayMode)
+ }
+ 
+ 
++/*!	Display power management: anything but B_DPMS_ON stops the encoder and
++	switches the PHY's TMDS output off, so that the display sees no signal and
++	can go to sleep (what the screen saver's "Turn off screen" asks for).
++	B_DPMS_ON gives the PHY its setting back and programs the mode again, as
++	a mode switch does.
++*/
++status_t
++MesonHdmi::SetDpmsMode(uint32 mode)
++{
++	if (mode != B_DPMS_ON && mode != B_DPMS_STAND_BY
++		&& mode != B_DPMS_SUSPEND && mode != B_DPMS_OFF) {
++		return B_BAD_VALUE;
++	}
++
++	MutexLocker locker(fModeLock);
++	bool on = mode == B_DPMS_ON;
++	if (on == (fShared->dpms_mode == B_DPMS_ON)) {
++		fShared->dpms_mode = mode;
++		return B_OK;
++	}
++
++	if (!on) {
++		fPhyControl0 = _Hhi(HHI_HDMI_PHY_CNTL0);
++		_SetVpu(ENCP_VIDEO_EN, 0);
++		_SetHhi(HHI_HDMI_PHY_CNTL0, 0);
++		INFO("display off (DPMS %" B_PRIu32 ")\n", mode);
++	} else {
++		_SetHhi(HHI_HDMI_PHY_CNTL0, fPhyControl0);
++		if (fMode != NULL) {
++			status_t status = _ProgramMode(*fMode, fFrameBufferPhysical,
++				fShared->bytes_per_row);
++			if (status != B_OK)
++				return status;
++		} else {
++			// U-Boot's mode: everything but the encoder is still set
++			_ResetPhy();
++			_SetVpu(ENCP_VIDEO_EN, 1);
++		}
++		INFO("display on\n");
++	}
++	fShared->dpms_mode = mode;
++	return B_OK;
++}
++
++
+ /*!	Puts U-Boot's registers and frame buffer back; works from KDL too. */
+ void
+ MesonHdmi::RestoreBootMode()
+ {
+ 	if (!fBootStateSaved)
+ 		return;
++	fMode = NULL;
+ 	_SetVpu(VIU_OSD1_CTRL_STAT, _Vpu(VIU_OSD1_CTRL_STAT) & ~OSD_ENABLE);
+ 	_SetVpu(ENCP_VIDEO_EN, 0);
+ 	_SetHhi(HHI_HDMI_PLL_CNTL2, fBootPllCntl2);
+@@ -1982,6 +2041,13 @@ device_control(void* cookie, uint32 op, void* buffer, size_t length)
+ 				return B_BAD_ADDRESS;
+ 			return device->ConfigureOverlay(config);
+ 		}
++		case MESON_HDMI_SET_DPMS_MODE:
++		{
++			uint32 mode;
++			if (user_memcpy(&mode, buffer, sizeof(mode)) != B_OK)
++				return B_BAD_ADDRESS;
++			return device->SetDpmsMode(mode);
++		}
+ 	}
+ 	return B_DEV_INVALID_IOCTL;
+ }

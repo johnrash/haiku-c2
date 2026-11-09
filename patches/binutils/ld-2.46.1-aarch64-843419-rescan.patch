@@ -1,0 +1,136 @@
+diff --git a/binutils/bfd/elfnn-aarch64.c b/binutils/bfd/elfnn-aarch64.c
+index 1ba7dd393..3ba74c378 100644
+--- a/binutils/bfd/elfnn-aarch64.c
++++ b/binutils/bfd/elfnn-aarch64.c
+@@ -2619,6 +2619,9 @@ struct elf_aarch64_link_hash_table
+   /* Fix erratum 843419.  */
+   erratum_84319_opts fix_erratum_843419;
+ 
++  /* Set when an erratum 843419 scan records a sequence it had not seen.  */
++  bool erratum_843419_added;
++
+   /* Don't apply link-time values for dynamic relocations.  */
+   int no_apply_dynamic_relocs;
+ 
+@@ -4269,6 +4272,7 @@ _bfd_aarch64_erratum_843419_fixup (uint32_t insn,
+   stub_entry->stub_type = aarch64_stub_erratum_843419_veneer;
+   stub_entry->veneered_insn = insn;
+   stub_entry->output_name = stub_name;
++  htab->erratum_843419_added = true;
+ 
+   return true;
+ }
+@@ -4356,6 +4360,56 @@ _bfd_aarch64_erratum_843419_scan (bfd *input_bfd, asection *section,
+ }
+ 
+ 
++/* Scan every input section for erratum 843419 sequences where the
++   current layout puts them, and lay the sections out again for what was
++   added.  A workaround's stub section moves the code after it, which can
++   bring sequences the scan saw elsewhere to 0xff8 or 0xffc, so scan again
++   until a scan finds nothing new.  */
++
++static bool
++_bfd_aarch64_erratum_843419_scan_all (struct bfd_link_info *info)
++{
++  struct elf_aarch64_link_hash_table *htab = elf_aarch64_hash_table (info);
++  int pass;
++
++  for (pass = 0; pass < 32; pass++)
++    {
++      bfd *input_bfd;
++
++      htab->erratum_843419_added = false;
++      for (input_bfd = info->input_bfds;
++	   input_bfd != NULL;
++	   input_bfd = input_bfd->link.next)
++	{
++	  asection *section;
++
++	  if (!is_aarch64_elf (input_bfd)
++	      || (input_bfd->flags & BFD_LINKER_CREATED) != 0)
++	    continue;
++
++	  for (section = input_bfd->sections;
++	       section != NULL;
++	       section = section->next)
++	    if (!_bfd_aarch64_erratum_843419_scan (input_bfd, section, info))
++	      return false;
++	}
++
++      if (pass > 0 && !htab->erratum_843419_added)
++	return true;
++
++      _bfd_aarch64_resize_stubs (htab);
++      (*htab->layout_sections_again) ();
++
++      if (!htab->erratum_843419_added)
++	return true;
++    }
++
++  _bfd_error_handler (_("erratum 843419 workarounds did not settle"));
++  bfd_set_error (bfd_error_bad_value);
++  return false;
++}
++
++
+ /* Add stub entries for calls.
+ 
+    The basic idea here is to examine all the relocations looking for
+@@ -4778,30 +4832,9 @@ elfNN_aarch64_size_stubs (bfd *output_bfd,
+      that have been created to be out of range.  Avoid this by running
+      this pass first and then creating the groups once we know how much
+      code this mitigation will insert.  */
+-  if (htab->fix_erratum_843419 != ERRAT_NONE)
+-    {
+-      bfd *input_bfd;
+-
+-      for (input_bfd = info->input_bfds;
+-	   input_bfd != NULL;
+-	   input_bfd = input_bfd->link.next)
+-	{
+-	  asection *section;
+-
+-	  if (!is_aarch64_elf (input_bfd)
+-	      || (input_bfd->flags & BFD_LINKER_CREATED) != 0)
+-	    continue;
+-
+-	  for (section = input_bfd->sections;
+-	       section != NULL;
+-	       section = section->next)
+-	    if (!_bfd_aarch64_erratum_843419_scan (input_bfd, section, info))
+-	      return false;
+-	}
+-
+-      _bfd_aarch64_resize_stubs (htab);
+-      (*htab->layout_sections_again) ();
+-    }
++  if (htab->fix_erratum_843419 != ERRAT_NONE
++      && !_bfd_aarch64_erratum_843419_scan_all (info))
++    return false;
+ 
+   group_sections (htab, stub_group_size, stubs_always_before_branch);
+ 
+@@ -4825,6 +4858,11 @@ elfNN_aarch64_size_stubs (bfd *output_bfd,
+ 
+       _bfd_aarch64_resize_stubs (htab);
+       (*htab->layout_sections_again) ();
++
++      /* Its veneers may have moved code too.  */
++      if (htab->fix_erratum_843419 != ERRAT_NONE
++	  && !_bfd_aarch64_erratum_843419_scan_all (info))
++	return false;
+     }
+ 
+   for (;;)
+@@ -4839,6 +4877,10 @@ elfNN_aarch64_size_stubs (bfd *output_bfd,
+ 
+       _bfd_aarch64_resize_stubs (htab);
+       (*htab->layout_sections_again) ();
++
++      if (htab->fix_erratum_843419 != ERRAT_NONE
++	  && !_bfd_aarch64_erratum_843419_scan_all (info))
++	return false;
+     }
+ }
+ 

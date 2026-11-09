@@ -1,0 +1,784 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 20:48:28 -0400
+Subject: [PATCH 073/342] Tracker: breadcrumb buttons above the Navigator's
+ location field
+
+jrash's tracker-breadcrumbs change, applied as is: IRIX-style path buttons, one per path component and lined up with its
+text in the location field. A click goes to that folder and selects the
+one you came from; Option-click opens it in a new window; the jumps are
+part of the Back/Forward history; a press released outside does nothing;
+the tool tip shows the full path; the buttons follow the text when a long
+path scrolls. BreadcrumbBar.cpp/.h are new; Navigator stacks the bar on
+the location field and handles its clicks.
+
+The Navigator only shows with Tracker preferences -> Windows -> Single
+window navigation and Show navigator.
+
+Tested on the ODROID-C2 with the change's GUI test (17 checks, real mouse
+and key events; the port's copy in tools/tracker-breadcrumbs): all pass.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kits/tracker/BreadcrumbBar.cpp | 473 +++++++++++++++++++++++++++++
+ src/kits/tracker/BreadcrumbBar.h   |  92 ++++++
+ src/kits/tracker/Jamfile           |   1 +
+ src/kits/tracker/Navigator.cpp     |  62 +++-
+ src/kits/tracker/Navigator.h       |  11 +-
+ 5 files changed, 629 insertions(+), 10 deletions(-)
+ create mode 100644 src/kits/tracker/BreadcrumbBar.cpp
+ create mode 100644 src/kits/tracker/BreadcrumbBar.h
+
+diff --git a/src/kits/tracker/BreadcrumbBar.cpp b/src/kits/tracker/BreadcrumbBar.cpp
+new file mode 100644
+index 0000000000..d5858dbc33
+--- /dev/null
++++ b/src/kits/tracker/BreadcrumbBar.cpp
+@@ -0,0 +1,473 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "BreadcrumbBar.h"
++
++#include <algorithm>
++
++#include <ControlLook.h>
++#include <LayoutUtils.h>
++#include <Looper.h>
++#include <MessageFilter.h>
++#include <Messenger.h>
++#include <TextView.h>
++#include <Window.h>
++
++
++namespace BPrivate {
++
++static const uint32 kMsgCheckTextView = 'BCtv';
++
++
++// BTextView has no hook for scrolling, so after every event that can
++// scroll it the bar is asked to check whether its buttons still line up.
++class TextViewWatcher : public BMessageFilter {
++public:
++	TextViewWatcher(BHandler* bar)
++		:
++		BMessageFilter(B_ANY_DELIVERY, B_ANY_SOURCE),
++		fBar(bar)
++	{
++	}
++
++	virtual filter_result Filter(BMessage* message, BHandler** target)
++	{
++		switch (message->what) {
++			case B_MOUSE_MOVED:
++				if (message->GetInt32("buttons", 0) == 0)
++					break;
++				// fall through
++			case B_KEY_DOWN:
++			case B_MOUSE_DOWN:
++			case B_MOUSE_UP:
++			case B_MOUSE_WHEEL_CHANGED:
++			case B_INPUT_METHOD_EVENT:
++			case B_CUT:
++			case B_PASTE:
++			case B_UNDO:
++			case B_REDO:
++			case B_SELECT_ALL:
++			{
++				// never block the window thread on its own port
++				BMessage check(kMsgCheckTextView);
++				fBar.SendMessage(&check, (BHandler*)NULL, 0);
++				break;
++			}
++		}
++
++		return B_DISPATCH_MESSAGE;
++	}
++
++private:
++	BMessenger fBar;
++};
++
++} // namespace BPrivate
++
++
++//	#pragma mark - BBreadcrumbBar
++
++
++BBreadcrumbBar::BBreadcrumbBar(BTextView* textView, BHandler* target,
++	uint32 command)
++	:
++	BView("breadcrumbs", B_WILL_DRAW | B_FRAME_EVENTS
++		| B_FULL_UPDATE_ON_RESIZE),
++	fTextView(textView),
++	fWatchingTextView(false),
++	fTarget(target),
++	fCommand(command),
++	fTextOrigin(0),
++	fTextLeft(0),
++	fTextRight(0),
++	fHoverSegment(-1),
++	fPressedSegment(-1),
++	fPressedInside(false)
++{
++	fEdges.push_back(0);
++}
++
++
++BBreadcrumbBar::~BBreadcrumbBar()
++{
++}
++
++
++void
++BBreadcrumbBar::SetPath(const char* path)
++{
++	if (path == NULL)
++		path = "";
++	if (fPath == path)
++		return;
++
++	fPath = path;
++
++	// One segment per path component, the slash after a component belongs
++	// to its segment: "/", "boot/", "home/", "Desktop".
++	fStarts.clear();
++	if (fPath.Length() > 0) {
++		fStarts.push_back(0);
++		for (int32 i = 0; i < fPath.Length() - 1; i++) {
++			if (fPath[i] == '/')
++				fStarts.push_back(i + 1);
++		}
++	}
++
++	fHoverSegment = -1;
++	fPressedSegment = -1;
++	fPressedInside = false;
++	HideToolTip();
++
++	_Layout();
++	Invalidate();
++}
++
++
++int32
++BBreadcrumbBar::CountSegments() const
++{
++	return (int32)fStarts.size();
++}
++
++
++BString
++BBreadcrumbBar::SegmentPath(int32 index) const
++{
++	BString path;
++	if (index < 0 || index >= CountSegments())
++		return path;
++
++	if (index == CountSegments() - 1)
++		return fPath;
++
++	// up to the slash ending this segment, but keep the root's slash
++	int32 length = std::max(fStarts[index + 1] - 1, (int32)1);
++	fPath.CopyInto(path, 0, length);
++	return path;
++}
++
++
++BRect
++BBreadcrumbBar::SegmentFrame(int32 index) const
++{
++	if (index < 0 || index >= CountSegments()
++		|| fEdges.size() != fStarts.size() + 1) {
++		return BRect();
++	}
++
++	BRect bounds(Bounds());
++	return BRect(fEdges[index], bounds.top, fEdges[index + 1] - 1,
++		bounds.bottom);
++}
++
++
++void
++BBreadcrumbBar::AttachedToWindow()
++{
++	BView::AttachedToWindow();
++	AdoptParentColors();
++
++	if (fTextView != NULL && !fWatchingTextView) {
++		fTextView->AddFilter(new TextViewWatcher(this));
++		fWatchingTextView = true;
++	}
++}
++
++
++void
++BBreadcrumbBar::Draw(BRect updateRect)
++{
++	// the text view may have scrolled or moved since the last time
++	_Layout();
++
++	rgb_color base = ui_color(B_CONTROL_BACKGROUND_COLOR);
++	rgb_color background = ViewColor();
++
++	for (int32 i = 0; i < CountSegments(); i++) {
++		BRect frame(SegmentFrame(i));
++		if (!frame.IsValid() || !frame.Intersects(updateRect))
++			continue;
++
++		uint32 flags = 0;
++		if (i == fPressedSegment && fPressedInside)
++			flags |= BControlLook::B_ACTIVATED;
++		else if (i == fHoverSegment)
++			flags |= BControlLook::B_HOVER;
++
++		be_control_look->DrawButtonFrame(this, frame, updateRect, 0.0f, base,
++			background, flags);
++		be_control_look->DrawButtonBackground(this, frame, updateRect, 0.0f,
++			base, flags);
++	}
++}
++
++
++void
++BBreadcrumbBar::FrameResized(float width, float height)
++{
++	BView::FrameResized(width, height);
++
++	// the text view may scroll once it got its new size, too
++	if (Looper() != NULL)
++		Looper()->PostMessage(kMsgCheckTextView, this);
++}
++
++
++void
++BBreadcrumbBar::MessageReceived(BMessage* message)
++{
++	switch (message->what) {
++		case kMsgCheckTextView:
++			if (_TextViewMoved())
++				Invalidate();
++			break;
++
++		default:
++			BView::MessageReceived(message);
++			break;
++	}
++}
++
++
++void
++BBreadcrumbBar::MouseDown(BPoint where)
++{
++	int32 buttons = B_PRIMARY_MOUSE_BUTTON;
++	if (Window()->CurrentMessage() != NULL) {
++		buttons = Window()->CurrentMessage()->GetInt32("buttons",
++			B_PRIMARY_MOUSE_BUTTON);
++	}
++
++	int32 index = _SegmentAt(where);
++	if (buttons != B_PRIMARY_MOUSE_BUTTON || !_IsClickable(index))
++		return;
++
++	fPressedSegment = index;
++	fPressedInside = true;
++	SetMouseEventMask(B_POINTER_EVENTS, B_NO_POINTER_HISTORY);
++	_InvalidateSegment(index);
++}
++
++
++void
++BBreadcrumbBar::MouseMoved(BPoint where, uint32 transit,
++	const BMessage* dragMessage)
++{
++	int32 index = -1;
++	if (transit != B_EXITED_VIEW && transit != B_OUTSIDE_VIEW)
++		index = _SegmentAt(where);
++
++	if (fPressedSegment >= 0) {
++		bool inside = index == fPressedSegment;
++		if (inside != fPressedInside) {
++			fPressedInside = inside;
++			_InvalidateSegment(fPressedSegment);
++		}
++		return;
++	}
++
++	if (dragMessage != NULL || !_IsClickable(index))
++		index = -1;
++	_SetHoverSegment(index);
++
++	BView::MouseMoved(where, transit, dragMessage);
++}
++
++
++void
++BBreadcrumbBar::MouseUp(BPoint where)
++{
++	if (fPressedSegment < 0)
++		return;
++
++	int32 index = fPressedSegment;
++	bool invoke = fPressedInside && _SegmentAt(where) == index;
++
++	fPressedSegment = -1;
++	fPressedInside = false;
++	_InvalidateSegment(index);
++
++	if (invoke)
++		_Invoke(index);
++}
++
++
++bool
++BBreadcrumbBar::GetToolTipAt(BPoint where, BToolTip** _tip)
++{
++	int32 index = _SegmentAt(where);
++	if (index < 0) {
++		*_tip = NULL;
++		return false;
++	}
++
++	SetToolTip(SegmentPath(index).String());
++	return BView::GetToolTipAt(where, _tip);
++}
++
++
++BSize
++BBreadcrumbBar::MinSize()
++{
++	return BLayoutUtils::ComposeSize(ExplicitMinSize(),
++		BSize(10, _Height() - 1));
++}
++
++
++BSize
++BBreadcrumbBar::MaxSize()
++{
++	return BLayoutUtils::ComposeSize(ExplicitMaxSize(),
++		BSize(B_SIZE_UNLIMITED, _Height() - 1));
++}
++
++
++BSize
++BBreadcrumbBar::PreferredSize()
++{
++	return BLayoutUtils::ComposeSize(ExplicitPreferredSize(),
++		BSize(10, _Height() - 1));
++}
++
++
++void
++BBreadcrumbBar::_TextViewGeometry(float& origin, float& left,
++	float& right) const
++{
++	BRect bounds(Bounds());
++	origin = left = bounds.left;
++	right = bounds.right;
++
++	if (fTextView == NULL || fTextView->Window() == NULL
++		|| fTextView->Window() != Window()) {
++		return;
++	}
++
++	BRect textBounds = ConvertFromScreen(
++		fTextView->ConvertToScreen(fTextView->Bounds()));
++	BPoint textOrigin = ConvertFromScreen(
++		fTextView->ConvertToScreen(fTextView->PointAt(0)));
++
++	origin = textOrigin.x;
++	left = textBounds.left;
++	right = textBounds.right;
++}
++
++
++void
++BBreadcrumbBar::_Layout()
++{
++	_TextViewGeometry(fTextOrigin, fTextLeft, fTextRight);
++
++	BFont font;
++	if (fTextView != NULL)
++		fTextView->GetFontAndColor(0, &font);
++	else
++		GetFont(&font);
++
++	// Each button starts where the text of its component starts; the first
++	// one also covers the space left of the text, the last one the space
++	// right of it. Components scrolled out of sight get no button.
++	BRect bounds(Bounds());
++	int32 count = CountSegments();
++	fEdges.resize(count + 1);
++	fEdges[0] = bounds.left;
++	for (int32 i = 1; i < count; i++) {
++		float x = fTextOrigin + font.StringWidth(fPath.String(), fStarts[i]);
++		if (x < fTextLeft)
++			x = bounds.left;
++		else if (x > fTextRight)
++			x = bounds.right + 1;
++		fEdges[i] = roundf(x);
++	}
++	fEdges[count] = bounds.right + 1;
++}
++
++
++bool
++BBreadcrumbBar::_TextViewMoved() const
++{
++	float origin;
++	float left;
++	float right;
++	_TextViewGeometry(origin, left, right);
++
++	return origin != fTextOrigin || left != fTextLeft || right != fTextRight;
++}
++
++
++int32
++BBreadcrumbBar::_SegmentAt(BPoint where) const
++{
++	if (!Bounds().Contains(where))
++		return -1;
++
++	for (int32 i = 0; i < CountSegments(); i++) {
++		if (SegmentFrame(i).Contains(where))
++			return i;
++	}
++
++	return -1;
++}
++
++
++bool
++BBreadcrumbBar::_IsClickable(int32 index) const
++{
++	// the last segment is the folder that is already shown
++	return index >= 0 && index < CountSegments() - 1;
++}
++
++
++void
++BBreadcrumbBar::_SetHoverSegment(int32 index)
++{
++	if (index == fHoverSegment)
++		return;
++
++	_InvalidateSegment(fHoverSegment);
++	fHoverSegment = index;
++	_InvalidateSegment(fHoverSegment);
++
++	// the tool tip shows the path of the segment below the mouse
++	HideToolTip();
++}
++
++
++void
++BBreadcrumbBar::_InvalidateSegment(int32 index)
++{
++	BRect frame(SegmentFrame(index));
++	if (frame.IsValid())
++		Invalidate(frame);
++}
++
++
++void
++BBreadcrumbBar::_Invoke(int32 index)
++{
++	if (fTarget == NULL || Looper() == NULL)
++		return;
++
++	BMessage message(fCommand);
++	message.AddString("path", SegmentPath(index));
++	if (index + 1 < CountSegments())
++		message.AddString("select", SegmentPath(index + 1));
++
++	Looper()->PostMessage(&message, fTarget);
++}
++
++
++float
++BBreadcrumbBar::_Height()
++{
++	font_height fontHeight;
++	GetFontHeight(&fontHeight);
++
++	return std::max(8.0f,
++		ceilf((fontHeight.ascent + fontHeight.descent) * 0.7f));
++}
+diff --git a/src/kits/tracker/BreadcrumbBar.h b/src/kits/tracker/BreadcrumbBar.h
+new file mode 100644
+index 0000000000..205042f49c
+--- /dev/null
++++ b/src/kits/tracker/BreadcrumbBar.h
+@@ -0,0 +1,92 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef _BREADCRUMB_BAR_H
++#define _BREADCRUMB_BAR_H
++
++
++#include <String.h>
++#include <View.h>
++
++#include <vector>
++
++
++class BTextView;
++
++namespace BPrivate {
++
++// A row of buttons drawn right above a text view that shows a path, one
++// button per path component and lined up with the component's text, like
++// the path buttons of the IRIX file manager. Clicking a button sends the
++// command to the target with the "path" of that folder and the "select"
++// path of the next component, the folder to select in it.
++//
++// The text view must stay alive as long as the bar does.
++
++class BBreadcrumbBar : public BView {
++public:
++								BBreadcrumbBar(BTextView* textView,
++									BHandler* target, uint32 command);
++	virtual						~BBreadcrumbBar();
++
++			void				SetPath(const char* path);
++			const char*			Path() const { return fPath.String(); }
++
++			int32				CountSegments() const;
++			BString				SegmentPath(int32 index) const;
++			BRect				SegmentFrame(int32 index) const;
++
++	virtual	void				AttachedToWindow();
++	virtual	void				Draw(BRect updateRect);
++	virtual	void				FrameResized(float width, float height);
++	virtual	void				MessageReceived(BMessage* message);
++	virtual	void				MouseDown(BPoint where);
++	virtual	void				MouseMoved(BPoint where, uint32 transit,
++									const BMessage* dragMessage);
++	virtual	void				MouseUp(BPoint where);
++	virtual	bool				GetToolTipAt(BPoint where, BToolTip** _tip);
++
++	virtual	BSize				MinSize();
++	virtual	BSize				MaxSize();
++	virtual	BSize				PreferredSize();
++
++private:
++			void				_TextViewGeometry(float& origin, float& left,
++									float& right) const;
++			void				_Layout();
++			bool				_TextViewMoved() const;
++			int32				_SegmentAt(BPoint where) const;
++			bool				_IsClickable(int32 index) const;
++			void				_SetHoverSegment(int32 index);
++			void				_InvalidateSegment(int32 index);
++			void				_Invoke(int32 index);
++			float				_Height();
++
++			BTextView*			fTextView;
++			bool				fWatchingTextView;
++			BHandler*			fTarget;
++			uint32				fCommand;
++
++			BString				fPath;
++			std::vector<int32>	fStarts;
++				// byte offset in fPath where each segment starts
++			std::vector<float>	fEdges;
++				// left edge of each segment and the end of the last one
++
++			float				fTextOrigin;
++			float				fTextLeft;
++			float				fTextRight;
++				// where the text view was at the last _Layout()
++
++			int32				fHoverSegment;
++			int32				fPressedSegment;
++			bool				fPressedInside;
++};
++
++} // namespace BPrivate
++
++using namespace BPrivate;
++
++
++#endif	// _BREADCRUMB_BAR_H
+diff --git a/src/kits/tracker/Jamfile b/src/kits/tracker/Jamfile
+index b60d34589b..3d7e5aea8d 100644
+--- a/src/kits/tracker/Jamfile
++++ b/src/kits/tracker/Jamfile
+@@ -29,6 +29,7 @@ for architectureObject in [ MultiArchSubDirSetup ] {
+ 			AutoMounterSettings.cpp
+ 			BackgroundImage.cpp
+ 			Bitmaps.cpp
++			BreadcrumbBar.cpp
+ 			ContainerWindow.cpp
+ 			CountView.cpp
+ 			DeskWindow.cpp
+diff --git a/src/kits/tracker/Navigator.cpp b/src/kits/tracker/Navigator.cpp
+index 94ee60805b..3b49a60f38 100644
+--- a/src/kits/tracker/Navigator.cpp
++++ b/src/kits/tracker/Navigator.cpp
+@@ -35,11 +35,15 @@ All rights reserved.
+ 
+ #include "Navigator.h"
+ 
++#include <string.h>
++
+ #include <ControlLook.h>
++#include <LayoutBuilder.h>
+ #include <TextControl.h>
+ #include <Window.h>
+ 
+ #include "Bitmaps.h"
++#include "BreadcrumbBar.h"
+ #include "Commands.h"
+ #include "FSUtils.h"
+ #include "Tracker.h"
+@@ -68,6 +72,9 @@ BNavigator::BNavigator(const Model* model)
+ 		new BMessage(kNavigatorCommandLocation));
+ 	fLocation->SetDivider(0);
+ 
++	fBreadcrumbs = new BBreadcrumbBar(fLocation->TextView(), this,
++		kNavigatorCommandBreadcrumb);
++
+ 	GroupLayout()->SetInsets(0.0f, 0.0f, B_USE_HALF_ITEM_INSETS, 1.0f);
+ 		// 1px bottom inset used for border
+ 
+@@ -108,7 +115,13 @@ BNavigator::AttachedToWindow()
+ 	SetActionEnabled(kNavigatorCommandUp, false);
+ 	delete bmpUp;
+ 
+-	AddView(fLocation);
++	// One button per path component right above the location, like the
++	// path buttons of the IRIX file manager.
++	BLayoutBuilder::Group<>(GroupLayout())
++		.AddGroup(B_VERTICAL, 0)
++			.Add(fBreadcrumbs)
++			.Add(fLocation)
++		.End();
+ 	fLocation->SetTarget(this);
+ }
+ 
+@@ -160,6 +173,11 @@ BNavigator::MessageReceived(BMessage* message)
+ 			fLocation->MakeFocus();
+ 			break;
+ 
++		case kNavigatorCommandBreadcrumb:
++			GoToBreadcrumb(message,
++				(modifiers() & B_OPTION_KEY) == B_OPTION_KEY);
++			break;
++
+ 		default:
+ 		{
+ 			// Catch any dropped refs and try to switch to this new directory
+@@ -218,9 +236,34 @@ BNavigator::GoUp(bool option)
+ }
+ 
+ 
++void
++BNavigator::GoToBreadcrumb(const BMessage* message, bool option)
++{
++	const char* path;
++	BEntry entry;
++	if (message->FindString("path", &path) != B_OK
++		|| entry.SetTo(path) != B_OK || !entry.IsDirectory()) {
++		return;
++	}
++
++	// select the folder we came from (or its ancestor) in the new location
++	const char* childPath;
++	BNode child;
++	node_ref childNodeRef;
++	const node_ref* nodeRefToSelect = NULL;
++	if (message->FindString("select", &childPath) == B_OK
++		&& child.SetTo(childPath) == B_OK
++		&& child.GetNodeRef(&childNodeRef) == B_OK) {
++		nodeRefToSelect = &childNodeRef;
++	}
++
++	SendNavigationMessage(kActionSet, &entry, option, nodeRefToSelect);
++}
++
++
+ void
+ BNavigator::SendNavigationMessage(NavigationAction action, BEntry* entry,
+-	bool option)
++	bool option, const node_ref* nodeRefToSelect)
+ {
+ 	entry_ref ref;
+ 
+@@ -230,11 +273,9 @@ BNavigator::SendNavigationMessage(NavigationAction action, BEntry* entry,
+ 		message.AddInt32("action", action);
+ 
+ 		// get the node of this folder for selecting it in the new location
+-		const node_ref* nodeRef;
+-		if (Window() && Window()->TargetModel())
++		const node_ref* nodeRef = nodeRefToSelect;
++		if (nodeRef == NULL && Window() && Window()->TargetModel())
+ 			nodeRef = Window()->TargetModel()->NodeRef();
+-		else
+-			nodeRef = NULL;
+ 
+ 		// if the option key was held down, open in new window (send message
+ 		// to be_app) otherwise send message to this window. TTracker
+@@ -345,7 +386,12 @@ BNavigator::UpdateLocation(const Model* newmodel, int32 action)
+ 	SetActionEnabled(kNavigatorCommandForward, fForwHistory.CountItems() > 0);
+ 	SetActionEnabled(kNavigatorCommandBackward, fBackHistory.CountItems() > 1);
+ 
+-	// Avoid loss of selection and cursor position
+-	if (action != kActionLocation)
++	// Avoid loss of selection and cursor position, but show the normalized
++	// path the breadcrumb buttons line up with
++	if (action != kActionLocation
++		|| strcmp(fLocation->Text(), fPath.Path()) != 0) {
+ 		fLocation->SetText(fPath.Path());
++	}
++
++	fBreadcrumbs->SetPath(fPath.Path());
+ }
+diff --git a/src/kits/tracker/Navigator.h b/src/kits/tracker/Navigator.h
+index b5b1b0dc60..eb33c83079 100644
+--- a/src/kits/tracker/Navigator.h
++++ b/src/kits/tracker/Navigator.h
+@@ -46,6 +46,8 @@ class BEntry;
+ 
+ namespace BPrivate {
+ 
++class BBreadcrumbBar;
++
+ enum NavigationAction
+ {
+ 	kActionSet,
+@@ -59,7 +61,8 @@ enum NavigationAction
+ 	kNavigatorCommandForward = 'NVFW',
+ 	kNavigatorCommandUp = 'NVUP',
+ 	kNavigatorCommandLocation = 'NVLC',
+-	kNavigatorCommandSetFocus = 'NVSF'
++	kNavigatorCommandSetFocus = 'NVSF',
++	kNavigatorCommandBreadcrumb = 'NVBC'
+ };
+ 
+ 
+@@ -82,13 +85,17 @@ protected:
+ 		// is option key held down?
+ 	void GoBackward(bool option);
+ 	void GoUp(bool option);
+-	void SendNavigationMessage(NavigationAction, BEntry*, bool option);
++	void GoToBreadcrumb(const BMessage* message, bool option);
++	void SendNavigationMessage(NavigationAction, BEntry*, bool option,
++		const node_ref* nodeRefToSelect = NULL);
++		// selects the current folder in the new one by default
+ 
+ 	void GoTo();
+ 
+ private:
+ 	BPath fPath;
+ 	BTextControl* fLocation;
++	BBreadcrumbBar* fBreadcrumbs;
+ 
+ 	BObjectList<BPath, true> fBackHistory;
+ 	BObjectList<BPath, true> fForwHistory;

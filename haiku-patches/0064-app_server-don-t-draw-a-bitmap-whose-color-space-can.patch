@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 17:28:56 -0400
+Subject: [PATCH 064/342] app_server: don't draw a bitmap whose color space
+ can't be converted
+
+BitmapPainter::_ConvertColorSpace() went on with the unconverted pixels
+when the conversion failed, and they were then drawn as RGBA32. For a
+B_YCbCr422 bitmap (BBitmap::ImportBits() can't convert from it), that
+reads twice the bitmap's size: MediaPlayer draws its overlay bitmap
+once it stops the overlay, and with meson_hdmi's overlay buffers mapped
+exactly, app_server crashed in the bilinear scaler, past the buffer's
+end. A bitmap that can't be converted is now not drawn.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../Painter/bitmap_painter/BitmapPainter.cpp   | 18 ++++++++++++------
+ .../Painter/bitmap_painter/BitmapPainter.h     |  2 +-
+ 2 files changed, 13 insertions(+), 7 deletions(-)
+
+diff --git a/src/servers/app/drawing/Painter/bitmap_painter/BitmapPainter.cpp b/src/servers/app/drawing/Painter/bitmap_painter/BitmapPainter.cpp
+index c02415616f..26c7118ba9 100644
+--- a/src/servers/app/drawing/Painter/bitmap_painter/BitmapPainter.cpp
++++ b/src/servers/app/drawing/Painter/bitmap_painter/BitmapPainter.cpp
+@@ -106,7 +106,12 @@ Painter::BitmapPainter::Draw(const BRect& sourceRect,
+ 	}
+ 
+ 	ObjectDeleter<BBitmap> convertedBitmapDeleter;
+-	_ConvertColorSpace(convertedBitmapDeleter);
++	if (!_ConvertColorSpace(convertedBitmapDeleter)) {
++		// drawing the unconverted pixels as RGBA32 would read past the
++		// bitmap's end when they take fewer bytes (B_YCbCr422 overlay
++		// buffers, which a video player draws once it stops the overlay)
++		return;
++	}
+ 
+ 	if ((fOptions & B_TILE_BITMAP) == 0) {
+ 		// optimized version if there is no scale
+@@ -255,12 +260,12 @@ Painter::BitmapPainter::_HasAlphaMask()
+ }
+ 
+ 
+-void
++bool
+ Painter::BitmapPainter::_ConvertColorSpace(
+ 	ObjectDeleter<BBitmap>& convertedBitmapDeleter)
+ {
+ 	if (fColorSpace == B_RGBA32)
+-		return;
++		return true;
+ 
+ 	if (fColorSpace == B_RGB32
+ 		&& (fPainter->fDrawingMode == B_OP_COPY
+@@ -274,7 +279,7 @@ Painter::BitmapPainter::_ConvertColorSpace(
+ 		|| fPainter->fDrawingMode == B_OP_ALPHA
+ #endif
+ 		)) {
+-		return;
++		return true;
+ 	}
+ 
+ 	BBitmap* conversionBitmap = new(std::nothrow) BBitmap(fBitmapBounds,
+@@ -282,7 +287,7 @@ Painter::BitmapPainter::_ConvertColorSpace(
+ 	if (conversionBitmap == NULL) {
+ 		fprintf(stderr, "BitmapPainter::_ConvertColorSpace() - "
+ 			"out of memory for creating temporary conversion bitmap\n");
+-		return;
++		return false;
+ 	}
+ 	convertedBitmapDeleter.SetTo(conversionBitmap);
+ 
+@@ -292,7 +297,7 @@ Painter::BitmapPainter::_ConvertColorSpace(
+ 	if (err < B_OK) {
+ 		fprintf(stderr, "BitmapPainter::_ConvertColorSpace() - "
+ 			"colorspace conversion failed: %s\n", strerror(err));
+-		return;
++		return false;
+ 	}
+ 
+ 	// the original bitmap might have had some of the
+@@ -326,6 +331,7 @@ Painter::BitmapPainter::_ConvertColorSpace(
+ 		(uint32)fBitmapBounds.IntegerWidth() + 1,
+ 		(uint32)fBitmapBounds.IntegerHeight() + 1,
+ 		conversionBitmap->BytesPerRow());
++	return true;
+ }
+ 
+ 
+diff --git a/src/servers/app/drawing/Painter/bitmap_painter/BitmapPainter.h b/src/servers/app/drawing/Painter/bitmap_painter/BitmapPainter.h
+index 4afaa50645..feab7dd675 100644
+--- a/src/servers/app/drawing/Painter/bitmap_painter/BitmapPainter.h
++++ b/src/servers/app/drawing/Painter/bitmap_painter/BitmapPainter.h
+@@ -32,7 +32,7 @@ private:
+ 			bool				_HasAffineTransform();
+ 			bool				_HasAlphaMask();
+ 
+-			void				_ConvertColorSpace(ObjectDeleter<BBitmap>&
++			bool				_ConvertColorSpace(ObjectDeleter<BBitmap>&
+ 									convertedBitmapDeleter);
+ 
+ 			template<typename sourcePixel>

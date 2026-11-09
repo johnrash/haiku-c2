@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 14:32:31 -0400
+Subject: [PATCH 060/342] net notifications: stay loaded, fixing a deadlock at
+ boot
+
+The notifications module unloaded with the network stack and kept itself
+loaded while it had listeners, by getting a reference to itself when the
+first was added (from within its generic syscall). That deadlocked: the
+stack's last user (net_server closing its last socket) put the stack
+while holding the module lock, the stack put us, and our uninit waited in
+unregister_generic_syscall() for a thread in our syscall (launch_daemon
+starting to watch the network) that was adding the first listener and
+waited for the module lock in get_module(). Seen once in about 30 boots
+of an ODROID-C2: a hung boot, no network, no desktop.
+
+The module is now B_KEEP_LOADED: its syscall is never unregistered, and
+adding a listener no longer takes the module lock. That also settles the
+race the uninit's TODO described. Listeners now survive the stack being
+unloaded and loaded again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../network/notifications/notifications.cpp   | 41 +++++++------------
+ 1 file changed, 14 insertions(+), 27 deletions(-)
+
+diff --git a/src/add-ons/kernel/network/notifications/notifications.cpp b/src/add-ons/kernel/network/notifications/notifications.cpp
+index cdb7609d55..664ad2956e 100644
+--- a/src/add-ons/kernel/network/notifications/notifications.cpp
++++ b/src/add-ons/kernel/network/notifications/notifications.cpp
+@@ -3,7 +3,18 @@
+  * Distributed under the terms of the MIT License.
+  */
+ 
+-/*! Provides the networking stack notification service. */
++/*! Provides the networking stack notification service.
++
++	The module stays loaded once it was loaded (B_KEEP_LOADED). It used to
++	unload with the stack, and to keep itself loaded while it had listeners
++	by getting a reference to itself when the first one was added. That
++	deadlocked: the stack's last user put it, holding the module lock, and
++	the stack put us; our uninit then waited in unregister_generic_syscall()
++	for a thread inside our syscall that was adding the first listener and
++	waited for the module lock in get_module() (seen at boot, between
++	net_server closing its last socket and launch_daemon starting to watch
++	the network).
++*/
+ 
+ #include <net_notifications.h>
+ 
+@@ -29,8 +40,6 @@ public:
+ 
+ protected:
+ 	virtual	void				LastReferenceReleased();
+-	virtual	void				FirstAdded();
+-	virtual	void				LastRemoved();
+ };
+ 
+ 
+@@ -72,24 +81,6 @@ NetNotificationService::LastReferenceReleased()
+ }
+ 
+ 
+-void
+-NetNotificationService::FirstAdded()
+-{
+-	// The reference counting doesn't work for us, as we'll have to
+-	// ensure our module stays loaded.
+-	module_info* dummy;
+-	get_module(NET_NOTIFICATIONS_MODULE_NAME, &dummy);
+-}
+-
+-
+-void
+-NetNotificationService::LastRemoved()
+-{
+-	// Give up the reference _AddListener()
+-	put_module(NET_NOTIFICATIONS_MODULE_NAME);
+-}
+-
+-
+ //	#pragma mark - User generic syscall
+ 
+ 
+@@ -144,14 +135,10 @@ notifications_std_ops(int32 op, ...)
+ 			return B_OK;
+ 		}
+ 		case B_MODULE_UNINIT:
++			// not called: the module is kept loaded
+ 			TRACE("uninit\n");
+ 
+ 			unregister_generic_syscall(NET_NOTIFICATIONS_SYSCALLS, 1);
+-
+-			// TODO: due to the way the locking in the notification
+-			// manager works, there's a potential race condition here
+-			// where someone attempts to add a listener right as
+-			// we're uninitializing. Needs to be looked at/resolved.
+ 			sNotificationService.Unregister();
+ 
+ 			// we need to release the reference that was acquired
+@@ -169,7 +156,7 @@ notifications_std_ops(int32 op, ...)
+ net_notifications_module_info sNotificationsModule = {
+ 	{
+ 		NET_NOTIFICATIONS_MODULE_NAME,
+-		0,
++		B_KEEP_LOADED,
+ 		notifications_std_ops
+ 	},
+ 

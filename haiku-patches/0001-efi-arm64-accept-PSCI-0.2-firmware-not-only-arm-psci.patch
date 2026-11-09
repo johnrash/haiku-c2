@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Tue, 27 Oct 2026 23:07:17 -0400
+Subject: [PATCH 001/342] efi/arm64: accept PSCI 0.2 firmware, not only
+ "arm,psci-1.0"
+
+The device tree PSCI node was only recognised when its first compatible
+string was "arm,psci-1.0". Firmware that implements PSCI 0.2, like the
+Amlogic S905 BL31 on the ODROID-C2 ("arm,psci-0.2"), left sPsciCallFn
+NULL while the CPU nodes still asked for enable-method "psci", so starting
+the secondary CPUs called through a NULL pointer after ExitBootServices.
+
+Match "arm,psci-1.0", "arm,psci-0.2" or "arm,psci" anywhere in the list.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/boot/platform/efi/arch/arm64/arch_dtb.cpp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/system/boot/platform/efi/arch/arm64/arch_dtb.cpp b/src/system/boot/platform/efi/arch/arm64/arch_dtb.cpp
+index b0257341bb..8526d88a03 100644
+--- a/src/system/boot/platform/efi/arch/arm64/arch_dtb.cpp
++++ b/src/system/boot/platform/efi/arch/arm64/arch_dtb.cpp
+@@ -70,8 +70,13 @@ arch_handle_fdt(const void* fdt, int node)
+ 		}
+ 	}
+ 
+-	if (strcmp(compatible, "arm,psci-1.0") == 0)
++	// Firmware lists the PSCI versions it implements, newest first; the
++	// Amlogic S905 (ODROID-C2) BL31 only claims "arm,psci-0.2".
++	if (dtb_has_fdt_string(compatible, compatibleLen, "arm,psci-1.0")
++		|| dtb_has_fdt_string(compatible, compatibleLen, "arm,psci-0.2")
++		|| dtb_has_fdt_string(compatible, compatibleLen, "arm,psci")) {
+ 		arm64_handle_fdt_psci_node(fdt, node);
++	}
+ }
+ 
+ 

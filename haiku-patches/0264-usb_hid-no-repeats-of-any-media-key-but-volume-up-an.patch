@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Tue, 3 Nov 2026 12:28:58 -0500
+Subject: [PATCH 264/342] usb_hid: no repeats of any media key but volume up
+ and down
+
+7084d089a1 only covered buttons with a bit each. A wireless receiver's media
+keys come as an array, and one held for good would keep the screen saver away
+just the same, so the rule now goes for every key outside the keyboard page.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../input/hid_shared/KeyboardProtocolHandler.cpp   | 14 ++++++--------
+ 1 file changed, 6 insertions(+), 8 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/input/hid_shared/KeyboardProtocolHandler.cpp b/src/add-ons/kernel/drivers/input/hid_shared/KeyboardProtocolHandler.cpp
+index fb589b5ef2..9cdcc4f928 100644
+--- a/src/add-ons/kernel/drivers/input/hid_shared/KeyboardProtocolHandler.cpp
++++ b/src/add-ons/kernel/drivers/input/hid_shared/KeyboardProtocolHandler.cpp
+@@ -835,14 +835,12 @@ KeyboardProtocolHandler::_ReadReport(bigtime_t timeout, uint32 *cookie)
+ 			_WriteKey(key, keyDown);
+ 
+ 			if (keyDown) {
+-				// repeat handling; of the buttons with a bit each (headsets,
+-				// USB audio adapters) only volume up and down repeat: such a
+-				// button can read as held for good (an adapter's "play"),
+-				// and its repeats would count as input for ever, so the
+-				// screen saver would never start
+-				bool onOffControl = !fKeys[i]->Array()
+-					&& fKeys[i]->UsagePage() != B_HID_USAGE_PAGE_KEYBOARD;
+-				if (!onOffControl
++				// repeat handling; of the media keys (headsets, USB audio
++				// adapters, wireless receivers) only volume up and down
++				// repeat: such a key can read as held for good (an adapter's
++				// "play"), and its repeats would count as input for ever, so
++				// the screen saver would never start
++				if (fKeys[i]->UsagePage() == B_HID_USAGE_PAGE_KEYBOARD
+ 					|| key == ((B_HID_USAGE_PAGE_CONSUMER << 16)
+ 						| B_HID_UID_CON_VOLUME_INCREMENT)
+ 					|| key == ((B_HID_USAGE_PAGE_CONSUMER << 16)

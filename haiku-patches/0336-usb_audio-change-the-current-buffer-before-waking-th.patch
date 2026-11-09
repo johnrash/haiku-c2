@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 7 Nov 2026 03:42:14 -0500
+Subject: [PATCH 336/342] usb_audio: change the current buffer before waking
+ the exchange
+
+The test board recorded 80 ms of an MP3 played twice, once in a few minutes,
+with +344's new checks silent: the node was not late. usb_audio's
+transfer callback released the exchange's semaphore before it set the
+current buffer (and queued the done one again). An exchange woken on
+another CPU in between read the buffer before, the one its last
+exchange had named, so the node took it for nothing new and filled no
+slot; the next two buffers went out with their old data, and the song
+stayed 80 ms behind. The callback now queues the buffer and sets the
+current one first. The node logs a playback exchange that names the
+slot of the one before again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/drivers/audio/usb/Stream.cpp       | 12 ++++++--
+ .../multi_audio/MultiAudioNode.cpp            | 29 +++++++++++++++++++
+ 2 files changed, 38 insertions(+), 3 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Stream.cpp b/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
+index 4d9b3c8eda..2433330b20 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
++++ b/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
+@@ -472,6 +472,15 @@ Stream::_TransferCallback(void* cookie, status_t status, void* data,
+ 		release_spinlock(&stream->fCompletedLock);
+ 		restore_interrupts(state);
+ 	}
++
++	// The buffer goes out again (its data copied now), and the current
++	// buffer changes, before the client is woken: an exchange that came in
++	// between, on another CPU, read the buffer before this one, the same as
++	// in its last exchange. The node then refilled nothing, and the last two
++	// buffers played again, 80 ms of a song twice, with nothing logged.
++	stream->fCurrentBuffer = completed;
++	status = stream->_QueueNextTransfer(completed, false);
++
+ 	if (lost) {
+ 		TRACE(ERR, "recording: the client was late, %" B_PRIu32 " buffers "
+ 			"lost so far\n", stream->fLostBuffers);
+@@ -484,9 +493,6 @@ Stream::_TransferCallback(void* cookie, status_t status, void* data,
+ 			B_DO_NOT_RESCHEDULE);
+ 	}
+ 
+-	stream->fCurrentBuffer = completed;
+-	status = stream->_QueueNextTransfer(completed, false);
+-
+ 	atomic_add(&stream->fInsideNotify, -1);
+ }
+ 
+diff --git a/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp b/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp
+index 3c010c281f..a3dbc9f1cb 100644
+--- a/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp
++++ b/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp
+@@ -57,6 +57,9 @@ public:
+ 	int32				fLate;
+ 	bigtime_t			fWorstLate;
+ 	bigtime_t			fLateLogged;
++	// playback exchanges that named the slot of the one before again
++	int32				fSameSlot;
++	bigtime_t			fSameSlotLogged;
+ 	Resampler			*fResampler;
+ 
+ 	// The producer's buffers wait here, oldest first, for the output thread
+@@ -160,6 +163,8 @@ node_input::node_input(media_input& input, media_format preferredFormat)
+ 	fLate = 0;
+ 	fWorstLate = 0;
+ 	fLateLogged = 0;
++	fSameSlot = 0;
++	fSameSlotLogged = 0;
+ 	fPendingCount = 0;
+ 	fResampler = NULL;
+ }
+@@ -1835,6 +1840,7 @@ MultiAudioNode::_OutputThread()
+ 			system_time());
+ 	}
+ 
++	int64 lastPlayedFrames = 0;
+ 	while (atomic_get(&fQuitThread) == 0) {
+ 		BAutolock locker(fBufferLock);
+ 			// make sure the buffers don't change while we're playing with them
+@@ -1842,6 +1848,29 @@ MultiAudioNode::_OutputThread()
+ 		// send buffer
+ 		fDevice->BufferExchange(&bufferInfo);
+ 
++		// A playback buffer was done, but the exchange names the same slot
++		// as the last: nothing is refilled, and the device plays the old
++		// data again (usb_audio did, until it changed its current buffer
++		// before waking the exchange)
++		bool played = bufferInfo.played_frames_count != lastPlayedFrames;
++		lastPlayedFrames = bufferInfo.played_frames_count;
++		node_input* first = (node_input*)fInputs.ItemAt(0);
++		if (played && first != NULL
++			&& fDevice->BufferList().return_playback_buffers > 1
++			&& first->fOldBufferCycle == bufferInfo.playback_buffer_cycle
++			&& RunState() == BMediaEventLooper::B_STARTED) {
++			first->fSameSlot++;
++			bigtime_t now = system_time();
++			if (now - first->fSameSlotLogged > 1000000) {
++				syslog(LOG_WARNING, "multi_audio %s: exchange named slot %"
++					B_PRId32 " again, not refilled (%" B_PRId32 " since the "
++					"last message)\n", Name(), bufferInfo.playback_buffer_cycle,
++					first->fSameSlot);
++				first->fSameSlot = 0;
++				first->fSameSlotLogged = now;
++			}
++		}
++
+ 		//PRINT(("MultiAudioNode::RunThread: buffer exchanged\n"));
+ 		//PRINT(("MultiAudioNode::RunThread: played_real_time: %lld\n", bufferInfo.played_real_time));
+ 		//PRINT(("MultiAudioNode::RunThread: played_frames_count: %lld\n", bufferInfo.played_frames_count));

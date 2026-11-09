@@ -1,0 +1,1377 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 18:09:08 -0400
+Subject: [PATCH 131/342] meson_decoder: H.264 with the S905's video decoder
+
+A decoder plugin for the streams FFmpeg's reader describes as H.264, before
+FFmpeg's (media_decoder_priority): the chunks go to meson_vdec as Annex B
+(avcC streams converted, their parameter sets first), the NV12 frames come
+back in display order and are written as B_YCbCr422 (NEON, for the video
+overlay) or B_RGB32 (swscale). A frame's time is that of the chunk its
+picture is in. Setup() fails, leaving the stream to FFmpeg, if the decoder
+is in use, the firmware (system data firmware/meson/vdec/gxbb_h264.bin) is
+missing or the stream is more than the hardware decodes (beyond 1920x1088,
+High 10, 4:2:2, fields).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/jam/images/definitions/regular          |   1 +
+ src/add-ons/media/plugins/Jamfile             |   1 +
+ .../media/plugins/meson_decoder/H264.cpp      | 297 +++++++++
+ .../media/plugins/meson_decoder/H264.h        |  53 ++
+ .../media/plugins/meson_decoder/Jamfile       |  31 +
+ .../meson_decoder/MesonVdecDecoder.cpp        | 621 ++++++++++++++++++
+ .../plugins/meson_decoder/MesonVdecDecoder.h  | 110 ++++
+ .../plugins/meson_decoder/MesonVdecPlugin.cpp |  81 +++
+ .../media/plugins/meson_decoder/nv12_neon.c   |  50 ++
+ .../media/plugins/meson_decoder/nv12_neon.h   |  26 +
+ 10 files changed, 1271 insertions(+)
+ create mode 100644 src/add-ons/media/plugins/meson_decoder/H264.cpp
+ create mode 100644 src/add-ons/media/plugins/meson_decoder/H264.h
+ create mode 100644 src/add-ons/media/plugins/meson_decoder/Jamfile
+ create mode 100644 src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
+ create mode 100644 src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h
+ create mode 100644 src/add-ons/media/plugins/meson_decoder/MesonVdecPlugin.cpp
+ create mode 100644 src/add-ons/media/plugins/meson_decoder/nv12_neon.c
+ create mode 100644 src/add-ons/media/plugins/meson_decoder/nv12_neon.h
+
+diff --git a/build/jam/images/definitions/regular b/build/jam/images/definitions/regular
+index f390eaf10c..cda6c07839 100644
+--- a/build/jam/images/definitions/regular
++++ b/build/jam/images/definitions/regular
+@@ -236,6 +236,7 @@ SYSTEM_ADD_ONS_MEDIA_PLUGINS += [ FFilterByBuildFeatures
+ 	ape_reader@x86
+ 	ffmpeg@ffmpeg
+ 	http_streamer
++	arm64 @{ meson_decoder@ffmpeg }@
+ 	raw_decoder
+ ] ;
+ 
+diff --git a/src/add-ons/media/plugins/Jamfile b/src/add-ons/media/plugins/Jamfile
+index 18fac0b190..d5fd07a117 100644
+--- a/src/add-ons/media/plugins/Jamfile
++++ b/src/add-ons/media/plugins/Jamfile
+@@ -5,5 +5,6 @@ SubInclude HAIKU_TOP src add-ons media plugins au_reader ;
+ SubInclude HAIKU_TOP src add-ons media plugins ffmpeg ;
+ SubInclude HAIKU_TOP src add-ons media plugins dvd_streamer ;
+ SubInclude HAIKU_TOP src add-ons media plugins http_streamer ;
++SubInclude HAIKU_TOP src add-ons media plugins meson_decoder ;
+ SubInclude HAIKU_TOP src add-ons media plugins raw_decoder ;
+ SubInclude HAIKU_TOP src add-ons media plugins rtsp_streamer ;
+diff --git a/src/add-ons/media/plugins/meson_decoder/H264.cpp b/src/add-ons/media/plugins/meson_decoder/H264.cpp
+new file mode 100644
+index 0000000000..dfeef92992
+--- /dev/null
++++ b/src/add-ons/media/plugins/meson_decoder/H264.cpp
+@@ -0,0 +1,297 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * The little of H.264's syntax (ITU-T H.264, 7.3.2.1.1) and of its MP4
++ * storage (ISO/IEC 14496-15, the AVCDecoderConfigurationRecord) the
++ * hardware decoder's plugin needs.
++ */
++
++
++#include "H264.h"
++
++#include <string.h>
++
++
++namespace {
++
++
++/*!	Reads the bits of a NAL unit's payload, skipping the emulation
++	prevention bytes (00 00 03 -> 00 00).
++*/
++class BitReader {
++public:
++	BitReader(const uint8* data, size_t size)
++		:
++		fData(data),
++		fSize(size),
++		fPosition(0),
++		fBit(0),
++		fZeros(0),
++		fError(false)
++	{
++	}
++
++	bool Error() const { return fError; }
++
++	uint32 Bit()
++	{
++		if (fBit == 0 && !_NextByte())
++			return 0;
++		uint32 bit = (fByte >> (7 - fBit)) & 1;
++		fBit = (fBit + 1) % 8;
++		return bit;
++	}
++
++	uint32 Bits(uint32 count)
++	{
++		uint32 value = 0;
++		while (count-- > 0)
++			value = (value << 1) | Bit();
++		return value;
++	}
++
++	uint32 UnsignedGolomb()
++	{
++		uint32 zeros = 0;
++		while (Bit() == 0) {
++			if (fError || ++zeros > 31) {
++				fError = true;
++				return 0;
++			}
++		}
++		return ((1u << zeros) - 1) + Bits(zeros);
++	}
++
++	int32 SignedGolomb()
++	{
++		uint32 value = UnsignedGolomb();
++		return (value & 1) != 0 ? (int32)((value + 1) / 2)
++			: -(int32)(value / 2);
++	}
++
++private:
++	bool _NextByte()
++	{
++		while (fPosition < fSize) {
++			uint8 byte = fData[fPosition++];
++			if (fZeros >= 2 && byte == 3) {
++				fZeros = 0;
++				continue;
++			}
++			fZeros = byte == 0 ? fZeros + 1 : 0;
++			fByte = byte;
++			return true;
++		}
++		fError = true;
++		return false;
++	}
++
++	const uint8*	fData;
++	size_t			fSize;
++	size_t			fPosition;
++	uint32			fBit;
++	uint32			fZeros;
++	uint8			fByte;
++	bool			fError;
++};
++
++
++void
++skip_scaling_list(BitReader& reader, uint32 size)
++{
++	int32 last = 8;
++	int32 next = 8;
++	for (uint32 i = 0; i < size; i++) {
++		if (next != 0) {
++			int32 delta = reader.SignedGolomb();
++			next = (last + delta + 256) % 256;
++		}
++		if (next != 0)
++			last = next;
++	}
++}
++
++
++inline uint32
++read_be(const uint8* data, uint32 length)
++{
++	uint32 value = 0;
++	for (uint32 i = 0; i < length; i++)
++		value = (value << 8) | data[i];
++	return value;
++}
++
++
++}	// namespace
++
++
++bool
++h264_parse_sequence(const uint8* nal, size_t size, h264_sequence& sequence)
++{
++	if (size < 4 || (nal[0] & 0x1f) != 7)
++		return false;
++
++	BitReader reader(nal + 1, size - 1);
++	memset(&sequence, 0, sizeof(sequence));
++	sequence.profile = reader.Bits(8);
++	reader.Bits(8);		// the constraint flags
++	sequence.level = reader.Bits(8);
++	reader.UnsignedGolomb();	// seq_parameter_set_id
++	sequence.chroma_format = 1;
++	sequence.bit_depth = 8;
++	switch (sequence.profile) {
++		case 100: case 110: case 122: case 244: case 44: case 83: case 86:
++		case 118: case 128: case 138: case 139: case 134: case 135:
++		{
++			sequence.chroma_format = reader.UnsignedGolomb();
++			if (sequence.chroma_format == 3)
++				reader.Bit();	// separate_colour_plane_flag
++			uint32 lumaDepth = reader.UnsignedGolomb() + 8;
++			uint32 chromaDepth = reader.UnsignedGolomb() + 8;
++			sequence.bit_depth = lumaDepth == chromaDepth ? lumaDepth : 0;
++			reader.Bit();	// qpprime_y_zero_transform_bypass_flag
++			if (reader.Bit()) {
++				// seq_scaling_matrix_present_flag
++				uint32 lists = sequence.chroma_format != 3 ? 8 : 12;
++				for (uint32 i = 0; i < lists; i++) {
++					if (reader.Bit())
++						skip_scaling_list(reader, i < 6 ? 16 : 64);
++				}
++			}
++			break;
++		}
++	}
++	reader.UnsignedGolomb();	// log2_max_frame_num_minus4
++	uint32 orderType = reader.UnsignedGolomb();
++	if (orderType == 0)
++		reader.UnsignedGolomb();	// log2_max_pic_order_cnt_lsb_minus4
++	else if (orderType == 1) {
++		reader.Bit();	// delta_pic_order_always_zero_flag
++		reader.SignedGolomb();
++		reader.SignedGolomb();
++		uint32 cycle = reader.UnsignedGolomb();
++		if (cycle > 255)
++			return false;
++		for (uint32 i = 0; i < cycle; i++)
++			reader.SignedGolomb();
++	}
++	sequence.reference_frames = reader.UnsignedGolomb();
++	reader.Bit();	// gaps_in_frame_num_value_allowed_flag
++	uint32 widthInMbs = reader.UnsignedGolomb() + 1;
++	uint32 heightInMapUnits = reader.UnsignedGolomb() + 1;
++	sequence.frame_only = reader.Bit() != 0;
++	if (!sequence.frame_only)
++		reader.Bit();	// mb_adaptive_frame_field_flag
++	reader.Bit();	// direct_8x8_inference_flag
++	sequence.coded_width = widthInMbs * 16;
++	sequence.coded_height = (sequence.frame_only ? 1 : 2) * heightInMapUnits
++		* 16;
++	sequence.width = sequence.coded_width;
++	sequence.height = sequence.coded_height;
++	if (reader.Bit()) {
++		// frame_cropping_flag: in chroma samples (in luma samples without
++		// chroma), and of field rows in field coding
++		uint32 left = reader.UnsignedGolomb();
++		uint32 right = reader.UnsignedGolomb();
++		uint32 top = reader.UnsignedGolomb();
++		uint32 bottom = reader.UnsignedGolomb();
++		uint32 unitX = sequence.chroma_format == 0
++			|| sequence.chroma_format == 3 ? 1 : 2;
++		uint32 unitY = (sequence.chroma_format == 1 ? 2 : 1)
++			* (sequence.frame_only ? 1 : 2);
++		uint32 cropX = (left + right) * unitX;
++		uint32 cropY = (top + bottom) * unitY;
++		if (cropX >= sequence.coded_width || cropY >= sequence.coded_height)
++			return false;
++		sequence.width -= cropX;
++		sequence.height -= cropY;
++	}
++	return !reader.Error() && widthInMbs <= 512 && heightInMapUnits <= 512;
++}
++
++
++bool
++h264_parse_avcc(const uint8* data, size_t size, uint8* annexB,
++	size_t* _annexBSize, size_t annexBCapacity, uint32* _lengthSize)
++{
++	// version 1, profile, compatibility, level, 6 bits set and the length
++	// size - 1, 3 bits set and the SPS count
++	if (size < 7 || data[0] != 1)
++		return false;
++	*_lengthSize = (data[4] & 3) + 1;
++
++	size_t position = 5;
++	size_t written = 0;
++	for (uint32 type = 0; type < 2; type++) {
++		// the sequence parameter sets, then the picture parameter sets
++		if (position >= size)
++			return false;
++		uint32 count = type == 0 ? data[position] & 0x1f : data[position];
++		position++;
++		for (uint32 i = 0; i < count; i++) {
++			if (position + 2 > size)
++				return false;
++			uint32 length = read_be(data + position, 2);
++			position += 2;
++			if (position + length > size
++				|| written + 4 + length > annexBCapacity) {
++				return false;
++			}
++			static const uint8 kStartCode[4] = { 0, 0, 0, 1 };
++			memcpy(annexB + written, kStartCode, 4);
++			memcpy(annexB + written + 4, data + position, length);
++			written += 4 + length;
++			position += length;
++		}
++	}
++	*_annexBSize = written;
++	return true;
++}
++
++
++size_t
++h264_lengths_to_annexb(const uint8* chunk, size_t size, uint32 lengthSize,
++	uint8* out, size_t capacity)
++{
++	size_t position = 0;
++	size_t written = 0;
++	while (position + lengthSize <= size) {
++		uint32 length = read_be(chunk + position, lengthSize);
++		position += lengthSize;
++		if (length > size - position || written + 4 + length > capacity)
++			return 0;
++		out[written++] = 0;
++		out[written++] = 0;
++		out[written++] = 0;
++		out[written++] = 1;
++		memcpy(out + written, chunk + position, length);
++		written += length;
++		position += length;
++	}
++	return written;
++}
++
++
++const uint8*
++h264_find_sps(const uint8* data, size_t size, size_t* _nalSize)
++{
++	for (size_t i = 0; i + 3 < size; i++) {
++		if (data[i] != 0 || data[i + 1] != 0 || data[i + 2] != 1
++			|| (data[i + 3] & 0x1f) != 7) {
++			continue;
++		}
++		const uint8* nal = data + i + 3;
++		size_t end = i + 3;
++		while (end + 2 < size
++			&& !(data[end] == 0 && data[end + 1] == 0
++				&& (data[end + 2] == 1 || data[end + 2] == 0))) {
++			end++;
++		}
++		if (end + 2 >= size)
++			end = size;
++		*_nalSize = data + end - nal;
++		return nal;
++	}
++	return NULL;
++}
+diff --git a/src/add-ons/media/plugins/meson_decoder/H264.h b/src/add-ons/media/plugins/meson_decoder/H264.h
+new file mode 100644
+index 0000000000..3f46bbb384
+--- /dev/null
++++ b/src/add-ons/media/plugins/meson_decoder/H264.h
+@@ -0,0 +1,53 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef H264_H
++#define H264_H
++
++
++#include <SupportDefs.h>
++
++
++/*!	What the decoder needs to know of an H.264 stream before decoding it:
++	from its first sequence parameter set.
++*/
++struct h264_sequence {
++	uint32	profile;			// profile_idc
++	uint32	level;				// level_idc
++	uint32	chroma_format;		// 1: 4:2:0
++	uint32	bit_depth;			// luma and chroma: 8
++	bool	frame_only;			// no fields
++	uint32	coded_width;		// in pixels, a multiple of 16
++	uint32	coded_height;
++	uint32	width;				// after cropping
++	uint32	height;
++	uint32	reference_frames;	// max_num_ref_frames
++};
++
++
++bool	h264_parse_sequence(const uint8* nal, size_t size,
++			h264_sequence& sequence);
++			// nal: from its header byte, without the start code
++
++
++/*!	The parameter sets of an MP4/Matroska "avcC" record as Annex B NAL units
++	(each after 00 00 00 01), and the length of the length prefix of the
++	stream's NAL units. Returns false if \a data is not an avcC record.
++*/
++bool	h264_parse_avcc(const uint8* data, size_t size, uint8* annexB,
++			size_t* _annexBSize, size_t annexBCapacity,
++			uint32* _lengthSize);
++
++/*!	A chunk whose NAL units each come after a big endian length of
++	\a lengthSize bytes, as Annex B. Returns the bytes written to \a out, or
++	0 if the chunk is malformed or doesn't fit.
++*/
++size_t	h264_lengths_to_annexb(const uint8* chunk, size_t size,
++			uint32 lengthSize, uint8* out, size_t capacity);
++
++/*!	The first sequence parameter set in Annex B data. */
++const uint8* h264_find_sps(const uint8* data, size_t size, size_t* _nalSize);
++
++
++#endif	// H264_H
+diff --git a/src/add-ons/media/plugins/meson_decoder/Jamfile b/src/add-ons/media/plugins/meson_decoder/Jamfile
+new file mode 100644
+index 0000000000..f9eeac2587
+--- /dev/null
++++ b/src/add-ons/media/plugins/meson_decoder/Jamfile
+@@ -0,0 +1,31 @@
++SubDir HAIKU_TOP src add-ons media plugins meson_decoder ;
++
++UsePrivateHeaders media drivers ;
++
++local sources =
++	H264.cpp
++	MesonVdecDecoder.cpp
++	MesonVdecPlugin.cpp
++	nv12_neon.c
++	;
++
++if $(TARGET_ARCH) = arm64 {
++	local architectureObject ;
++	for architectureObject in [ MultiArchSubDirSetup ] {
++		on $(architectureObject) {
++			UseBuildFeatureHeaders ffmpeg ;
++			Includes [ FGristFiles $(sources) ]
++				: [ BuildFeatureAttribute ffmpeg : headers ] ;
++			UseHeaders [ BuildFeatureAttribute ffmpeg : headers : path ] ;
++
++			Addon [ MultiArchDefaultGristFiles meson_decoder ] :
++				$(sources)
++				:
++				[ BuildFeatureAttribute ffmpeg : libraries ]
++				be
++				media
++				[ TargetLibsupc++ ]
++			;
++		}
++	}
++}
+diff --git a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
+new file mode 100644
+index 0000000000..e0c3047a0a
+--- /dev/null
++++ b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
+@@ -0,0 +1,621 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * Decodes H.264 with the S905's video decoder, through the meson_vdec
++ * driver (headers/private/drivers/meson_vdec.h): the chunks go to the
++ * driver as an Annex B stream, the decoded NV12 frames come back in display
++ * order and are written to the caller's buffer as B_YCbCr422 (for the video
++ * overlay) or B_RGB32.
++ *
++ * Setup() fails when the decoder is in use, the firmware is missing or the
++ * stream is one the hardware can't decode (beyond 1920x1088, 4:2:2, 10
++ * bits, fields): the Media Kit then takes the next decoder (FFmpeg's).
++ */
++
++
++#include "MesonVdecDecoder.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include <new>
++
++#include <FindDirectory.h>
++
++extern "C" {
++#include "libavcodec/codec_id.h"
++#include "libswscale/swscale.h"
++}
++
++#include "nv12_neon.h"
++
++
++//#define TRACE_MESON_VDEC
++#ifdef TRACE_MESON_VDEC
++#	define TRACE(x...)	printf("meson_vdec: " x)
++#else
++#	define TRACE(x...)
++#endif
++#define ERROR(x...)		fprintf(stderr, "meson_vdec: " x)
++
++
++static const char* kFirmwarePath = "firmware/meson/vdec/gxbb_h264.bin";
++	// in the system data directory
++static const uint32 kMaxInFlight = 24;
++	// chunks written ahead of the frames taken
++static const bigtime_t kFrameTimeout = 1000000;
++
++
++MesonVdecDecoder::MesonVdecDecoder()
++	:
++	fDevice(-1),
++	fCodec(MESON_VDEC_H264),
++	fFirmware(NULL),
++	fFirmwareSize(0),
++	fHeaders(NULL),
++	fHeadersSize(0),
++	fLengthSize(0),
++	fConverted(NULL),
++	fConvertedSize(0),
++	fRunning(false),
++	fHeadersSent(false),
++	fInputEnded(false),
++	fEndSent(false),
++	fOutputEnded(false),
++	fMappingCount(0),
++	fHaveFrame(false),
++	fChunksInFlight(0),
++	fTimes(NULL),
++	fTimeCount(0),
++	fTimeCapacity(0),
++	fOutputColorSpace(B_RGB32),
++	fOutputBytesPerRow(0),
++	fSwsContext(NULL),
++	fFrameNumber(0),
++	fFieldRate(0)
++{
++	memset(&fSequence, 0, sizeof(fSequence));
++	memset(&fFrame, 0, sizeof(fFrame));
++}
++
++
++MesonVdecDecoder::~MesonVdecDecoder()
++{
++	_StopSession();
++	if (fDevice >= 0)
++		close(fDevice);
++	if (fSwsContext != NULL)
++		sws_freeContext(fSwsContext);
++	free(fFirmware);
++	free(fHeaders);
++	free(fConverted);
++	free(fTimes);
++}
++
++
++void
++MesonVdecDecoder::GetCodecInfo(media_codec_info* info)
++{
++	strlcpy(info->short_name, "meson_vdec", sizeof(info->short_name));
++	strlcpy(info->pretty_name, "H.264 (Amlogic S905 video decoder)",
++		sizeof(info->pretty_name));
++	info->id = 0;
++	info->sub_id = AV_CODEC_ID_H264;
++}
++
++
++status_t
++MesonVdecDecoder::Setup(media_format* ioEncodedFormat, const void* infoBuffer,
++	size_t infoSize)
++{
++	if (ioEncodedFormat->type != B_MEDIA_ENCODED_VIDEO)
++		return B_MEDIA_BAD_FORMAT;
++	BMediaFormats formats;
++	media_format_description description;
++	if (formats.GetCodeFor(*ioEncodedFormat, B_MISC_FORMAT_FAMILY,
++			&description) != B_OK
++		|| description.u.misc.file_format != 'ffmp'
++		|| description.u.misc.codec != AV_CODEC_ID_H264) {
++		return B_MEDIA_BAD_FORMAT;
++	}
++	fInputFormat = *ioEncodedFormat;
++	fFieldRate = ioEncodedFormat->u.encoded_video.output.field_rate;
++
++	// the parameter sets: an avcC record (MP4, Matroska) or Annex B (the
++	// stream itself has them then too)
++	const uint8* info = (const uint8*)infoBuffer;
++	free(fHeaders);
++	fHeadersSize = infoSize * 2 + 64;
++	fHeaders = (uint8*)malloc(fHeadersSize);
++	if (fHeaders == NULL)
++		return B_NO_MEMORY;
++	if (infoSize > 0 && info[0] == 1) {
++		if (!h264_parse_avcc(info, infoSize, fHeaders, &fHeadersSize,
++				fHeadersSize, &fLengthSize)) {
++			ERROR("bad avcC record\n");
++			return B_MEDIA_BAD_FORMAT;
++		}
++	} else {
++		memcpy(fHeaders, info, infoSize);
++		fHeadersSize = infoSize;
++		fLengthSize = 0;
++	}
++
++	size_t spsSize;
++	const uint8* sps = h264_find_sps(fHeaders, fHeadersSize, &spsSize);
++	if (sps == NULL || !h264_parse_sequence(sps, spsSize, fSequence)) {
++		TRACE("no sequence parameter set before the stream\n");
++		return B_MEDIA_BAD_FORMAT;
++	}
++	TRACE("profile %" B_PRIu32 ", level %" B_PRIu32 ", %" B_PRIu32 "x%"
++		B_PRIu32 " (coded %" B_PRIu32 "x%" B_PRIu32 "), %" B_PRIu32
++		" reference frames\n", fSequence.profile, fSequence.level,
++		fSequence.width, fSequence.height, fSequence.coded_width,
++		fSequence.coded_height, fSequence.reference_frames);
++	bool profileOkay = fSequence.profile == 66 || fSequence.profile == 77
++		|| fSequence.profile == 100;
++	if (!profileOkay || fSequence.chroma_format != 1
++		|| fSequence.bit_depth != 8 || !fSequence.frame_only
++		|| fSequence.coded_width > 1920 || fSequence.coded_height > 1088) {
++		TRACE("not for the hardware: profile %" B_PRIu32 ", chroma %" B_PRIu32
++			", %" B_PRIu32 " bits%s\n", fSequence.profile,
++			fSequence.chroma_format, fSequence.bit_depth,
++			fSequence.frame_only ? "" : ", fields");
++		return B_MEDIA_BAD_FORMAT;
++	}
++
++	status_t status = _LoadFirmware();
++	if (status != B_OK)
++		return status;
++
++	// one session at a time: if another one has the decoder, the next
++	// decoder plugin gets the stream
++	fDevice = open(MESON_VDEC_DEVICE, O_RDWR | O_CLOEXEC);
++	if (fDevice < 0) {
++		TRACE("%s: %s\n", MESON_VDEC_DEVICE, strerror(errno));
++		return errno == EBUSY ? B_BUSY : B_MEDIA_BAD_FORMAT;
++	}
++	return B_OK;
++}
++
++
++status_t
++MesonVdecDecoder::_LoadFirmware()
++{
++	char path[B_PATH_NAME_LENGTH];
++	if (find_directory(B_SYSTEM_DATA_DIRECTORY, -1, false, path,
++			sizeof(path)) != B_OK) {
++		return B_ENTRY_NOT_FOUND;
++	}
++	strlcat(path, "/", sizeof(path));
++	strlcat(path, kFirmwarePath, sizeof(path));
++
++	int fd = open(path, O_RDONLY | O_CLOEXEC);
++	if (fd < 0) {
++		TRACE("%s: %s\n", path, strerror(errno));
++		return B_ENTRY_NOT_FOUND;
++	}
++	struct stat st;
++	if (fstat(fd, &st) != 0 || st.st_size <= 0 || st.st_size > 256 * 1024) {
++		close(fd);
++		return B_BAD_DATA;
++	}
++	free(fFirmware);
++	fFirmware = (uint8*)malloc(st.st_size);
++	if (fFirmware == NULL) {
++		close(fd);
++		return B_NO_MEMORY;
++	}
++	fFirmwareSize = st.st_size;
++	ssize_t bytesRead = read(fd, fFirmware, fFirmwareSize);
++	close(fd);
++	return bytesRead == (ssize_t)fFirmwareSize ? B_OK : B_IO_ERROR;
++}
++
++
++status_t
++MesonVdecDecoder::_StartSession()
++{
++	meson_vdec_start start;
++	memset(&start, 0, sizeof(start));
++	start.codec = fCodec;
++	start.firmware = fFirmware;
++	start.firmware_size = fFirmwareSize;
++	start.width = fSequence.width;
++	start.height = fSequence.height;
++	if (ioctl(fDevice, MESON_VDEC_START, &start, sizeof(start)) != 0) {
++		ERROR("start: %s\n", strerror(errno));
++		return errno;
++	}
++	fRunning = true;
++	fHeadersSent = false;
++	fInputEnded = false;
++	fEndSent = false;
++	fOutputEnded = false;
++	fHaveFrame = false;
++	fChunksInFlight = 0;
++	fTimeCount = 0;
++	return B_OK;
++}
++
++
++void
++MesonVdecDecoder::_StopSession()
++{
++	if (!fRunning)
++		return;
++	ioctl(fDevice, MESON_VDEC_STOP, NULL, 0);
++	fRunning = false;
++	fHaveFrame = false;
++	_UnmapFrames();
++}
++
++
++/*!	Our clone of a frame area of the driver's (H.264: one per frame, which
++	the driver may replace when the stream changes).
++*/
++const uint8*
++MesonVdecDecoder::_MapFrames(area_id frames)
++{
++	for (uint32 i = 0; i < fMappingCount; i++) {
++		if (fMappings[i].source == frames)
++			return fMappings[i].address;
++	}
++	if (fMappingCount == kMaxMappings)
++		_UnmapFrames();
++	mapping& entry = fMappings[fMappingCount];
++	void* address;
++	entry.clone = clone_area("meson_vdec frame", &address, B_ANY_ADDRESS,
++		B_READ_AREA, frames);
++	if (entry.clone < 0) {
++		ERROR("clone_area: %s\n", strerror(entry.clone));
++		return NULL;
++	}
++	entry.source = frames;
++	entry.address = (const uint8*)address;
++	fMappingCount++;
++	return entry.address;
++}
++
++
++void
++MesonVdecDecoder::_UnmapFrames()
++{
++	for (uint32 i = 0; i < fMappingCount; i++)
++		delete_area(fMappings[i].clone);
++	fMappingCount = 0;
++}
++
++
++status_t
++MesonVdecDecoder::_Write(const uint8* data, size_t size, uint32* _offset)
++{
++	meson_vdec_write write;
++	write.data = data;
++	write.size = size;
++	write.offset = 0;
++	if (ioctl(fDevice, MESON_VDEC_WRITE, &write, sizeof(write)) != 0) {
++		ERROR("write of %" B_PRIuSIZE " bytes: %s\n", size, strerror(errno));
++		return errno;
++	}
++	*_offset = write.offset;
++	return B_OK;
++}
++
++
++/*!	Writes the next chunk to the decoder as Annex B, one picture per write
++	(at the start of a session, after the parameter sets).
++*/
++status_t
++MesonVdecDecoder::_FeedChunk()
++{
++	const void* chunk;
++	size_t size;
++	media_header header;
++	status_t status = GetNextChunk(&chunk, &size, &header);
++	if (status == B_LAST_BUFFER_ERROR) {
++		fInputEnded = true;
++		return B_OK;
++	}
++	if (status != B_OK)
++		return status;
++
++	size_t headers = fHeadersSent ? 0 : fHeadersSize;
++	size_t capacity = headers + (fLengthSize > 0 ? 4 * size + 64 : size);
++	if (fConvertedSize < capacity) {
++		uint8* converted = (uint8*)realloc(fConverted, capacity);
++		if (converted == NULL)
++			return B_NO_MEMORY;
++		fConverted = converted;
++		fConvertedSize = capacity;
++	}
++	memcpy(fConverted, fHeaders, headers);
++	if (fLengthSize > 0) {
++		size = h264_lengths_to_annexb((const uint8*)chunk, size, fLengthSize,
++			fConverted + headers, fConvertedSize - headers);
++		if (size == 0) {
++			ERROR("malformed chunk\n");
++			return B_OK;
++		}
++	} else
++		memcpy(fConverted + headers, chunk, size);
++	if (headers + size == 0)
++		return B_OK;
++
++	uint32 offset;
++	status = _Write(fConverted, headers + size, &offset);
++	if (status != B_OK)
++		return status;
++	fHeadersSent = true;
++	_AddTime(offset, header.start_time);
++	fChunksInFlight++;
++	return B_OK;
++}
++
++
++/*!	Takes the next decoded frame from the driver into fFrame, writing the
++	stream to the decoder until there is one.
++*/
++status_t
++MesonVdecDecoder::_NextFrame()
++{
++	if (fHaveFrame)
++		return B_OK;
++	if (fOutputEnded)
++		return B_LAST_BUFFER_ERROR;
++	if (!fRunning) {
++		status_t status = _StartSession();
++		if (status != B_OK)
++			return status;
++	}
++
++	while (true) {
++		// wait for a frame only when there is nothing more to write
++		bool full = fChunksInFlight >= kMaxInFlight;
++		meson_vdec_frame frame;
++		memset(&frame, 0, sizeof(frame));
++		frame.timeout = fInputEnded || full ? kFrameTimeout : 0;
++		if (ioctl(fDevice, MESON_VDEC_GET_FRAME, &frame, sizeof(frame))
++				== 0) {
++			if ((frame.flags & MESON_VDEC_FRAME_END_OF_STREAM) != 0) {
++				fOutputEnded = true;
++				return B_LAST_BUFFER_ERROR;
++			}
++			if (_MapFrames(frame.frames) == NULL)
++				return B_NO_MEMORY;
++			fFrame = frame;
++			fHaveFrame = true;
++			if (fChunksInFlight > 0)
++				fChunksInFlight--;
++			return B_OK;
++		}
++		status_t error = errno;
++		if (error != B_TIMED_OUT && error != B_WOULD_BLOCK) {
++			ERROR("frame: %s\n", strerror(error));
++			return error;
++		}
++
++		if (fInputEnded) {
++			if (fEndSent) {
++				ERROR("no end of the stream\n");
++				return B_LAST_BUFFER_ERROR;
++			}
++			if (ioctl(fDevice, MESON_VDEC_END_OF_STREAM, NULL, 0) != 0)
++				return errno;
++			fEndSent = true;
++			continue;
++		}
++		if (full) {
++			// chunks without a picture of their own: write on
++			ERROR("no frame after %" B_PRIu32 " chunks\n", fChunksInFlight);
++			fChunksInFlight = kMaxInFlight - 1;
++			continue;
++		}
++		status_t status = _FeedChunk();
++		if (status != B_OK)
++			return status;
++	}
++}
++
++
++void
++MesonVdecDecoder::_ReleaseFrame()
++{
++	if (!fHaveFrame)
++		return;
++	ioctl(fDevice, MESON_VDEC_RECYCLE_FRAME, &fFrame.index,
++		sizeof(fFrame.index));
++	fHaveFrame = false;
++}
++
++
++void
++MesonVdecDecoder::_AddTime(uint32 offset, bigtime_t time)
++{
++	if (fTimeCount >= 4 * kMaxInFlight) {
++		// chunks that had no picture of their own: drop the oldest
++		memmove(fTimes, fTimes + 1, (fTimeCount - 1) * sizeof(chunk_time));
++		fTimeCount--;
++	}
++	if (fTimeCount == fTimeCapacity) {
++		uint32 capacity = fTimeCapacity > 0 ? fTimeCapacity * 2 : 64;
++		chunk_time* times = (chunk_time*)realloc(fTimes,
++			capacity * sizeof(chunk_time));
++		if (times == NULL)
++			return;
++		fTimes = times;
++		fTimeCapacity = capacity;
++	}
++	fTimes[fTimeCount].offset = offset;
++	fTimes[fTimeCount].time = time;
++	fTimeCount++;
++}
++
++
++/*!	The start time of the frame whose picture is at \a offset in the
++	stream: of the last chunk written at or before it (they are in stream
++	order here). Without one, the earliest: the frames come in display
++	order.
++*/
++bigtime_t
++MesonVdecDecoder::_TakeTime(uint32 offset)
++{
++	if (fTimeCount == 0)
++		return -1;
++	int32 found = -1;
++	for (uint32 i = 0; i < fTimeCount; i++) {
++		if ((int32)(fTimes[i].offset - offset) <= 0)
++			found = i;
++		else
++			break;
++	}
++	if (found < 0) {
++		found = 0;
++		for (uint32 i = 1; i < fTimeCount; i++) {
++			if (fTimes[i].time < fTimes[found].time)
++				found = i;
++		}
++	}
++	bigtime_t time = fTimes[found].time;
++	memmove(fTimes + found, fTimes + found + 1,
++		(fTimeCount - found - 1) * sizeof(chunk_time));
++	fTimeCount--;
++	return time;
++}
++
++
++status_t
++MesonVdecDecoder::NegotiateOutputFormat(media_format* ioDecodedFormat)
++{
++	if (fDevice < 0)
++		return B_NO_INIT;
++
++	fOutputColorSpace
++		= ioDecodedFormat->u.raw_video.display.format == B_YCbCr422
++			? B_YCbCr422 : B_RGB32;
++	uint32 bytesPerRow = fOutputColorSpace == B_YCbCr422
++		? (fSequence.width + 1) / 2 * 4 : fSequence.width * 4;
++	if (ioDecodedFormat->u.raw_video.display.bytes_per_row > bytesPerRow)
++		bytesPerRow = ioDecodedFormat->u.raw_video.display.bytes_per_row;
++	fOutputBytesPerRow = bytesPerRow;
++
++	// the first frame, as the FFmpeg plugin does: whether the decoder can
++	// decode the stream at all
++	status_t status = _NextFrame();
++	if (status != B_OK && status != B_LAST_BUFFER_ERROR) {
++		ERROR("no first frame: %s\n", strerror(status));
++		return status;
++	}
++
++	ioDecodedFormat->type = B_MEDIA_RAW_VIDEO;
++	ioDecodedFormat->require_flags = 0;
++	ioDecodedFormat->deny_flags = B_MEDIA_MAUI_UNDEFINED_FLAGS;
++	ioDecodedFormat->u.raw_video = fInputFormat.u.encoded_video.output;
++	ioDecodedFormat->u.raw_video.interlace = 1;
++	ioDecodedFormat->u.raw_video.first_active = 0;
++	ioDecodedFormat->u.raw_video.last_active = fSequence.height - 1;
++	if (fFieldRate > 0 && fFieldRate < 70)
++		ioDecodedFormat->u.raw_video.field_rate = fFieldRate;
++	ioDecodedFormat->u.raw_video.display.format = fOutputColorSpace;
++	ioDecodedFormat->u.raw_video.display.line_width = fSequence.width;
++	ioDecodedFormat->u.raw_video.display.line_count = fSequence.height;
++	ioDecodedFormat->u.raw_video.display.bytes_per_row = fOutputBytesPerRow;
++	ioDecodedFormat->u.raw_video.display.pixel_offset = 0;
++	ioDecodedFormat->u.raw_video.display.line_offset = 0;
++	ioDecodedFormat->u.raw_video.display.flags = 0;
++	return B_OK;
++}
++
++
++status_t
++MesonVdecDecoder::SeekedTo(int64 frame, bigtime_t time)
++{
++	// The decoder can't drop what it holds: a new session, which starts
++	// with the parameter sets again.
++	_ReleaseFrame();
++	_StopSession();
++	fFrameNumber = frame;
++	return B_OK;
++}
++
++
++status_t
++MesonVdecDecoder::_Convert(void* buffer)
++{
++	const uint8* base = _MapFrames(fFrame.frames);
++	if (base == NULL)
++		return B_NO_MEMORY;
++	base += fFrame.offset;
++	const uint8* luma = base;
++	const uint8* chroma = base + fFrame.chroma_offset;
++	uint32 width = min_c(fFrame.width, fSequence.width);
++	uint32 height = min_c(fFrame.height, fSequence.height);
++
++	if (fOutputColorSpace == B_YCbCr422) {
++		nv12_to_ycbcr422_neon(luma, chroma, fFrame.bytes_per_row,
++			(uint8*)buffer, fOutputBytesPerRow, width, height);
++		return B_OK;
++	}
++
++	fSwsContext = sws_getCachedContext(fSwsContext, width, height,
++		AV_PIX_FMT_NV12, width, height, AV_PIX_FMT_BGRA, SWS_POINT, NULL,
++		NULL, NULL);
++	if (fSwsContext == NULL)
++		return B_NO_MEMORY;
++	const uint8* sourcePlanes[4] = { luma, chroma, NULL, NULL };
++	int sourceStrides[4] = { (int)fFrame.bytes_per_row,
++		(int)fFrame.bytes_per_row, 0, 0 };
++	uint8* targetPlanes[4] = { (uint8*)buffer, NULL, NULL, NULL };
++	int targetStrides[4] = { (int)fOutputBytesPerRow, 0, 0, 0 };
++	sws_scale(fSwsContext, sourcePlanes, sourceStrides, 0, height,
++		targetPlanes, targetStrides);
++	return B_OK;
++}
++
++
++void
++MesonVdecDecoder::_FillHeader(media_header* header)
++{
++	memset(header, 0, sizeof(*header));
++	header->type = B_MEDIA_RAW_VIDEO;
++	header->start_time = _TakeTime(fFrame.stream_offset);
++	header->size_used = (size_t)fOutputBytesPerRow * fSequence.height;
++	header->u.raw_video.display_line_width = fSequence.width;
++	header->u.raw_video.display_line_count = fSequence.height;
++	header->u.raw_video.bytes_per_row = fOutputBytesPerRow;
++	header->u.raw_video.field_gamma = 1.0;
++	header->u.raw_video.field_sequence = fFrameNumber;
++	header->u.raw_video.first_active_line = 1;
++	header->u.raw_video.line_count = fSequence.height;
++	header->u.raw_video.pixel_width_aspect
++		= fInputFormat.u.encoded_video.output.pixel_width_aspect;
++	header->u.raw_video.pixel_height_aspect
++		= fInputFormat.u.encoded_video.output.pixel_height_aspect;
++}
++
++
++status_t
++MesonVdecDecoder::Decode(void* buffer, int64* frameCount,
++	media_header* mediaHeader, media_decode_info* info)
++{
++	if (fDevice < 0)
++		return B_NO_INIT;
++	status_t status = _NextFrame();
++	if (status != B_OK)
++		return status;
++
++	status = _Convert(buffer);
++	_FillHeader(mediaHeader);
++	_ReleaseFrame();
++	if (status != B_OK)
++		return status;
++	*frameCount = 1;
++	fFrameNumber++;
++	return B_OK;
++}
+diff --git a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h
+new file mode 100644
+index 0000000000..5550dfd6e6
+--- /dev/null
++++ b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h
+@@ -0,0 +1,110 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef MESON_VDEC_DECODER_H
++#define MESON_VDEC_DECODER_H
++
++
++#include <MediaFormats.h>
++#include <OS.h>
++
++#include <meson_vdec.h>
++
++#include "DecoderPlugin.h"
++#include "H264.h"
++
++
++struct SwsContext;
++
++
++class MesonVdecDecoder : public Decoder {
++public:
++								MesonVdecDecoder();
++	virtual						~MesonVdecDecoder();
++
++	virtual	void				GetCodecInfo(media_codec_info* codecInfo);
++	virtual	status_t			Setup(media_format* ioEncodedFormat,
++									const void* infoBuffer, size_t infoSize);
++	virtual	status_t			NegotiateOutputFormat(
++									media_format* ioDecodedFormat);
++	virtual	status_t			SeekedTo(int64 frame, bigtime_t time);
++	virtual	status_t			Decode(void* buffer, int64* frameCount,
++									media_header* mediaHeader,
++									media_decode_info* info);
++
++private:
++			status_t			_LoadFirmware();
++			status_t			_StartSession();
++			void				_StopSession();
++			status_t			_NextFrame();
++			status_t			_FeedChunk();
++			status_t			_Write(const uint8* data, size_t size,
++									uint32* _offset);
++			const uint8*		_MapFrames(area_id frames);
++			void				_UnmapFrames();
++			void				_ReleaseFrame();
++			status_t			_Convert(void* buffer);
++			void				_FillHeader(media_header* header);
++
++			void				_AddTime(uint32 offset, bigtime_t time);
++			bigtime_t			_TakeTime(uint32 offset);
++
++private:
++			int					fDevice;
++			uint32				fCodec;			// MESON_VDEC_*
++			uint8*				fFirmware;
++			size_t				fFirmwareSize;
++			media_format		fInputFormat;
++			h264_sequence		fSequence;
++
++			// the parameter sets of an MP4 stream ("avcC"), as Annex B, for
++			// the start of each session; the length of its NAL lengths (0:
++			// the stream is Annex B already)
++			uint8*				fHeaders;
++			size_t				fHeadersSize;
++			uint32				fLengthSize;
++			uint8*				fConverted;
++			size_t				fConvertedSize;
++
++			bool				fRunning;
++			bool				fHeadersSent;
++			bool				fInputEnded;
++			bool				fEndSent;
++			bool				fOutputEnded;
++			// our clones of the driver's frame areas
++			struct mapping {
++				area_id			source;
++				area_id			clone;
++				const uint8*	address;
++			};
++	static	const uint32		kMaxMappings = 32;
++			mapping				fMappings[kMaxMappings];
++			uint32				fMappingCount;
++
++			// the frame taken from the driver, not yet given back
++			meson_vdec_frame	fFrame;
++			bool				fHaveFrame;
++			uint32				fChunksInFlight;
++				// written, their frames not taken yet
++
++			// the chunks written whose frames weren't taken: where in the
++			// stream they start, and their start times. A frame takes the
++			// last chunk that starts at or before its picture.
++			struct chunk_time {
++				uint32			offset;
++				bigtime_t		time;
++			};
++			chunk_time*			fTimes;
++			uint32				fTimeCount;
++			uint32				fTimeCapacity;
++
++			color_space			fOutputColorSpace;
++			uint32				fOutputBytesPerRow;
++			SwsContext*			fSwsContext;
++			uint32				fFrameNumber;
++			float				fFieldRate;
++};
++
++
++#endif	// MESON_VDEC_DECODER_H
+diff --git a/src/add-ons/media/plugins/meson_decoder/MesonVdecPlugin.cpp b/src/add-ons/media/plugins/meson_decoder/MesonVdecPlugin.cpp
+new file mode 100644
+index 0000000000..f1ac4cf219
+--- /dev/null
++++ b/src/add-ons/media/plugins/meson_decoder/MesonVdecPlugin.cpp
+@@ -0,0 +1,81 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * meson_decoder: a decoder plugin for the S905's video decoder (PLAN.md M26).
++ * It takes the streams FFmpeg's reader describes as H.264, and comes first
++ * among the decoders (media_decoder_priority).
++ */
++
++
++#include <new>
++
++#include <MediaFormats.h>
++
++extern "C" {
++#include "libavcodec/codec_id.h"
++}
++
++#include "DecoderPlugin.h"
++#include "MesonVdecDecoder.h"
++
++
++class MesonVdecPlugin : public DecoderPlugin {
++public:
++	virtual	Decoder*			NewDecoder(uint index);
++	virtual	status_t			GetSupportedFormats(media_format** _formats,
++									size_t* _count);
++};
++
++
++static media_format sFormats[1];
++
++
++Decoder*
++MesonVdecPlugin::NewDecoder(uint index)
++{
++	return new(std::nothrow) MesonVdecDecoder();
++}
++
++
++status_t
++MesonVdecPlugin::GetSupportedFormats(media_format** _formats, size_t* _count)
++{
++	BMediaFormats mediaFormats;
++	if (mediaFormats.InitCheck() != B_OK)
++		return B_ERROR;
++
++	// as AVFormatReader describes them
++	media_format_description description;
++	memset(&description, 0, sizeof(description));
++	description.family = B_MISC_FORMAT_FAMILY;
++	description.u.misc.file_format = 'ffmp';
++	description.u.misc.codec = AV_CODEC_ID_H264;
++
++	media_format format;
++	format.type = B_MEDIA_ENCODED_VIDEO;
++	format.require_flags = 0;
++	format.deny_flags = B_MEDIA_MAUI_UNDEFINED_FLAGS;
++	if (mediaFormats.MakeFormatFor(&description, 1, &format) != B_OK)
++		return B_ERROR;
++	sFormats[0] = format;
++
++	*_formats = sFormats;
++	*_count = 1;
++	return B_OK;
++}
++
++
++extern "C" {
++
++// before the software decoders (AddOnManager)
++int32 media_decoder_priority = 100;
++
++}
++
++
++MediaPlugin*
++instantiate_plugin()
++{
++	return new(std::nothrow) MesonVdecPlugin;
++}
+diff --git a/src/add-ons/media/plugins/meson_decoder/nv12_neon.c b/src/add-ons/media/plugins/meson_decoder/nv12_neon.c
+new file mode 100644
+index 0000000000..adb3e77820
+--- /dev/null
++++ b/src/add-ons/media/plugins/meson_decoder/nv12_neon.c
+@@ -0,0 +1,50 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "nv12_neon.h"
++
++// The build includes GCC's headers like its own, with -Werror.
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wsign-compare"
++#pragma GCC diagnostic ignored "-Wmissing-braces"
++#include <arm_neon.h>
++#pragma GCC diagnostic pop
++
++
++/*!	NV12 (a Y plane, then Cb and Cr interleaved at half the height) to
++	packed 4:2:2 Y0 Cb Y1 Cr (B_YCbCr422), what the video overlay takes. Each
++	chroma row serves two rows, as in the FFmpeg plugin's conversion from
++	planar 4:2:0. 32 pixels at a time, the rest one pair at a time.
++*/
++void
++nv12_to_ycbcr422_neon(const uint8_t* luma, const uint8_t* chroma,
++	size_t sourceBytesPerRow, uint8_t* out, size_t outBytesPerRow,
++	uint32_t width, uint32_t height)
++{
++	for (uint32_t y = 0; y < height; y++) {
++		const uint8_t* lumaRow = luma + (size_t)y * sourceBytesPerRow;
++		const uint8_t* chromaRow = chroma + (size_t)(y / 2) * sourceBytesPerRow;
++		uint8_t* pixel = out + (size_t)y * outBytesPerRow;
++
++		uint32_t x = 0;
++		for (; x + 32 <= width; x += 32) {
++			uint8x16x2_t lumaPairs = vld2q_u8(lumaRow + x);
++			uint8x16x2_t chromaPairs = vld2q_u8(chromaRow + x);
++			uint8x16x4_t packed;
++			packed.val[0] = lumaPairs.val[0];
++			packed.val[1] = chromaPairs.val[0];
++			packed.val[2] = lumaPairs.val[1];
++			packed.val[3] = chromaPairs.val[1];
++			vst4q_u8(pixel + 2 * x, packed);
++		}
++		for (; x + 1 < width; x += 2) {
++			pixel[2 * x] = lumaRow[x];
++			pixel[2 * x + 1] = chromaRow[x];
++			pixel[2 * x + 2] = lumaRow[x + 1];
++			pixel[2 * x + 3] = chromaRow[x + 1];
++		}
++	}
++}
+diff --git a/src/add-ons/media/plugins/meson_decoder/nv12_neon.h b/src/add-ons/media/plugins/meson_decoder/nv12_neon.h
+new file mode 100644
+index 0000000000..7c84f03c44
+--- /dev/null
++++ b/src/add-ons/media/plugins/meson_decoder/nv12_neon.h
+@@ -0,0 +1,26 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef NV12_NEON_H
++#define NV12_NEON_H
++
++
++#include <stddef.h>
++#include <stdint.h>
++
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++void nv12_to_ycbcr422_neon(const uint8_t* luma, const uint8_t* chroma,
++	size_t sourceBytesPerRow, uint8_t* out, size_t outBytesPerRow,
++	uint32_t width, uint32_t height);
++
++#ifdef __cplusplus
++}
++#endif
++
++
++#endif	// NV12_NEON_H

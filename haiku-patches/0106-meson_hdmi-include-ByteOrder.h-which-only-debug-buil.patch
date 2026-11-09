@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 14:20:12 -0400
+Subject: [PATCH 106/342] meson_hdmi: include ByteOrder.h, which only debug
+ builds brought in
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+index 2b1d173a36..6d469a5876 100644
+--- a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
++++ b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+@@ -40,6 +40,7 @@
+ #include <stdio.h>
+ #include <string.h>
+ 
++#include <ByteOrder.h>
+ #include <KernelExport.h>
+ #include <boot_item.h>
+ #include <debug.h>

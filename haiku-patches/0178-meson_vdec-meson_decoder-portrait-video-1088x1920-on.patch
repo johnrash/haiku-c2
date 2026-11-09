@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 18:55:04 -0400
+Subject: [PATCH 178/342] meson_vdec, meson_decoder: portrait video (1088x1920)
+ on the hardware
+
+H.264 and HEVC took at most 1920x1088, so video filmed upright on a phone
+(1080x1920) went to FFmpeg. They now take as many macroblocks as 1920x1088
+either way round, no side longer than 1920. Linux's 1920x1080 limit is its
+policy; the hardware's own limit is unknown. MPEG-1/2 keep theirs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../drivers/video/meson_vdec/meson_vdec.cpp   |  2 +-
+ .../video/meson_vdec/meson_vdec_hevc.cpp      |  4 ++--
+ .../video/meson_vdec/meson_vdec_private.h     | 14 ++++++++++++++
+ .../meson_decoder/MesonVdecDecoder.cpp        | 19 ++++++++++++++++---
+ 4 files changed, 33 insertions(+), 6 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+index d208fca9ab..893206c0f0 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+@@ -971,7 +971,7 @@ MesonVdec::_SetupH264Frames(const uint32* info)
+ 	uint32 mbHeight = mbTotal / mbWidth;
+ 	uint32 cropBottom = info[3] & 0xff;
+ 	uint32 cropRight = (info[3] >> 16) & 0xff;
+-	if (16 * mbWidth > kMaxWidth || 16 * mbHeight > kMaxHeight
++	if (!picture_fits(16 * mbWidth, 16 * mbHeight)
+ 		|| cropRight >= 16 * mbWidth || cropBottom >= 16 * mbHeight) {
+ 		INFO("stream of %" B_PRIu32 "x%" B_PRIu32 " macroblocks: too large\n",
+ 			mbWidth, mbHeight);
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp
+index 96c3ab7997..062ff97ff7 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp
+@@ -4,7 +4,7 @@
+  *
+  * meson_vdec's HEVC block (PLAN.md M26 stage 3): the S905's HEVC decoder
+  * with linux-firmware's gxl_hevc.bin (MESON_VDEC_HEVC). It decodes Main
+- * and Main 10 streams (4:2:0, up to 1920x1088) to 8-bit NV12
++ * and Main 10 streams (4:2:0, up to 1920x1088 or 1088x1920) to 8-bit NV12
+  * (10-bit ones keep their references compressed, and the NV12 copy is the
+  * firmware's "double write"). The register
+  * facts are in the port's docs/m26-vdec-hevc-facts.md and
+@@ -573,7 +573,7 @@ MesonVdec::_SetupHevcFrames()
+ 	uint32 width = _Rpm(RPM_WIDTH);
+ 	uint32 height = _Rpm(RPM_HEIGHT);
+ 	uint32 log2Ctb = _Rpm(RPM_LOG2_MIN_CB) + 3 + _Rpm(RPM_LOG2_DIFF_CB);
+-	if (width < 16 || height < 16 || width > kMaxWidth || height > kMaxHeight
++	if (width < 16 || height < 16 || !picture_fits(width, height)
+ 		|| log2Ctb < 4 || log2Ctb > 6) {
+ 		INFO("HEVC stream of %" B_PRIu32 "x%" B_PRIu32 ", CTB %" B_PRIu32
+ 			": not decoded\n", width, height, 1u << log2Ctb);
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
+index 2636050a87..f8e708ade8 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
+@@ -181,8 +181,22 @@ static const uint32 kMaxFrames = 24;
+ 	// H.264's at most (and the queue's)
+ static const uint32 kMaxWidth = 1920;
+ static const uint32 kMaxHeight = 1088;
++	// MPEG-1/2's
++// H.264 and HEVC: as many macroblocks as 1920x1088, either way round (phones
++// film 1080x1920). Linux's 1920x1080 is its policy; the hardware's limit is
++// unknown (docs/m26-vdec-h264-facts.md §13).
++static const uint32 kMaxSide = 1920;
++static const uint32 kMaxMacroblocks = (1920 / 16) * (1088 / 16);
+ static const bigtime_t kPollInterval = 2000;
+ 
++
++static inline bool
++picture_fits(uint32 width, uint32 height)
++{
++	return width <= kMaxSide && height <= kMaxSide
++		&& ((width + 15) / 16) * ((height + 15) / 16) <= kMaxMacroblocks;
++}
++
+ // H.264
+ static const uint32 kH264ExtensionSize = 20 * 1024;
+ static const size_t kH264WorkspaceSize = 0x1ee000;
+diff --git a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
+index 5b3cd85f66..39f647989b 100644
+--- a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
++++ b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
+@@ -13,7 +13,8 @@
+  * the frame from the decoder's memory.
+  *
+  * Setup() fails when the decoder is in use, the firmware is missing or the
+- * stream is one the hardware can't decode (beyond 1920x1088, not 4:2:0;
++ * stream is one the hardware can't decode (more than 1920x1088 or
++ * 1088x1920 (portrait), not 4:2:0;
+  * H.264: 10 bits, fields; HEVC: more than 10 bits): the Media Kit then
+  * takes the next decoder (FFmpeg's).
+  * MESON_DECODER_DISABLE in the environment makes it fail always (to compare
+@@ -61,6 +62,18 @@ static const uint32 kMaxInFlight = 24;
+ static const bigtime_t kFrameTimeout = 1000000;
+ 
+ 
++/*!	What meson_vdec takes: as many macroblocks as 1920x1088, either way round
++	(portrait video), no side longer than 1920.
++*/
++static bool
++picture_fits(uint32 width, uint32 height)
++{
++	return width <= 1920 && height <= 1920
++		&& ((width + 15) / 16) * ((height + 15) / 16)
++			<= (1920 / 16) * (1088 / 16);
++}
++
++
+ MesonVdecDecoder::MesonVdecDecoder()
+ 	:
+ 	fDevice(-1),
+@@ -191,7 +204,7 @@ MesonVdecDecoder::Setup(media_format* ioEncodedFormat, const void* infoBuffer,
+ 		// the profile number doesn't matter, what it takes does
+ 		if (sequence.chroma_format != 1
+ 			|| (sequence.bit_depth != 8 && sequence.bit_depth != 10)
+-			|| sequence.coded_width > 1920 || sequence.coded_height > 1088) {
++			|| !picture_fits(sequence.coded_width, sequence.coded_height)) {
+ 			TRACE("not for the hardware\n");
+ 			return B_MEDIA_BAD_FORMAT;
+ 		}
+@@ -213,7 +226,7 @@ MesonVdecDecoder::Setup(media_format* ioEncodedFormat, const void* infoBuffer,
+ 			|| sequence.profile == 100;
+ 		if (!profileOkay || sequence.chroma_format != 1
+ 			|| sequence.bit_depth != 8 || !sequence.frame_only
+-			|| sequence.coded_width > 1920 || sequence.coded_height > 1088) {
++			|| !picture_fits(sequence.coded_width, sequence.coded_height)) {
+ 			TRACE("not for the hardware: profile %" B_PRIu32 ", chroma %"
+ 				B_PRIu32 ", %" B_PRIu32 " bits%s\n", sequence.profile,
+ 				sequence.chroma_format, sequence.bit_depth,

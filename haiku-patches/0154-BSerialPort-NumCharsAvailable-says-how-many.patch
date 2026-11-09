@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 01:45:41 -0400
+Subject: [PATCH 154/342] BSerialPort: NumCharsAvailable() says how many
+
+It was a stub that always gave 0; it asks the driver (FIONREAD) now.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kits/device/SerialPort.cpp | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/src/kits/device/SerialPort.cpp b/src/kits/device/SerialPort.cpp
+index b84899d4d1..e37535492e 100644
+--- a/src/kits/device/SerialPort.cpp
++++ b/src/kits/device/SerialPort.cpp
+@@ -390,13 +390,15 @@ BSerialPort::SetRTS(bool asserted)
+ status_t
+ BSerialPort::NumCharsAvailable(int32 *numChars)
+ {
+-	//No help from the BeBook...
+ 	if (ffd < 0)
+ 		return B_NO_INIT;
+ 
+-	// TODO: Implement ?
++	// the bytes a read could take now
++	int size;
++	if (ioctl(ffd, FIONREAD, &size, sizeof(size)) < 0)
++		return errno;
+ 	if (numChars)
+-		*numChars = 0;
++		*numChars = size;
+ 	return B_OK;
+ }
+ 

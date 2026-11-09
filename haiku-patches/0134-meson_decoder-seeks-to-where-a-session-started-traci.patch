@@ -1,0 +1,206 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 18:45:34 -0400
+Subject: [PATCH 134/342] meson_decoder: seeks to where a session started;
+ tracing, disabling
+
+MediaPlayer seeks back to the start after settling the format (which
+decoded the first frame): the session goes on past the chunks it had, no
+restart. MESON_DECODER_TRACE logs what the decoder is asked to stderr,
+MESON_DECODER_DISABLE leaves the streams to FFmpeg (for comparing). The
+frame areas stay mapped across sessions.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../meson_decoder/MesonVdecDecoder.cpp        | 68 ++++++++++++++++---
+ .../plugins/meson_decoder/MesonVdecDecoder.h  |  7 ++
+ 2 files changed, 64 insertions(+), 11 deletions(-)
+
+diff --git a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
+index e0c3047a0a..06a708879a 100644
+--- a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
++++ b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
+@@ -11,6 +11,8 @@
+  * Setup() fails when the decoder is in use, the firmware is missing or the
+  * stream is one the hardware can't decode (beyond 1920x1088, 4:2:2, 10
+  * bits, fields): the Media Kit then takes the next decoder (FFmpeg's).
++ * MESON_DECODER_DISABLE in the environment makes it fail always (to compare
++ * with FFmpeg); MESON_DECODER_TRACE logs what it is asked to stderr.
+  */
+ 
+ 
+@@ -36,12 +38,10 @@ extern "C" {
+ #include "nv12_neon.h"
+ 
+ 
+-//#define TRACE_MESON_VDEC
+-#ifdef TRACE_MESON_VDEC
+-#	define TRACE(x...)	printf("meson_vdec: " x)
+-#else
+-#	define TRACE(x...)
+-#endif
++// MESON_DECODER_TRACE=1 in the environment: what the decoder is asked
++static bool sTrace = getenv("MESON_DECODER_TRACE") != NULL;
++#define TRACE(x...)		do { if (sTrace) fprintf(stderr, "meson_vdec: " x); } \
++							while (false)
+ #define ERROR(x...)		fprintf(stderr, "meson_vdec: " x)
+ 
+ 
+@@ -71,6 +71,10 @@ MesonVdecDecoder::MesonVdecDecoder()
+ 	fMappingCount(0),
+ 	fHaveFrame(false),
+ 	fChunksInFlight(0),
++	fSessionChunks(0),
++	fSessionStart(-1),
++	fSessionFrames(0),
++	fSkipChunks(0),
+ 	fTimes(NULL),
+ 	fTimeCount(0),
+ 	fTimeCapacity(0),
+@@ -88,6 +92,7 @@ MesonVdecDecoder::MesonVdecDecoder()
+ MesonVdecDecoder::~MesonVdecDecoder()
+ {
+ 	_StopSession();
++	_UnmapFrames();
+ 	if (fDevice >= 0)
+ 		close(fDevice);
+ 	if (fSwsContext != NULL)
+@@ -116,6 +121,10 @@ MesonVdecDecoder::Setup(media_format* ioEncodedFormat, const void* infoBuffer,
+ {
+ 	if (ioEncodedFormat->type != B_MEDIA_ENCODED_VIDEO)
+ 		return B_MEDIA_BAD_FORMAT;
++	if (getenv("MESON_DECODER_DISABLE") != NULL) {
++		// for comparing with FFmpeg's decoder
++		return B_MEDIA_BAD_FORMAT;
++	}
+ 	BMediaFormats formats;
+ 	media_format_description description;
+ 	if (formats.GetCodeFor(*ioEncodedFormat, B_MISC_FORMAT_FAMILY,
+@@ -241,6 +250,10 @@ MesonVdecDecoder::_StartSession()
+ 	fHaveFrame = false;
+ 	fChunksInFlight = 0;
+ 	fTimeCount = 0;
++	fSessionChunks = 0;
++	fSessionStart = -1;
++	fSessionFrames = 0;
++	fSkipChunks = 0;
+ 	return B_OK;
+ }
+ 
+@@ -253,7 +266,7 @@ MesonVdecDecoder::_StopSession()
+ 	ioctl(fDevice, MESON_VDEC_STOP, NULL, 0);
+ 	fRunning = false;
+ 	fHaveFrame = false;
+-	_UnmapFrames();
++	// the driver keeps the frame areas for the next session
+ }
+ 
+ 
+@@ -320,11 +333,20 @@ MesonVdecDecoder::_FeedChunk()
+ 	media_header header;
+ 	status_t status = GetNextChunk(&chunk, &size, &header);
+ 	if (status == B_LAST_BUFFER_ERROR) {
++		TRACE("the chunks ended\n");
+ 		fInputEnded = true;
+ 		return B_OK;
+ 	}
+ 	if (status != B_OK)
+ 		return status;
++	TRACE("chunk: %" B_PRIuSIZE " bytes, time %" B_PRIdBIGTIME "%s\n", size,
++		header.start_time, fSkipChunks > 0 ? ", written already" : "");
++	if (fSkipChunks > 0) {
++		fSkipChunks--;
++		return B_OK;
++	}
++	if (fSessionChunks++ == 0)
++		fSessionStart = header.start_time;
+ 
+ 	size_t headers = fHeadersSent ? 0 : fHeadersSize;
+ 	size_t capacity = headers + (fLengthSize > 0 ? 4 * size + 64 : size);
+@@ -413,7 +435,8 @@ MesonVdecDecoder::_NextFrame()
+ 		}
+ 		if (full) {
+ 			// chunks without a picture of their own: write on
+-			ERROR("no frame after %" B_PRIu32 " chunks\n", fChunksInFlight);
++			ERROR("no frame after %" B_PRIu32 " chunks, %" B_PRIu32
++				" times waiting\n", fChunksInFlight, fTimeCount);
+ 			fChunksInFlight = kMaxInFlight - 1;
+ 			continue;
+ 		}
+@@ -495,6 +518,9 @@ MesonVdecDecoder::NegotiateOutputFormat(media_format* ioDecodedFormat)
+ {
+ 	if (fDevice < 0)
+ 		return B_NO_INIT;
++	TRACE("negotiate: color space %#x, %" B_PRIu32 " bytes per row\n",
++		ioDecodedFormat->u.raw_video.display.format,
++		ioDecodedFormat->u.raw_video.display.bytes_per_row);
+ 
+ 	fOutputColorSpace
+ 		= ioDecodedFormat->u.raw_video.display.format == B_YCbCr422
+@@ -536,11 +562,21 @@ MesonVdecDecoder::NegotiateOutputFormat(media_format* ioDecodedFormat)
+ status_t
+ MesonVdecDecoder::SeekedTo(int64 frame, bigtime_t time)
+ {
++	TRACE("seeked to frame %" B_PRId64 ", %" B_PRIdBIGTIME " us (%s)\n", frame,
++		time, fRunning ? "running" : "stopped");
+ 	// The decoder can't drop what it holds: a new session, which starts
+-	// with the parameter sets again.
++	// with the parameter sets again. Unless it is a seek to where this
++	// session started, before it handed out a frame (MediaPlayer does that
++	// after settling the format, which decoded the first frame): it just
++	// goes on, past the chunks it was given already.
++	fFrameNumber = frame;
++	if (fRunning && fSessionFrames == 0 && fSessionStart >= 0
++		&& time >= fSessionStart - 1000 && time <= fSessionStart + 1000) {
++		fSkipChunks = fSessionChunks;
++		return B_OK;
++	}
+ 	_ReleaseFrame();
+ 	_StopSession();
+-	fFrameNumber = frame;
+ 	return B_OK;
+ }
+ 
+@@ -606,13 +642,23 @@ MesonVdecDecoder::Decode(void* buffer, int64* frameCount,
+ {
+ 	if (fDevice < 0)
+ 		return B_NO_INIT;
++	bigtime_t begin = system_time();
+ 	status_t status = _NextFrame();
+-	if (status != B_OK)
++	if (status != B_OK) {
++		TRACE("decode: %s\n", strerror(status));
+ 		return status;
++	}
++	bigtime_t decoded = system_time();
+ 
+ 	status = _Convert(buffer);
+ 	_FillHeader(mediaHeader);
+ 	_ReleaseFrame();
++	fSessionFrames++;
++	TRACE("frame %" B_PRIu32 ": buffer %" B_PRIu32 ", time %" B_PRIdBIGTIME
++		", offset %#" B_PRIx32 ", %" B_PRIu32 " chunks ahead; %" B_PRIdBIGTIME
++		" us to the frame, %" B_PRIdBIGTIME " us to convert\n", fFrameNumber,
++		fFrame.index, mediaHeader->start_time, fFrame.stream_offset,
++		fChunksInFlight, decoded - begin, system_time() - decoded);
+ 	if (status != B_OK)
+ 		return status;
+ 	*frameCount = 1;
+diff --git a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h
+index 5550dfd6e6..17c8a870d5 100644
+--- a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h
++++ b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h
+@@ -87,6 +87,13 @@ private:
+ 			bool				fHaveFrame;
+ 			uint32				fChunksInFlight;
+ 				// written, their frames not taken yet
++			uint32				fSessionChunks;
++			bigtime_t			fSessionStart;
++			uint32				fSessionFrames;
++				// this session's: chunks written, the first one's time,
++				// frames handed out
++			uint32				fSkipChunks;
++				// written already: a seek to where the session started
+ 
+ 			// the chunks written whose frames weren't taken: where in the
+ 			// stream they start, and their start times. A frame takes the

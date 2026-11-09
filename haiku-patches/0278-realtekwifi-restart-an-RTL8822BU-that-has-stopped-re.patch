@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Tue, 3 Nov 2026 19:13:08 -0500
+Subject: [PATCH 278/342] realtekwifi: restart an RTL8822BU that has stopped
+ receiving
+
+Under heavy traffic the chip stops receiving, after minutes (seen after 1.5 to
+7.5 minutes, 1 to 5 GB): a bulk IN stays open and is NAKed, its Rx FIFO is empty,
+its Rx DMA idle and the MAC's receive enabled, on any channel. Taking the interface
+down and up cures it at once. The cause isn't known: not the temperature
+triggered IQK (none ran), and it happens with Rx aggregation off as well. net80211
+sees a beacon miss and then scans in vain, forever.
+
+As a beacon comes every 100 ms, 4 s after the last frame the watchdog now restarts
+the device, or every 2 minutes if a restart brought none, as there may simply be
+no access point around. Only for this chip (rx_silence_limit).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../wlan/realtekwifi/dev/rtwn/if_rtwn.c       | 21 +++++++++++++++++++
+ .../wlan/realtekwifi/dev/rtwn/if_rtwnvar.h    |  5 +++++
+ .../dev/rtwn/rtl8822b/usb/r22bu_attach.c      |  8 +++++++
+ .../realtekwifi/dev/rtwn/usb/rtwn_usb_rx.c    |  1 +
+ 4 files changed, 35 insertions(+)
+
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn.c
+index 510e00b1bb..f03f47cf33 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn.c
+@@ -1474,6 +1474,27 @@ rtwn_watchdog(void *arg)
+ 		ieee80211_restart_all(ic);
+ 		return;
+ 	}
++
++	/*
++	 * A chip that has stopped receiving (see rx_silence_limit): after frames
++	 * came and then none for the limit, or every 2 minutes if a restart
++	 * didn't bring any, as there may simply be nothing around.
++	 */
++	if (sc->rx_silence_limit != 0) {
++		if (sc->sc_rx_transfers != sc->sc_rx_seen) {
++			sc->sc_rx_seen = sc->sc_rx_transfers;
++			sc->sc_rx_silence = 0;
++			sc->sc_rx_flowing = 1;
++		} else if (++sc->sc_rx_silence
++		    >= (sc->sc_rx_flowing ? sc->rx_silence_limit : 120)) {
++			ic_printf(ic, "nothing received for %d s, restarting\n",
++			    sc->sc_rx_silence);
++			sc->sc_rx_silence = 0;
++			sc->sc_rx_flowing = 0;
++			ieee80211_restart_all(ic);
++			return;
++		}
++	}
+ 	callout_reset(&sc->sc_watchdog_to, hz, rtwn_watchdog, sc);
+ }
+ #endif
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwnvar.h b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwnvar.h
+index 494a44cddd..195c705559 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwnvar.h
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwnvar.h
+@@ -224,6 +224,11 @@ struct rtwn_softc {
+ #ifndef D4054
+ 	struct callout		sc_watchdog_to;
+ 	int			sc_tx_timer;
++	uint32_t		sc_rx_transfers;	/* completed, with data */
++	uint32_t		sc_rx_seen;
++	int			sc_rx_silence;		/* seconds */
++	int			sc_rx_flowing;
++	int			rx_silence_limit;	/* seconds; 0: not watched */
+ #endif
+ 
+ 	struct mtx		sc_mtx;
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_attach.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_attach.c
+index 48699227f7..0b9d237682 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_attach.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_attach.c
+@@ -244,6 +244,14 @@ r22bu_attach(struct rtwn_usb_softc *uc)
+ 	/* Rx aggregation: 5 KiB and then a frame of up to 11454 bytes */
+ 	uc->uc_rx_buf_size = RTWN_USB_RXBUFSZ_MAX;
+ 
++	/*
++	 * Under heavy traffic the chip stops receiving after minutes: USB and
++	 * its Rx DMA are idle, nothing is in its Rx FIFO, on any channel, until
++	 * it is initialized again. The cause isn't known yet. At least a beacon
++	 * comes every 100 ms, so 4 s without a frame means that.
++	 */
++	sc->rx_silence_limit		= 4;
++
+ 	/* USB part. */
+ 	uc->uc_align_rx			= r22bu_align_rx;
+ 	uc->tx_agg_desc_num		= 1;	/* TODO: Tx aggregation */
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/usb/rtwn_usb_rx.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/usb/rtwn_usb_rx.c
+index 4a4294c0d8..9158d5adb8 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/usb/rtwn_usb_rx.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/usb/rtwn_usb_rx.c
+@@ -398,6 +398,7 @@ rtwn_bulk_rx_callback(struct usb_xfer *xfer, usb_error_t error)
+ 
+ 	switch (USB_GET_STATE(xfer)) {
+ 	case USB_ST_TRANSFERRED:
++		sc->sc_rx_transfers++;
+ 		data = STAILQ_FIRST(&uc->uc_rx_active);
+ 		if (data == NULL)
+ 			goto tr_setup;

@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 5 Nov 2026 10:20:09 -0500
+Subject: [PATCH 304/342] net_socket: socket_acquire() doesn't bring a socket
+ back from no references
+
+It read the count, then added one, as two steps. The last reference goes
+without the endpoint manager's lock that the lookup holds, so a receive thread
+between the two could take the count from 0 to 1 while another thread destroyed
+the socket, and its own release destroyed the socket a second time:
+sSocketList.Remove() on links the first run had cleared, a fault at 0x168.
+
+With a program closing connections with a reset while the peer keeps sending
+(tools/probes/tcpchurn.c in the port's project), the panic came within about a
+second, 5 times of 5, with memory to spare. With this, none.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/network/stack/net_socket.cpp | 12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/src/add-ons/kernel/network/stack/net_socket.cpp b/src/add-ons/kernel/network/stack/net_socket.cpp
+index b1716c0e85..e09e6008c5 100644
+--- a/src/add-ons/kernel/network/stack/net_socket.cpp
++++ b/src/add-ons/kernel/network/stack/net_socket.cpp
+@@ -609,11 +609,13 @@ socket_acquire(net_socket* _socket)
+ 	// endpoint protocol. We need to make sure the endpoint cannot acquire the
+ 	// socket anymore -- while not obvious, the endpoint protocol is responsible
+ 	// for the proper locking here.
+-	if (socket->CountReferences() == 0)
+-		return false;
+-
+-	socket->AcquireReference();
+-	return true;
++	// The last reference can go at any moment, as that doesn't take the
++	// endpoint manager's lock, so the check and the increment must be one step:
++	// a count brought back from zero has the socket destroyed a second time.
++	BPrivate::WeakPointer* pointer = socket->GetWeakPointer();
++	const bool acquired = pointer->Get() != NULL;
++	pointer->ReleaseReference();
++	return acquired;
+ }
+ 
+ 

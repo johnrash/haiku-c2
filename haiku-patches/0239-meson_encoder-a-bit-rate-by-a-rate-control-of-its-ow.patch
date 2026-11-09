@@ -1,0 +1,312 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 18:38:35 -0500
+Subject: [PATCH 239/342] meson_encoder: a bit rate, by a rate control of its
+ own
+
+The S905's encoder has no rate control of its own on GXBB: the caller
+picks a QP for each picture. With a bit rate asked for (encode_parameters'
+avg_field_size, bytes a picture), the plugin now picks it: the P
+pictures' QP follows a model of their size (it halves every 6 steps,
+from the last pictures' sizes) toward the average less a share of what
+was written beyond it, so that IDR pictures and busy scenes are made up
+within half a second; an IDR picture takes 3 below, but no lower than
+keeps it within half the driver's 1 MB bitstream buffer. QP 14 to 51.
+Without a bit rate, the quality's QP as before. A line in the log at the
+end says what was asked, what was written and the QPs used.
+
+The FFmpeg plugin's encoder takes a video bit rate from avg_field_size
+too (it was a TODO): MPEG-4 clips, without the hardware.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../media/plugins/ffmpeg/AVCodecEncoder.cpp   |  15 ++-
+ .../media/plugins/ffmpeg/AVCodecEncoder.h     |   3 +
+ .../plugins/meson_encoder/MesonEncoder.cpp    | 106 +++++++++++++++++-
+ .../plugins/meson_encoder/MesonEncoder.h      |  25 ++++-
+ 4 files changed, 143 insertions(+), 6 deletions(-)
+
+diff --git a/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.cpp b/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.cpp
+index ae8d12f4fa..3acf85d2f6 100644
+--- a/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.cpp
++++ b/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.cpp
+@@ -54,7 +54,8 @@ AVCodecEncoder::AVCodecEncoder(uint32 codecID, int bitRateScale)
+ 	fConvertNeon(false),
+ 	fInputSampleFormat(AV_SAMPLE_FMT_NONE),
+ 	fResampleContext(NULL),
+-	fFramesWritten(0)
++	fFramesWritten(0),
++	fVideoBitRate(0)
+ {
+ 	TRACE("AVCodecEncoder::AVCodecEncoder()\n");
+ 	_Init();
+@@ -181,6 +182,7 @@ AVCodecEncoder::GetEncodeParameters(encode_parameters* parameters) const
+ //	}
+ 
+ 	parameters->quality = fEncodeParameters.quality;
++	parameters->avg_field_size = fEncodeParameters.avg_field_size;
+ 
+ 	return B_OK;
+ }
+@@ -200,6 +202,15 @@ AVCodecEncoder::SetEncodeParameters(encode_parameters* parameters)
+ 		TRACE("  using default quality (1.0)\n");
+ 		fEncodeParameters.quality = 1.0f;
+ 	}
++	// a video bit rate asked for, as bytes a picture
++	fEncodeParameters.avg_field_size = parameters->avg_field_size;
++	fVideoBitRate = 0;
++	if (parameters->avg_field_size > 0
++		&& fInputFormat.type == B_MEDIA_RAW_VIDEO
++		&& fInputFormat.u.raw_video.field_rate > 0) {
++		fVideoBitRate = (int64)(parameters->avg_field_size * 8.0
++			* fInputFormat.u.raw_video.field_rate);
++	}
+ 
+ // TODO: Auto-bit_rate versus user supplied. See above.
+ //	int avgBytesPerSecond = 0;
+@@ -467,6 +478,8 @@ AVCodecEncoder::_Setup()
+ 		wantedBitRate = (int)(rawBitRate / fBitRateScale);
+ 
+ 	fCodecContext->bit_rate = wantedBitRate;
++	if (fVideoBitRate > 0 && fInputFormat.type == B_MEDIA_RAW_VIDEO)
++		fCodecContext->bit_rate = fVideoBitRate;
+ 
+ 	if (fInputFormat.type == B_MEDIA_RAW_AUDIO) {
+ 		// Some audio encoders support certain bitrates only. Use the
+diff --git a/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.h b/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.h
+index 04bf5007dc..978b7946ec 100644
+--- a/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.h
++++ b/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.h
+@@ -102,6 +102,9 @@ private:
+ 				// the input's (AAC takes planar floats only)
+ 
+ 			int64				fFramesWritten;
++			int64				fVideoBitRate;
++				// from SetEncodeParameters()' avg_field_size; 0: from the
++				// quality
+ 
+ 			uint8*				fChunkBuffer;
+ };
+diff --git a/src/add-ons/media/plugins/meson_encoder/MesonEncoder.cpp b/src/add-ons/media/plugins/meson_encoder/MesonEncoder.cpp
+index abd046af38..e5e174564f 100644
+--- a/src/add-ons/media/plugins/meson_encoder/MesonEncoder.cpp
++++ b/src/add-ons/media/plugins/meson_encoder/MesonEncoder.cpp
+@@ -26,6 +26,14 @@ static const size_t kChunkSize = 1024 * 1024 + 256;
+ 	// the driver's bitstream buffer, and the headers in front
+ static const uint32 kDefaultQp = 26;
+ 
++// rate control
++static const uint32 kMinQp = 14;
++static const uint32 kMaxQp = 51;
++static const double kMaxPictureBits = 512 * 1024 * 8;
++	// half the driver's bitstream buffer, which a picture must fit in
++static const double kIdrQpOffset = 3;
++	// an IDR picture's QP below the P pictures'
++
+ 
+ MesonEncoder::MesonEncoder()
+ 	:
+@@ -45,7 +53,16 @@ MesonEncoder::MesonEncoder()
+ 	fQp(kDefaultQp),
+ 	fFramesWritten(0),
+ 	fKeyInterval(60),
+-	fEncodeTime(0)
++	fEncodeTime(0),
++	fTargetBits(0),
++	fOverBits(0),
++	fComplexityP(0),
++	fComplexityI(0),
++	fRateQp(kDefaultQp),
++	fPPictures(0),
++	fBitsWritten(0),
++	fLowestQp(kMaxQp),
++	fHighestQp(0)
+ {
+ }
+ 
+@@ -152,6 +169,14 @@ MesonEncoder::SetUp(const media_format* inputFormat)
+ 	}
+ 	fHeadersSize = headers.size;
+ 	fFramesWritten = 0;
++	fOverBits = 0;
++	fComplexityP = 0;
++	fComplexityI = 0;
++	fRateQp = kDefaultQp;
++	fPPictures = 0;
++	fBitsWritten = 0;
++	fLowestQp = kMaxQp;
++	fHighestQp = 0;
+ 	return B_OK;
+ }
+ 
+@@ -161,12 +186,14 @@ MesonEncoder::GetEncodeParameters(encode_parameters* parameters) const
+ {
+ 	memset(parameters, 0, sizeof(*parameters));
+ 	parameters->quality = fQuality >= 0 ? fQuality : 0.75f;
++	parameters->avg_field_size = (int32)(fTargetBits / 8);
+ 	return B_OK;
+ }
+ 
+ 
+ /*!	The quality (0 to 1) as the QP of every picture: 1 is 22, 0.75 (and the
+-	default) 26, 0 is 38.
++	default) 26, 0 is 38. Or, with avg_field_size, a bit rate: that many
++	bytes a picture on average.
+ */
+ status_t
+ MesonEncoder::SetEncodeParameters(encode_parameters* parameters)
+@@ -177,6 +204,8 @@ MesonEncoder::SetEncodeParameters(encode_parameters* parameters)
+ 	if (fQuality > 1)
+ 		fQuality = 1;
+ 	fQp = (uint32)lroundf(38 - fQuality * 16);
++	fTargetBits = parameters->avg_field_size > 0
++		? parameters->avg_field_size * 8.0 : 0;
+ 	return B_OK;
+ }
+ 
+@@ -206,13 +235,17 @@ MesonEncoder::Encode(const void* buffer, int64 frameCount,
+ 			|| (info->flags & B_MEDIA_KEY_FRAME) != 0;
+ 		meson_venc_encode encode = {};
+ 		encode.flags = keyFrame ? MESON_VENC_IDR : 0;
+-		encode.qp = fQp;
++		// (the driver makes the first picture an IDR one anyway)
++		encode.qp = fTargetBits > 0
++			? _RateQp(keyFrame || fFramesWritten == 0) : fQp;
+ 		encode.timeout = 1000000;
+ 		encode.output.buffer = fChunk + fHeadersSize;
+ 		encode.output.buffer_size = kChunkSize - fHeadersSize;
+ 		if (ioctl(fDevice, MESON_VENC_ENCODE, &encode, sizeof(encode)) != 0)
+ 			return errno;
+ 		fEncodeTime += encode.encode_time;
++		if (fTargetBits > 0)
++			_RateUpdate(encode.idr, encode.qp, encode.output.size);
+ 
+ 		// an IDR picture starts with the parameter sets
+ 		uint8* chunk = fChunk + fHeadersSize;
+@@ -271,9 +304,76 @@ MesonEncoder::_LoadMicrocode()
+ }
+ 
+ 
++/*!	The QP for the next picture. The P pictures' follows a model of their
++	size (it halves every 6 QP steps, from the last pictures' sizes) toward
++	the average a picture may take, less a share of what was written beyond
++	it so far: what the IDR pictures and busy scenes take is made up within
++	half a second. An IDR picture takes the P pictures' QP less 3, but no
++	lower than keeps it in kMaxPictureBits.
++*/
++uint32
++MesonEncoder::_RateQp(bool idr)
++{
++	if (idr) {
++		double qp = fRateQp - kIdrQpOffset;
++		if (fComplexityI > 0) {
++			double lowest = 6 * log2(fComplexityI / kMaxPictureBits);
++			if (qp < lowest)
++				qp = lowest;
++		}
++		return (uint32)lround(fmin(fmax(qp, kMinQp), kMaxQp));
++	}
++
++	if (fComplexityP > 0) {
++		double target = fTargetBits
++			- fOverBits / fmax(fFrameRate / 2, 1);
++		if (target < fTargetBits / 4)
++			target = fTargetBits / 4;
++		double qp = 6 * log2(fComplexityP / target);
++		// settled, at most two steps a picture
++		double step = fPPictures < 10 ? 6 : 2;
++		fRateQp = fmin(fmax(qp, fRateQp - step), fRateQp + step);
++		fRateQp = fmin(fmax(fRateQp, kMinQp), kMaxQp);
++	}
++	return (uint32)lround(fRateQp);
++}
++
++
++void
++MesonEncoder::_RateUpdate(bool idr, uint32 qp, size_t size)
++{
++	double bits = size * 8.0;
++	double complexity = bits * exp2(qp / 6.0);
++	if (idr)
++		fComplexityI = complexity;
++	else {
++		fComplexityP = fComplexityP > 0
++			? 0.6 * complexity + 0.4 * fComplexityP : complexity;
++		fPPictures++;
++	}
++	fOverBits += bits - fTargetBits;
++	// at most two seconds' worth either way: an old excess counts no more
++	double limit = 2 * fTargetBits * fFrameRate;
++	fOverBits = fmin(fmax(fOverBits, -limit), limit);
++
++	fBitsWritten += size * 8;
++	fLowestQp = min_c(fLowestQp, qp);
++	fHighestQp = max_c(fHighestQp, qp);
++}
++
++
+ void
+ MesonEncoder::_Close()
+ {
++	if (fTargetBits > 0 && fBitsWritten > 0) {
++		printf("MesonEncoder: %" B_PRId64 " pictures, %.2f Mbit/s asked, "
++			"%.2f written, QP %" B_PRIu32 " to %" B_PRIu32 "\n",
++			fFramesWritten, fTargetBits * fFrameRate / 1e6,
++			fBitsWritten * fFrameRate / fFramesWritten / 1e6, fLowestQp,
++			fHighestQp);
++		fflush(stdout);
++		fBitsWritten = 0;
++	}
+ 	if (fInputArea >= 0) {
+ 		delete_area(fInputArea);
+ 		fInputArea = -1;
+diff --git a/src/add-ons/media/plugins/meson_encoder/MesonEncoder.h b/src/add-ons/media/plugins/meson_encoder/MesonEncoder.h
+index 2be7ab9bf1..37961aba90 100644
+--- a/src/add-ons/media/plugins/meson_encoder/MesonEncoder.h
++++ b/src/add-ons/media/plugins/meson_encoder/MesonEncoder.h
+@@ -14,8 +14,10 @@
+ /*!	H.264 from the S905's encoder (meson_venc): B_RGB32 pictures go into the
+ 	driver's input area as they are (the hardware converts them), each comes
+ 	back as one chunk, an IDR picture with the stream's SPS and PPS in front
+-	of it. Annex B form, one QP a picture (from the quality asked for), the
+-	input reader's noise reduction on.
++	of it. Annex B form, one QP a picture, the input reader's noise
++	reduction on. The QP comes from the quality asked for, or with a bit
++	rate asked for (encode_parameters' avg_field_size, bytes a picture),
++	from a rate control of its own: the hardware has none.
+ */
+ class MesonEncoder : public Encoder {
+ public:
+@@ -39,6 +41,9 @@ public:
+ private:
+ 			status_t			_LoadMicrocode();
+ 			void				_Close();
++			uint32				_RateQp(bool idr);
++			void				_RateUpdate(bool idr, uint32 qp,
++									size_t size);
+ 
+ 			int					fDevice;
+ 			uint8*				fMicrocode;
+@@ -58,6 +63,22 @@ private:
+ 			int64				fFramesWritten;
+ 			int64				fKeyInterval;
+ 			bigtime_t			fEncodeTime;
++
++			// rate control
++			double				fTargetBits;
++				// a picture's, on average; 0: the quality's QP
++			double				fOverBits;
++				// what was written beyond the target so far
++			double				fComplexityP;
++			double				fComplexityI;
++				// bits × 2^(QP / 6) of the last P pictures and the last IDR
++				// picture: a picture's size halves every 6 QP steps
++			double				fRateQp;
++				// the P pictures'
++			int64				fPPictures;
++			uint64				fBitsWritten;
++			uint32				fLowestQp;
++			uint32				fHighestQp;
+ };
+ 
+ 

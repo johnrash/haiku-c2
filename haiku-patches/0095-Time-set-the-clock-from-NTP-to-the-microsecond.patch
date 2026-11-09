@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 12:18:23 -0400
+Subject: [PATCH 095/342] Time: set the clock from NTP to the microsecond
+
+ntp_update_time() set the clock with set_real_time_clock(), in whole
+seconds of the server's transmit time stamp, which left it up to a
+second behind; with a real-time clock chip (the ODROID-C2's RTC shield)
+that error went into the chip too. Use the server's receive and
+transmit time stamps against the local send and receive times (RFC
+4330, the network delay split evenly) and clock_settime().
+
+On the ODROID-C2 with an NTP server on the LAN: the first precise sync
+moved the clock by 446 ms, the next ones every 32 s by 1.1 ms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/preferences/time/ntp.cpp | 36 ++++++++++++++++++++++++++++++++++--
+ 1 file changed, 34 insertions(+), 2 deletions(-)
+
+diff --git a/src/preferences/time/ntp.cpp b/src/preferences/time/ntp.cpp
+index 91668ce5df..46229502d1 100644
+--- a/src/preferences/time/ntp.cpp
++++ b/src/preferences/time/ntp.cpp
+@@ -13,6 +13,7 @@
+ #include <stdlib.h>
+ #include <sys/select.h>
+ #include <sys/socket.h>
++#include <time.h>
+ #include <unistd.h>
+ 
+ #include <OS.h>
+@@ -112,6 +113,15 @@ seconds_since_1900(void)
+ }
+ 
+ 
++/*!	An NTP time stamp in microseconds since 1970. */
++static bigtime_t
++usecs_since_1970(ufixed64& time)
++{
++	return ((bigtime_t)time.Integer() - kSecondsBetween1900And1970) * 1000000
++		+ (bigtime_t)(((uint64)time.Fraction() * 1000000) >> 32);
++}
++
++
+ status_t
+ ntp_update_time(const char* hostname, const char** errorString,
+ 	int32* errorCode)
+@@ -148,6 +158,9 @@ ntp_update_time(const char* hostname, const char** errorString,
+ 		return B_ERROR;
+ 	}
+ 
++	// the local time of the request, for the clock offset (RFC 4330)
++	bigtime_t sendTime = real_time_clock_usecs();
++	bigtime_t sendSystemTime = system_time();
+ 	while (resolver.GetNextAddress(&cookie, address) == B_OK) {
+ 		if (sendto(connection, reinterpret_cast<char*>(&message),
+ 				sizeof(ntp_data), 0, &address.SockAddr(),
+@@ -195,6 +208,7 @@ ntp_update_time(const char* hostname, const char** errorString,
+ 		return B_ERROR;
+ 	}
+ 
++	bigtime_t receiveTime = sendTime + system_time() - sendSystemTime;
+ 	close(connection);
+ 
+ 	if (message.transmit_timestamp.Integer() == 0) {
+@@ -202,7 +216,25 @@ ntp_update_time(const char* hostname, const char** errorString,
+ 		return B_BAD_VALUE;
+ 	}
+ 
+-	time_t now = message.transmit_timestamp.Integer() - kSecondsBetween1900And1970;
+-	set_real_time_clock(now);
++	// The clock's offset from the server's: from the time stamps of the
++	// request's arrival and the answer's departure, against the local times
++	// of sending and receiving, the network delay split evenly. Set to the
++	// microsecond (set_real_time_clock() takes whole seconds, which left the
++	// clock up to a second behind).
++	bigtime_t transmitTime = usecs_since_1970(message.transmit_timestamp);
++	bigtime_t serverReceiveTime = message.receive_timestamp.Integer() != 0
++		? usecs_since_1970(message.receive_timestamp) : transmitTime;
++	bigtime_t offset = ((serverReceiveTime - sendTime)
++		+ (transmitTime - receiveTime)) / 2;
++
++	bigtime_t now = real_time_clock_usecs() + offset;
++	struct timespec time;
++	time.tv_sec = now / 1000000;
++	time.tv_nsec = (now % 1000000) * 1000;
++	if (clock_settime(CLOCK_REALTIME, &time) != 0) {
++		*errorString = B_TRANSLATE("Setting the clock failed");
++		*errorCode = errno;
++		return B_ERROR;
++	}
+ 	return B_OK;
+ }

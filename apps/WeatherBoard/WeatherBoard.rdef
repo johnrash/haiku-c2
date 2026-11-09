@@ -1,0 +1,18 @@
+/*
+ * Copyright 2026, haiku-odroid-c2 port authors.
+ * Distributed under the terms of the MIT License.
+ */
+
+resource app_signature "application/x-vnd.C2-WeatherBoard";
+
+resource app_flags B_SINGLE_LAUNCH;
+
+resource app_version {
+	major  = 1,
+	middle = 2,
+	minor  = 0,
+	variety = B_APPV_FINAL,
+	internal = 0,
+	short_info = "Weather Board",
+	long_info = "Weather Board 1.2, Copyright 2026, haiku-odroid-c2 port authors."
+};

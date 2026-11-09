@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 20:44:45 -0400
+Subject: [PATCH 038/342] Debugger CLI: unlock the team while waiting for a
+ stack trace
+
+"bt" waited for the stack trace with the team locked, but the job
+creating it needs the team lock: a deadlock whenever the trace was not
+ready yet (seen on a slow board right after the thread stopped).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../user_interface/cli/commands/CliStackTraceCommand.cpp       | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/apps/debugger/user_interface/cli/commands/CliStackTraceCommand.cpp b/src/apps/debugger/user_interface/cli/commands/CliStackTraceCommand.cpp
+index ea93d349fb..87ba7b6060 100644
+--- a/src/apps/debugger/user_interface/cli/commands/CliStackTraceCommand.cpp
++++ b/src/apps/debugger/user_interface/cli/commands/CliStackTraceCommand.cpp
+@@ -46,9 +46,12 @@ CliStackTraceCommand::Execute(int argc, const char* const* argv,
+ 	// get its stack trace
+ 	StackTrace* stackTrace = thread->GetStackTrace();
+ 	while (stackTrace == NULL) {
++		// the job creating the stack trace needs the team lock
++		teamLocker.Unlock();
+ 		context.WaitForEvent(CliContext::MSG_THREAD_STACK_TRACE_CHANGED);
+ 		if (context.IsTerminating())
+ 			return;
++		teamLocker.Lock();
+ 		stackTrace = thread->GetStackTrace();
+ 	}
+ 	BReference<StackTrace> stackTraceReference(stackTrace);

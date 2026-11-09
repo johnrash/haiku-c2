@@ -1,0 +1,244 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 5 Nov 2026 19:22:00 -0500
+Subject: [PATCH 308/342] arp: announce the local addresses when the link comes
+ back
+
+ARP announced an interface's addresses only when the interface went up or an
+address was set. A wireless device that joins another access point, or a cable
+moved to another switch, kept its addresses and its link-layer address, and the
+hosts that had been sending to it along the old path went on doing so until
+their entries timed out: about 35 to 40 seconds of silence from Linux, and a
+repeater that answers for what's behind it made it longer.
+
+device_link_changed() now tells the interfaces of a device whose link came
+back, through their IPv4 datalink protocols (NET_DATALINK_LINK_UP), and ARP
+announces each address three times, 1, 3 and 5 seconds later, like RFC 5227's
+two announcements 2 seconds apart, the first late enough for a wireless link's
+keys.
+
+Seen on the board: a cable pulled and plugged in, the three announcements at
+1.0, 3.0 and 5.0 s after the link came back; none before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/net/net_datalink_protocol.h   |  7 +++
+ .../network/datalink_protocols/arp/arp.cpp    | 57 +++++++++++++++++++
+ .../network/stack/device_interfaces.cpp       |  4 ++
+ .../kernel/network/stack/interfaces.cpp       | 33 +++++++++++
+ src/add-ons/kernel/network/stack/interfaces.h |  2 +
+ 5 files changed, 103 insertions(+)
+
+diff --git a/headers/private/net/net_datalink_protocol.h b/headers/private/net/net_datalink_protocol.h
+index 7df4d98593..2052645e67 100644
+--- a/headers/private/net/net_datalink_protocol.h
++++ b/headers/private/net/net_datalink_protocol.h
+@@ -9,6 +9,13 @@
+ #include <net_buffer.h>
+ 
+ 
++// A control option the stack gives an interface's IPv4 datalink protocols when
++// its device has a link again: it may be on another network segment now (a
++// wireless device on another access point), where others still have the
++// interface's addresses at the path they took before. ARP announces them.
++#define NET_DATALINK_LINK_UP	0x4e4c5550	// 'NLUP'
++
++
+ typedef struct net_datalink_protocol {
+ 	struct net_datalink_protocol*				next;
+ 	struct net_datalink_protocol_module_info*	module;
+diff --git a/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp b/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp
+index e368fd6a97..34ba23166e 100644
+--- a/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp
++++ b/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp
+@@ -116,12 +116,15 @@ struct arp_entry {
+ struct arp_protocol : net_datalink_protocol {
+ 	sockaddr_dl	hardware_address;
+ 	in_addr_t	local_address;
++	net_timer	announce_timer;
++	int32		announcements_left;
+ };
+ 
+ 
+ static const net_buffer* kDeletedBuffer = (net_buffer*)~0;
+ 
+ static void arp_timer(struct net_timer *timer, void *data);
++static void arp_announce_timer(struct net_timer *timer, void *data);
+ 
+ net_buffer_module_info* gBufferModule;
+ static net_stack_module_info* sStackModule;
+@@ -966,6 +969,40 @@ arp_uninit()
+ //	#pragma mark - net_datalink_protocol
+ 
+ 
++/*!	Announces the interface's addresses once more after its link came back
++	(NET_DATALINK_LINK_UP), so that hosts that sent to them along another path
++	before, through another access point, use this one.
++*/
++static void
++arp_announce_timer(struct net_timer* timer, void* data)
++{
++	arp_protocol* protocol = (arp_protocol*)data;
++	net_interface* interface = protocol->interface;
++
++	if ((interface->flags & IFF_UP) == 0
++		|| (interface->device->flags & IFF_LINK) == 0)
++		return;
++
++	net_interface_address* address = NULL;
++	while (sDatalinkModule->get_next_interface_address(interface, &address)) {
++		if (address->local == NULL || address->local->sa_family != AF_INET)
++			continue;
++
++		in_addr_t inetAddress = ((sockaddr_in*)address->local)->sin_addr.s_addr;
++		if (inetAddress == INADDR_ANY)
++			continue;
++
++		net_buffer* buffer = arp_prepare_request(interface->device, inetAddress,
++			inetAddress);
++		if (buffer != NULL)
++			protocol->next->module->send_data(protocol->next, buffer);
++	}
++
++	if (--protocol->announcements_left > 0)
++		sStackModule->set_timer(&protocol->announce_timer, 2000000);
++}
++
++
+ status_t
+ arp_init_protocol(net_interface* interface, net_domain* domain,
+ 	net_datalink_protocol** _protocol)
+@@ -991,6 +1028,9 @@ arp_init_protocol(net_interface* interface, net_domain* domain,
+ 
+ 	memset(&protocol->hardware_address, 0, sizeof(sockaddr_dl));
+ 	protocol->local_address = 0;
++	sStackModule->init_timer(&protocol->announce_timer, arp_announce_timer,
++		protocol);
++	protocol->announcements_left = 0;
+ 
+ 	*_protocol = protocol;
+ 	return B_OK;
+@@ -1005,6 +1045,10 @@ arp_uninit_protocol(net_datalink_protocol *protocol)
+ 	sStackModule->unregister_device_handler(protocol->interface->device,
+ 		B_NET_FRAME_TYPE(IFT_ETHER, ETHER_TYPE_IP));
+ 
++	arp_protocol* arpProtocol = (arp_protocol*)protocol;
++	sStackModule->cancel_timer(&arpProtocol->announce_timer);
++	sStackModule->wait_for_timer(&arpProtocol->announce_timer);
++
+ 	delete protocol;
+ 	return B_OK;
+ }
+@@ -1086,6 +1130,10 @@ arp_up(net_datalink_protocol* _protocol)
+ void
+ arp_down(net_datalink_protocol *protocol)
+ {
++	arp_protocol* arpProtocol = (arp_protocol*)protocol;
++	sStackModule->cancel_timer(&arpProtocol->announce_timer);
++	sStackModule->wait_for_timer(&arpProtocol->announce_timer);
++
+ 	// remove local ARP entries from the cache
+ 	arp_remove_local((arp_protocol*)protocol);
+ 
+@@ -1135,6 +1183,15 @@ arp_control(net_datalink_protocol *_protocol, int32 op, void *argument,
+ 	size_t length)
+ {
+ 	arp_protocol* protocol = (arp_protocol*)_protocol;
++
++	if (op == NET_DATALINK_LINK_UP) {
++		// RFC 5227 announces twice, 2 seconds apart; the first one here waits
++		// a second for a wireless link's keys, and a third goes for luck
++		protocol->announcements_left = 3;
++		sStackModule->set_timer(&protocol->announce_timer, 1000000);
++		return B_OK;
++	}
++
+ 	return protocol->next->module->control(protocol->next, op, argument,
+ 		length);
+ }
+diff --git a/src/add-ons/kernel/network/stack/device_interfaces.cpp b/src/add-ons/kernel/network/stack/device_interfaces.cpp
+index 90d2bf4db0..ecb14b22d0 100644
+--- a/src/add-ons/kernel/network/stack/device_interfaces.cpp
++++ b/src/add-ons/kernel/network/stack/device_interfaces.cpp
+@@ -780,6 +780,10 @@ status_t
+ device_link_changed(net_device* device)
+ {
+ 	notify_link_changed(device);
++
++	if ((device->flags & IFF_LINK) != 0)
++		interfaces_link_up(device);
++
+ 	return B_OK;
+ }
+ 
+diff --git a/src/add-ons/kernel/network/stack/interfaces.cpp b/src/add-ons/kernel/network/stack/interfaces.cpp
+index 49139fcab7..6cf0e5f936 100644
+--- a/src/add-ons/kernel/network/stack/interfaces.cpp
++++ b/src/add-ons/kernel/network/stack/interfaces.cpp
+@@ -933,6 +933,25 @@ Interface::Control(net_domain* domain, int32 option, ifreq& request,
+ }
+ 
+ 
++/*!	The interface's device has a link again: the datalink protocols for IPv4
++	get to tell the network (see NET_DATALINK_LINK_UP).
++*/
++void
++Interface::LinkUp()
++{
++	RecursiveLocker locker(fLock);
++
++	if ((flags & IFF_UP) == 0)
++		return;
++
++	domain_datalink* datalink = DomainDatalink(AF_INET);
++	if (datalink != NULL && datalink->first_info != NULL) {
++		datalink->first_info->control(datalink->first_protocol,
++			NET_DATALINK_LINK_UP, NULL, 0);
++	}
++}
++
++
+ void
+ Interface::SetDown()
+ {
+@@ -1526,6 +1545,20 @@ get_interface_for_link(net_domain* domain, const sockaddr* _linkAddress)
+ }
+ 
+ 
++/*!	\a device has a link again: its interfaces let the network know. */
++void
++interfaces_link_up(net_device* device)
++{
++	RecursiveLocker locker(sLock);
++
++	InterfaceList::Iterator iterator = sInterfaces.GetIterator();
++	while (Interface* interface = iterator.Next()) {
++		if (interface->device == device)
++			interface->LinkUp();
++	}
++}
++
++
+ InterfaceAddress*
+ get_interface_address(const sockaddr* local)
+ {
+diff --git a/src/add-ons/kernel/network/stack/interfaces.h b/src/add-ons/kernel/network/stack/interfaces.h
+index 536ab34d94..fe5b406713 100644
+--- a/src/add-ons/kernel/network/stack/interfaces.h
++++ b/src/add-ons/kernel/network/stack/interfaces.h
+@@ -141,6 +141,7 @@ public:
+ 
+ 			void				SetDown();
+ 			void				WentDown();
++			void				LinkUp();
+ 
+ 			recursive_lock&		Lock() { return fLock; }
+ 
+@@ -196,6 +197,7 @@ Interface* get_interface(net_domain* domain, uint32 index);
+ Interface* get_interface(net_domain* domain, const char* name);
+ Interface* get_interface_for_device(net_domain* domain, uint32 index);
+ Interface* get_interface_for_link(net_domain* domain, const sockaddr* address);
++void interfaces_link_up(net_device* device);
+ InterfaceAddress* get_interface_address(const struct sockaddr* address);
+ InterfaceAddress* get_interface_address_for_destination(net_domain* domain,
+ 	const sockaddr* destination);

@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 02:40:25 -0400
+Subject: [PATCH 016/342] device_manager: probe busses/usb for generic (device
+ tree) nodes
+
+Device tree nodes have no type, so the device manager only tries a fixed
+list of module directories for them; busses/mmc is there, busses/usb was
+not, so FDT-attached USB host controllers were never probed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/kernel/device_manager/device_manager.cpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/system/kernel/device_manager/device_manager.cpp b/src/system/kernel/device_manager/device_manager.cpp
+index d06303c01f..0f6400c1b1 100644
+--- a/src/system/kernel/device_manager/device_manager.cpp
++++ b/src/system/kernel/device_manager/device_manager.cpp
+@@ -1749,6 +1749,8 @@ device_node::_GetNextDriverPath(void*& cookie, KPath& _path)
+ 					_AddPath(*stack, "bus_managers/pci");
+ 					_AddPath(*stack, "busses/pci");
+ 					_AddPath(*stack, "busses/mmc");
++					_AddPath(*stack, "busses/usb");
++						// device tree attached USB host controllers
+ 				}
+ 				break;
+ 		}

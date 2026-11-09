@@ -1,0 +1,10 @@
+The GUI test of /build/TrackerBreadcrumbs/tracker-breadcrumbs, adapted for
+the fork, where the breadcrumbs are in the system's Tracker (milestone M16 (docs/milestones.md)).
+
+  . tools/haiku-arm64-env.sh
+  $CXX -O2 $HAIKU_CPPFLAGS -I haiku/headers/private/app -o run/crumbinput \
+      tools/tracker-breadcrumbs/crumbinput.cpp -lbe
+  copy run/crumbinput and gui-test.sh into one folder on the board, turn on
+  SingleWindowBrowse, ShowNavigator and ShowFullPathInTitleBar in
+  ~/config/settings/Tracker/TrackerSettings (then kill -9 Tracker, so it
+  doesn't write its old settings back), and run ./gui-test.sh <out folder>.

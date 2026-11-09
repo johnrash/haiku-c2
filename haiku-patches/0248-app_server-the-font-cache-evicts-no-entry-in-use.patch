@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 21:36:20 -0500
+Subject: [PATCH 248/342] app_server: the font cache evicts no entry in use
+
+The cache keeps 30 font entries and, making another, evicted the one
+with the fewest uses per time since its last. An entry counts a use
+only when recycled, so one being made and used had none and was always
+the one. Drawing a string that needs fallbacks makes an entry for each
+fallback family (eight with the colour emoji), so with the cache full
+those entries evicted each other as they were made, the string's own
+font's among them: its glyphs were made again at every draw, and the
+fallback fonts opened again. 32 emoji at 12.5 points took 66 ms every
+time (2 ms a picture, scaled again, and 12 ms of fonts), against 0.7 ms
+from the cache at a size whose entries had been kept.
+
+Entries in use (referenced beyond the cache's own reference) are left
+out now; they live on anyway. With all of them in use, none is evicted.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/servers/app/font/FontCache.cpp | 26 +++++++++++++++-----------
+ 1 file changed, 15 insertions(+), 11 deletions(-)
+
+diff --git a/src/servers/app/font/FontCache.cpp b/src/servers/app/font/FontCache.cpp
+index f27e208f7b..1eff336155 100644
+--- a/src/servers/app/font/FontCache.cpp
++++ b/src/servers/app/font/FontCache.cpp
+@@ -124,26 +124,30 @@ FontCache::_ConstrainEntryCount()
+ 
+ 	FontMap::Iterator iterator = fFontCacheEntries.GetIterator();
+ 
+-	// NOTE: if kMaxEntryCount has a sane value, there has got to be
+-	// some entries, so using the iterator like that should be ok
+-	FontCacheEntry* leastUsedEntry = iterator.Next().value;
++	// An entry in use (referenced by more than the map) is never the one:
++	// it lives on anyway, and the next use would make it again, without
++	// its glyphs. Entries are made in use and counted only when recycled,
++	// so a new one would always be the least used: drawing a string that
++	// needs fallbacks (each makes an entry) with the cache full evicted
++	// the entries it was making, its own font's among them, every time.
++	FontCacheEntry* leastUsedEntry = NULL;
++	double leastUsageIndex = 0;
+ 	bigtime_t now = system_time();
+-	bigtime_t age = now - leastUsedEntry->LastUsed();
+-	uint64 useCount = leastUsedEntry->UsedCount();
+-	double leastUsageIndex = usage_index(useCount, age);
+-//printf("  leastUsageIndex: %f\n", leastUsageIndex);
+-
+ 	while (iterator.HasNext()) {
+ 		FontCacheEntry* entry = iterator.Next().value;
+-		age = now - entry->LastUsed();
+-		useCount = entry->UsedCount();
++		if (entry->CountReferences() > 1)
++			continue;
++		bigtime_t age = now - entry->LastUsed();
++		uint64 useCount = entry->UsedCount();
+ 		double usageIndex = usage_index(useCount, age);
+ //printf("  usageIndex: %f\n", usageIndex);
+-		if (usageIndex < leastUsageIndex) {
++		if (leastUsedEntry == NULL || usageIndex < leastUsageIndex) {
+ 			leastUsedEntry = entry;
+ 			leastUsageIndex = usageIndex;
+ 		}
+ 	}
++	if (leastUsedEntry == NULL)
++		return;
+ 
+ 	iterator = fFontCacheEntries.GetIterator();
+ 	while (iterator.HasNext()) {

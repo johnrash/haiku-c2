@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 4 Nov 2026 11:30:03 -0500
+Subject: [PATCH 287/342] freebsd_network: a zero length packet ends a full
+ bulk OUT transfer
+
+force_short_xfer asks for a short packet at the end of a transfer. FreeBSD's
+stack sends a zero length one when the data fills its last packet, and rtw88 sets
+URB_ZERO_PACKET on Linux. Here the flag did nothing, so such a transfer had no end
+for the device. Rare: 3 times in 22 GB through the RTL8812BU, and not what stalled
+it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/libs/compat/freebsd_network/usb.cpp | 44 ++++++++++++++++++++++++-
+ 1 file changed, 43 insertions(+), 1 deletion(-)
+
+diff --git a/src/libs/compat/freebsd_network/usb.cpp b/src/libs/compat/freebsd_network/usb.cpp
+index 4c1a34dace..4362ddb372 100644
+--- a/src/libs/compat/freebsd_network/usb.cpp
++++ b/src/libs/compat/freebsd_network/usb.cpp
+@@ -334,6 +334,8 @@ struct usb_xfer {
+ 	iovec* frames;
+ 	usb_page_cache* buffers;
+ 	int max_frame_count, nframes;
++	uint16 max_packet_size;
++	bool out;
+ 
+ 	uint8 usb_state;
+ 	bool in_progress;
+@@ -410,6 +412,8 @@ usbd_transfer_setup(struct freebsd_usb_device* udev,
+ 				continue;
+ 
+ 			xfer->pipe = iface->endpoint[i].handle;
++			xfer->max_packet_size = iface->endpoint[i].descr->max_packet_size;
++			xfer->out = UE_GET_DIR(endpoint) == UE_DIR_OUT;
+ 			if (xfer->max_data_length == 0)
+ 				xfer->max_data_length = iface->endpoint[i].descr->max_packet_size;
+ 			break;
+@@ -619,6 +623,35 @@ usbd_callback(void* arg, status_t status, void* data, size_t actualLength)
+ }
+ 
+ 
++/*!	The zero length packet after a transfer's data has gone: what is reported
++	is the data.
++*/
++static void
++usbd_end_sent(void* arg, status_t status, void* data, size_t actualLength)
++{
++	struct usb_xfer* xfer = (struct usb_xfer*)arg;
++	usbd_callback(xfer, status, data, xfer->transferred_length);
++}
++
++
++/*!	The data of a bulk OUT transfer with force_short_xfer filled its last
++	packet: a zero length packet tells the device that it has ended.
++*/
++static void
++usbd_data_sent(void* arg, status_t status, void* data, size_t actualLength)
++{
++	struct usb_xfer* xfer = (struct usb_xfer*)arg;
++	if (status == B_OK) {
++		xfer->transferred_length = actualLength;
++		status = sUSB->queue_bulk(xfer->pipe, xfer->frames[0].iov_base, 0,
++			usbd_end_sent, xfer);
++		if (status == B_OK)
++			return;
++	}
++	usbd_callback(xfer, status, data, actualLength);
++}
++
++
+ extern "C" void
+ usbd_transfer_start(struct usb_xfer* xfer)
+ {
+@@ -640,8 +673,17 @@ usbd_transfer_submit(struct usb_xfer* xfer)
+ 	status_t status = B_NOT_SUPPORTED;
+ 	switch (xfer->type) {
+ 	case UE_BULK:
+-		status = sUSB->queue_bulk_v(xfer->pipe, xfer->frames, xfer->nframes, usbd_callback, xfer);
++	{
++		size_t total = 0;
++		for (int i = 0; i < xfer->nframes; i++)
++			total += xfer->frames[i].iov_len;
++		bool endPacket = xfer->flags.force_short_xfer && xfer->out
++			&& xfer->max_packet_size != 0 && total != 0
++			&& (total % xfer->max_packet_size) == 0;
++		status = sUSB->queue_bulk_v(xfer->pipe, xfer->frames, xfer->nframes,
++			endPacket ? usbd_data_sent : usbd_callback, xfer);
+ 		break;
++	}
+ 
+ 	case UE_INTERRUPT:
+ 		KASSERT(xfer->nframes == 1, ("invalid frame count for interrupt transfer"));

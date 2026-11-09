@@ -1,0 +1,1200 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 21:31:02 -0400
+Subject: [PATCH 138/342] meson_vdec: HEVC, P and B pictures, 10 bits, the
+ interrupt
+
+The HEVC block now decodes Main and Main 10 streams (4:2:0, up to
+1920x1088) to 8-bit NV12. The firmware only parses, so the host does the
+rest, following ITU-T H.265: the picture order count (8.3.1), which
+pictures stay references (8.3.2, the RPS), the reference lists with their
+modifications (8.3.4), the co-located picture, RASL pictures skipped after
+a fresh IRAP, and the output order by bumping (C.5). Frames are the
+stream's reordering depth + 7, at most 16, each one area; they are kept
+for the next session if the stream's are the same (a seek).
+
+10-bit streams keep their references in Amlogic's compressed format, and
+the frames handed out are the firmware's 8-bit "double write" (rounded);
+meson_vdec_frame.offset says where the picture starts in the area.
+
+A thread of the session answers the firmware, woken by the mailbox
+interrupt (and every few milliseconds). At a stop it goes first, and the
+firmware is let finish the slice it decodes (up to 200 ms, or 20 ms
+without progress, without the rest of its stream): stopped and reset in
+the middle of a picture, the block now and then hung the whole system.
+Nothing is logged per session; a busy open says who has the decoder.
+
+On the ODROID-C2, 8-bit streams with B-pyramids, 4 references, 4 slices a
+picture and one starting at a CRA picture, and a 10-bit one, match FFmpeg
+bit for bit (the 10-bit one rounded to 8 bits); 1080p decodes at about
+277 frames/s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/drivers/meson_vdec.h          |   5 +-
+ .../drivers/video/meson_vdec/meson_vdec.cpp   |  48 +-
+ .../video/meson_vdec/meson_vdec_hevc.cpp      | 661 +++++++++++++++---
+ .../video/meson_vdec/meson_vdec_private.h     |  43 +-
+ 4 files changed, 623 insertions(+), 134 deletions(-)
+
+diff --git a/headers/private/drivers/meson_vdec.h b/headers/private/drivers/meson_vdec.h
+index 7e94392ccd..7dff592e88 100644
+--- a/headers/private/drivers/meson_vdec.h
++++ b/headers/private/drivers/meson_vdec.h
+@@ -41,10 +41,11 @@ enum {
+ 	MESON_VDEC_MPEG12 = 1,
+ 	MESON_VDEC_H264 = 2,
+ 	MESON_VDEC_HEVC = 3,
+-		// experimental: intra pictures of 8-bit streams, linux-firmware's
++		// Main and Main 10, 4:2:0, to 8-bit NV12; linux-firmware's
+ 		// gxl_hevc.bin
+ 	MESON_VDEC_HEVC_VENDOR = 4,
+-		// the same with the vendor kernel's microcode
++		// the same with the vendor kernel's microcode (for research: it is
++		// not distributed)
+ };
+ 
+ struct meson_vdec_start {
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+index 5e7b4a8925..e97b12ebb9 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+@@ -48,6 +48,7 @@ MesonVdec::MesonVdec(device_node* node)
+ 	fVdecIrq(-1),
+ 	fParserIrq(-1),
+ 	fOpen(false),
++	fOpener(-1),
+ 	fRunning(false),
+ 	fEndOfStream(false),
+ 	fWarmedUp(false),
+@@ -82,6 +83,18 @@ MesonVdec::MesonVdec(device_node* node)
+ 	fHevcReports(0),
+ 	fHevcSlices(0),
+ 	fHevcSkipped(0),
++	fHevcReorder(0),
++	fHevcPoc(0),
++	fHevcPreviousPoc(0),
++	fHevcFirstPicture(true),
++	fHevcSkipRasl(true),
++	fHevcPendingPicture(false),
++	fHevcSkippingPicture(false),
++	fHevcFramesKey(0),
++	fHevcCompressed(false),
++	fHevcBodySize(0),
++	fHevcHeaderSize(0),
++	fHevcLumaOffset(0),
+ 	fDecodeErrors(0),
+ 	fBadPictures(0),
+ 	fFrameSem(-1),
+@@ -444,6 +457,10 @@ MesonVdec::_VdecInterrupt(void* data)
+ 	MesonVdec* device = (MesonVdec*)data;
+ 	SpinLocker locker(device->fStateLock);
+ 	device->fVdecInterrupts++;
++	if (device->_IsHevc()) {
++		return device->_HevcInterrupt() ? B_HANDLED_INTERRUPT
++			: B_UNHANDLED_INTERRUPT;
++	}
+ 	return device->_CheckDecoder() ? B_HANDLED_INTERRUPT
+ 		: B_UNHANDLED_INTERRUPT;
+ }
+@@ -1060,14 +1077,13 @@ MesonVdec::_Stop(bool keepBuffers)
+ {
+ 	if (fRunning) {
+ 		// the firmware stops; what it still writes, it writes into buffers
+-		// that stay until it is powered down
+-		if (_IsHevc())
+-			_StopHevcProcessor();
+-		else {
++		// that stay until it is powered down. HEVC's goes on to the end of
++		// the slice it decodes, once its thread no longer answers it
++		if (!_IsHevc()) {
+ 			_SetDos(MPSR, 0);
+ 			_SetDos(CPSR, 0);
++			snooze(5000);
+ 		}
+-		snooze(5000);
+ 		InterruptsSpinLocker locker(fStateLock);
+ 		fRunning = false;
+ 		locker.Unlock();
+@@ -1077,11 +1093,7 @@ MesonVdec::_Stop(bool keepBuffers)
+ 			fSetupThread = -1;
+ 		}
+ 		if (_IsHevc()) {
+-			INFO("HEVC session ended: %" B_PRIu32 " reports, %" B_PRIu32
+-				" slices decoded, %" B_PRIu32 " skipped, %" B_PRIu32
+-				" frames, %" B_PRIu32 " damaged\n", fHevcReports, fHevcSlices,
+-				fHevcSkipped, fFramesDecoded, fBadPictures);
+-			_DumpTrace(false);
++			_StopHevcProcessor();
+ 			_PowerDownHevc();
+ 		} else
+ 			_PowerDown();
+@@ -1300,7 +1312,6 @@ MesonVdec::_GetFrame(meson_vdec_frame& frame)
+ 			timeout = min_c(timeout, system_time() + endPause);
+ 		}
+ 		if (_IsHevc()) {
+-			_PollHevc();
+ 			InterruptsSpinLocker locker(fStateLock);
+ 			bool ended = fHevcEnded && fQueueCount == 0;
+ 			bool queued = fQueueCount > 0;
+@@ -1375,7 +1386,7 @@ MesonVdec::_GetFrame(meson_vdec_frame& frame)
+ 	if (fCodec == MESON_VDEC_H264 || _IsHevc()) {
+ 		flush_cache_range(fFrameBuffers[index].physical, fFrameSize);
+ 		frame.frames = fFrameBuffers[index].area;
+-		frame.offset = 0;
++		frame.offset = _IsHevc() ? fHevcLumaOffset : 0;
+ 		if ((info & H264_STATUS_ERROR) != 0)
+ 			frame.flags |= MESON_VDEC_FRAME_DAMAGED;
+ 	} else {
+@@ -1401,8 +1412,10 @@ MesonVdec::_Recycle(uint32 index)
+ 	if (index >= fFrameCount || (fHeld & (1 << index)) == 0)
+ 		return B_BAD_VALUE;
+ 	if (_IsHevc()) {
+-		// the driver itself picks the frames for new pictures
++		// the driver itself picks the frames for new pictures; one may wait
++		// for this
+ 		fHeld &= ~(1 << index);
++		release_sem_etc(fSetupSem, 1, B_DO_NOT_RESCHEDULE);
+ 		return B_OK;
+ 	}
+ 	if (fCodec == MESON_VDEC_H264) {
+@@ -1440,9 +1453,16 @@ status_t
+ MesonVdec::Open()
+ {
+ 	MutexLocker locker(fLock);
+-	if (fOpen)
++	thread_info thread;
++	get_thread_info(find_thread(NULL), &thread);
++	if (fOpen) {
++		INFO("busy: thread \"%s\" of team %" B_PRId32 " has the decoder, "
++			"\"%s\" asks\n", fOpenerName, fOpener, thread.name);
+ 		return B_BUSY;
++	}
+ 	fOpen = true;
++	fOpener = team_get_current_team_id();
++	strlcpy(fOpenerName, thread.name, sizeof(fOpenerName));
+ 	return B_OK;
+ }
+ 
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp
+index 59fad85b87..e05f8f91b2 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp
+@@ -2,18 +2,23 @@
+  * Copyright 2026, haiku-odroid-c2 port authors.
+  * Distributed under the terms of the MIT License.
+  *
+- * meson_vdec's HEVC block (experimental, PLAN.md M26 stage 3): a
+- * feasibility test of the S905's HEVC decoder with linux-firmware's
+- * gxl_hevc.bin (MESON_VDEC_HEVC) or the vendor kernel's microcode
+- * (MESON_VDEC_HEVC_VENDOR). It decodes intra pictures of 8-bit streams to
+- * NV12 and skips the others. The register facts are in the port's
+- * docs/m26-vdec-hevc-facts.md and docs/m26-vdec-hevc-vendor-facts.md.
++ * meson_vdec's HEVC block (PLAN.md M26 stage 3): the S905's HEVC decoder
++ * with linux-firmware's gxl_hevc.bin (MESON_VDEC_HEVC) or, for research,
++ * the vendor kernel's microcode (MESON_VDEC_HEVC_VENDOR). It decodes Main
++ * and Main 10 streams (4:2:0, up to 1920x1088) to 8-bit NV12
++ * (10-bit ones keep their references compressed, and the NV12 copy is the
++ * firmware's "double write"). The register
++ * facts are in the port's docs/m26-vdec-hevc-facts.md and
++ * docs/m26-vdec-hevc-vendor-facts.md; the reference handling follows ITU-T
++ * H.265 (8.3, C.5).
+  *
+  * Unlike VDEC_1's firmware, the HEVC firmware only parses: it reports each
+  * slice segment header (status 8) with the parameters it parsed (the RPM),
+- * and the host programs the picture's buffers and the slice's decoding and
+- * tells it to go on. The mailbox interrupt stays masked; the waits poll the
+- * status register.
++ * and the host does the rest: the picture order count, which pictures stay
++ * references, the reference lists, a frame for the picture, the slice's
++ * decoding registers, and the output order. A thread of the session does
++ * this, woken by the mailbox interrupt (and every few milliseconds, in
++ * case one is lost).
+  */
+ 
+ 
+@@ -84,7 +89,10 @@ enum {
+ 	HEVCD_MPP_ANC_CANVAS_ACCCONFIG_ADDR = 0xd300,
+ 	HEVCD_MPP_ANC_CANVAS_DATA_ADDR = 0xd304,
+ 	HEVCD_MPP_DECOMP_CTL1		= 0xd308,
++	HEVCD_MPP_DECOMP_CTL2		= 0xd30c,
+ 	HEVCD_MCRCC_CTL1			= 0xd3c0,
++	HEVCD_MCRCC_CTL2			= 0xd3c4,
++	HEVCD_MCRCC_CTL3			= 0xd3c8,
+ 	HEVC_DBLK_CFG1				= 0xd404,
+ 	HEVC_DBLK_CFG2				= 0xd408,
+ 	HEVC_DBLK_CFG4				= 0xd410,
+@@ -101,6 +109,10 @@ enum {
+ 	HEVC_SAO_Y_WPTR				= 0xd83c,
+ 	HEVC_SAO_C_WPTR				= 0xd840,
+ 	HEVC_SAO_CTRL5				= 0xd88c,
++	HEVC_CM_BODY_START_ADDR		= 0xd898,
++	HEVC_CM_BODY_LENGTH			= 0xd89c,
++	HEVC_CM_HEADER_LENGTH		= 0xd8a4,
++	HEVC_CM_HEADER_OFFSET		= 0xd8ac,
+ 	HEVC_IQIT_SCALELUT_WR_ADDR	= 0xdc08,
+ 	HEVC_IQIT_SCALELUT_DATA		= 0xdc10,
+ 	HEVC_PSCALE_CTRL			= 0xe444,
+@@ -152,6 +164,9 @@ enum {
+ // microcode has 8 tile entries less: its fields from misc_flag0 on are 8
+ // lower
+ enum {
++	RPM_RPS						= 0,	// to 15: the current RPS
++	RPM_NUM_REF_L0				= 16,
++	RPM_NUM_REF_L1				= 17,
+ 	RPM_SLICE_TYPE				= 18,	// 0 B, 1 P, 2 I
+ 	RPM_TMVP					= 19,
+ 	RPM_DEPENDENT_SLICE			= 20,
+@@ -160,11 +175,14 @@ enum {
+ 	RPM_HEIGHT					= 24,
+ 	RPM_LOG2_MIN_CB				= 25,	// - 3
+ 	RPM_LOG2_DIFF_CB			= 26,
++	RPM_LOG2_MAX_POC_LSB		= 27,	// - 4
+ 	RPM_POC_LSB					= 28,
+ 	RPM_COL_FROM_L0				= 29,
++	RPM_COL_REF_INDEX			= 30,
+ 	RPM_PARALLEL_MERGE			= 31,
+ 	RPM_FIVE_MINUS_MERGE		= 32,
+ 	RPM_REORDER					= 33,
++	RPM_MODIFICATION			= 34,	// bit 0: L0, bit 1: L1
+ 	RPM_TILES					= 35,
+ 	RPM_MISC_FLAG0				= 54,
+ 	RPM_PPS_BETA				= 55,
+@@ -177,6 +195,7 @@ enum {
+ 	RPM_TEMPORAL_ID				= 62,
+ 	RPM_NAL_TYPE				= 63,
+ 	RPM_BIT_DEPTH				= 68,
++	RPM_MODIFICATION_LIST		= 72,	// to 103: L0's, then L1's
+ 	RPM_CONFORMANCE				= 104,
+ 	RPM_CONF_LEFT				= 105,
+ 	RPM_CONF_RIGHT				= 106,
+@@ -214,8 +233,8 @@ static const uint32 kWorkRpm = 0x1a0000;
+ static const uint32 kWorkLmem = 0x1a0100;
+ static const size_t kHevcWorkspaceSize = 0x1b0000;
+ static const size_t kHevcAuxSize = 16 * 1024;
+-static const uint32 kHevcFrames = 6;
+-	// intra pictures only, for now
++static const uint32 kHevcFrameMargin = 7;
++	// frames beyond the reordering depth (the vendor's choice), at most 16
+ static const uint32 kHevcTableSlots = 48;
+ 	// the reference address table: 24 pictures of two planes
+ 
+@@ -263,10 +282,37 @@ MesonVdec::_PowerUpHevc()
+ }
+ 
+ 
++/*!	Stops the firmware, with the session's thread gone: it is let finish
++	the slice it decodes first (as Amlogic's Android driver does, for up to
++	200 ms), or until it has come to a standstill, without the rest of the
++	slice in the stream (20 ms without a CTB decoded). Stopped in the middle
++	of a picture, and reset or powered down right after, the block hung the
++	whole system now and then: its writes to memory were cut off,
++	presumably.
++*/
+ void
+ MesonVdec::_StopHevcProcessor()
+ {
+ 	_SetDos(HEVC_ASSIST_MBOX1_MASK, 0);
++	bigtime_t now = system_time();
++	bigtime_t timeout = now + 200000;
++	bigtime_t lastMove = now;
++	uint32 lastCtb = _Dos(HEVC_PARSER_LCU_START);
++	while ((_Dos(HEVC_DEC_STATUS_REG) & 0xff) == HEVC_STATUS_DECODE_SLICE) {
++		snooze(500);
++		now = system_time();
++		uint32 ctb = _Dos(HEVC_PARSER_LCU_START);
++		if (ctb != lastCtb) {
++			lastCtb = ctb;
++			lastMove = now;
++		} else if (now - lastMove > 20000)
++			break;
++		if (now > timeout) {
++			INFO("HEVC stop: the slice is not decoded after 200 ms (CTB %#"
++				B_PRIx32 ")\n", ctb);
++			break;
++		}
++	}
+ 	_SetDos(HEVC_MPSR, 0);
+ 	_SetDos(HEVC_CPSR, 0);
+ 	// what the processor's DMA still does
+@@ -278,9 +324,11 @@ MesonVdec::_StopHevcProcessor()
+ 		spin(10);
+ 	}
+ 	_SetDos(HEVC_STREAM_CONTROL, 0);
+-	_SetDos(DOS_SW_RESET3, 0x000ed918);
+-	spin(10);
+-	_SetDos(DOS_SW_RESET3, 0);
++	if (fFatal || fDecodeErrors > 0 || fBadPictures > 0) {
++		INFO("HEVC session ended: %" B_PRIu32 " reports, %" B_PRIu32
++			" slices decoded, %" B_PRIu32 " skipped\n", fHevcReports,
++			fHevcSlices, fHevcSkipped);
++	}
+ }
+ 
+ 
+@@ -342,8 +390,7 @@ MesonVdec::_StartHevcCodec()
+ 	_SetDos(HEVCD_IPP_TOP_CNTL, 2);
+ 	_SetDos(HEVC_WAIT_FLAG, 1);
+ 	_SetDos(HEVC_ASSIST_MBOX1_CLR_REG, 1);
+-	_SetDos(HEVC_ASSIST_MBOX1_MASK, 0);
+-		// the waits poll the status
++	_SetDos(HEVC_ASSIST_MBOX1_MASK, 1);
+ 	_SetDos(HEVC_PSCALE_CTRL, 0);
+ 	_SetDos(HEVC_NAL_SEARCH_CTL, fHevcVendor ? 0x8 : 0xc);
+ 	_SetDos(HEVC_DECODE_STOP_POS, 0);
+@@ -431,6 +478,12 @@ MesonVdec::_StartHevc(meson_vdec_start& start, const void* userFirmware)
+ 		fBadPictures = 0;
+ 	}
+ 	fHevcPicture = -1;
++	fHevcPendingPicture = false;
++	fHevcSkippingPicture = false;
++	fHevcFirstPicture = true;
++	fHevcSkipRasl = true;
++	fHevcPreviousPoc = 0;
++	fHevcPoc = 0;
+ 	fHevcEnded = false;
+ 	fHevcLastStatus = 0;
+ 	fHevcLastChange = system_time();
+@@ -442,14 +495,21 @@ MesonVdec::_StartHevc(meson_vdec_start& start, const void* userFirmware)
+ 		acquire_sem_etc(fFrameSem, count, 0, 0);
+ 	if (get_sem_count(fParserSem, &count) == B_OK && count > 0)
+ 		acquire_sem_etc(fParserSem, count, 0, 0);
++	if (get_sem_count(fSetupSem, &count) == B_OK && count > 0)
++		acquire_sem_etc(fSetupSem, count, 0, 0);
+ 
+ 	_PowerUpHevc();
+ 	uint32 version = _Dos(HEVC_PARSER_VERSION);
+ 	uint32 startCode = _Dos(HEVC_SHIFT_STARTCODE);
+ 	uint32 emulateCode = _Dos(HEVC_SHIFT_EMULATECODE);
+-	INFO("HEVC block: parser version %#" B_PRIx32 ", start code %#" B_PRIx32
+-		", emulation code %#" B_PRIx32 " (%s firmware)\n", version, startCode,
+-		emulateCode, fHevcVendor ? "vendor" : "linux-firmware");
++	static bool sReported = false;
++	if (!sReported) {
++		INFO("HEVC block: parser version %#" B_PRIx32 ", start code %#"
++			B_PRIx32 ", emulation code %#" B_PRIx32 " (%s firmware)\n",
++			version, startCode, emulateCode,
++			fHevcVendor ? "vendor" : "linux-firmware");
++		sReported = true;
++	}
+ 
+ 	// the stream buffer
+ 	_SetDos(HEVC_STREAM_CONTROL, _Dos(HEVC_STREAM_CONTROL) & ~1u);
+@@ -476,6 +536,10 @@ MesonVdec::_StartHevc(meson_vdec_start& start, const void* userFirmware)
+ 
+ 	_StartHevcCodec();
+ 	fRunning = true;
++	fSetupThread = spawn_kernel_thread(&_HevcThread, "meson_vdec hevc",
++		B_URGENT_DISPLAY_PRIORITY, this);
++	if (fSetupThread >= 0)
++		resume_thread(fSetupThread);
+ 	(void)_Dos(DOS_SW_RESET3);
+ 	_SetDos(DOS_SW_RESET3, (1 << 12) | (1 << 11));
+ 	_SetDos(DOS_SW_RESET3, 0);
+@@ -487,8 +551,6 @@ MesonVdec::_StartHevc(meson_vdec_start& start, const void* userFirmware)
+ 	start.frame_count = 0;
+ 	start.frame_size = 0;
+ 	start.frames = -1;
+-	INFO("HEVC session: byte count %" B_PRIu32 ", status %#" B_PRIx32 "\n",
+-		_Dos(HEVC_SHIFT_BYTE_COUNT), _Dos(HEVC_DEC_STATUS_REG));
+ 	return B_OK;
+ }
+ 
+@@ -508,10 +570,12 @@ MesonVdec::_Rpm(uint32 index) const
+ }
+ 
+ 
+-/*!	The frames, once the first slice header gives the picture's size: each
+-	one area with the Y plane, the CbCr plane and the motion vectors, every
+-	part 64 KB aligned (the GXBB's reference table keeps only address bits
+-	31:16); and the reference table pointing at them.
++/*!	The frames, once the first slice header gives the picture's size: the
++	reordering depth and 7 more (at most 16), each one area with (for 10-bit
++	streams) the compressed reference picture, the Y plane, the CbCr plane
++	and the motion vectors, every part 64 KB aligned (the GXBB's reference
++	table keeps only address bits 31:16); and the reference table pointing
++	at them: two slots per frame, Y and CbCr, or one, the compressed picture.
+ */
+ status_t
+ MesonVdec::_SetupHevcFrames()
+@@ -532,28 +596,48 @@ MesonVdec::_SetupHevcFrames()
+ 	fHevcCtbColumns = (width + ctb - 1) / ctb;
+ 	fHevcCtbRows = (height + ctb - 1) / ctb;
+ 	fHevcMvUnit = log2Ctb == 6 ? 0x200 : log2Ctb == 5 ? 0x80 : 0x20;
++	fHevcReorder = _Rpm(RPM_REORDER);
++	uint32 count = min_c(fHevcReorder + kHevcFrameMargin, 16u);
++
++	// 10 bits: the references compressed (Amlogic's lossless format: 4 KB
++	// per 64x32 block, then a header of 32 bytes per 128x64)
++	fHevcCompressed = _Rpm(RPM_BIT_DEPTH) != 0;
++	fHevcBodySize = fHevcCompressed
++		? 4096 * (align_up(width, 64) / 64) * (align_up(height, 32) / 32) : 0;
++	fHevcHeaderSize = fHevcCompressed
++		? 32 * (align_up(width, 128) / 128) * (align_up(height, 64) / 64) : 0;
++	fHevcLumaOffset = align_up(fHevcBodySize + fHevcHeaderSize, 64 * 1024);
+ 
+ 	uint32 bytesPerRow = align_up(width, 32);
+ 	uint32 lumaSize = align_up(bytesPerRow * align_up(height, 32), 64 * 1024);
+ 	uint32 chromaSize = align_up(lumaSize / 2, 64 * 1024);
+ 	uint32 mvSize = align_up(fHevcCtbColumns * fHevcCtbRows * fHevcMvUnit,
+ 		64 * 1024);
+-	size_t frameSize = lumaSize + chromaSize + mvSize;
+-
+-	_FreeH264Frames();
+-	for (uint32 i = 0; i < kHevcFrames; i++) {
+-		char name[32];
+-		snprintf(name, sizeof(name), "meson_vdec frame %" B_PRIu32, i);
+-		status_t status = _AllocateBuffer(name, frameSize, fFrameBuffers[i],
+-			true);
+-		if (status != B_OK) {
+-			_FreeH264Frames();
+-			return status;
++	size_t frameSize = fHevcLumaOffset + lumaSize + chromaSize + mvSize;
++
++	// the frames of the last session if they are the same (a seek)
++	uint32 key = width | (height << 12) | (fHevcCompressed ? 1u << 24 : 0);
++	bool allocate = fFrameBuffersAllocated != count || fFrameSize != frameSize
++		|| fHevcFramesKey != key;
++	if (allocate) {
++		_FreeH264Frames();
++		for (uint32 i = 0; i < count; i++) {
++			char name[32];
++			snprintf(name, sizeof(name), "meson_vdec frame %" B_PRIu32, i);
++			status_t status = _AllocateBuffer(name, frameSize,
++				fFrameBuffers[i], true);
++			if (status != B_OK) {
++				_FreeH264Frames();
++				return status;
++			}
+ 		}
++		fHevcFramesKey = key;
+ 	}
+-	fFrameBuffersAllocated = kHevcFrames;
++	for (uint32 i = 0; i < count; i++)
++		fHevcFrames[i] = hevc_frame();
++	fFrameBuffersAllocated = count;
+ 	fFrameSize = frameSize;
+-	fHevcMvOffset = lumaSize + chromaSize;
++	fHevcMvOffset = fHevcLumaOffset + lumaSize + chromaSize;
+ 
+ 	// the display size: the conformance window is in chroma samples
+ 	uint32 cropX = 0;
+@@ -564,7 +648,7 @@ MesonVdec::_SetupHevcFrames()
+ 	}
+ 	{
+ 		InterruptsSpinLocker locker(fStateLock);
+-		fFrameCount = kHevcFrames;
++		fFrameCount = count;
+ 		fWidth = width > cropX ? width - cropX : width;
+ 		fHeight = height > cropY ? height - cropY : height;
+ 		fBytesPerRow = bytesPerRow;
+@@ -574,10 +658,12 @@ MesonVdec::_SetupHevcFrames()
+ 	// the reference table: Y in slot 2k, CbCr in 2k + 1; the slots of
+ 	// pictures that don't exist show the first one
+ 	_SetDos(HEVCD_MPP_ANC2AXI_TBL_CONF_ADDR, 0);
+-	for (uint32 slot = 0; slot < kHevcTableSlots; slot++) {
+-		uint32 frame = slot / 2 < kHevcFrames ? slot / 2 : 0;
+-		phys_addr_t address = fFrameBuffers[frame].physical
+-			+ ((slot & 1) != 0 ? lumaSize : 0);
++	uint32 perFrame = fHevcCompressed ? 1 : 2;
++	for (uint32 slot = 0; slot < kHevcTableSlots / (3 - perFrame); slot++) {
++		uint32 frame = slot / perFrame < count ? slot / perFrame : 0;
++		phys_addr_t address = fFrameBuffers[frame].physical;
++		if (!fHevcCompressed && (slot & 1) != 0)
++			address += lumaSize;
+ 		_SetDos(HEVCD_MPP_ANC2AXI_TBL_CMD_ADDR,
+ 			(uint32)address | (slot << 8) | 1);
+ 	}
+@@ -585,18 +671,65 @@ MesonVdec::_SetupHevcFrames()
+ 	_SetDos(HEVCD_MPP_ANC_CANVAS_ACCCONFIG_ADDR, 1);
+ 	for (int32 i = 0; i < 32; i++)
+ 		_SetDos(HEVCD_MPP_ANC_CANVAS_DATA_ADDR, 0);
+-	_SetDos(HEVCD_MPP_DECOMP_CTL1, 0x80000000);
++	if (fHevcCompressed) {
++		// references read decompressed from the body and its header
++		_SetDos(HEVCD_MPP_DECOMP_CTL1, 0);
++		_SetDos(HEVCD_MPP_DECOMP_CTL2, fHevcBodySize >> 5);
++		_SetDos(HEVC_CM_BODY_LENGTH, fHevcBodySize);
++		_SetDos(HEVC_CM_HEADER_OFFSET, fHevcBodySize);
++		_SetDos(HEVC_CM_HEADER_LENGTH, fHevcHeaderSize);
++	} else {
+ 		// references as two NV12 planes, no compression
++		_SetDos(HEVCD_MPP_DECOMP_CTL1, 0x80000000);
++	}
+ 
+-	INFO("HEVC %" B_PRIu32 "x%" B_PRIu32 " (coded %" B_PRIu32 "x%" B_PRIu32
+-		"), CTB %" B_PRIu32 ", %" B_PRIu32 "-bit: %" B_PRIu32 " frames of %"
+-		B_PRIuSIZE " bytes\n", fWidth, fHeight, width, height, ctb,
+-		(_Rpm(RPM_BIT_DEPTH) & 0xf) + 8, kHevcFrames, frameSize);
++	if (allocate) {
++		INFO("HEVC %" B_PRIu32 "x%" B_PRIu32 " (coded %" B_PRIu32 "x%"
++			B_PRIu32 "), CTB %" B_PRIu32 ", %" B_PRIu32 "-bit, reordering %"
++			B_PRIu32 ": %" B_PRIu32 " frames of %" B_PRIuSIZE " bytes\n",
++			fWidth, fHeight, width, height, ctb,
++			(_Rpm(RPM_BIT_DEPTH) & 0xf) + 8, fHevcReorder, count, frameSize);
++	}
+ 	return B_OK;
+ }
+ 
+ 
+-/*!	The picture being decoded is complete: to the caller. */
++/*!	Hands the picture in \a frame to the caller. With fStateLock held. */
++void
++MesonVdec::_OutputHevcFrame(uint32 frame)
++{
++	hevc_frame& picture = fHevcFrames[frame];
++	picture.waiting = false;
++	_QueueFrame(frame, picture.damaged ? H264_STATUS_ERROR : 0,
++		picture.offset);
++}
++
++
++/*!	Hands out the decoded pictures in display order (lowest picture order
++	count first) while more than \a keep of them wait (H.265 C.5.2: the
++	"bumping"). With fStateLock held.
++*/
++void
++MesonVdec::_BumpHevcFrames(uint32 keep)
++{
++	while (true) {
++		int32 first = -1;
++		uint32 waiting = 0;
++		for (uint32 i = 0; i < fFrameCount; i++) {
++			if (!fHevcFrames[i].waiting)
++				continue;
++			waiting++;
++			if (first < 0 || fHevcFrames[i].poc < fHevcFrames[first].poc)
++				first = i;
++		}
++		if (first < 0 || waiting <= keep)
++			return;
++		_OutputHevcFrame(first);
++	}
++}
++
++
++/*!	The picture being decoded is complete: it waits to be handed out. */
+ void
+ MesonVdec::_FinishHevcPicture()
+ {
+@@ -604,19 +737,22 @@ MesonVdec::_FinishHevcPicture()
+ 		return;
+ 	uint32 lcu = _Dos(HEVC_PARSER_LCU_START) & 0xffffff;
+ 	uint32 last = fHevcCtbColumns * fHevcCtbRows - 1;
+-	_Trace('F', fHevcPicture, lcu, last);
+-	if (lcu != last)
+-		fBadPictures++;
++	_Trace('F', fHevcPicture, lcu, fHevcFrames[fHevcPicture].poc);
+ 	InterruptsSpinLocker locker(fStateLock);
++	hevc_frame& picture = fHevcFrames[fHevcPicture];
++	if (lcu != last) {
++		picture.damaged = true;
++		fBadPictures++;
++	}
++	picture.waiting = true;
+ 	fLastReport = system_time();
+-	_QueueFrame(fHevcPicture, lcu == last ? 0 : H264_STATUS_ERROR,
+-		fHevcPictureOffset);
+ 	fHevcPicture = -1;
++	_BumpHevcFrames(fHevcReorder);
+ }
+ 
+ 
+-/*!	A free frame for a new picture: not with the caller, not waiting for
+-	it. Intra pictures only so far: no references to keep.
++/*!	A frame for a new picture: not a reference, not waiting to be handed
++	out, not with the caller or waiting for it.
+ */
+ int32
+ MesonVdec::_FreeHevcFrame()
+@@ -626,61 +762,249 @@ MesonVdec::_FreeHevcFrame()
+ 	for (uint32 i = 0; i < fQueueCount; i++)
+ 		busy |= 1u << fQueue[(fQueueHead + i) % kMaxFrames];
+ 	for (uint32 i = 0; i < fFrameCount; i++) {
+-		if ((busy & (1u << i)) == 0)
++		if ((busy & (1u << i)) == 0 && !fHevcFrames[i].referenced
++			&& !fHevcFrames[i].waiting) {
+ 			return i;
++		}
++	}
++	// None. If the caller has frames to give back, they come back; if not,
++	// the pictures waiting to be handed out fill the buffer: hand out the
++	// first one early (H.265 C.5.2.2, "bumping" while the buffer is full).
++	// (Not while the caller has frames: a picture still to be decoded may
++	// come before it.)
++	if (busy != 0)
++		return -1;
++	uint32 waiting = 0;
++	for (uint32 i = 0; i < fFrameCount; i++) {
++		if (fHevcFrames[i].waiting)
++			waiting++;
++	}
++	if (waiting > 0)
++		_BumpHevcFrames(waiting - 1);
++	return -1;
++}
++
++
++int32
++MesonVdec::_HevcFrameForPoc(int32 poc)
++{
++	for (uint32 i = 0; i < fFrameCount; i++) {
++		if (fHevcFrames[i].referenced && fHevcFrames[i].poc == poc
++			&& (int32)i != fHevcPicture) {
++			return i;
++		}
+ 	}
+ 	return -1;
+ }
+ 
+ 
++/*!	Prepares the picture whose first slice segment header is in fRpm, once:
++	completes the last one, the picture order count (H.265 8.3.1), the
++	pictures that stay references (the reference picture set, 8.3.2), the
++	pictures handed out before it. Returns false if the picture is not
++	decoded (leading pictures that refer to what came before the stream's
++	start, 10-bit streams).
++*/
++bool
++MesonVdec::_PrepareHevcPicture()
++{
++	_FinishHevcPicture();
++
++	uint32 nalType = _Rpm(RPM_NAL_TYPE);
++	bool idr = nalType == 19 || nalType == 20;
++	bool irap = nalType >= 16 && nalType <= 23;
++	// an IRAP picture after which nothing earlier is needed: an IDR or BLA
++	// picture, a CRA picture at the start
++	bool fresh = idr || (nalType >= 16 && nalType <= 18)
++		|| (nalType == 21 && fHevcFirstPicture);
++	if (irap)
++		fHevcSkipRasl = fresh;
++	if ((nalType == 8 || nalType == 9) && fHevcSkipRasl)
++		return false;
++	if (_Rpm(RPM_CHROMA_FORMAT) != 1
++		|| (_Rpm(RPM_BIT_DEPTH) != 0) != fHevcCompressed) {
++		return false;
++	}
++
++	int32 poc;
++	uint32 lsb = _Rpm(RPM_POC_LSB);
++	if (idr)
++		poc = 0;
++	else if (fresh)
++		poc = lsb;
++	else {
++		int32 maxLsb = 1 << (_Rpm(RPM_LOG2_MAX_POC_LSB) + 4);
++		int32 previousLsb = fHevcPreviousPoc & (maxLsb - 1);
++		int32 previousMsb = fHevcPreviousPoc - previousLsb;
++		int32 msb = previousMsb;
++		if ((int32)lsb < previousLsb && previousLsb - (int32)lsb >= maxLsb / 2)
++			msb = previousMsb + maxLsb;
++		else if ((int32)lsb > previousLsb
++			&& (int32)lsb - previousLsb > maxLsb / 2) {
++			msb = previousMsb - maxLsb;
++		}
++		poc = msb + lsb;
++	}
++	// the next picture's reference for the most significant part: one of
++	// temporal layer 0 that is not a leading or sub-layer non-reference
++	// picture (the firmware's temporal ID is TemporalId + 1)
++	bool sublayerNonReference = nalType <= 14 && (nalType & 1) == 0;
++	if ((_Rpm(RPM_TEMPORAL_ID) & 7) <= 1 && !(nalType >= 6 && nalType <= 9)
++		&& !sublayerNonReference) {
++		fHevcPreviousPoc = poc;
++	}
++	fHevcPoc = poc;
++	fHevcFirstPicture = false;
++
++	InterruptsSpinLocker locker(fStateLock);
++	if (irap && fresh) {
++		// what came before is handed out and no reference anymore
++		_BumpHevcFrames(0);
++		for (uint32 i = 0; i < fFrameCount; i++)
++			fHevcFrames[i].referenced = false;
++	}
++	// what the picture's reference picture set lists stays a reference,
++	// whether the picture itself uses it or not
++	for (uint32 i = 0; i < fFrameCount; i++) {
++		if (!fHevcFrames[i].referenced)
++			continue;
++		bool listed = false;
++		for (uint32 entry = 0; entry < 16; entry++) {
++			uint32 value = _Rpm(RPM_RPS + entry);
++			if ((value & 0x8000) != 0)
++				break;
++			int32 delta = value & 0x3fff;
++			if ((delta & 0x2000) != 0)
++				delta -= 0x4000;
++			if (fHevcFrames[i].poc == poc + delta) {
++				listed = true;
++				break;
++			}
++		}
++		fHevcFrames[i].referenced = listed;
++	}
++	return true;
++}
++
++
++/*!	The slice's reference lists (H.265 8.3.4) in fHevcList, as frames; -1
++	where a reference is missing. Returns false if one is.
++*/
++bool
++MesonVdec::_BuildHevcLists(uint32 sliceType)
++{
++	int32 before[16];
++	int32 after[16];
++	uint32 beforeCount = 0;
++	uint32 afterCount = 0;
++	bool complete = true;
++	for (uint32 entry = 0; entry < 16; entry++) {
++		uint32 value = _Rpm(RPM_RPS + entry);
++		if ((value & 0x8000) != 0)
++			break;
++		if ((value & 0x4000) == 0)
++			continue;
++		int32 delta = value & 0x3fff;
++		if ((delta & 0x2000) != 0)
++			delta -= 0x4000;
++		int32 frame = _HevcFrameForPoc(fHevcPoc + delta);
++		if (frame < 0)
++			complete = false;
++		if (delta < 0)
++			before[beforeCount++] = frame;
++		else
++			after[afterCount++] = frame;
++	}
++	uint32 total = beforeCount + afterCount;
++
++	fHevcListCount[0] = sliceType == 2 ? 0 : min_c(_Rpm(RPM_NUM_REF_L0), 16u);
++	fHevcListCount[1] = sliceType == 0 ? min_c(_Rpm(RPM_NUM_REF_L1), 16u) : 0;
++	if (total == 0) {
++		fHevcListCount[0] = fHevcListCount[1] = 0;
++		return sliceType == 2;
++	}
++	uint32 modification = _Rpm(RPM_MODIFICATION);
++	for (uint32 list = 0; list < 2; list++) {
++		// the initial list: before, after (L1: after, before), repeated
++		int32 initial[32];
++		uint32 length = max_c(fHevcListCount[list], total);
++		if (length > 32)
++			length = 32;
++		for (uint32 i = 0; i < length; i++) {
++			uint32 index = i % total;
++			if (list == 0) {
++				initial[i] = index < beforeCount ? before[index]
++					: after[index - beforeCount];
++			} else {
++				initial[i] = index < afterCount ? after[index]
++					: before[index - afterCount];
++			}
++		}
++		bool modified = (modification & (1 << list)) != 0;
++		uint32 base = list == 1 && (modification & 1) != 0
++			? fHevcListCount[0] : 0;
++		for (uint32 i = 0; i < fHevcListCount[list]; i++) {
++			uint32 index = modified
++				? _Rpm(RPM_MODIFICATION_LIST + min_c(base + i, 31u)) : i;
++			fHevcList[list][i] = index < length ? initial[index] : -1;
++			if (fHevcList[list][i] < 0)
++				complete = false;
++		}
++	}
++	return complete;
++}
++
++
+ /*!	Status 8: a slice segment header was parsed. Programs the slice's
+-	decoding (intra slices) or skips it. Returns false if it must wait for
+-	a free frame.
++	decoding or skips it. Returns false if it must wait for a free frame.
+ */
+ bool
+ MesonVdec::_HevcSlice()
+ {
+-	flush_cache_range(fWorkspace.physical + kWorkRpm, sizeof(fRpm));
+-	memcpy(fRpm, fWorkspace.address + kWorkRpm, sizeof(fRpm));
++	if (!fHevcPendingPicture) {
++		flush_cache_range(fWorkspace.physical + kWorkRpm, sizeof(fRpm));
++		memcpy(fRpm, fWorkspace.address + kWorkRpm, sizeof(fRpm));
++	}
+ 	uint32 sliceType = _Rpm(RPM_SLICE_TYPE);
+ 	uint32 address = _Rpm(RPM_SLICE_ADDRESS);
+ 	bool newPicture = address == 0;
+ 	uint32 nalType = _Rpm(RPM_NAL_TYPE);
+-	fHevcReports++;
+-	_Trace('H', sliceType | (nalType << 8) | (address << 16),
+-		_Rpm(RPM_WIDTH) | (_Rpm(RPM_HEIGHT) << 16), _Rpm(RPM_POC_LSB),
+-		_Dos(HEVC_SHIFT_BYTE_COUNT));
+-	if (fHevcReports == 1) {
+-		INFO("HEVC slice: type %" B_PRIu32 ", NAL %" B_PRIu32 ", address %"
+-			B_PRIu32 ", %" B_PRIu32 "x%" B_PRIu32 ", CTB log2 %" B_PRIu32
+-			"+3+%" B_PRIu32 ", POC lsb %" B_PRIu32 ", first %" B_PRIu32
+-			", bit depth %#" B_PRIx32 ", chroma %" B_PRIu32 ", conformance %"
+-			B_PRIu32 " (%" B_PRIu32 " %" B_PRIu32 " %" B_PRIu32 " %" B_PRIu32
+-			"), byte count %" B_PRIu32 "\n", sliceType, nalType, address,
+-			_Rpm(RPM_WIDTH), _Rpm(RPM_HEIGHT), _Rpm(RPM_LOG2_MIN_CB),
+-			_Rpm(RPM_LOG2_DIFF_CB), _Rpm(RPM_POC_LSB), _Rpm(RPM_FIRST_SLICE),
+-			_Rpm(RPM_BIT_DEPTH), _Rpm(RPM_CHROMA_FORMAT),
+-			_Rpm(RPM_CONFORMANCE), _Rpm(RPM_CONF_LEFT), _Rpm(RPM_CONF_RIGHT),
+-			_Rpm(RPM_CONF_TOP), _Rpm(RPM_CONF_BOTTOM),
+-			_Dos(HEVC_SHIFT_BYTE_COUNT));
+-	}
+-
+-	if (newPicture)
+-		_FinishHevcPicture();
+ 
+-	if (fFrameCount == 0 && newPicture && _SetupHevcFrames() != B_OK) {
+-		fFatal = true;
+-		release_sem_etc(fFrameSem, 1, 0);
+-		return true;
++	if (!fHevcPendingPicture) {
++		fHevcReports++;
++		_Trace('H', sliceType | (nalType << 8) | (address << 16),
++			_Rpm(RPM_POC_LSB), _Dos(HEVC_SHIFT_BYTE_COUNT),
++			_Rpm(RPM_NUM_REF_L0) | (_Rpm(RPM_NUM_REF_L1) << 8));
++		if (fFrameCount == 0 && newPicture && _SetupHevcFrames() != B_OK) {
++			fFatal = true;
++			release_sem_etc(fFrameSem, 1, 0);
++			return true;
++		}
++		if (newPicture) {
++			fHevcSkippingPicture = !_PrepareHevcPicture();
++			if (!fHevcSkippingPicture)
++				fHevcPendingPicture = true;
++		}
+ 	}
+-	bool decode = fFrameCount > 0 && sliceType == 2
+-		&& _Rpm(RPM_BIT_DEPTH) == 0 && (newPicture || fHevcPicture >= 0);
+-	if (decode && newPicture) {
++	if (fHevcPendingPicture) {
+ 		int32 frame = _FreeHevcFrame();
+ 		if (frame < 0)
+ 			return false;
++		fHevcPendingPicture = false;
++		hevc_frame& picture = fHevcFrames[frame];
++		picture.poc = fHevcPoc;
++		picture.referenced = true;
++		picture.waiting = false;
++		picture.damaged = false;
++		picture.offset = _Dos(HEVC_SHIFT_BYTE_COUNT);
+ 		fHevcPicture = frame;
+-		fHevcPictureOffset = _Dos(HEVC_SHIFT_BYTE_COUNT);
++	}
++
++	bool decode = fFrameCount > 0 && !fHevcSkippingPicture
++		&& fHevcPicture >= 0 && sliceType <= 2;
++	if (decode && !_BuildHevcLists(sliceType)) {
++		// a reference is missing: the picture is decoded from what there is
++		fHevcFrames[fHevcPicture].damaged = true;
+ 	}
+ 	if (!decode) {
+ 		fHevcSkipped++;
+@@ -695,26 +1019,86 @@ MesonVdec::_HevcSlice()
+ 	uint32 log2Ctb = fHevcLog2Ctb;
+ 	uint32 ctbCount = fHevcCtbColumns * fHevcCtbRows;
+ 	phys_addr_t frame = fFrameBuffers[fHevcPicture].physical;
+-	phys_addr_t luma = frame;
+-	phys_addr_t chroma = frame + fLumaSize;
++	phys_addr_t luma = frame + fHevcLumaOffset;
++	phys_addr_t chroma = luma + fLumaSize;
+ 	phys_addr_t mv = frame + fHevcMvOffset;
+ 	bool dependent = _Rpm(RPM_DEPENDENT_SLICE) != 0;
++	uint32 counts[2] = { fHevcListCount[0], fHevcListCount[1] };
++
++	// the reference lists, as the reference table's slots (Y 2k, CbCr
++	// 2k + 1; compressed: k for both); a missing reference is the picture
++	// itself
++	uint32 words[2][16];
++	for (uint32 list = 0; list < 2; list++) {
++		for (uint32 i = 0; i < counts[list]; i++) {
++			int32 k = fHevcList[list][i] >= 0 ? fHevcList[list][i]
++				: fHevcPicture;
++			uint32 y = fHevcCompressed ? k : 2 * k;
++			uint32 c = fHevcCompressed ? k : y + 1;
++			words[list][i] = (c << 16) | (c << 8) | y;
++		}
++	}
++	if (counts[0] > 0) {
++		_SetDos(HEVCD_MPP_ANC_CANVAS_ACCCONFIG_ADDR, 1);
++		for (uint32 i = 0; i < counts[0]; i++)
++			_SetDos(HEVCD_MPP_ANC_CANVAS_DATA_ADDR, words[0][i]);
++	}
++	if (counts[1] > 0) {
++		_SetDos(HEVCD_MPP_ANC_CANVAS_ACCCONFIG_ADDR, (16 << 8) | 1);
++		for (uint32 i = 0; i < counts[1]; i++)
++			_SetDos(HEVCD_MPP_ANC_CANVAS_DATA_ADDR, words[1][i]);
++	}
+ 
+-	// no references: no reference lists, no reference cache
+-	_SetDos(HEVCD_MCRCC_CTL1, 0);
++	// the reference cache: the first two references
++	if (sliceType == 2 || counts[0] == 0)
++		_SetDos(HEVCD_MCRCC_CTL1, 0);
++	else {
++		_SetDos(HEVCD_MCRCC_CTL1, 2);
++		uint32 first = words[0][0] & 0xffff;
++		uint32 second;
++		if (sliceType == 1)
++			second = counts[0] > 1 ? words[0][1] & 0xffff : first;
++		else {
++			second = counts[1] > 0 ? words[1][0] & 0xffff : first;
++			if (second == first && counts[1] > 1)
++				second = words[1][1] & 0xffff;
++		}
++		_SetDos(HEVCD_MCRCC_CTL2, first | (first << 16));
++		_SetDos(HEVCD_MCRCC_CTL3, second | (second << 16));
++		_SetDos(HEVCD_MCRCC_CTL1, 0xff0);
++	}
+ 
+-	// motion prediction, intra slices included (the MVs are written)
++	// the co-located picture, whose motion vectors are read
++	int32 colocated = fHevcPicture;
++	if (sliceType != 2) {
++		uint32 list = sliceType == 0 && _Rpm(RPM_COL_FROM_L0) == 0 ? 1 : 0;
++		uint32 index = _Rpm(RPM_COL_REF_INDEX);
++		if (index < counts[list] && fHevcList[list][index] >= 0)
++			colocated = fHevcList[list][index];
++	}
++	phys_addr_t colocatedMv = fFrameBuffers[colocated].physical
++		+ fHevcMvOffset;
++	bool lowDelay = true;
++	for (uint32 list = 0; list < 2; list++) {
++		for (uint32 i = 0; i < counts[list]; i++) {
++			int32 k = fHevcList[list][i];
++			if (k >= 0 && fHevcFrames[k].poc > fHevcPoc)
++				lowDelay = false;
++		}
++	}
++
++	// motion prediction
+ 	(void)_Dos(HEVC_MPRED_CURR_LCU);
+ 	_SetDos(HEVC_MPRED_MV_WR_START_ADDR, mv);
+-	_SetDos(HEVC_MPRED_MV_RD_START_ADDR, mv);
++	_SetDos(HEVC_MPRED_MV_RD_START_ADDR, colocatedMv);
+ 	if (newPicture) {
+ 		_SetDos(HEVC_MPRED_ABV_START_ADDR,
+ 			fWorkspace.physical + kWorkMpredAbove);
+ 		_SetDos(HEVC_MPRED_MV_WPTR, mv);
+-		_SetDos(HEVC_MPRED_MV_RPTR, mv);
++		_SetDos(HEVC_MPRED_MV_RPTR, colocatedMv);
+ 	} else if (!dependent)
+-		_SetDos(HEVC_MPRED_MV_RPTR, mv + address * fHevcMvUnit);
+-	_SetDos(HEVC_MPRED_MV_RD_END_ADDR, mv + ctbCount * fHevcMvUnit);
++		_SetDos(HEVC_MPRED_MV_RPTR, colocatedMv + address * fHevcMvUnit);
++	_SetDos(HEVC_MPRED_MV_RD_END_ADDR, colocatedMv + ctbCount * fHevcMvUnit);
+ 	_SetDos(HEVC_MPRED_MV_WR_ROW_JUMP, 0);
+ 	_SetDos(HEVC_MPRED_MV_RD_ROW_JUMP, 0);
+ 	_SetDos(HEVC_MPRED_TILE_START, 0);
+@@ -723,21 +1107,27 @@ MesonVdec::_HevcSlice()
+ 	_SetDos(HEVC_MPRED_PIC_SIZE, width | (height << 16));
+ 	_SetDos(HEVC_MPRED_PIC_SIZE_LCU,
+ 		(fHevcCtbColumns - 1) | ((fHevcCtbRows - 1) << 16));
+-	_SetDos(HEVC_MPRED_REF_NUM, 0);
+-	_SetDos(HEVC_MPRED_REF_EN_L0, 0);
+-	_SetDos(HEVC_MPRED_REF_EN_L1, 0);
+-	bool idr = nalType == 19 || nalType == 20;
+-	_SetDos(HEVC_MPRED_CUR_POC, idr ? 0 : _Rpm(RPM_POC_LSB));
+-	_SetDos(HEVC_MPRED_COL_POC, 0x80000000);
+-	for (int32 i = 0; i < 16; i++) {
+-		_SetDos(HEVC_MPRED_L0_REF00_POC + 4 * i, 0);
+-		_SetDos(HEVC_MPRED_L1_REF00_POC + 4 * i, 0);
+-	}
+-	_SetDos(HEVC_MPRED_CTRL0, 2 | (newPicture ? (1 << 2) | (1 << 3) : 0)
+-		| (dependent ? 1 << 4 : 0) | ((_Rpm(RPM_TMVP) & 1) << 5) | (1 << 6)
++	_SetDos(HEVC_MPRED_REF_NUM, (counts[1] << 8) | counts[0]);
++	_SetDos(HEVC_MPRED_REF_EN_L0, (1u << counts[0]) - 1);
++	_SetDos(HEVC_MPRED_REF_EN_L1, (1u << counts[1]) - 1);
++	_SetDos(HEVC_MPRED_CUR_POC, fHevcPoc);
++	_SetDos(HEVC_MPRED_COL_POC, sliceType == 2 || colocated == fHevcPicture
++		? 0x80000000 : (uint32)fHevcFrames[colocated].poc);
++	for (uint32 i = 0; i < 16; i++) {
++		// in pairs, L0 then L1
++		int32 k0 = i < counts[0] ? fHevcList[0][i] : -1;
++		int32 k1 = i < counts[1] ? fHevcList[1][i] : -1;
++		_SetDos(HEVC_MPRED_L0_REF00_POC + 4 * i,
++			k0 >= 0 ? (uint32)fHevcFrames[k0].poc : 0);
++		_SetDos(HEVC_MPRED_L1_REF00_POC + 4 * i,
++			k1 >= 0 ? (uint32)fHevcFrames[k1].poc : 0);
++	}
++	_SetDos(HEVC_MPRED_CTRL0, sliceType
++		| (newPicture ? (1 << 2) | (1 << 3) : 0) | (dependent ? 1 << 4 : 0)
++		| ((_Rpm(RPM_TMVP) & 1) << 5) | (lowDelay ? 1 << 6 : 0)
+ 		| ((_Rpm(RPM_COL_FROM_L0) & 1) << 7) | (1 << 9) | (1 << 10)
+-		| (1 << 13) | (log2Ctb << 16) | (3 << 20)
+-		| ((_Rpm(RPM_PARALLEL_MERGE) & 0xf) << 24));
++		| (sliceType != 2 ? 1 << 11 : 0) | (1 << 13) | (log2Ctb << 16)
++		| (3 << 20) | ((_Rpm(RPM_PARALLEL_MERGE) & 0xf) << 24));
+ 	_SetDos(HEVC_MPRED_CTRL1, ((5 - _Rpm(RPM_FIVE_MINUS_MERGE)) & 0xf)
+ 		| (2 << 4) | (3 << 8) | (5 << 12) | (36 << 16));
+ 
+@@ -764,8 +1154,15 @@ MesonVdec::_HevcSlice()
+ 		}
+ 		_SetDos(HEVC_DBLK_CFG1, cfg1);
+ 	}
+-	_SetDos(HEVC_SAO_CTRL1, (_Dos(HEVC_SAO_CTRL1) & ~0x3ff3u) | 0xff0 | 1);
++	if (fHevcCompressed) {
++		// the compressed reference, and the NV12 copy ("double write")
++		_SetDos(HEVC_CM_BODY_START_ADDR, frame);
++		_SetDos(HEVC_SAO_CTRL1, (_Dos(HEVC_SAO_CTRL1) & ~0x3ff3u) | 0xff0);
++	} else {
+ 		// NV12 byte order; no compressed copy
++		_SetDos(HEVC_SAO_CTRL1, (_Dos(HEVC_SAO_CTRL1) & ~0x3ff3u) | 0xff0
++			| 1);
++	}
+ 	_SetDos(HEVC_SAO_CTRL5, _Dos(HEVC_SAO_CTRL5) & ~(0xffu << 16));
+ 	_SetDos(HEVCD_IPP_AXIIF_CONFIG, (_Dos(HEVCD_IPP_AXIIF_CONFIG) & ~0x30u)
+ 		| 0xf);
+@@ -808,8 +1205,35 @@ MesonVdec::_HevcSlice()
+ }
+ 
+ 
++/*static*/ status_t
++MesonVdec::_HevcThread(void* data)
++{
++	MesonVdec* device = (MesonVdec*)data;
++	while (device->fRunning) {
++		acquire_sem_etc(device->fSetupSem, 1, B_RELATIVE_TIMEOUT,
++			kPollInterval);
++		if (!device->fRunning)
++			break;
++		device->_PollHevc();
++	}
++	return B_OK;
++}
++
++
++/*!	The mailbox interrupt: the firmware has something to report. */
++bool
++MesonVdec::_HevcInterrupt()
++{
++	if (!fRunning)
++		return false;
++	_SetDos(HEVC_ASSIST_MBOX1_CLR_REG, 1);
++	release_sem_etc(fSetupSem, 1, B_DO_NOT_RESCHEDULE);
++	return true;
++}
++
++
+ /*!	Looks at the HEVC firmware's status and answers it. Called by the
+-	waits, without fStateLock (it may allocate the frames).
++	session's thread, without fStateLock (it may allocate the frames).
+ */
+ void
+ MesonVdec::_PollHevc()
+@@ -839,8 +1263,11 @@ MesonVdec::_PollHevc()
+ 			if (status == HEVC_STATUS_NAL_FOUND
+ 				|| (fEndOfStream && status == HEVC_STATUS_SEARCH_EMPTY)) {
+ 				_FinishHevcPicture();
+-				if (fEndOfStream)
++				if (fEndOfStream) {
++					InterruptsSpinLocker locker(fStateLock);
++					_BumpHevcFrames(0);
+ 					fHevcEnded = true;
++				}
+ 			}
+ 			if (status != HEVC_STATUS_SEARCH_EMPTY) {
+ 				_SetDos(HEVC_WAIT_FLAG, _Dos(HEVC_WAIT_FLAG) & ~2u);
+@@ -861,6 +1288,8 @@ MesonVdec::_PollHevc()
+ 		_Trace('Q', status, _Dos(HEVC_PARSER_LCU_START),
+ 			_Dos(HEVC_SHIFT_BYTE_COUNT));
+ 		_FinishHevcPicture();
++		InterruptsSpinLocker locker(fStateLock);
++		_BumpHevcFrames(0);
+ 		fHevcEnded = true;
+ 	}
+ }
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
+index 89977cbf8e..cca0b41a43 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
+@@ -4,7 +4,7 @@
+  *
+  * meson_vdec's registers, constants and its class, for its source files:
+  * meson_vdec.cpp (VDEC_1: MPEG-1/2 and H.264) and meson_vdec_hevc.cpp (the
+- * HEVC block, experimental).
++ * HEVC block).
+  */
+ #ifndef MESON_VDEC_PRIVATE_H
+ #define MESON_VDEC_PRIVATE_H
+@@ -22,6 +22,7 @@
+ #include <kernel.h>
+ #include <arch/int.h>
+ #include <lock.h>
++#include <team.h>
+ #include <util/AutoLock.h>
+ #include <vm/vm.h>
+ 
+@@ -312,7 +313,7 @@ private:
+ 			status_t			_SetupH264Frames(const uint32* info);
+ 			void				_FreeH264Frames();
+ 
+-			// HEVC (experimental, meson_vdec_hevc.cpp)
++			// HEVC (meson_vdec_hevc.cpp)
+ 			bool				_IsHevc() const
+ 									{ return fCodec == MESON_VDEC_HEVC
+ 										|| fCodec == MESON_VDEC_HEVC_VENDOR; }
+@@ -324,10 +325,17 @@ private:
+ 			void				_StartHevcCodec();
+ 			void				_InitHevcParser();
+ 			void				_PollHevc();
++	static	status_t			_HevcThread(void* data);
++			bool				_HevcInterrupt();
+ 			bool				_HevcSlice();
+ 			status_t			_SetupHevcFrames();
+ 			void				_FinishHevcPicture();
+ 			int32				_FreeHevcFrame();
++			int32				_HevcFrameForPoc(int32 poc);
++			bool				_PrepareHevcPicture();
++			bool				_BuildHevcLists(uint32 sliceType);
++			void				_OutputHevcFrame(uint32 frame);
++			void				_BumpHevcFrames(uint32 keep);
+ 			status_t			_EndOfStreamHevc();
+ 			uint32				_Rpm(uint32 index) const;
+ 			void				_DumpHevc();
+@@ -370,6 +378,8 @@ private:
+ 			spinlock			fStateLock;
+ 				// the frame queue, the interrupt handlers
+ 			bool				fOpen;
++			team_id				fOpener;
++			char				fOpenerName[B_OS_NAME_LENGTH];
+ 			bool				fRunning;
+ 			bool				fEndOfStream;
+ 			bool				fWarmedUp;
+@@ -430,6 +440,35 @@ private:
+ 			uint32				fHevcReports;
+ 			uint32				fHevcSlices;
+ 			uint32				fHevcSkipped;
++			struct hevc_frame {
++				int32			poc;
++				bool			referenced;
++				bool			waiting;	// decoded, not handed out yet
++				bool			damaged;
++				uint32			offset;
++
++				hevc_frame() : poc(0), referenced(false), waiting(false),
++					damaged(false), offset(0) {}
++			};
++			hevc_frame			fHevcFrames[kMaxFrames];
++			uint32				fHevcReorder;
++			int32				fHevcPoc;
++			int32				fHevcPreviousPoc;
++				// of the last picture of temporal layer 0 (H.265 8.3.1)
++			bool				fHevcFirstPicture;
++			bool				fHevcSkipRasl;
++			bool				fHevcPendingPicture;
++				// prepared, waiting for a free frame
++			bool				fHevcSkippingPicture;
++			uint32				fHevcFramesKey;
++				// the frames' size and kind, for reusing them
++			bool				fHevcCompressed;
++				// 10 bits: compressed references, an NV12 copy
++			uint32				fHevcBodySize;
++			uint32				fHevcHeaderSize;
++			uint32				fHevcLumaOffset;
++			int32				fHevcList[2][16];
++			uint32				fHevcListCount[2];
+ 			uint32				fDecodeErrors;
+ 			uint32				fBadPictures;
+ 

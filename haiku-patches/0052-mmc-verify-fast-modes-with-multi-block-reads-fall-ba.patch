@@ -1,0 +1,281 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 07:05:44 -0400
+Subject: [PATCH 052/342] mmc: verify fast modes with multi-block reads, fall
+ back on errors
+
+After the update to SD high speed, an ODROID-C2 booting from its
+microSD no longer came up; its card had passed only three single-block
+test reads at 50 MHz. Fast modes are now harder to get into and easier
+to leave:
+
+- meson_gx_mmc keeps an SD card above 25 MHz only if three 128-block
+  reads at the new clock pass (as for eMMC DDR52). The device interface's
+  set_clock() now returns the outcome, so mmc_disk logs the speed used.
+- A transfer that fails in a fast mode is retried once at a safe speed,
+  which stays: SD at 25 MHz, eMMC DDR at 26 MHz.
+- "sd_high_speed false" in the meson_gx_mmc driver settings keeps SD
+  cards at 25 MHz, like "emmc_ddr false" for DDR52.
+
+Tested on the ODROID-C2: its SD card passes at 50 MHz; with the setting
+it stays at 25 MHz (11.7 MB/s); eMMC DDR52 unaffected.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/drivers/mmc.h                 |  3 +-
+ .../kernel/bus_managers/mmc/mmc_bus.cpp       |  4 +-
+ src/add-ons/kernel/bus_managers/mmc/mmc_bus.h |  2 +-
+ .../kernel/bus_managers/mmc/mmc_module.cpp    |  5 +-
+ .../kernel/busses/mmc/meson_gx_mmc.cpp        | 93 ++++++++++++++-----
+ .../kernel/drivers/disk/mmc/mmc_disk.cpp      |  9 +-
+ 6 files changed, 88 insertions(+), 28 deletions(-)
+
+diff --git a/headers/private/drivers/mmc.h b/headers/private/drivers/mmc.h
+index 21e370afd5..d2cc219759 100644
+--- a/headers/private/drivers/mmc.h
++++ b/headers/private/drivers/mmc.h
+@@ -137,9 +137,10 @@ typedef struct mmc_device_interface {
+ 		// Execute a command with a single-block data-in phase into a kernel
+ 		// buffer (e.g. MMC_SEND_EXT_CSD). B_NOT_SUPPORTED if the host
+ 		// controller driver cannot.
+-	void (*set_clock)(device_node* controller, void* cookie,
++	status_t (*set_clock)(device_node* controller, void* cookie,
+ 		uint32_t kilohertz);
+ 		// Change the bus clock, e.g. after switching a card to high speed.
++		// An error if the host controller could not or would not.
+ 	status_t (*set_ddr)(device_node* controller, void* cookie, bool ddr);
+ 		// Data on both clock edges, after switching an eMMC to a DDR bus
+ 		// width. B_NOT_SUPPORTED if the host controller cannot.
+diff --git a/src/add-ons/kernel/bus_managers/mmc/mmc_bus.cpp b/src/add-ons/kernel/bus_managers/mmc/mmc_bus.cpp
+index 27fa7f8fae..d7ba54b9e6 100644
+--- a/src/add-ons/kernel/bus_managers/mmc/mmc_bus.cpp
++++ b/src/add-ons/kernel/bus_managers/mmc/mmc_bus.cpp
+@@ -116,10 +116,10 @@ MMCBus::ExecuteReadCommand(uint16_t rca, uint8_t command, uint32_t argument,
+ }
+ 
+ 
+-void
++status_t
+ MMCBus::SetClock(int frequency)
+ {
+-	fController->set_clock(fCookie, frequency);
++	return fController->set_clock(fCookie, frequency);
+ }
+ 
+ 
+diff --git a/src/add-ons/kernel/bus_managers/mmc/mmc_bus.h b/src/add-ons/kernel/bus_managers/mmc/mmc_bus.h
+index b9d68bfdbc..e1117a2abe 100644
+--- a/src/add-ons/kernel/bus_managers/mmc/mmc_bus.h
++++ b/src/add-ons/kernel/bus_managers/mmc/mmc_bus.h
+@@ -146,7 +146,7 @@ public:
+ 									uint8_t command, uint32_t argument,
+ 									void* buffer, size_t length);
+ 
+-				void			SetClock(int frequency);
++				status_t		SetClock(int frequency);
+ 				void			SetBusWidth(int width);
+ 				status_t		SetDDR(bool ddr);
+ 				void			SetCardType(card_type type);
+diff --git a/src/add-ons/kernel/bus_managers/mmc/mmc_module.cpp b/src/add-ons/kernel/bus_managers/mmc/mmc_module.cpp
+index 92f9a15515..936a8f5329 100644
+--- a/src/add-ons/kernel/bus_managers/mmc/mmc_module.cpp
++++ b/src/add-ons/kernel/bus_managers/mmc/mmc_module.cpp
+@@ -134,14 +134,15 @@ mmc_bus_execute_read_command(device_node* node, void* cookie, uint16_t rca,
+ }
+ 
+ 
+-static void
++static status_t
+ mmc_bus_set_clock(device_node* node, void* cookie, uint32_t kilohertz)
+ {
+ 	MMCBus* bus = (MMCBus*)cookie;
+ 
+ 	bus->AcquireBus();
+-	bus->SetClock(kilohertz);
++	status_t status = bus->SetClock(kilohertz);
+ 	bus->ReleaseBus();
++	return status;
+ }
+ 
+ 
+diff --git a/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp b/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
+index f7fb6b7753..2294d0e88f 100644
+--- a/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
++++ b/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
+@@ -25,8 +25,11 @@
+  *   change the card are refused. With "sd_writable true" in the driver
+  *   settings (an image that runs from the card) they are writable beyond
+  *   their first 4 MiB, which hold the MBR and U-Boot.
+- * - eMMC data can run at double data rate (DDR52, set_ddr()); "emmc_ddr
+- *   false" in the driver settings turns that off.
++ * - eMMC data can run at double data rate (DDR52, set_ddr()), SD cards
++ *   at 50 MHz (high speed); either is kept only if multi-block test reads
++ *   pass, and a transfer that fails in such a mode is retried at a safe
++ *   speed (SD 25 MHz, eMMC 26 MHz DDR), which stays. "emmc_ddr false" and
++ *   "sd_high_speed false" in the driver settings turn the modes off.
+  */
+ 
+ 
+@@ -137,6 +140,7 @@ static const uint32 kMaxBlocksPerCommand = COMMAND_LENGTH_MASK;
+ static const size_t kBounceSize
+ 	= ROUNDUP(kMaxBlocksPerCommand * kBlockSize, B_PAGE_SIZE);
+ static const uint32 kMaxSegments = 64;
++static const uint32 kSdDefaultSpeed = 25000;	// kHz
+ 	// per I/O operation: 64 pages cover the 511 blocks of one command
+ static const uint32 kXtalRate = 24000000;
+ static const uint32 kFclkDiv2Rate = 1000000000;
+@@ -184,7 +188,7 @@ dcache_maintain(phys_addr_t physical, size_t length, bool invalidate)
+ }
+ 
+ 
+-static bool emmc_ddr_allowed();
++static bool driver_setting_enabled(const char* name);
+ 
+ 
+ class MesonMmc {
+@@ -225,6 +229,7 @@ private:
+ 									generic_size_t& vecOffset,
+ 									generic_size_t length);
+ 			status_t			_ApplyClock();
++			bool				_SlowDown();
+ 			bool				_TestRead();
+ 			bool				_IsMmc() const;
+ 			response_type		_ResponseType(uint8 command,
+@@ -420,8 +425,50 @@ MesonMmc::SetClock(uint32 kilohertz)
+ 	if (kilohertz == 0)
+ 		return B_BAD_VALUE;
+ 	MutexLocker locker(fLock);
++	bool sdHighSpeed = !_IsMmc() && kilohertz > kSdDefaultSpeed;
++	if (sdHighSpeed && !driver_setting_enabled("sd_high_speed")) {
++		fClockKilohertz = kSdDefaultSpeed;
++		_ApplyClock();
++		return B_NOT_ALLOWED;
++	}
+ 	fClockKilohertz = kilohertz;
+-	return _ApplyClock();
++	status_t status = _ApplyClock();
++	if (status != B_OK || !sdHighSpeed)
++		return status;
++
++	// SD high speed: only with clean multi-block reads at it
++	if (!_TestRead()) {
++		ERROR("%#" B_PRIxPHYSADDR ": SD: test reads at %" B_PRIu32 " kHz "
++			"failed, back to %" B_PRIu32 " kHz\n", fPhysicalBase, kilohertz,
++			kSdDefaultSpeed);
++		fClockKilohertz = kSdDefaultSpeed;
++		_ApplyClock();
++		return B_ERROR;
++	}
++	return B_OK;
++}
++
++
++/*!	After a failed transfer in a fast mode: SD back to its default speed,
++	eMMC DDR down to half the clock. True if there was something to slow
++	down (and the transfer should be retried).
++*/
++bool
++MesonMmc::_SlowDown()
++{
++	uint32 slower;
++	if (_IsMmc())
++		slower = fDDR && fClockKilohertz > 26000 ? 26000 : 0;
++	else
++		slower = fClockKilohertz > kSdDefaultSpeed ? kSdDefaultSpeed : 0;
++	if (slower == 0)
++		return false;
++	ERROR("%#" B_PRIxPHYSADDR ": transfer errors at %" B_PRIu32 " kHz%s, "
++		"slowing down to %" B_PRIu32 " kHz\n", fPhysicalBase,
++		fClockKilohertz, fDDR ? " DDR" : "", slower);
++	fClockKilohertz = slower;
++	_ApplyClock();
++	return true;
+ }
+ 
+ 
+@@ -435,7 +482,7 @@ MesonMmc::SetClock(uint32 kilohertz)
+ status_t
+ MesonMmc::SetDDR(bool ddr)
+ {
+-	if (ddr && !emmc_ddr_allowed())
++	if (ddr && !driver_setting_enabled("emmc_ddr"))
+ 		return B_NOT_SUPPORTED;
+ 	MutexLocker locker(fLock);
+ 	fDDR = ddr;
+@@ -832,16 +879,21 @@ MesonMmc::DoIO(uint8 command, IOOperation* operation, bool offsetAsSectors)
+ 
+ 		uint32 argument = offsetAsSectors
+ 			? (uint32)(offset / kBlockSize) : (uint32)offset;
+-		uint32 response;
+-		status_t status = _Execute(command, argument, &response, address,
+-			chunk / kBlockSize, write);
+-
+-		if (command == SD_READ_MULTIPLE_BLOCKS
+-			|| command == SD_WRITE_MULTIPLE_BLOCKS) {
+-			status_t stopStatus = _Execute(SD_STOP_TRANSMISSION, 0, &response,
+-				0, 0, false);
+-			if (status == B_OK)
+-				status = stopStatus;
++		status_t status;
++		while (true) {
++			uint32 response;
++			status = _Execute(command, argument, &response, address,
++				chunk / kBlockSize, write);
++			if (command == SD_READ_MULTIPLE_BLOCKS
++				|| command == SD_WRITE_MULTIPLE_BLOCKS) {
++				status_t stopStatus = _Execute(SD_STOP_TRANSMISSION, 0,
++					&response, 0, 0, false);
++				if (status == B_OK)
++					status = stopStatus;
++			}
++			// once more at a safe speed, if this was a fast one
++			if (status == B_OK || !_SlowDown())
++				break;
+ 		}
+ 		if (status != B_OK) {
+ 			ERROR("%s of %" B_PRIuGENADDR " bytes at %" B_PRIdOFF
+@@ -1097,19 +1149,18 @@ supports_device(device_node* parent)
+ }
+ 
+ 
+-/*!	eMMC DDR52 unless the driver settings say "emmc_ddr false", should a
+-	module not cope.
++/*!	Fast modes ("emmc_ddr", "sd_high_speed") are on unless the driver
++	settings turn them off, should a card or module not cope.
+ */
+ static bool
+-emmc_ddr_allowed()
++driver_setting_enabled(const char* name)
+ {
+ 	void* settings = load_driver_settings("meson_gx_mmc");
+ 	if (settings == NULL)
+ 		return true;
+-	bool allowed = get_driver_boolean_parameter(settings, "emmc_ddr", true,
+-		true);
++	bool enabled = get_driver_boolean_parameter(settings, name, true, true);
+ 	unload_driver_settings(settings);
+-	return allowed;
++	return enabled;
+ }
+ 
+ 
+diff --git a/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp b/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
+index f533dc2239..cc1ac3677f 100644
+--- a/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
++++ b/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
+@@ -183,7 +183,14 @@ switch_sd_high_speed(mmc_disk_driver_info* info)
+ 		return false;
+ 	}
+ 
+-	info->mmc->set_clock(info->parent, info->parentCookie, 50000);
++	// the host controller tests reads at the new clock itself, if it can
++	status = info->mmc->set_clock(info->parent, info->parentCookie, 50000);
++	if (status != B_OK) {
++		INFO("SD: 50 MHz refused by the host controller (%s)\n",
++			strerror(status));
++		info->mmc->set_clock(info->parent, info->parentCookie, 25000);
++		return false;
++	}
+ 	uint8* block = (uint8*)malloc(kBlockSize);
+ 	if (block == NULL) {
+ 		info->mmc->set_clock(info->parent, info->parentCookie, 25000);

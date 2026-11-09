@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Mon, 2 Nov 2026 14:11:37 -0500
+Subject: [PATCH 259/342] MediaPlayer: a seek forward no longer goes back to an
+ earlier keyframe
+
+Controller::SetFramePosition() snaps a seek to the keyframe at or before
+the wanted frame, to show it quickly. Where keyframes are seconds apart
+(6 to 10 s in some MP4 films), that keyframe can be at or before the
+current frame, so the right arrow's 5 seconds forward went back to it and
+the same scene played again. A seek forward then goes to the first
+keyframe after the wanted frame instead (or, past the last one, to the
+frame itself); VideoTrackSupplier::FindKeyFrameForFrame() can now look
+forward.
+
+With keyframes every 10 s: at 11.7 s the right arrow went back to 10 s;
+now at 12.4 s it goes on to 20 s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apps/mediaplayer/Controller.cpp                | 14 ++++++++++++++
+ .../supplier/ImageTrackVideoSupplier.cpp           |  2 +-
+ .../mediaplayer/supplier/ImageTrackVideoSupplier.h |  3 ++-
+ .../supplier/MediaTrackVideoSupplier.cpp           |  4 ++--
+ .../mediaplayer/supplier/MediaTrackVideoSupplier.h |  3 ++-
+ src/apps/mediaplayer/supplier/VideoTrackSupplier.h |  5 ++++-
+ 6 files changed, 25 insertions(+), 6 deletions(-)
+
+diff --git a/src/apps/mediaplayer/Controller.cpp b/src/apps/mediaplayer/Controller.cpp
+index 18c12e904f..e64137cc4d 100644
+--- a/src/apps/mediaplayer/Controller.cpp
++++ b/src/apps/mediaplayer/Controller.cpp
+@@ -929,6 +929,20 @@ Controller::SetFramePosition(int64 value)
+ 	if (Duration() > 240 && fVideoTrackSupplier != NULL
+ 		&& abs(value - currentFrame) > 5) {
+ 		fVideoTrackSupplier->FindKeyFrameForFrame(&fSeekFrame);
++		// Where keyframes are seconds apart, the one before the wanted
++		// frame can be at or before the current frame: a seek forward
++		// (the right arrow's 5 seconds) went back instead. Then go on to
++		// the first keyframe after the wanted frame (or, past the last
++		// one, to the frame itself).
++		if (fRequestedSeekFrame > currentFrame && fSeekFrame <= currentFrame) {
++			int64 nextKeyFrame = fRequestedSeekFrame;
++			if (fVideoTrackSupplier->FindKeyFrameForFrame(&nextKeyFrame, true)
++					== B_OK && nextKeyFrame > currentFrame
++				&& nextKeyFrame <= _FrameDuration()) {
++				fSeekFrame = nextKeyFrame;
++			} else
++				fSeekFrame = fRequestedSeekFrame;
++		}
+ 	}
+ 
+ //printf("SetFramePosition(%lld) -> %lld (current: %lld, duration: %lld) "
+diff --git a/src/apps/mediaplayer/supplier/ImageTrackVideoSupplier.cpp b/src/apps/mediaplayer/supplier/ImageTrackVideoSupplier.cpp
+index eba3b7eab8..04a52df102 100644
+--- a/src/apps/mediaplayer/supplier/ImageTrackVideoSupplier.cpp
++++ b/src/apps/mediaplayer/supplier/ImageTrackVideoSupplier.cpp
+@@ -95,7 +95,7 @@ ImageTrackVideoSupplier::ReadFrame(void* buffer, bigtime_t* performanceTime,
+ 
+ 
+ status_t
+-ImageTrackVideoSupplier::FindKeyFrameForFrame(int64* frame)
++ImageTrackVideoSupplier::FindKeyFrameForFrame(int64* frame, bool forward)
+ {
+ 	return B_OK;
+ }
+diff --git a/src/apps/mediaplayer/supplier/ImageTrackVideoSupplier.h b/src/apps/mediaplayer/supplier/ImageTrackVideoSupplier.h
+index da3d561d90..596aeb5fcf 100644
+--- a/src/apps/mediaplayer/supplier/ImageTrackVideoSupplier.h
++++ b/src/apps/mediaplayer/supplier/ImageTrackVideoSupplier.h
+@@ -28,7 +28,8 @@ public:
+ 									bigtime_t* performanceTime,
+ 									const media_raw_video_format& format,
+ 									bool& wasCached);
+-	virtual	status_t			FindKeyFrameForFrame(int64* frame);
++	virtual	status_t			FindKeyFrameForFrame(int64* frame,
++									bool forward = false);
+ 	virtual	status_t			SeekToTime(bigtime_t* performanceTime);
+ 	virtual	status_t			SeekToFrame(int64* frame);
+ 
+diff --git a/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.cpp b/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.cpp
+index 464ba3a30b..42b1224274 100644
+--- a/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.cpp
++++ b/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.cpp
+@@ -168,7 +168,7 @@ delete bitmap;
+ 
+ 
+ status_t
+-MediaTrackVideoSupplier::FindKeyFrameForFrame(int64* frame)
++MediaTrackVideoSupplier::FindKeyFrameForFrame(int64* frame, bool forward)
+ {
+ 	if (!fVideoTrack)
+ 		return B_NO_INIT;
+@@ -178,7 +178,7 @@ MediaTrackVideoSupplier::FindKeyFrameForFrame(int64* frame)
+ 
+ //int64 wantedFrame = *frame;
+ 	status_t ret = fVideoTrack->FindKeyFrameForFrame(frame,
+-		B_MEDIA_SEEK_CLOSEST_BACKWARD);
++		forward ? B_MEDIA_SEEK_CLOSEST_FORWARD : B_MEDIA_SEEK_CLOSEST_BACKWARD);
+ //printf("found keyframe for frame %lld -> %lld\n", wantedFrame, *frame);
+ 	return ret;
+ }
+diff --git a/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.h b/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.h
+index fc2e877ed3..9ef48d837c 100644
+--- a/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.h
++++ b/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.h
+@@ -28,7 +28,8 @@ class MediaTrackVideoSupplier : public VideoTrackSupplier {
+ 									bigtime_t* performanceTime,
+ 									const media_raw_video_format& format,
+ 									bool& wasCached);
+-	virtual	status_t			FindKeyFrameForFrame(int64* frame);
++	virtual	status_t			FindKeyFrameForFrame(int64* frame,
++									bool forward = false);
+ 	virtual	status_t			SeekToTime(bigtime_t* performanceTime);
+ 	virtual	status_t			SeekToFrame(int64* frame);
+ 
+diff --git a/src/apps/mediaplayer/supplier/VideoTrackSupplier.h b/src/apps/mediaplayer/supplier/VideoTrackSupplier.h
+index b0903ae42e..abfd39c048 100644
+--- a/src/apps/mediaplayer/supplier/VideoTrackSupplier.h
++++ b/src/apps/mediaplayer/supplier/VideoTrackSupplier.h
+@@ -37,7 +37,10 @@ public:
+ 									bigtime_t* performanceTime,
+ 									const media_raw_video_format& format,
+ 									bool& wasCached) = 0;
+-	virtual	status_t			FindKeyFrameForFrame(int64* frame) = 0;
++	virtual	status_t			FindKeyFrameForFrame(int64* frame,
++									bool forward = false) = 0;
++									// the keyframe at or before the frame,
++									// or (forward) at or after it
+ 	virtual	status_t			SeekToTime(bigtime_t* performanceTime) = 0;
+ 	virtual	status_t			SeekToFrame(int64* frame) = 0;
+ 

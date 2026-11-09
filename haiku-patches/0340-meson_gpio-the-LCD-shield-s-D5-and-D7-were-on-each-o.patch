@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 8 Nov 2026 13:11:30 -0500
+Subject: [PATCH 340/342] meson_gpio: the LCD shield's D5 and D7 were on each
+ other's pins
+
+D5 is header pin 26 and D7 pin 36 (Hardkernel's example drives the LEDs
+on wiringPi 21, 22, 23, 24, 11, 26, 27); the table had them the other way
+round, so "0000100" lit D7. The swap was seen on a real shield.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/drivers/misc/meson_gpio/lcd_shield.cpp | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/misc/meson_gpio/lcd_shield.cpp b/src/add-ons/kernel/drivers/misc/meson_gpio/lcd_shield.cpp
+index c0d1e3ebcb..3791a4ae35 100644
+--- a/src/add-ons/kernel/drivers/misc/meson_gpio/lcd_shield.cpp
++++ b/src/add-ons/kernel/drivers/misc/meson_gpio/lcd_shield.cpp
+@@ -12,8 +12,9 @@
+  *     E 11, D4 13, D5 15, D6 12, D7 16; its R/W is tied low, so it is only
+  *     written, and its busy flag can't be read: commands get the
+  *     datasheet's time instead (37 us, 1.52 ms to clear or go home);
+- *   - LEDs D1 to D7 on pins 29, 31, 33, 35, 36, 32, 26, each through
+- *     3.9 kOhm to ground: high is lit;
++ *   - LEDs D1 to D7 on pins 29, 31, 33, 35, 26, 32, 36, each through
++ *     3.9 kOhm to ground: high is lit (Hardkernel's example drives them on
++ *     wiringPi 21, 22, 23, 24, 11, 26, 27: D5 is pin 26, D7 pin 36);
+  *   - SW1 on pin 18, SW2 on pin 22, closing to ground, with no resistor:
+  *     the pins' pull-ups are turned on.
+  *
+@@ -50,7 +51,7 @@ static const uint32 kRS = 1 << 0;
+ static const uint32 kE = 1 << 1;
+ static const uint32 kDataShift = 2;
+ 
+-static const uint8 kLedPins[] = { 29, 31, 33, 35, 36, 32, 26 };
++static const uint8 kLedPins[] = { 29, 31, 33, 35, 26, 32, 36 };
+ static const uint8 kButtonPins[] = { 18, 22 };
+ 
+ static const bigtime_t kButtonPeriod = 10000;

@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 6 Nov 2026 17:53:10 -0500
+Subject: [PATCH 324/342] dwc2: report how long split parts took, and what the
+ first gaps looked like
+
+A split isochronous OUT packet's parts must reach the hub's translator in
+consecutive microframes; a gap loses the packet, a 1 ms click. On a C2
+with USB audio next to its Wi-Fi adapter a 3 minute song had 14-17 gaps,
+and on the test board a USB disk read during playback gave 17 in 3
+minutes against none without it. The stream's report now also says how
+long each part took from being armed to its halt being handled (a
+histogram and the longest) and, for the first eight gaps, the microframes
+it was armed in, was for and was handled in, the time between, and which
+lanes had a channel running, to tell a late transaction from a late
+interrupt.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/busses/usb/dwc2.h          | 14 ++++++
+ .../kernel/busses/usb/dwc2_isochronous.cpp    | 43 ++++++++++++++++++-
+ 2 files changed, 56 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.h b/src/add-ons/kernel/busses/usb/dwc2.h
+index 82f1270e84..c3f707a582 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.h
++++ b/src/add-ons/kernel/busses/usb/dwc2.h
+@@ -89,6 +89,18 @@ struct dwc2_iso_statistics {
+ 	uint64		incomplete;			// high speed: halted, neither done nor
+ 									// an error
+ 	uint64		shortPackets;		// high speed: fewer bytes than asked
++	uint32		partTimes[5];		// split: part armed to its halt handled,
++									// under 125, 250, 500, 1000 us, longer
++	bigtime_t	worstPart;			// split: the longest of those
++	uint32		gapRecords;
++	struct {
++		uint32	armFrame;			// HFNUM when the part was armed
++		uint32	haltFrame;			// HFNUM when its halt was handled
++		uint32	partFrame;			// the microframe the part was for
++		uint32	sinceArm;			// us
++		uint32	part;
++		uint32	lanesRunning;		// bit per lane: channel enabled
++	}			gapRecord[8];		// split: the first gaps
+ };
+ 
+ 
+@@ -135,6 +147,8 @@ struct dwc2_iso_stream {
+ 	bool					stopping;
+ 	bigtime_t				timerTarget;
+ 	uint32					partFrame;		// microframe the part is for
++	bigtime_t				armTime;		// the running part's
++	uint32					armFrame;		// HFNUM then
+ 
+ 	dwc2_iso_statistics		stats;
+ };
+diff --git a/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp b/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
+index d2a71b2674..1f7a2a1e74 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
+@@ -437,6 +437,25 @@ DWC2::_CancelIsochronous(Pipe* pipe, bool force)
+ 			pipe->HubAddress(), pipe->HubPort(), stats.packets, stats.bytes,
+ 			stats.late, stats.errors, stats.lastError, stats.underruns,
+ 			stats.worstTimer, stats.worstFinish, detail);
++		if (!highSpeed) {
++			INFO("  part armed to its halt handled: under 125 us %" B_PRIu32
++				", 250 %" B_PRIu32 ", 500 %" B_PRIu32 ", 1000 %" B_PRIu32
++				", longer %" B_PRIu32 "; at most %" B_PRIdBIGTIME " us\n",
++				stats.partTimes[0], stats.partTimes[1], stats.partTimes[2],
++				stats.partTimes[3], stats.partTimes[4], stats.worstPart);
++		}
++		for (uint32 i = 0; i < stats.gapRecords; i++) {
++			const auto& record = stats.gapRecord[i];
++			INFO("  gap: part %" B_PRIu32 " for microframe %" B_PRIu32
++				", armed in %" B_PRIu32 " (%" B_PRIu32 " left), halt handled"
++				" in %" B_PRIu32 " (%" B_PRIu32 " left) %" B_PRIu32 " us"
++				" later; lanes running %#" B_PRIx32 "\n", record.part,
++				record.partFrame, record.armFrame & 0x3fff,
++				record.armFrame >> HFNUM_FRREM_SHIFT,
++				record.haltFrame & 0x3fff,
++				record.haltFrame >> HFNUM_FRREM_SHIFT, record.sinceArm,
++				record.lanesRunning);
++		}
+ 	}
+ 
+ 	dwc2_iso_transfer* entry;
+@@ -545,6 +564,8 @@ DWC2::_IsoStartPart(dwc2_iso_stream* stream, bool oddFrame)
+ 	_Write(HC_TSIZ(channel), size | (1 << HCTSIZ_PKTCNT_SHIFT)
+ 		| (PID_DATA0 << HCTSIZ_PID_SHIFT));
+ 	_Write(HC_DMA(channel), (uint32)(stream->bouncePhysical + offset));
++	stream->armFrame = _Read(kHfnum);
++	stream->armTime = system_time();
+ 	asm volatile("dsb sy" : : : "memory");
+ 	_Write(HC_CHAR(channel), character | HCCHAR_CHENA);
+ 	stream->running = true;
+@@ -674,11 +695,31 @@ DWC2::_IsoHalted(dwc2_iso_stream* stream, uint32 status)
+ 	// after it get NYET). The interrupt may come only in that microframe:
+ 	// then the part still goes out in it, armed with its parity. The first
+ 	// part ran in an even microframe.
+-	uint32 frame = _Read(kHfnum) & 0x3fff;
++	uint32 hfnum = _Read(kHfnum);
++	uint32 frame = hfnum & 0x3fff;
++	bigtime_t sinceArm = system_time() - stream->armTime;
++	stream->stats.partTimes[sinceArm < 125 ? 0 : sinceArm < 250 ? 1
++		: sinceArm < 500 ? 2 : sinceArm < 1000 ? 3 : 4]++;
++	if (sinceArm > stream->stats.worstPart)
++		stream->stats.worstPart = sinceArm;
+ 	uint32 nextFrame = (stream->part == 0 ? frame & ~(uint32)1
+ 		: stream->partFrame) + 1;
+ 	nextFrame &= 0x3fff;
+ 	if (((frame - nextFrame) & 0x3fff) < 0x2000 && frame != nextFrame) {
++		if (stream->stats.gapRecords < B_COUNT_OF(stream->stats.gapRecord)) {
++			auto& record = stream->stats.gapRecord[stream->stats.gapRecords++];
++			record.armFrame = stream->armFrame;
++			record.haltFrame = hfnum;
++			record.partFrame = stream->part == 0 ? frame & ~(uint32)1
++				: stream->partFrame;
++			record.sinceArm = sinceArm;
++			record.part = stream->part;
++			record.lanesRunning = 0;
++			for (uint32 i = 0; i < kLaneCount; i++) {
++				if ((_Read(HC_CHAR(i)) & HCCHAR_CHENA) != 0)
++					record.lanesRunning |= 1 << i;
++			}
++		}
+ 		stream->stats.gaps++;
+ 		nextFrame = (frame + 1) & 0x3fff;
+ 	}

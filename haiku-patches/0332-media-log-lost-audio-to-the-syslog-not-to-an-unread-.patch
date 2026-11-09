@@ -1,0 +1,183 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 7 Nov 2026 00:58:24 -0500
+Subject: [PATCH 332/342] media: log lost audio to the syslog, not to an unread
+ stderr
+
+USB audio on a C2 on Wi-Fi still stutters a few times a song with every
+packet reaching the adapter on time, so the audio is lost before the
+driver; the media add-ons said so only on media_addon_server's stdout and
+stderr, which nobody reads. Now in the syslog: the multi_audio node's
+buffers dropped late or because the one before wasn't played yet, and
+slots it filled with silence for want of a buffer (at most once a second,
+with a count, while running); the mixer's input glitches (a buffer not
+where the last one ended) and the late notices it gets.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../media/media-add-ons/mixer/AudioMixer.cpp  |  5 +--
+ .../media/media-add-ons/mixer/MixerInput.cpp  | 11 ++++---
+ .../multi_audio/MultiAudioNode.cpp            | 33 ++++++++++++++++---
+ 3 files changed, 38 insertions(+), 11 deletions(-)
+
+diff --git a/src/add-ons/media/media-add-ons/mixer/AudioMixer.cpp b/src/add-ons/media/media-add-ons/mixer/AudioMixer.cpp
+index 8b9116997d..402fce3b50 100644
+--- a/src/add-ons/media/media-add-ons/mixer/AudioMixer.cpp
++++ b/src/add-ons/media/media-add-ons/mixer/AudioMixer.cpp
+@@ -13,6 +13,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <syslog.h>
+ 
+ #include <Buffer.h>
+ #include <Catalog.h>
+@@ -1110,8 +1111,8 @@ AudioMixer::LateNoticeReceived(const media_source& what, bigtime_t howMuch,
+ 	// is the only runmode in which we can do anything about this
+ 	// TODO: quality could be decreased, too
+ 
+-	ERROR("AudioMixer::LateNoticeReceived, %lld too late at %lld\n", howMuch,
+-		performanceTime);
++	syslog(LOG_WARNING, "mixer: late notice, %" B_PRIdBIGTIME " us too late"
++		" at %" B_PRIdBIGTIME "\n", howMuch, performanceTime);
+ 
+ 	if (what == fCore->Output()->MediaOutput().source
+ 		&& RunMode() == B_INCREASE_LATENCY) {
+diff --git a/src/add-ons/media/media-add-ons/mixer/MixerInput.cpp b/src/add-ons/media/media-add-ons/mixer/MixerInput.cpp
+index 57f2c7ad02..8b6ff2c2cb 100644
+--- a/src/add-ons/media/media-add-ons/mixer/MixerInput.cpp
++++ b/src/add-ons/media/media-add-ons/mixer/MixerInput.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <Buffer.h>
+ #include <string.h>
++#include <syslog.h>
+ #include <TimeSource.h> // TODO: debug only
+ 
+ #include "ByteSwap.h"
+@@ -182,7 +183,7 @@ MixerInput::BufferReceived(BBuffer* buffer)
+ //					fLastDataFrameWritten, expected_frame, offset);
+ 				offset = expected_frame;
+ 			} else {
+-				printf("MixerInput::BufferReceived: GLITCH! last frame was "
++				syslog(LOG_WARNING, "MixerInput::BufferReceived: GLITCH! last frame was "
+ 					"%4" B_PRId32 ", expected frame was %4d, new frame is %4d"
+ 					"\n", fLastDataFrameWritten, expected_frame, offset);
+ 
+@@ -190,7 +191,7 @@ MixerInput::BufferReceived(BBuffer* buffer)
+ 					if ((start - fLastDataAvailableTime)
+ 						< (buffer_duration / 10)) {
+ 						// buffer is less than 10% of buffer duration too late
+-						printf("short glitch, buffer too late, time delta "
++						syslog(LOG_WARNING, "mixer: short glitch, buffer too late, time delta "
+ 							"%" B_PRIdBIGTIME "\n", start
+ 							- fLastDataAvailableTime);
+ 						offset = expected_frame;
+@@ -198,7 +199,7 @@ MixerInput::BufferReceived(BBuffer* buffer)
+ 					} else {
+ 						// buffer more than 10% of buffer duration too late
+ 						// TODO: zerofill buffer
+-						printf("MAJOR glitch, buffer too late, time delta "
++						syslog(LOG_WARNING, "mixer: MAJOR glitch, buffer too late, time delta "
+ 							"%" B_PRIdBIGTIME "\n", start
+ 							- fLastDataAvailableTime);
+ 					}
+@@ -207,7 +208,7 @@ MixerInput::BufferReceived(BBuffer* buffer)
+ 					if ((fLastDataAvailableTime - start)
+ 						< (buffer_duration / 10)) {
+ 						// buffer is less than 10% of buffer duration too early
+-						printf("short glitch, buffer too early, time delta "
++						syslog(LOG_WARNING, "mixer: short glitch, buffer too early, time delta "
+ 							"%" B_PRIdBIGTIME "\n", fLastDataAvailableTime
+ 							- start);
+ 						offset = expected_frame;
+@@ -217,7 +218,7 @@ MixerInput::BufferReceived(BBuffer* buffer)
+ 					} else {
+ 						// buffer more than 10% of buffer duration too early
+ 						// TODO: zerofill buffer
+-						printf("MAJOR glitch, buffer too early, time delta "
++						syslog(LOG_WARNING, "mixer: MAJOR glitch, buffer too early, time delta "
+ 							"%" B_PRIdBIGTIME "\n", fLastDataAvailableTime
+ 							- start);
+ 					}
+diff --git a/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp b/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp
+index 8e0ba06921..14349b29e6 100644
+--- a/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp
++++ b/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <stdio.h>
+ #include <string.h>
++#include <syslog.h>
+ 
+ #include <Autolock.h>
+ #include <Buffer.h>
+@@ -48,6 +49,8 @@ public:
+ 
+ 	volatile uint32		fBufferCycle;
+ 	int32				fOldBufferCycle;
++	int32				fMissed;
++	bigtime_t			fMissedLogged;
+ 	BBuffer*			fBuffer;
+ 	Resampler			*fResampler;
+ };
+@@ -132,6 +135,8 @@ node_input::node_input(media_input& input, media_format preferredFormat)
+ 	fPreferredFormat = preferredFormat;
+ 	fBufferCycle = 1;
+ 	fOldBufferCycle = -1;
++	fMissed = 0;
++	fMissedLogged = 0;
+ 	fBuffer = NULL;
+ 	fResampler = NULL;
+ }
+@@ -1178,7 +1183,9 @@ MultiAudioNode::_HandleBuffer(const media_timed_event* event,
+ 		// lateness doesn't matter in offline mode or in recording mode
+ 		//mLateBuffers++;
+ 		NotifyLateProducer(channel->fInput.source, lateness, event->event_time);
+-		fprintf(stderr,"	<- LATE BUFFER: %" B_PRIdBIGTIME "\n", lateness);
++		// heard as a gap: the slot gets zeros (it went to stderr, unseen)
++		syslog(LOG_WARNING, "multi_audio %s: dropped a buffer %" B_PRIdBIGTIME
++			" us late\n", Name(), lateness);
+ 		buffer->Recycle();
+ 	} else {
+ 		//WriteBuffer(buffer, *channel);
+@@ -1190,9 +1197,12 @@ MultiAudioNode::_HandleBuffer(const media_timed_event* event,
+ 				channel->fChannelId, lateness));
+ 			//channel->fBuffer->Recycle();
+ 			snooze(100);
+-			if (channel->fBuffer != NULL)
++			if (channel->fBuffer != NULL) {
++				syslog(LOG_WARNING, "multi_audio %s: dropped a buffer, the one"
++					" before it not played yet (%" B_PRIdBIGTIME " us early)\n",
++					Name(), -lateness);
+ 				buffer->Recycle();
+-			else
++			} else
+ 				channel->fBuffer = buffer;
+ 		} else {
+ 			//PRINT(("MultiAudioNode::HandleBuffer writing channelId: %li, how_early:%lld\n", channel->fChannelId, howEarly));
+@@ -1819,8 +1829,23 @@ MultiAudioNode::_OutputThread()
+ 					input->fBuffer = NULL;
+ 				} else {
+ 					// put zeros in current buffer
+-					if (input->fInput.source != media_source::null)
++					if (input->fInput.source != media_source::null) {
++						// no buffer from the producer for this slot: silence
++						// (logged once a second at most, while running)
++						if (RunState() == BMediaEventLooper::B_STARTED) {
++							input->fMissed++;
++							bigtime_t now = system_time();
++							if (now - input->fMissedLogged > 1000000) {
++								syslog(LOG_WARNING, "multi_audio %s: no buffer"
++									" for slot %" B_PRIu32 ", silence (%" B_PRId32
++									" since the last message)\n", Name(),
++									input->fBufferCycle, input->fMissed);
++								input->fMissed = 0;
++								input->fMissedLogged = now;
++							}
++						}
+ 						_WriteZeros(*input, input->fBufferCycle);
++					}
+ 					//PRINT(("MultiAudioNode::Runthread WriteZeros\n"));
+ 				}
+ 			} else {

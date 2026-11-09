@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Tue, 3 Nov 2026 18:06:47 -0500
+Subject: [PATCH 277/342] dwc2: wait for a channel to really halt
+
+_HaltChannel() waited once on the lane's condition variable, which
+SubmitTransfer() also notifies when a transfer is queued on the bulk lane. With
+two busy devices the wait often ended before the channel had halted. The caller
+then reported no response, and the next transfer reprogrammed a running channel:
+with a Wi-Fi download and a USB stick together, all bulk transfers failed from
+then on, until a reboot. It now waits until the channel has halted, for at most
+100 ms as before. A channel that has just halted by itself isn't enabled again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/busses/usb/dwc2.cpp | 26 ++++++++++++++++++++++----
+ 1 file changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.cpp b/src/add-ons/kernel/busses/usb/dwc2.cpp
+index 5fbad9f0e2..0f6e2c51b3 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2.cpp
+@@ -1421,10 +1421,28 @@ DWC2::_ShouldYield(dwc2_lane* lane, uint32 packets)
+ void
+ DWC2::_HaltChannel(dwc2_lane* lane)
+ {
+-	ConditionVariableEntry entry;
+-	lane->halted.Add(&entry);
+-	_Write(HC_CHAR(lane->channel), _Read(HC_CHAR(lane->channel)) | HCCHAR_CHDIS | HCCHAR_CHENA);
+-	entry.Wait(B_RELATIVE_TIMEOUT, 100000);
++	// (a channel that has just halted by itself isn't enabled again)
++	uint32 character = _Read(HC_CHAR(lane->channel));
++	if ((character & HCCHAR_CHENA) != 0) {
++		_Write(HC_CHAR(lane->channel),
++			character | HCCHAR_CHDIS | HCCHAR_CHENA);
++	}
++
++	// The lane's condition variable also tells of new transfers on the lane,
++	// so it doesn't by itself mean that the channel has halted. Taking it for
++	// that, the next transfer reprogrammed a running channel, and all that
++	// followed on the bulk lane failed.
++	bigtime_t deadline = system_time() + 100000;
++	while ((atomic_get(&lane->status) & HCINT_CHHLTD) == 0) {
++		ConditionVariableEntry entry;
++		lane->halted.Add(&entry);
++		if ((atomic_get(&lane->status) & HCINT_CHHLTD) != 0)
++			break;
++		bigtime_t remaining = deadline - system_time();
++		if (remaining <= 0)
++			break;
++		entry.Wait(B_RELATIVE_TIMEOUT, remaining);
++	}
+ }
+ 
+ 

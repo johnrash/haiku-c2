@@ -1,0 +1,293 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 4 Nov 2026 00:04:18 -0500
+Subject: [PATCH 281/342] realtekwifi: RTL8822B false alarm counters and
+ receive gain control
+
+Linux's rtw88 reads and resets the PHY's counters and adjusts the receive gain
+every 2 seconds. The port did neither: IGI stayed at 0x20 from the tables. With an
+access point nearby, on signal 80 of 100, that is far too much gain. It's now
+rtw_phy_stat_false_alarm() and rtw_phy_dig() from sc_set_rssi, as far as they
+apply while associated.
+
+On 2.4 GHz, in a busy band: 15 minutes of full load, about 10 MB/s each way, up
+from 3-6 and 2-4, and no stall in 7.4 GB, where the chip had stopped receiving at
+1 to 5 GB. 5 GHz still to be measured.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../wlan/realtekwifi/dev/rtwn/rtl8822b/r22b.h |   7 +
+ .../realtekwifi/dev/rtwn/rtl8822b/r22b_chan.c |   2 +-
+ .../realtekwifi/dev/rtwn/rtl8822b/r22b_phy.c  | 160 +++++++++++++++++-
+ .../realtekwifi/dev/rtwn/rtl8822b/r22b_ra.c   |   6 +-
+ .../realtekwifi/dev/rtwn/rtl8822b/r22b_var.h  |   9 +-
+ 5 files changed, 179 insertions(+), 5 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b.h b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b.h
+index 5e96100256..d545006102 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b.h
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b.h
+@@ -116,6 +116,12 @@
+ 
+ /* DIG / EDCCA (phy.h, rtw8822b.h). */
+ #define R22B_DIG_CVRG_MIN		0x1c
++#define R22B_DIG_PERF_MAX		0x5a
++#define R22B_DIG_PERF_MID		0x40
++#define R22B_DIG_PERF_FA_TH_LOW		250
++#define R22B_DIG_PERF_FA_TH_HIGH	500
++#define R22B_DIG_PERF_FA_TH_EXTRA_HIGH	750
++#define R22B_DIG_RSSI_GAIN_OFFSET	15
+ #define R22B_EDCCA_MAX			0x7f
+ #define R22B_EDCCA_SRC_DEF		1
+ 
+@@ -203,6 +209,7 @@ void	r22b_phy_rfe_init(struct rtwn_softc *);
+ void	r22b_pwrtrack_init(struct rtwn_softc *);
+ void	r22b_phy_bf_init(struct rtwn_softc *);
+ void	r22b_dig_write(struct rtwn_softc *, uint8_t);
++void	r22b_phy_dynamic_mechanism(struct rtwn_softc *, uint8_t);
+ void	r22b_temp_measure(struct rtwn_softc *);
+ uint8_t	r22b_temp_read(struct rtwn_softc *);
+ void	r22b_lc_calib(struct rtwn_softc *);
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_chan.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_chan.c
+index 444c4206ec..a56df1af52 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_chan.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_chan.c
+@@ -468,7 +468,7 @@ r22b_scan_end(struct ieee80211com *ic)
+ 	RTWN_LOCK(sc);
+ 	/* rtw_phy_dig_reset() */
+ 	if (sc->sc_flags & RTWN_RUNNING)
+-		r22b_dig_write(sc, rs->igi_default);
++		r22b_dig_write(sc, rs->igi_history[0]);
+ 	RTWN_UNLOCK(sc);
+ 
+ 	rs->rs_scan_end(ic);
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_phy.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_phy.c
+index 0bdf41a5e1..d7362b2f1b 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_phy.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_phy.c
+@@ -697,14 +697,21 @@ r22b_adaptivity_init(struct rtwn_softc *sc)
+ /*
+  * rtw_phy_init(): only the register side.  The dynamic mechanisms that
+  * use this state (DIG, EDCCA adaptivity, CCK PD, CFO tracking) run from
+- * rtw88's watchdog and are not ported yet (see docs/rtl8822b-port.md).
++ * rtw88's watchdog (r22b_phy_dynamic_mechanism() has what is ported of that,
++ * see docs/rtl8822b-port.md).
+  */
+ void
+ r22b_phy_init(struct rtwn_softc *sc)
+ {
+ 	struct r22b_softc *rs = sc->sc_priv;
+ 
+-	rs->igi_default = r22b_read32_mask(sc, R22B_REG_RXIGI_A, 0x7f);
++	memset(rs->igi_history, 0, sizeof(rs->igi_history));
++	memset(rs->fa_history, 0, sizeof(rs->fa_history));
++	rs->igi_bitmap = 0;
++	rs->min_rssi = 0;
++	rs->pre_min_rssi = 0;
++	rs->damping = 0;
++	rs->igi_history[0] = r22b_read32_mask(sc, R22B_REG_RXIGI_A, 0x7f);
+ 
+ 	/*
+ 	 * rtw_phy_adaptivity_init(): rtw88 picks the EDCCA mode from the
+@@ -727,6 +734,155 @@ r22b_dig_write(struct rtwn_softc *sc, uint8_t igi)
+ 		r22b_write32_mask(sc, dig_reg[path], 0x7f, igi);
+ }
+ 
++/*
++ * rtw8822b_false_alarm_statistics(): the false alarm count since the last
++ * call, and the PHY's counters reset.
++ */
++static uint32_t
++r22b_false_alarm_statistics(struct rtwn_softc *sc)
++{
++	uint32_t count;
++
++	count = rtwn_read_2(sc, 0xf48);
++	if (rtwn_read_4(sc, 0x808) & R22B_BIT(28))
++		count += rtwn_read_2(sc, 0xa5c);
++
++	r22b_write32_set(sc, 0x9a4, R22B_BIT(17));
++	r22b_write32_clr(sc, 0x9a4, R22B_BIT(17));
++	r22b_write32_clr(sc, 0xa2c, R22B_BIT(15));
++	r22b_write32_set(sc, 0xa2c, R22B_BIT(15));
++	r22b_write32_set(sc, 0xb58, R22B_BIT(0));
++	r22b_write32_clr(sc, 0xb58, R22B_BIT(0));
++
++	return (count);
++}
++
++/* rtw_phy_dig_check_damping() */
++static int
++r22b_dig_check_damping(struct r22b_softc *rs)
++{
++	const uint16_t fa_lo = R22B_DIG_PERF_FA_TH_LOW;
++	const uint16_t fa_hi = R22B_DIG_PERF_FA_TH_HIGH;
++	const uint8_t *igi = rs->igi_history;
++	const uint16_t *fa = rs->fa_history;
++	int damping = 0;
++
++	if (rs->damping) {
++		int diff = abs((int)rs->min_rssi - (int)rs->damping_rssi);
++		if (diff > 3 || rs->damping_cnt++ > 20) {
++			rs->damping = 0;
++			return (0);
++		}
++		return (1);
++	}
++
++	switch (rs->igi_bitmap & 0xf) {
++	case 5:
++		/* down -> up -> down -> up */
++		if (igi[0] > igi[1] && igi[2] > igi[3] &&
++		    igi[0] - igi[1] >= 2 && igi[2] - igi[3] >= 2 &&
++		    fa[0] > fa_hi && fa[1] < fa_lo &&
++		    fa[2] > fa_hi && fa[3] < fa_lo)
++			damping = 1;
++		break;
++	case 9:
++		/* up -> down -> down -> up */
++		if (igi[0] > igi[1] && igi[3] > igi[2] &&
++		    igi[0] - igi[1] >= 4 && igi[3] - igi[2] >= 2 &&
++		    fa[0] > fa_hi && fa[1] < fa_lo &&
++		    fa[2] < fa_lo && fa[3] > fa_hi)
++			damping = 1;
++		break;
++	default:
++		return (0);
++	}
++
++	if (damping) {
++		rs->damping = 1;
++		rs->damping_cnt = 0;
++		rs->damping_rssi = rs->min_rssi;
++	}
++	return (damping);
++}
++
++/*
++ * rtw_phy_dig() while linked, which is when it is called here: the receive
++ * gain follows the false alarm count, within bounds from the weakest
++ * station's signal.
++ */
++static void
++r22b_dig(struct rtwn_softc *sc, uint32_t fa_cnt)
++{
++	struct r22b_softc *rs = sc->sc_priv;
++	uint16_t fa_th[3] = { R22B_DIG_PERF_FA_TH_EXTRA_HIGH,
++	    R22B_DIG_PERF_FA_TH_HIGH, R22B_DIG_PERF_FA_TH_LOW };
++	uint8_t step[3] = { 4, 3, 2 };
++	uint8_t pre_igi, min_rssi, lower, upper, dig_max;
++	int cur_igi, level;
++
++	if (r22b_dig_check_damping(rs))
++		return;
++
++	pre_igi = rs->igi_history[0];
++	if (rs->pre_min_rssi > rs->min_rssi) {
++		step[0] = 6;
++		step[1] = 4;
++		step[2] = 2;
++	}
++
++	/* the step size is offset by -2 */
++	cur_igi = pre_igi;
++	for (level = 0; level < 3; level++) {
++		if (fa_cnt > fa_th[level]) {
++			cur_igi += step[level];
++			break;
++		}
++	}
++	cur_igi -= 2;
++
++	/* rtw_phy_dig_get_boundary(), linked */
++	min_rssi = MAX(rs->min_rssi, R22B_DIG_CVRG_MIN);
++	dig_max = MIN(R22B_DIG_PERF_MAX, min_rssi + R22B_DIG_RSSI_GAIN_OFFSET);
++	lower = MIN(min_rssi, R22B_DIG_PERF_MID);
++	upper = MIN(lower + R22B_DIG_RSSI_GAIN_OFFSET, dig_max);
++	if (cur_igi < lower)
++		cur_igi = lower;
++	else if (cur_igi > upper)
++		cur_igi = upper;
++
++	/* rtw_phy_dig_recorder() */
++	rs->igi_bitmap = (rs->igi_bitmap << 1 & 0xfe) |
++	    (cur_igi > rs->igi_history[0]);
++	memmove(rs->igi_history + 1, rs->igi_history,
++	    3 * sizeof(rs->igi_history[0]));
++	rs->igi_history[0] = cur_igi;
++	memmove(rs->fa_history + 1, rs->fa_history,
++	    3 * sizeof(rs->fa_history[0]));
++	rs->fa_history[0] = fa_cnt > 0xffff ? 0xffff : fa_cnt;
++
++	if (cur_igi != pre_igi)
++		r22b_dig_write(sc, cur_igi);
++}
++
++/*
++ * What is ported of rtw_phy_dynamic_mechanism(), every 2 seconds while
++ * associated, with the weakest station's signal on rtw88's 0..100 scale:
++ * rtw_phy_stat_false_alarm() and rtw_phy_dig().
++ */
++void
++r22b_phy_dynamic_mechanism(struct rtwn_softc *sc, uint8_t min_rssi)
++{
++	struct r22b_softc *rs = sc->sc_priv;
++	uint32_t fa_cnt;
++
++	rs->pre_min_rssi = rs->min_rssi;
++	rs->min_rssi = min_rssi;
++
++	fa_cnt = r22b_false_alarm_statistics(sc);
++	if ((sc->sc_ic.ic_flags & IEEE80211_F_SCAN) == 0)
++		r22b_dig(sc, fa_cnt);
++}
++
+ /* rtw8822b_phy_rfe_init() */
+ void
+ r22b_phy_rfe_init(struct rtwn_softc *sc)
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_ra.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_ra.c
+index 9038ecc5f7..b118a503f3 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_ra.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_ra.c
+@@ -774,7 +774,7 @@ r22b_set_rssi(struct rtwn_softc *sc)
+ 	struct r22b_softc *rs = sc->sc_priv;
+ 	struct r22b_sta_info *si;
+ 	struct ieee80211_node *ni;
+-	int id, pwdb, update, found;
++	int id, pwdb, update, found, min_rssi = 100;
+ 
+ 	RTWN_ASSERT_LOCKED(sc);
+ 
+@@ -805,8 +805,12 @@ r22b_set_rssi(struct rtwn_softc *sc)
+ 
+ 		si->rssi_level = r22b_get_rssi_level(si->rssi_level, pwdb);
+ 		r22b_fw_send_rssi_info(sc, id, si, pwdb);
++		if (pwdb < min_rssi)
++			min_rssi = pwdb;
+ 	}
+ 
++	r22b_phy_dynamic_mechanism(sc, min_rssi);
++
+ 	if (update) {
+ 		for (id = 0; id < R22B_MACID_NUM; id++) {
+ 			si = &rs->sta[id];
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_var.h b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_var.h
+index d0ce00f5d5..b441e5671c 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_var.h
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_var.h
+@@ -155,7 +155,14 @@ struct r22b_softc {
+ 	uint8_t		cch_by_bw[R22B_CHANNEL_WIDTH_MAX];
+ 
+ 	/* PHY dynamic state (rtw_dm_info subset). */
+-	uint8_t		igi_default;		/* dm_info->igi_history[0] */
++	uint8_t		igi_history[4];		/* dm_info->igi_history */
++	uint16_t	fa_history[4];
++	uint8_t		igi_bitmap;
++	uint8_t		min_rssi;
++	uint8_t		pre_min_rssi;
++	uint8_t		damping;
++	uint8_t		damping_cnt;
++	uint8_t		damping_rssi;
+ 	uint8_t		default_ofdm_index;	/* rtw8822b_pwrtrack_init() */
+ 
+ 	/* Tx power (rtw_hal subset; regulatory domain WW only). */

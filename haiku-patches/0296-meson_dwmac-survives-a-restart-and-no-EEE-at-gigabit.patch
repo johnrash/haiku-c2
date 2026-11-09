@@ -1,0 +1,331 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 4 Nov 2026 18:40:21 -0500
+Subject: [PATCH 296/342] meson_dwmac: survives a restart, and no EEE at
+ gigabit
+
+Closing and opening the device (ifconfig down, up) reset the DMA, which also clears
+the MAC's speed and duplex, but _UpdateLink() put them back only for a change of
+link: Ethernet then stopped receiving until a reboot.
+
+The link stopped twice in a day with the DMA sitting on nothing to show for it,
+one of them after 632 MB of a TCP blast. Linux's device tree has eee-broken-1000t
+for this board for that symptom: with this MAC and PHY, sustained sending eventually
+stops the link in both directions. So the PHY no longer advertises EEE at gigabit,
+unless "eee true" in the driver's settings file says so.
+
+To see it if it happens: a transmit stuck for 3 s is logged with the state of the
+DMA, and KDL has a "dwmac" command for the same.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../network/ether/meson_dwmac/meson_dwmac.cpp | 183 +++++++++++++++++-
+ 1 file changed, 181 insertions(+), 2 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp b/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
+index 8bac153f7a..e7bcd23154 100644
+--- a/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
++++ b/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
+@@ -22,7 +22,10 @@
+  *   and writers. A transmitted frame raises one only every kTxInterruptEvery
+  *   frames: a writer waits only when the ring is full, and is then woken
+  *   once for that many free slots instead of once per frame;
+- * - the link is polled over MDIO once a second.
++ * - the link is polled over MDIO once a second;
++ * - Energy Efficient Ethernet stays off at gigabit, as Linux's device tree for
++ *   this board has it (eee-broken-1000t): with it, sustained sending eventually
++ *   stops the link. "eee true" in the driver's settings file leaves it on.
+  */
+ 
+ 
+@@ -34,6 +37,7 @@
+ #include <ByteOrder.h>
+ #include <KernelExport.h>
+ #include <device_manager.h>
++#include <driver_settings.h>
+ #include <drivers/bus/FDT.h>
+ #include <net/if_media.h>
+ 
+@@ -58,7 +62,9 @@ enum {
+ 	kMacFrameFilter		= 0x0004,
+ 	kMacMdioAddress		= 0x0010,
+ 	kMacMdioData		= 0x0014,
++	kMacFlowControl		= 0x0018,
+ 	kMacVersion			= 0x0020,
++	kMacDebug			= 0x0024,
+ 	kMacPmtControl		= 0x002c,
+ 	kMacInterruptStatus	= 0x0038,
+ 	kMacInterruptMask	= 0x003c,
+@@ -69,6 +75,10 @@ enum {
+ 	kMmcTxInterrupt		= 0x0108,
+ 	kMmcRxInterruptMask	= 0x010c,
+ 	kMmcTxInterruptMask	= 0x0110,
++	kMmcTxOctets		= 0x0114,
++	kMmcTxFrames		= 0x0118,
++	kMmcRxFrames		= 0x0180,
++	kMmcRxCrcErrors		= 0x0194,
+ 	kMmcIpcRxInterruptMask = 0x0200,
+ 	kMmcIpcRxInterrupt	= 0x0208,
+ };
+@@ -84,6 +94,9 @@ enum {
+ 	kDmaOperationMode	= 0x1018,
+ 	kDmaInterruptEnable	= 0x101c,
+ 	kDmaMissedFrames	= 0x1020,
++	kDmaCurrentTxDesc	= 0x1048,
++	kDmaCurrentRxDesc	= 0x104c,
++	kDmaCurrentTxBuffer	= 0x1050,
+ 	kDmaHwFeature		= 0x1058,
+ };
+ 
+@@ -147,10 +160,19 @@ enum {
+ #define DESC_BUFFER_SIZE_MASK	0x7ff
+ 
+ // PHY (IEEE 802.3 clause 22, plus RTL8211F extras)
++#define PHY_BMCR				0
++#define PHY_BMCR_RESTART_AN		(1 << 9)
+ #define PHY_BMSR				1
+ #define PHY_ID1					2
+ #define PHY_ID2					3
+ #define PHY_BMSR_LINK			(1 << 2)
++#define PHY_MMD_CONTROL			13
++#define PHY_MMD_DATA			14
++#define PHY_MMD_FUNCTION_DATA	(1 << 14)
++#define MMD_AN					7
++#define MMD_AN_EEE_ADVERTISED	60
++#define MMD_AN_EEE_PARTNER		61
++#define EEE_1000T				(1 << 2)
+ #define RTL8211F_PAGE_SELECT	0x1f
+ #define RTL8211F_PHYSR_PAGE		0xa43
+ #define RTL8211F_PHYSR			0x1a
+@@ -219,6 +241,8 @@ public:
+ 
+ 			device_node*		Node() const { return fNode; }
+ 
++			void				DumpState(void (*print)(const char*, ...));
++
+ private:
+ 			uint32				_Read(uint32 offset)
+ 									{ return fRegisters[offset / 4]; }
+@@ -252,6 +276,12 @@ private:
+ 
+ 			status_t			_MdioRead(uint32 reg, uint16* value);
+ 			status_t			_MdioWrite(uint32 reg, uint16 value);
++			status_t			_MmdRead(uint16 device, uint16 reg,
++									uint16* value);
++			status_t			_MmdWrite(uint16 device, uint16 reg,
++									uint16 value);
++			void				_ConfigureEee();
++			void				_CheckTransmit();
+ 			void				_UpdateLink();
+ 			void				_ClearSummaryInterrupts();
+ 	static	status_t			_LinkThread(void* data);
+@@ -292,9 +322,15 @@ private:
+ 			bool				fFullDuplex;
+ 			uint32				fSpeed;			// Mbit/s
+ 			sem_id				fLinkStateSemaphore;
++
++			uint32				fTxLastCurrent;
++			int32				fTxStuckSeconds;
+ };
+ 
+ 
++static MesonDwmac* sDebuggedDevice = NULL;
++
++
+ MesonDwmac::MesonDwmac(device_node* node)
+ 	:
+ 	fNode(node),
+@@ -320,7 +356,9 @@ MesonDwmac::MesonDwmac(device_node* node)
+ 	fLinkUp(false),
+ 	fFullDuplex(true),
+ 	fSpeed(0),
+-	fLinkStateSemaphore(-1)
++	fLinkStateSemaphore(-1),
++	fTxLastCurrent(0),
++	fTxStuckSeconds(0)
+ {
+ 	memset(fMacAddress, 0, sizeof(fMacAddress));
+ 	mutex_init(&fRxLock, "meson_dwmac rx");
+@@ -399,6 +437,7 @@ MesonDwmac::Init(phys_addr_t registers, size_t length, int32 irq,
+ 	_MdioRead(PHY_ID1, &id1);
+ 	_MdioRead(PHY_ID2, &id2);
+ 	INFO("PHY %" B_PRIu32 ": id %04x:%04x\n", fPhyAddress, id1, id2);
++	_ConfigureEee();
+ 
+ 	status_t status = _AllocateRings();
+ 	if (status != B_OK)
+@@ -516,6 +555,8 @@ MesonDwmac::_Start()
+ 		| (fMacAddress[2] << 16) | ((uint32)fMacAddress[3] << 24));
+ 	_Write(kMacFrameFilter, FRAME_FILTER_PM);
+ 
++	// the DMA reset also cleared the MAC's speed and duplex: not "no change"
++	fLinkUp = false;
+ 	_UpdateLink();
+ 	uint32 config = _Read(kMacConfiguration);
+ 	_Write(kMacConfiguration, config | MAC_CONFIG_TE | MAC_CONFIG_RE);
+@@ -803,6 +844,136 @@ MesonDwmac::_MdioWrite(uint32 reg, uint16 value)
+ }
+ 
+ 
++status_t
++MesonDwmac::_MmdRead(uint16 device, uint16 reg, uint16* value)
++{
++	_MdioWrite(PHY_MMD_CONTROL, device);
++	_MdioWrite(PHY_MMD_DATA, reg);
++	_MdioWrite(PHY_MMD_CONTROL, PHY_MMD_FUNCTION_DATA | device);
++	return _MdioRead(PHY_MMD_DATA, value);
++}
++
++
++status_t
++MesonDwmac::_MmdWrite(uint16 device, uint16 reg, uint16 value)
++{
++	_MdioWrite(PHY_MMD_CONTROL, device);
++	_MdioWrite(PHY_MMD_DATA, reg);
++	_MdioWrite(PHY_MMD_CONTROL, PHY_MMD_FUNCTION_DATA | device);
++	return _MdioWrite(PHY_MMD_DATA, value);
++}
++
++
++/*!	Stops advertising Energy Efficient Ethernet at gigabit, unless the
++	settings ask for it. The change takes effect with a new negotiation, so
++	only that is restarted, and only when needed: the PHY keeps it until it
++	loses power.
++*/
++void
++MesonDwmac::_ConfigureEee()
++{
++	bool keep = false;
++	void* settings = load_driver_settings("meson_dwmac");
++	if (settings != NULL) {
++		keep = get_driver_boolean_parameter(settings, "eee", false, true);
++		unload_driver_settings(settings);
++	}
++
++	uint16 advertised = 0, partner = 0;
++	if (_MmdRead(MMD_AN, MMD_AN_EEE_ADVERTISED, &advertised) != B_OK
++		|| _MmdRead(MMD_AN, MMD_AN_EEE_PARTNER, &partner) != B_OK) {
++		ERROR("can't read the PHY's EEE registers\n");
++		return;
++	}
++	INFO("EEE: advertised %#x, link partner %#x, %s\n", advertised, partner,
++		keep ? "left as it is" : "off at gigabit");
++	if (keep || (advertised & EEE_1000T) == 0)
++		return;
++
++	_MmdWrite(MMD_AN, MMD_AN_EEE_ADVERTISED, advertised & ~EEE_1000T);
++	uint16 control = 0;
++	if (_MdioRead(PHY_BMCR, &control) == B_OK)
++		_MdioWrite(PHY_BMCR, control | PHY_BMCR_RESTART_AN);
++}
++
++
++/*!	Logs it when the DMA engine sits on a frame it owns for 3 s. */
++void
++MesonDwmac::_CheckTransmit()
++{
++	if (!fLinkUp)
++		return;
++
++	MutexLocker locker(fTxLock);
++	uint32 current = (_Read(kDmaCurrentTxDesc)
++		- (uint32)_DescriptorPhysical(kRxCount)) / kDescriptorStride;
++	if (current >= kTxCount)
++		return;
++	_SyncDescriptor(kRxCount + current, true);
++	bool owned = (_TxDescriptor(current)->status & DESC_OWN) != 0;
++
++	if (!owned || current != fTxLastCurrent) {
++		if (fTxStuckSeconds >= 3)
++			INFO("transmit moving again after %" B_PRId32 " s\n", fTxStuckSeconds);
++		fTxStuckSeconds = 0;
++		fTxLastCurrent = current;
++		return;
++	}
++	if (++fTxStuckSeconds == 3) {
++		ERROR("transmit stuck on a frame for 3 s\n");
++		DumpState(&dprintf);
++	}
++}
++
++
++/*!	The state of the DMA engines, for the log and for KDL ("dwmac"). */
++void
++MesonDwmac::DumpState(void (*print)(const char*, ...))
++{
++	uint32 status = _Read(kDmaStatus);
++	print("meson_dwmac: DMA status %#" B_PRIx32 ": transmit state %" B_PRIu32
++		", receive state %" B_PRIu32 ", error bits %" B_PRIu32 "\n", status,
++		(status >> 20) & 7, (status >> 17) & 7, (status >> 23) & 7);
++	print("meson_dwmac: operation %#" B_PRIx32 ", interrupts %#" B_PRIx32
++		", MAC configuration %#" B_PRIx32 ", flow control %#" B_PRIx32
++		", MAC debug %#" B_PRIx32 ", RGMII %#" B_PRIx32 "\n",
++		_Read(kDmaOperationMode), _Read(kDmaInterruptEnable),
++		_Read(kMacConfiguration), _Read(kMacFlowControl), _Read(kMacDebug),
++		_Read(kMacRgmiiStatus));
++
++	uint32 txBase = (uint32)_DescriptorPhysical(kRxCount);
++	uint32 rxBase = (uint32)_DescriptorPhysical(0);
++	uint32 current = (_Read(kDmaCurrentTxDesc) - txBase) / kDescriptorStride;
++	uint32 currentRx = (_Read(kDmaCurrentRxDesc) - rxBase) / kDescriptorStride;
++	print("meson_dwmac: transmit slot %" B_PRIu32 " of the engine, %" B_PRIu32
++		" of the driver, buffer %#" B_PRIx32 "; receive slot %" B_PRIu32
++		" of the engine, %" B_PRIu32 " of the driver\n", current, fTxHead,
++		_Read(kDmaCurrentTxBuffer), currentRx, fRxHead);
++	if (current < kTxCount) {
++		_SyncDescriptor(kRxCount + current, true);
++		volatile descriptor* desc = _TxDescriptor(current);
++		print("meson_dwmac: its descriptor: status %#" B_PRIx32 ", control %#"
++			B_PRIx32 ", buffer %#" B_PRIx32 ", next %#" B_PRIx32 "\n",
++			desc->status, desc->control, desc->buffer, desc->next);
++	}
++	print("meson_dwmac: counters: sent %" B_PRIu32 " frames, %" B_PRIu32
++		" bytes; received %" B_PRIu32 " frames, %" B_PRIu32 " CRC errors; "
++		"missed %#" B_PRIx32 "\n", _Read(kMmcTxFrames), _Read(kMmcTxOctets),
++		_Read(kMmcRxFrames), _Read(kMmcRxCrcErrors), _Read(kDmaMissedFrames));
++}
++
++
++static int
++dump_dwmac(int argc, char** argv)
++{
++	if (sDebuggedDevice == NULL)
++		kprintf("no meson_dwmac device\n");
++	else
++		sDebuggedDevice->DumpState(&kprintf);
++	return 0;
++}
++
++
+ /*!	The MAC, counter and power management interrupts show up in the DMA
+ 	status as summary bits that clear only when their source registers are
+ 	read.
+@@ -883,6 +1054,7 @@ MesonDwmac::_LinkThread(void* data)
+ 	MesonDwmac* self = (MesonDwmac*)data;
+ 	while (!self->fStopLinkThread) {
+ 		self->_UpdateLink();
++		self->_CheckTransmit();
+ 		for (int32 i = 0; i < 10 && !self->fStopLinkThread; i++)
+ 			snooze(100000);
+ 	}
+@@ -1024,6 +1196,11 @@ init_driver(device_node* node, void** _cookie)
+ 		return status;
+ 	}
+ 
++	sDebuggedDevice = device;
++	add_debugger_command_etc("dwmac", &dump_dwmac,
++		"Shows the state of the Ethernet controller", "\n"
++		"Shows the DMA engines' state and the controller's counters.\n", 0);
++
+ 	*_cookie = device;
+ 	return B_OK;
+ }
+@@ -1032,6 +1209,8 @@ init_driver(device_node* node, void** _cookie)
+ static void
+ uninit_driver(void* cookie)
+ {
++	remove_debugger_command("dwmac", &dump_dwmac);
++	sDebuggedDevice = NULL;
+ 	delete (MesonDwmac*)cookie;
+ }
+ 

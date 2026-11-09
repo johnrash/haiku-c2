@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 01:59:57 -0400
+Subject: [PATCH 080/342] ffmpeg plugin: decode video with at least 8 frame
+ threads
+
+Players ask for each video frame shortly before it is due, and a frame
+thread's frame is only returned after the frames started after it, so
+the decoder has thread_count frames under way. With one thread per core
+on the ODROID-C2 (4), a frame of a 1080x1920 10 Mbit H.264 clip took
+longer than those four frame times to finish; MediaPlayer showed 19.1
+of its 30 frames per second, dropping late ones it had still decoded.
+With 8 frame threads it shows 29.6 (HDMI capture), using 1.8 instead of
+2.3 cores for decoding and 7 MB more memory.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.cpp b/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.cpp
+index e361319e97..e15abb38b3 100644
+--- a/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.cpp
++++ b/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.cpp
+@@ -28,6 +28,9 @@
+ #include "Utilities.h"
+ 
+ 
++static const int kMinimumVideoThreads = 8;
++
++
+ #undef TRACE
+ //#define TRACE_AV_CODEC
+ #ifdef TRACE_AV_CODEC
+@@ -315,6 +318,13 @@ AVCodecDecoder::NegotiateOutputFormat(media_format* inOutFormat)
+ 	fCodecContext->err_recognition = AV_EF_CAREFUL;
+ 	fCodecContext->error_concealment = 3;
+ 	fCodecContext->thread_count = info.cpu_count;
++	if (!fIsAudio && fCodecContext->thread_count < kMinimumVideoThreads) {
++		// Frame threads decode the next frames while one is shown. Media
++		// players ask for each frame only shortly before it is due, so the
++		// frames must have been started early enough: with few cores, each
++		// frame takes longer, and more of them have to be under way.
++		fCodecContext->thread_count = kMinimumVideoThreads;
++	}
+ 
+ 	if (fIsAudio)
+ 		return _NegotiateAudioOutputFormat(inOutFormat);

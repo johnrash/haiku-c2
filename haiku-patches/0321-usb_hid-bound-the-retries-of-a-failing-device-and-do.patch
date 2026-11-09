@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 6 Nov 2026 10:16:29 -0500
+Subject: [PATCH 321/342] usb_hid: bound the retries of a failing device, and
+ don't lose its transfer
+
+A keyboard whose interrupt endpoint stays stalled (seen with a 71M-RGB
+after its Fn colour keys) was tried again forever, every 13 ms, each time
+logging "Unable to unstall device". Failed transfers in a row are now
+tried again at once three times, then after 20 ms, doubling up to once a
+second, until one succeeds; the waiting happens in the reader's thread,
+and a removal during it is noticed when it ends. The logs say it once when the
+device starts failing and once when it works again.
+
+Two failures left fTransferScheduled set with no transfer queued, so every
+reader waiting on the device waited for good (a mouse with no timeout):
+queue_interrupt() failing, and the CLEAR_FEATURE request for a stall
+failing to queue (its result was ignored, and no callback came). Both now
+end the attempt like a failed transfer: the flag cleared and every report
+told, which wakes its readers.
+
+Tested on the test board with a temporary fault injection (stalls, failed
+queuing of either kind, and the hub port cut during a backoff, with the
+USB mouse receiver): all four recover; no panic.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../drivers/input/usb_hid/HIDDevice.cpp       | 73 ++++++++++++++++---
+ .../kernel/drivers/input/usb_hid/HIDDevice.h  |  3 +
+ 2 files changed, 67 insertions(+), 9 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/input/usb_hid/HIDDevice.cpp b/src/add-ons/kernel/drivers/input/usb_hid/HIDDevice.cpp
+index 4cfd2532f6..93f5c58e0f 100644
+--- a/src/add-ons/kernel/drivers/input/usb_hid/HIDDevice.cpp
++++ b/src/add-ons/kernel/drivers/input/usb_hid/HIDDevice.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include <usb/USB_hid.h>
+ 
++#include <algorithm>
+ #include <stdlib.h>
+ #include <stdio.h>
+ #include <string.h>
+@@ -23,12 +24,20 @@
+ #include <new>
+ 
+ 
++// Transfers that fail in a row are tried again at once this many times, then
++// after kRetryDelay, doubled each time up to kMaxRetryDelay.
++static const int32 kImmediateRetries = 3;
++static const bigtime_t kRetryDelay = 10000;
++static const bigtime_t kMaxRetryDelay = 1000000;
++
++
+ HIDDevice::HIDDevice(usb_device device, const usb_configuration_info *config,
+ 	size_t interfaceIndex, int32 quirkyIndex)
+ 	:	fStatus(B_NO_INIT),
+ 		fDevice(device),
+ 		fInterfaceIndex(interfaceIndex),
+ 		fTransferScheduled(0),
++		fFailures(0),
+ 		fTransferBufferSize(0),
+ 		fTransferBuffer(NULL),
+ 		fParentCookie(-1),
+@@ -287,12 +296,30 @@ HIDDevice::MaybeScheduleTransfer(HIDReport*)
+ 		return B_OK;
+ 	}
+ 
++	// A device whose transfers keep failing (a keyboard whose endpoint stays
++	// stalled, say) is tried again more and more slowly, up to once a second,
++	// rather than every few milliseconds for good. This is a reader's thread.
++	int32 failures = atomic_get(&fFailures);
++	if (failures > kImmediateRetries) {
++		int32 shift = std::min(failures - kImmediateRetries, (int32)7);
++		snooze(std::min(kRetryDelay << shift, kMaxRetryDelay));
++		if (fRemoved) {
++			_TransferDone(ENODEV, 0);
++			return ENODEV;
++		}
++	}
++
+ 	TRACE("scheduling interrupt transfer of %lu bytes\n", fTransferBufferSize);
+ 	status_t result = gUSBModule->queue_interrupt(fInterruptPipe,
+ 		fTransferBuffer, fTransferBufferSize, _TransferCallback, this);
+ 	if (result != B_OK) {
+-		TRACE_ALWAYS("failed to schedule interrupt transfer 0x%08" B_PRIx32
+-			"\n", result);
++		if (failures < kImmediateRetries) {
++			TRACE_ALWAYS("failed to schedule interrupt transfer 0x%08" B_PRIx32
++				"\n", result);
++		}
++		// Nothing is queued, so no callback would ever clear the flag: the
++		// readers that found it set would wait for good.
++		_TransferDone(result, 0);
+ 		return result;
+ 	}
+ 
+@@ -332,12 +359,11 @@ HIDDevice::_UnstallCallback(void *cookie, status_t status, void *data,
+ 	size_t actualLength)
+ {
+ 	HIDDevice *device = (HIDDevice *)cookie;
+-	if (status != B_OK) {
++	if (status != B_OK && atomic_get(&device->fFailures) < kImmediateRetries)
+ 		TRACE_ALWAYS("Unable to unstall device: %s\n", strerror(status));
+-	}
+ 
+ 	// Now report the original failure, since we're ready to retry
+-	_TransferCallback(cookie, B_ERROR, device->fTransferBuffer, 0);
++	device->_TransferDone(B_ERROR, 0);
+ }
+ 
+ 
+@@ -348,13 +374,42 @@ HIDDevice::_TransferCallback(void *cookie, status_t status, void *data,
+ 	HIDDevice *device = (HIDDevice *)cookie;
+ 	if (status == B_DEV_STALLED && !device->fRemoved) {
+ 		// try clearing stalls right away, the report listeners will resubmit
+-		gUSBModule->queue_request(device->fDevice,
++		status_t result = gUSBModule->queue_request(device->fDevice,
+ 			USB_REQTYPE_STANDARD | USB_REQTYPE_ENDPOINT_OUT,
+ 			USB_REQUEST_CLEAR_FEATURE, USB_FEATURE_ENDPOINT_HALT,
+ 			device->fEndpointAddress, 0, NULL, _UnstallCallback, device);
+-		return;
++		if (result == B_OK)
++			return;
++
++		// _UnstallCallback() won't come: report the stall now
++		if (atomic_get(&device->fFailures) < kImmediateRetries) {
++			TRACE_ALWAYS("Unable to unstall device: %s\n",
++				strerror(result));
++		}
++	}
++
++	device->_TransferDone(status, actualLength);
++}
++
++
++/*!	Ends the scheduled transfer (or the attempt to schedule one) and passes
++	its outcome to every report, which wakes all waiting readers. Counts
++	failures in a row for MaybeScheduleTransfer(); a cancellation (a close
++	or a removal) isn't the device's.
++*/
++void
++HIDDevice::_TransferDone(status_t status, size_t actualLength)
++{
++	if (status == B_OK) {
++		if (atomic_get_and_set(&fFailures, 0) > kImmediateRetries)
++			TRACE_ALWAYS("transfers work again\n");
++	} else if (status != B_CANCELED && !fRemoved) {
++		if (atomic_add(&fFailures, 1) == kImmediateRetries) {
++			TRACE_ALWAYS("transfers keep failing (%s), trying again more "
++				"slowly\n", strerror(status));
++		}
+ 	}
+ 
+-	atomic_set(&device->fTransferScheduled, 0);
+-	device->fParser.SetReport(status, device->fTransferBuffer, actualLength);
++	atomic_set(&fTransferScheduled, 0);
++	fParser.SetReport(status, fTransferBuffer, actualLength);
+ }
+diff --git a/src/add-ons/kernel/drivers/input/usb_hid/HIDDevice.h b/src/add-ons/kernel/drivers/input/usb_hid/HIDDevice.h
+index a19f97cb49..527a33ff16 100644
+--- a/src/add-ons/kernel/drivers/input/usb_hid/HIDDevice.h
++++ b/src/add-ons/kernel/drivers/input/usb_hid/HIDDevice.h
+@@ -51,6 +51,8 @@ private:
+ 	static	void				_UnstallCallback(void *cookie,
+ 									status_t status, void *data,
+ 									size_t actualLength);
++			void				_TransferDone(status_t status,
++									size_t actualLength);
+ 
+ private:
+ 			status_t			fStatus;
+@@ -60,6 +62,7 @@ private:
+ 			uint8				fEndpointAddress;
+ 
+ 			int32				fTransferScheduled;
++			int32				fFailures;
+ 			size_t				fTransferBufferSize;
+ 			uint8 *				fTransferBuffer;
+ 

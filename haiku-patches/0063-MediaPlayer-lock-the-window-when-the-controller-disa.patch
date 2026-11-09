@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 17:28:56 -0400
+Subject: [PATCH 063/342] MediaPlayer: lock the window when the controller
+ disables the overlay
+
+Controller::SetTo() calls VideoView::DisableOverlay() from its own
+thread when the playlist moves to the next file, and DisableOverlay()
+draws without the window locked: "Looper must be locked." With overlay
+support (meson_hdmi), MediaPlayer stopped in the debugger at the end of
+every file in a playlist. It now locks the window, with a timeout, as
+SetBitmap() does: the window thread may be waiting for the controller.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apps/mediaplayer/VideoView.cpp | 21 ++++++++++++++-------
+ 1 file changed, 14 insertions(+), 7 deletions(-)
+
+diff --git a/src/apps/mediaplayer/VideoView.cpp b/src/apps/mediaplayer/VideoView.cpp
+index 035bd9cea5..8040007382 100644
+--- a/src/apps/mediaplayer/VideoView.cpp
++++ b/src/apps/mediaplayer/VideoView.cpp
+@@ -285,16 +285,23 @@ VideoView::IsOverlayActive()
+ void
+ VideoView::DisableOverlay()
+ {
+-	if (!fOverlayMode)
++	// The controller calls this from its own thread when it switches to
++	// another file, and drawing needs the window locked. With a timeout:
++	// the window thread may be waiting for the controller.
++	if (LockLooperWithTimeout(100000) != B_OK)
+ 		return;
+ 
+-	FillRect(Bounds());
+-	Sync();
++	if (fOverlayMode) {
++		FillRect(Bounds());
++		Sync();
+ 
+-	ClearViewOverlay();
+-	snooze(20000);
+-	Sync();
+-	_SetOverlayMode(false);
++		ClearViewOverlay();
++		snooze(20000);
++		Sync();
++		_SetOverlayMode(false);
++	}
++
++	UnlockLooper();
+ }
+ 
+ 

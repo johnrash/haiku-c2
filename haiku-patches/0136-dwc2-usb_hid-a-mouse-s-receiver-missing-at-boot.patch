@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 19:18:42 -0400
+Subject: [PATCH 136/342] dwc2, usb_hid: a mouse's receiver missing at boot
+
+A Logitech M185 receiver behind the C2's hub came up at boot without its
+input device: usb_hid could not get its report descriptor (a full speed
+device, so split transactions, eight bytes a packet). Plugged in again, it
+worked.
+
+- dwc2: a split transaction's packet is tried again after a transaction
+  error or a frame overrun, three times, as USB 2.0 retries transactions;
+  it failed the whole transfer at the first. Logged when it happens. The
+  packet loop also repeats a zero length packet (a status stage) that was
+  NAKed, where it ended the transfer.
+- usb_hid: the report descriptor is asked for up to four times, 200 ms
+  apart, as Linux does; the error is logged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/busses/usb/dwc2.cpp        | 38 +++++++++++++++++--
+ src/add-ons/kernel/busses/usb/dwc2.h          |  2 +
+ .../drivers/input/usb_hid/HIDDevice.cpp       | 32 +++++++++++-----
+ 3 files changed, 60 insertions(+), 12 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.cpp b/src/add-ons/kernel/busses/usb/dwc2.cpp
+index 09212b2ba4..1d09c3ec7f 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2.cpp
+@@ -1145,7 +1145,12 @@ DWC2::_SplitTransaction(dwc2_lane* lane, Pipe* pipe, uint32 pid, bool in,
+ 	uint32 done = 0;
+ 	uint32 currentPid = pid;
+ 	int32 nakRetries = 0;
+-	do {
++	int32 errors = 0;
++		// transaction errors (no or a garbled answer, a missed frame) of the
++		// current packet: USB 2.0 retries a transaction three times before
++		// it gives up; a wireless mouse's receiver at boot needed it
++	while (true) {
++		// (a zero length packet, a control transfer's status stage, too)
+ 		uint32 chunk = min_c(length - done, maxPacket);
+ 		uint32 size = in ? maxPacket : chunk;
+ 		uint32 status;
+@@ -1156,6 +1161,8 @@ DWC2::_SplitTransaction(dwc2_lane* lane, Pipe* pipe, uint32 pid, bool in,
+ 			offset + done, in, &status, &transferSize);
+ 		if (result != B_OK)
+ 			return result;
++		if (_RetrySplit(status, errors, "start"))
++			continue;
+ 		result = dwc2_channel_error(status);
+ 		if (result != B_OK)
+ 			return result;
+@@ -1190,6 +1197,11 @@ DWC2::_SplitTransaction(dwc2_lane* lane, Pipe* pipe, uint32 pid, bool in,
+ 				return result;
+ 			if ((status & HCINT_NYET) != 0)
+ 				continue;
++			if (_RetrySplit(status, errors, "complete")) {
++				// the translator keeps the answer: ask again
++				tries--;
++				continue;
++			}
+ 			result = dwc2_channel_error(status);
+ 			if (result != B_OK)
+ 				return result;
+@@ -1219,9 +1231,10 @@ DWC2::_SplitTransaction(dwc2_lane* lane, Pipe* pipe, uint32 pid, bool in,
+ 		}
+ 
+ 		done += got;
+-		if (in && got < maxPacket)
++		errors = 0;
++		if ((in && got < maxPacket) || done >= length)
+ 			break;
+-	} while (done < length);
++	}
+ 
+ 	*_nextPid = currentPid;
+ 	*_actual = done;
+@@ -1229,6 +1242,25 @@ DWC2::_SplitTransaction(dwc2_lane* lane, Pipe* pipe, uint32 pid, bool in,
+ }
+ 
+ 
++/*!	Whether a split transaction's packet that ended in a transaction error
++	or a frame overrun should be tried again: up to three times.
++*/
++bool
++DWC2::_RetrySplit(uint32 status, int32& errors, const char* phase)
++{
++	if ((status & (HCINT_XACTERR | HCINT_FRMOVRUN)) == 0
++		|| (status & (HCINT_STALL | HCINT_BBLERR | HCINT_AHBERR)) != 0) {
++		return false;
++	}
++	if (++errors > 3)
++		return false;
++	dprintf("dwc2: %s-split: transaction error (%#" B_PRIx32 "), retry %"
++		B_PRId32 "\n", phase, status, errors);
++	snooze(1000);
++	return true;
++}
++
++
+ void
+ DWC2::_HaltChannel(dwc2_lane* lane)
+ {
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.h b/src/add-ons/kernel/busses/usb/dwc2.h
+index 81bf223d72..9843abbc46 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.h
++++ b/src/add-ons/kernel/busses/usb/dwc2.h
+@@ -181,6 +181,8 @@ private:
+ 									uint32 offset, uint32 length,
+ 									uint32* nextPid, size_t* actual,
+ 									bool* nak);
++			bool				_RetrySplit(uint32 status, int32& errors,
++									const char* phase);
+ 			bool				_NeedsSplit(Pipe* pipe);
+ 			uint32				_ChannelCharacteristics(Pipe* pipe, bool in,
+ 									bool split);
+diff --git a/src/add-ons/kernel/drivers/input/usb_hid/HIDDevice.cpp b/src/add-ons/kernel/drivers/input/usb_hid/HIDDevice.cpp
+index 7902bbf5ff..4cfd2532f6 100644
+--- a/src/add-ons/kernel/drivers/input/usb_hid/HIDDevice.cpp
++++ b/src/add-ons/kernel/drivers/input/usb_hid/HIDDevice.cpp
+@@ -117,16 +117,30 @@ HIDDevice::HIDDevice(usb_device device, const usb_configuration_info *config,
+ 			return;
+ 		}
+ 
+-		status_t result = gUSBModule->send_request(device,
+-			USB_REQTYPE_INTERFACE_IN | USB_REQTYPE_STANDARD,
+-			USB_REQUEST_GET_DESCRIPTOR,
+-			B_USB_HID_DESCRIPTOR_REPORT << 8, interfaceIndex, descriptorLength,
+-			reportDescriptor, &descriptorLength);
+-
+-		TRACE("get report descriptor: result: 0x%08" B_PRIx32 "; length: %"
+-			B_PRIuSIZE "\n", result, descriptorLength);
++		// A device just plugged in (or found at boot) may not answer yet: a
++		// wireless mouse's receiver failed this at boot and worked when
++		// plugged in again. Try a few times.
++		size_t requestedLength = descriptorLength;
++		status_t result = B_ERROR;
++		for (int32 attempt = 0; attempt < 4; attempt++) {
++			if (attempt > 0)
++				snooze(200000);
++			descriptorLength = requestedLength;
++			result = gUSBModule->send_request(device,
++				USB_REQTYPE_INTERFACE_IN | USB_REQTYPE_STANDARD,
++				USB_REQUEST_GET_DESCRIPTOR,
++				B_USB_HID_DESCRIPTOR_REPORT << 8, interfaceIndex,
++				descriptorLength, reportDescriptor, &descriptorLength);
++
++			TRACE("get report descriptor: result: 0x%08" B_PRIx32 "; length: %"
++				B_PRIuSIZE "\n", result, descriptorLength);
++			if (result == B_OK)
++				break;
++			TRACE_ALWAYS("failed to get the report descriptor of interface %"
++				B_PRIuSIZE " (attempt %" B_PRId32 "): %s\n", interfaceIndex,
++				attempt + 1, strerror(result));
++		}
+ 		if (result != B_OK) {
+-			TRACE_ALWAYS("failed tot get report descriptor\n");
+ 			free(reportDescriptor);
+ 			return;
+ 		}

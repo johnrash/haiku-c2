@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 12:07:24 -0400
+Subject: [PATCH 092/342] meson_i2c: probe the RTC shield again if the first
+ transfer fails
+
+At boot on the ODROID-C2 the first transfer after the pins are muxed
+failed, and the PCF8563 answered every transfer after it. Try three
+times, 10 ms apart. And check only the bits the PCF8563 has: the
+shield's clock reads bit 6 of control 2, the hours, the days and the
+months as 1.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/busses/i2c/meson/meson_i2c.cpp     | 25 +++++++++++++------
+ 1 file changed, 17 insertions(+), 8 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp b/src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp
+index f29ed51c10..43dcab14a1 100644
+--- a/src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp
++++ b/src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp
+@@ -562,15 +562,14 @@ MesonI2c::ExecCommand(i2c_op op, i2c_addr address, const uint8* command,
+ }
+ 
+ 
+-/*!	The PCF8563's control and time registers (0 to 8): the bits it doesn't
+-	have read as 0, and the time is valid BCD unless the clock says it isn't
+-	(VL, its battery ran out or it was never set).
++/*!	The PCF8563's control and time registers (0 to 8): the time is valid BCD
++	unless the clock says it isn't (VL: its battery ran out, or it was never
++	set). The bits it doesn't have read as anything (the shield's clock has
++	bit 6 of the hours, days and months set).
+ */
+ bool
+ MesonI2c::_LooksLikePcf8563(const uint8* registers)
+ {
+-	if ((registers[0] & 0x57) != 0 || (registers[1] & 0xe0) != 0)
+-		return false;
+ 	if ((registers[2] & 0x80) != 0)
+ 		return true;
+ 
+@@ -591,12 +590,22 @@ MesonI2c::_LooksLikePcf8563(const uint8* registers)
+ status_t
+ MesonI2c::ScanBus()
+ {
++	// the first transfer after the pins are muxed can fail (at boot on the
++	// ODROID-C2, not later)
+ 	uint8 reg = 0;
+ 	uint8 registers[9];
+-	status_t status = ExecCommand(I2C_OP_READ_STOP, kPcf8563Address, &reg, 1,
+-		registers, sizeof(registers));
++	status_t status = B_ERROR;
++	for (int attempt = 0; attempt < 3 && status != B_OK; attempt++) {
++		if (attempt > 0)
++			snooze(10000);
++		status = ExecCommand(I2C_OP_READ_STOP, kPcf8563Address, &reg, 1,
++			registers, sizeof(registers));
++		if (status != B_OK)
++			INFO("probing %#x: %s\n", kPcf8563Address, strerror(status));
++	}
+ 	if (status != B_OK) {
+-		INFO("nothing at address %#x\n", kPcf8563Address);
++		INFO("nothing at address %#x (%s)\n", kPcf8563Address,
++			strerror(status));
+ 		return B_OK;
+ 	}
+ 	if (!_LooksLikePcf8563(registers)) {

@@ -1,0 +1,352 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 20:38:38 -0400
+Subject: [PATCH 185/342] mmc: SD cards put in or taken out while running
+
+meson_gx_mmc reads the slot's card detect (the device tree's cd-gpios, a
+CARD bank pad; the ODROID-C2's CARD_6, low with a card) four times a second
+and has the bus manager look at the slot when it changed for two looks.
+mmc_bus keeps the card it published: asked to scan, it leaves a card that
+answers CMD13 as it is (clock and bus width too), and unregisters one that
+doesn't, then looks for a new card. mmc_disk fails I/O at once and reports
+no media once its card is gone (device_removed).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/drivers/mmc.h                 |   1 +
+ .../kernel/bus_managers/mmc/mmc_bus.cpp       |  29 ++++-
+ src/add-ons/kernel/bus_managers/mmc/mmc_bus.h |   3 +
+ .../kernel/busses/mmc/meson_gx_mmc.cpp        | 122 +++++++++++++++++-
+ .../kernel/drivers/disk/mmc/mmc_disk.cpp      |  20 ++-
+ .../kernel/drivers/disk/mmc/mmc_disk.h        |   2 +
+ 6 files changed, 168 insertions(+), 9 deletions(-)
+
+diff --git a/headers/private/drivers/mmc.h b/headers/private/drivers/mmc.h
+index d2cc219759..c02fa1cd55 100644
+--- a/headers/private/drivers/mmc.h
++++ b/headers/private/drivers/mmc.h
+@@ -55,6 +55,7 @@ enum SD_COMMANDS {
+ 	MMC_SEND_EXT_CSD = 8,
+ 	SEND_CSD = 9,
+ 	SD_STOP_TRANSMISSION = 12,
++	SEND_STATUS = 13,
+ 
+ 	// Block oriented read and write commands, class 2
+ 	SD_READ_SINGLE_BLOCK = 17,
+diff --git a/src/add-ons/kernel/bus_managers/mmc/mmc_bus.cpp b/src/add-ons/kernel/bus_managers/mmc/mmc_bus.cpp
+index af7801ac26..540b74288a 100644
+--- a/src/add-ons/kernel/bus_managers/mmc/mmc_bus.cpp
++++ b/src/add-ons/kernel/bus_managers/mmc/mmc_bus.cpp
+@@ -20,7 +20,9 @@ MMCBus::MMCBus(device_node* node)
+ 	fStatus(B_OK),
+ 	fWorkerThread(-1),
+ 	fActiveDevice(0),
+-	fCardType(CARD_TYPE_UNKNOWN)
++	fCardType(CARD_TYPE_UNKNOWN),
++	fCard(NULL),
++	fCardRca(0)
+ {
+ 	CALLED();
+ 
+@@ -222,6 +224,24 @@ MMCBus::_WorkerThread(void* cookie)
+ 	static const bigtime_t kCardReadyTimeout = 2000000;
+ 
+ 	while (bus->fStatus != B_SHUTTING_DOWN) {
++		if (bus->fCard != NULL) {
++			// Asked to scan with a card published (the slot's card detect
++			// changed): while it answers, it stays as it is (its clock and
++			// bus width too). Gone, its device goes.
++			uint32_t cardStatus;
++			if (bus->ExecuteCommand(bus->fCardRca, SEND_STATUS,
++					((uint32)bus->fCardRca) << 16, &cardStatus) == B_OK) {
++				bus->_AcquireScanSemaphore();
++				continue;
++			}
++			TRACE_ALWAYS("The card is gone\n");
++			gDeviceManager->unregister_node(bus->fCard);
++			bus->fCard = NULL;
++			bus->fActiveDevice = 0;
++			bus->ExecuteCommand(0, GO_IDLE_STATE, 0, NULL);
++			snooze(30000);
++		}
++
+ 		TRACE("Scanning the bus\n");
+ 
+ 		// Use the low speed clock and 1bit bus width for scanning
+@@ -439,8 +459,11 @@ MMCBus::_WorkerThread(void* cookie)
+ 			};
+ 
+ 			// publish child device for the card
+-			gDeviceManager->register_node(bus->fNode, MMC_BUS_MODULE_NAME,
+-				attrs, NULL, NULL);
++			if (gDeviceManager->register_node(bus->fNode, MMC_BUS_MODULE_NAME,
++					attrs, NULL, &bus->fCard) == B_OK) {
++				bus->fCardRca = rca;
++			} else
++				bus->fCard = NULL;
+ 		}
+ 
+ 		// TODO if there is a single card active, check if it supports CMD6
+diff --git a/src/add-ons/kernel/bus_managers/mmc/mmc_bus.h b/src/add-ons/kernel/bus_managers/mmc/mmc_bus.h
+index e1117a2abe..16486081c3 100644
+--- a/src/add-ons/kernel/bus_managers/mmc/mmc_bus.h
++++ b/src/add-ons/kernel/bus_managers/mmc/mmc_bus.h
+@@ -170,6 +170,9 @@ private:
+ 		sem_id					fLockSemaphore;
+ 		uint16					fActiveDevice;
+ 		card_type				fCardType;
++		device_node*			fCard;
++		uint16					fCardRca;
++			// the card published (one at most), for card detect
+ 		// FIXME card type shall be extended to map card type to RCA.
+ 		// In theory RCA is 16 bit allowing for 2^16 devices on signle bus
+ 		// Practically this is limited by bus max capacitance(ver low speed)
+diff --git a/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp b/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
+index 6fcf4515f1..7b66a2acee 100644
+--- a/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
++++ b/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
+@@ -20,6 +20,10 @@
+  *   blocks: cards, SD cards above all, write small pieces slowly;
+  * - pin muxing, clock gates and card power are left as the firmware
+  *   (U-Boot) set them up;
++ * - the SD slot's card detect (the device tree's cd-gpios, a pad of the
++ *   CARD bank) is polled: a card put in or taken out has the bus manager
++ *   look at the slot again (it publishes the new card, or unpublishes the
++ *   one that went);
+  * - removable cards (the SD slot, which holds the firmware on the
+  *   ODROID-C2) are read-only: data writes and every command that can
+  *   change the card are refused. With "sd_writable true" in the driver
+@@ -205,6 +209,7 @@ public:
+ 			void				SetBusWidth(int width);
+ 			void				SetCardType(card_type type);
+ 			void				SetScanSemaphore(sem_id semaphore);
++			status_t			SetCardDetect(uint32 pin, bool activeLow);
+ 
+ 			status_t			ExecuteCommand(uint8 command, uint32 argument,
+ 									uint32* result);
+@@ -246,6 +251,8 @@ private:
+ 									bigtime_t timeout);
+ 
+ 	static	int32				_InterruptHandler(void* data);
++			bool				_CardPresent() const;
++	static	status_t			_CardDetectThread(void* data);
+ 
+ private:
+ 			area_id				fArea;
+@@ -270,6 +277,12 @@ private:
+ 			bool				fDDR;
+ 			bool				fAppCommand;
+ 			sem_id				fScanSemaphore;
++			area_id				fCardDetectArea;
++			volatile uint32*	fCardDetect;		// its input register
++			uint32				fCardDetectMask;
++			bool				fCardDetectActiveLow;
++			thread_id			fCardDetectThread;
++			bool				fQuit;
+ };
+ 
+ 
+@@ -293,7 +306,13 @@ MesonMmc::MesonMmc(area_id area, volatile uint32* registers,
+ 	fDivider(0),
+ 	fDDR(false),
+ 	fAppCommand(false),
+-	fScanSemaphore(-1)
++	fScanSemaphore(-1),
++	fCardDetectArea(-1),
++	fCardDetect(NULL),
++	fCardDetectMask(0),
++	fCardDetectActiveLow(true),
++	fCardDetectThread(-1),
++	fQuit(false)
+ {
+ 	mutex_init(&fLock, "meson_gx_mmc");
+ 	fCommandDone.Init(this, "meson_gx_mmc command");
+@@ -302,6 +321,13 @@ MesonMmc::MesonMmc(area_id area, volatile uint32* registers,
+ 
+ MesonMmc::~MesonMmc()
+ {
++	fQuit = true;
++	if (fCardDetectThread >= 0) {
++		status_t result;
++		wait_for_thread(fCardDetectThread, &result);
++	}
++	if (fCardDetectArea >= 0)
++		delete_area(fCardDetectArea);
+ 	if (fUseInterrupts) {
+ 		_Write(kIrqEnable, 0);
+ 		remove_io_interrupt_handler(fIrq, _InterruptHandler, this);
+@@ -623,11 +649,85 @@ MesonMmc::SetCardType(card_type type)
+ void
+ MesonMmc::SetScanSemaphore(sem_id semaphore)
+ {
+-	// No card detect: the bus manager scans once and finds an empty slot
+-	// (an eMMC socket without a module, an SD slot without a card) when
+-	// nothing answers.
++	// The bus manager scans once, and finds an empty slot (an eMMC socket
++	// without a module, an SD slot without a card) when nothing answers;
++	// with card detect, again whenever a card goes in or out.
+ 	fScanSemaphore = semaphore;
+ 	release_sem(fScanSemaphore);
++	if (fCardDetect != NULL && fCardDetectThread < 0) {
++		INFO("%#" B_PRIxPHYSADDR ": card detect: %s\n", fPhysicalBase,
++			_CardPresent() ? "a card" : "no card");
++		fCardDetectThread = spawn_kernel_thread(_CardDetectThread,
++			"meson_gx_mmc card detect", B_LOW_PRIORITY, this);
++		if (fCardDetectThread >= 0)
++			resume_thread(fCardDetectThread);
++	}
++}
++
++
++/*!	The slot's card detect: \a pin of the device tree's GPIO numbering, of
++	the CARD bank (38 to 44 on the GXBB). The bank's direction, output and
++	input words are 6, 7 and 8 of the periphs pin controller's GPIO words,
++	from bit 20 (U-Boot's pinctrl-meson-gxbb.c, as meson_gpio's table). The
++	ODROID-C2's is CARD_6, low with a card in (U-Boot's "gpio status": "SDCard
++	Det", logs/m1-*).
++*/
++status_t
++MesonMmc::SetCardDetect(uint32 pin, bool activeLow)
++{
++	static const phys_addr_t kGpioPage = 0xc8834000;
++	static const uint32 kCardInput = 0x430 + 8 * 4;
++	static const uint32 kCardFirstPin = 38;
++	static const uint32 kCardLastPin = 44;
++	static const uint32 kCardFirstBit = 20;
++	if (pin < kCardFirstPin || pin > kCardLastPin)
++		return B_NOT_SUPPORTED;
++
++	void* mapped;
++	fCardDetectArea = map_physical_memory("meson_gx_mmc card detect",
++		kGpioPage, B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &mapped);
++	if (fCardDetectArea < 0)
++		return fCardDetectArea;
++	fCardDetect = (volatile uint32*)((uint8*)mapped + kCardInput);
++	fCardDetectMask = 1u << (kCardFirstBit + pin - kCardFirstPin);
++	fCardDetectActiveLow = activeLow;
++	return B_OK;
++}
++
++
++bool
++MesonMmc::_CardPresent() const
++{
++	bool level = (*fCardDetect & fCardDetectMask) != 0;
++	return level != fCardDetectActiveLow;
++}
++
++
++/*!	Looks at the card detect four times a second; a change that holds for
++	two looks (the contacts bounce) has the bus manager look at the slot.
++*/
++/*static*/ status_t
++MesonMmc::_CardDetectThread(void* data)
++{
++	MesonMmc* controller = (MesonMmc*)data;
++	bool present = controller->_CardPresent();
++	int32 differing = 0;
++	while (!controller->fQuit) {
++		snooze(250000);
++		if (controller->_CardPresent() == present) {
++			differing = 0;
++			continue;
++		}
++		if (++differing < 2)
++			continue;
++		present = !present;
++		differing = 0;
++		INFO("%#" B_PRIxPHYSADDR ": card %s\n", controller->fPhysicalBase,
++			present ? "put in" : "taken out");
++		release_sem(controller->fScanSemaphore);
++	}
++	return B_OK;
+ }
+ 
+ 
+@@ -1290,6 +1390,20 @@ init_driver(device_node* node, void** _cookie)
+ 	log_firmware_clocks();
+ 	controller->Init();
+ 
++	// cd-gpios: <&controller pin flags>, flags bit 0 GPIO_ACTIVE_LOW
++	int cardDetectLength;
++	const uint32* cardDetect = get_cells_prop(fdtModule, fdtDevice,
++		"cd-gpios", &cardDetectLength);
++	if (removable && cardDetect != NULL && cardDetectLength >= 12) {
++		uint32 pin = B_BENDIAN_TO_HOST_INT32(cardDetect[1]);
++		bool activeLow = (B_BENDIAN_TO_HOST_INT32(cardDetect[2]) & 1) != 0;
++		status = controller->SetCardDetect(pin, activeLow);
++		if (status != B_OK) {
++			INFO("no card detect (pin %" B_PRIu32 "): %s\n", pin,
++				strerror(status));
++		}
++	}
++
+ 	*_cookie = controller;
+ 	return B_OK;
+ }
+diff --git a/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp b/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
+index cc1ac3677f..f7bff0b068 100644
+--- a/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
++++ b/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
+@@ -138,6 +138,11 @@ mmc_disk_execute_iorequest(void* data, IOOperation* operation)
+ 	mmc_disk_driver_info* info = (mmc_disk_driver_info*)data;
+ 	status_t error;
+ 
++	if (info->removed) {
++		info->scheduler->OperationCompleted(operation, B_DEV_NOT_READY, 0);
++		return B_DEV_NOT_READY;
++	}
++
+ 	uint8_t command;
+ 	if (operation->IsWrite())
+ 		command = SD_WRITE_MULTIPLE_BLOCKS;
+@@ -515,6 +520,17 @@ mmc_disk_uninit_driver(void* _cookie)
+ }
+ 
+ 
++/*!	The card was taken out (mmc_bus unregistered its node): what is still
++	asked of it fails at once instead of waiting for the card.
++*/
++static void
++mmc_disk_device_removed(void* _cookie)
++{
++	mmc_disk_driver_info* info = (mmc_disk_driver_info*)_cookie;
++	info->removed = true;
++}
++
++
+ static status_t
+ mmc_disk_register_child_devices(void* _cookie)
+ {
+@@ -788,7 +804,7 @@ mmc_block_ioctl(void* cookie, uint32 op, void* buffer, size_t length)
+ 			if (buffer == NULL || length < sizeof(status_t))
+ 				return B_BAD_VALUE;
+ 
+-			status_t status = B_OK;
++			status_t status = info->removed ? B_DEV_NO_MEDIA : B_OK;
+ 			return user_memcpy(buffer, &status, sizeof(status_t));
+ 		}
+ 
+@@ -898,7 +914,7 @@ struct driver_module_info sMMCDiskDriver = {
+ 	mmc_disk_uninit_driver,
+ 	mmc_disk_register_child_devices,
+ 	NULL, // mmc_disk_rescan_child_devices,
+-	NULL,
++	mmc_disk_device_removed,
+ };
+ 
+ 
+diff --git a/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.h b/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.h
+index c9657e3a8a..cdc282c956 100644
+--- a/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.h
++++ b/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.h
+@@ -38,6 +38,8 @@ typedef struct {
+ 	uint8_t mmcDeviceType;
+ 		// EXT_CSD DEVICE_TYPE (supported eMMC speed modes), 0 if unknown
+ 	uint32_t flags;
++	bool removed;
++		// the card was taken out: I/O fails at once
+ 
+ 	device_geometry geometry;
+ 

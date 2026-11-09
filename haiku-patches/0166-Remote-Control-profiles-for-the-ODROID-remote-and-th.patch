@@ -1,0 +1,239 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 09:24:11 -0400
+Subject: [PATCH 166/342] Remote Control: profiles for the ODROID remote and
+ the JVC RM-RK52
+
+The add-on writes them when the user has no profiles yet:
+- Hardkernel's ODROID remote (NEC, address 0xb2; codes from Linux's
+  rc-odroid keymap and Hardkernel's LIRC file): arrows, OK, back, home,
+  menu, and the system volume and mute;
+- the JVC RM-RK52, a car stereo remote (JVC, address 0x8f, learned on
+  the board): MediaPlayer's play/pause, mute, full screen, next and
+  previous file, wind and volume.
+
+The preferences always give BInputDevice::Control() a message: it adds
+it to the request and empties it for the reply, and crashed on NULL.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../devices/remote_control/Jamfile            |   1 +
+ .../devices/remote_control/Presets.cpp        | 114 ++++++++++++++++++
+ .../devices/remote_control/Presets.h          |  23 ++++
+ .../remote_control/RemoteControlDevice.cpp    |   8 +-
+ .../remotecontrol/RemoteWindow.cpp            |   6 +-
+ 5 files changed, 149 insertions(+), 3 deletions(-)
+ create mode 100644 src/add-ons/input_server/devices/remote_control/Presets.cpp
+ create mode 100644 src/add-ons/input_server/devices/remote_control/Presets.h
+
+diff --git a/src/add-ons/input_server/devices/remote_control/Jamfile b/src/add-ons/input_server/devices/remote_control/Jamfile
+index 9bf1e5dd81..bec0da81de 100644
+--- a/src/add-ons/input_server/devices/remote_control/Jamfile
++++ b/src/add-ons/input_server/devices/remote_control/Jamfile
+@@ -3,6 +3,7 @@ SubDir HAIKU_TOP src add-ons input_server devices remote_control ;
+ UsePrivateHeaders input drivers shared ;
+ 
+ Addon <input>remote_control :
++	Presets.cpp
+ 	RemoteControlDevice.cpp
+ 	RemoteProfile.cpp
+ 	: be input_server shared [ TargetLibsupc++ ] ;
+diff --git a/src/add-ons/input_server/devices/remote_control/Presets.cpp b/src/add-ons/input_server/devices/remote_control/Presets.cpp
+new file mode 100644
+index 0000000000..3e9d859e5b
+--- /dev/null
++++ b/src/add-ons/input_server/devices/remote_control/Presets.cpp
+@@ -0,0 +1,114 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * The profiles that come with the system:
++ * - Hardkernel's ODROID remote (NEC, address 0xb2; codes from Linux's
++ *   rc-odroid keymap and Hardkernel's LIRC file, docs/m24-ir-facts.md): a
++ *   desktop remote, its volume and mute keys for the whole system;
++ * - the JVC RM-RK52, a car stereo remote (JVC, address 0x8f; learned on
++ *   the board): MediaPlayer's keys.
++ */
++
++
++#include "Presets.h"
++
++#include <Entry.h>
++#include <Path.h>
++
++#include <ir_remote.h>
++
++#include "RemoteProfile.h"
++
++
++namespace RemoteControl {
++
++
++// Haiku's raw key codes, and the media keys as the HID keyboard driver
++// sends them (usage page << 16 | usage)
++enum {
++	kEscape = 0x01, kHome = 0x20, kPageUp = 0x21, kPageDown = 0x36,
++	kEnter = 0x47, kUp = 0x57, kSpace = 0x5e, kLeft = 0x61, kDown = 0x62,
++	kRight = 0x63, kMenu = 0x68, kF = 0x3f, kM = 0x52,
++	kVolumeUp = 0x0c00e9, kVolumeDown = 0x0c00ea, kMute = 0x0c00e2
++};
++
++
++struct PresetButton {
++	const char*	label;
++	uint32		command;
++	uint32		key;
++	bool		repeat;
++};
++
++
++static const PresetButton kOdroid[] = {
++	{ "Power", 0xdc, 0, false },
++	{ "Mute", 0x88, kMute, false },
++	{ "Home", 0x82, kHome, false },
++	{ "Up", 0xca, kUp, true },
++	{ "Down", 0xd2, kDown, true },
++	{ "Left", 0x99, kLeft, true },
++	{ "Right", 0xc1, kRight, true },
++	{ "OK", 0xce, kEnter, false },
++	{ "Menu", 0xc5, kMenu, false },
++	{ "Back", 0x9a, kEscape, false },
++	{ "Volume up", 0x80, kVolumeUp, true },
++	{ "Volume down", 0x81, kVolumeDown, true },
++};
++
++
++static const PresetButton kJvcRmRk52[] = {
++	{ "ATT: play/pause", 0x8e, kSpace, false },
++	{ "SOUND: mute", 0x8d, kM, false },
++	{ "SRC: full screen", 0x88, kF, false },
++	{ "Up: next", 0x94, kPageUp, false },
++	{ "Down: previous", 0x95, kPageDown, false },
++	{ "Forward 5 s", 0x92, kRight, true },
++	{ "Back 5 s", 0x93, kLeft, true },
++	{ "Volume up", 0x84, kUp, true },
++	{ "Volume down", 0x85, kDown, true },
++};
++
++
++static status_t
++SavePreset(const char* name, uint32 protocol, uint32 address,
++	const PresetButton* buttons, int32 count)
++{
++	Profile profile;
++	profile.SetName(name);
++	profile.SetRemote(protocol, address);
++	for (int32 i = 0; i < count; i++) {
++		Button button;
++		button.label = buttons[i].label;
++		button.command = buttons[i].command;
++		button.key = buttons[i].key;
++		button.modifiers = 0;
++		button.repeat = buttons[i].repeat;
++		profile.AddButton(button);
++	}
++	return profile.Save();
++}
++
++
++status_t
++InstallPresets()
++{
++	BPath path;
++	status_t status = Profile::GetDirectory(&path, false);
++	if (status != B_OK)
++		return status;
++	if (BEntry(path.Path()).Exists())
++		return B_OK;
++
++	status = SavePreset("ODROID remote", IR_REMOTE_NEC, 0xb2, kOdroid,
++		B_COUNT_OF(kOdroid));
++	if (status == B_OK) {
++		status = SavePreset("JVC RM-RK52", IR_REMOTE_JVC, 0x8f, kJvcRmRk52,
++			B_COUNT_OF(kJvcRmRk52));
++	}
++	return status;
++}
++
++
++}	// namespace RemoteControl
+diff --git a/src/add-ons/input_server/devices/remote_control/Presets.h b/src/add-ons/input_server/devices/remote_control/Presets.h
+new file mode 100644
+index 0000000000..6e347365fb
+--- /dev/null
++++ b/src/add-ons/input_server/devices/remote_control/Presets.h
+@@ -0,0 +1,23 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef PRESETS_H
++#define PRESETS_H
++
++
++#include <SupportDefs.h>
++
++
++namespace RemoteControl {
++
++
++// Saves the profiles that come with the system (Hardkernel's ODROID remote,
++// the JVC RM-RK52), when the user has no profile directory yet
++status_t InstallPresets();
++
++
++}	// namespace RemoteControl
++
++
++#endif	// PRESETS_H
+diff --git a/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.cpp b/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.cpp
+index 1c7fb7d1ba..565e330b7f 100644
+--- a/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.cpp
++++ b/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.cpp
+@@ -19,6 +19,8 @@
+ 
+ #include "RemoteControlDevice.h"
+ 
++#include "Presets.h"
++
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <new>
+@@ -43,8 +45,9 @@ static const char* const kRemoteDirectory = IR_REMOTE_DEVICE_DIRECTORY;
+ // the key goes up this long after the last frame of the press: longer than
+ // the slowest repeat period (NEC 108 ms, RC-5 114 ms, JVC 50-60 ms)
+ static const bigtime_t kRelease = 200000;
+-// held buttons that repeat start repeating after this
+-static const bigtime_t kRepeatDelay = 400000;
++// held buttons that repeat start repeating after this: longer than the
++// frames a short press sends (the JVC RM-RK52 sends 6 to 10, 46 ms apart)
++static const bigtime_t kRepeatDelay = 600000;
+ 
+ 
+ class RemoteReceiver {
+@@ -196,6 +199,7 @@ RemoteControlDevice::RemoteControlDevice()
+ 	fProfiles(10)
+ {
+ 	fKeymap.SetToCurrent();
++	RemoteControl::InstallPresets();
+ 	_LoadProfiles();
+ 	// receivers can be published after the input_server starts
+ 	StartMonitoringDevice(kRemoteDirectory);
+diff --git a/src/preferences/remotecontrol/RemoteWindow.cpp b/src/preferences/remotecontrol/RemoteWindow.cpp
+index 9549c9618d..50473c10e1 100644
+--- a/src/preferences/remotecontrol/RemoteWindow.cpp
++++ b/src/preferences/remotecontrol/RemoteWindow.cpp
+@@ -89,7 +89,11 @@ control_add_on(uint32 code, BMessage* message)
+ 	BInputDevice* device = find_input_device(RemoteControl::kDeviceName);
+ 	if (device == NULL)
+ 		return B_ENTRY_NOT_FOUND;
+-	status_t status = device->Control(code, message);
++	// Control() needs a message: it sends it along and empties it for the
++	// reply
++	BMessage empty;
++	status_t status = device->Control(code, message != NULL ? message
++		: &empty);
+ 	delete device;
+ 	return status;
+ }

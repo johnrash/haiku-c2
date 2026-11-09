@@ -1,0 +1,309 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 18:09:08 -0400
+Subject: [PATCH 129/342] media: decoder priorities; the next decoder when one
+ can't set up
+
+A decoder add-on may export int32 media_decoder_priority: higher ones come
+first among a directory's decoders for a format (hardware decoders before
+FFmpeg). MediaExtractor::CreateDecoder() tries the decoders for the format
+in turn until one's Setup() succeeds (the TODO there), each with the format
+as the reader gave it: a hardware decoder that is in use leaves the stream
+to the next one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/media/PluginManager.h |  3 +-
+ src/kits/media/AddOnManager.cpp       | 51 +++++++++++++++++-----
+ src/kits/media/AddOnManager.h         |  8 ++--
+ src/kits/media/MediaExtractor.cpp     | 62 +++++++++++++++------------
+ src/kits/media/PluginManager.cpp      | 11 +++--
+ 5 files changed, 89 insertions(+), 46 deletions(-)
+
+diff --git a/headers/private/media/PluginManager.h b/headers/private/media/PluginManager.h
+index 7b863b7928..bba987568e 100644
+--- a/headers/private/media/PluginManager.h
++++ b/headers/private/media/PluginManager.h
+@@ -38,7 +38,8 @@ public:
+ 			void				DestroyReader(Reader* reader);
+ 
+ 			status_t			CreateDecoder(Decoder** decoder,
+-									const media_format& format);
++									const media_format& format,
++									int32 index = 0);
+ 			status_t			CreateDecoder(Decoder** decoder,
+ 									const media_codec_info& mci);
+ 			status_t			GetDecoderInfo(Decoder* decoder,
+diff --git a/src/kits/media/AddOnManager.cpp b/src/kits/media/AddOnManager.cpp
+index 8ef6228005..89cd309858 100644
+--- a/src/kits/media/AddOnManager.cpp
++++ b/src/kits/media/AddOnManager.cpp
+@@ -14,6 +14,9 @@
+ #include <stdio.h>
+ #include <string.h>
+ 
++#include <algorithm>
++#include <vector>
++
+ #include <Architecture.h>
+ #include <AutoDeleter.h>
+ #include <Autolock.h>
+@@ -86,9 +89,13 @@ AddOnManager::GetInstance()
+ }
+ 
+ 
++/*!	The decoder for \a format, or with \a index > 0, the next ones: for a
++	caller whose first choice can't decode the stream after all (a hardware
++	decoder that is in use, for one).
++*/
+ status_t
+ AddOnManager::GetDecoderForFormat(entry_ref* _decoderRef,
+-	const media_format& format)
++	const media_format& format, int32 index)
+ {
+ 	if ((format.type == B_MEDIA_ENCODED_VIDEO
+ 			|| format.type == B_MEDIA_ENCODED_AUDIO
+@@ -122,7 +129,7 @@ AddOnManager::GetDecoderForFormat(entry_ref* _decoderRef,
+ 	BPath path;
+ 	for (uint i = 0; i < directoryCount; i++) {
+ 		path.SetTo(directories[i]);
+-		if (_FindDecoder(format, path, _decoderRef))
++		if (_FindDecoder(format, path, _decoderRef, index))
+ 			return B_OK;
+ 	}
+ 
+@@ -366,8 +373,16 @@ AddOnManager::_RegisterAddOn(const entry_ref& ref)
+ 		_RegisterReader(reader, ref);
+ 
+ 	DecoderPlugin* decoder = dynamic_cast<DecoderPlugin*>(plugin);
+-	if (decoder != NULL)
+-		_RegisterDecoder(decoder, ref);
++	if (decoder != NULL) {
++		// Optional: decoders with a higher priority are tried first, those
++		// of hardware before those of software.
++		int32* priority;
++		if (get_image_symbol(loader.Image(), "media_decoder_priority",
++				B_SYMBOL_TYPE_DATA, (void**)&priority) != B_OK) {
++			priority = NULL;
++		}
++		_RegisterDecoder(decoder, ref, priority != NULL ? *priority : 0);
++	}
+ 
+ 	WriterPlugin* writer = dynamic_cast<WriterPlugin*>(plugin);
+ 	if (writer != NULL)
+@@ -464,7 +479,8 @@ AddOnManager::_RegisterReader(ReaderPlugin* reader, const entry_ref& ref)
+ 
+ 
+ void
+-AddOnManager::_RegisterDecoder(DecoderPlugin* plugin, const entry_ref& ref)
++AddOnManager::_RegisterDecoder(DecoderPlugin* plugin, const entry_ref& ref,
++	int32 priority)
+ {
+ 	BAutolock locker(fLock);
+ 
+@@ -478,6 +494,7 @@ AddOnManager::_RegisterDecoder(DecoderPlugin* plugin, const entry_ref& ref)
+ 
+ 	decoder_info info;
+ 	info.ref = ref;
++	info.priority = priority;
+ 
+ 	media_format* formats = 0;
+ 	size_t count = 0;
+@@ -597,7 +614,7 @@ AddOnManager::_RegisterStreamer(StreamerPlugin* streamer, const entry_ref& ref)
+ 
+ bool
+ AddOnManager::_FindDecoder(const media_format& format, const BPath& path,
+-	entry_ref* _decoderRef)
++	entry_ref* _decoderRef, int32& index)
+ {
+ 	node_ref nref;
+ 	BDirectory directory;
+@@ -606,6 +623,9 @@ AddOnManager::_FindDecoder(const media_format& format, const BPath& path,
+ 		return false;
+ 	}
+ 
++	// the matching decoders of this directory: highest priority first, in
++	// the order they were found otherwise
++	std::vector<decoder_info*> matching;
+ 	decoder_info* info;
+ 	for (fDecoderList.Rewind(); fDecoderList.GetNext(&info);) {
+ 		if (info->ref.directory != nref.node)
+@@ -614,13 +634,22 @@ AddOnManager::_FindDecoder(const media_format& format, const BPath& path,
+ 		media_format* decoderFormat;
+ 		for (info->formats.Rewind(); info->formats.GetNext(&decoderFormat);) {
+ 			// check if the decoder matches the supplied format
+-			if (!decoderFormat->Matches(&format))
+-				continue;
+-
+-			*_decoderRef = info->ref;
+-			return true;
++			if (decoderFormat->Matches(&format)) {
++				matching.push_back(info);
++				break;
++			}
+ 		}
+ 	}
++	std::stable_sort(matching.begin(), matching.end(),
++		[](const decoder_info* a, const decoder_info* b) {
++			return a->priority > b->priority;
++		});
++
++	if (index < (int32)matching.size()) {
++		*_decoderRef = matching[index]->ref;
++		return true;
++	}
++	index -= matching.size();
+ 	return false;
+ }
+ 
+diff --git a/src/kits/media/AddOnManager.h b/src/kits/media/AddOnManager.h
+index b947fc5d7b..e9e2f6388f 100644
+--- a/src/kits/media/AddOnManager.h
++++ b/src/kits/media/AddOnManager.h
+@@ -37,7 +37,8 @@ public:
+ 			static AddOnManager* GetInstance();
+ 
+ 			status_t			GetDecoderForFormat(entry_ref* _ref,
+-									const media_format& format);
++									const media_format& format,
++									int32 index = 0);
+ 
+ 			status_t			GetEncoderForFormat(entry_ref* _ref,
+ 									const media_format& outputFormat);
+@@ -70,7 +71,7 @@ private:
+ 			void				_RegisterReader(ReaderPlugin* reader,
+ 									const entry_ref& ref);
+ 			void				_RegisterDecoder(DecoderPlugin* decoder,
+-									const entry_ref& ref);
++									const entry_ref& ref, int32 priority);
+ 
+ 			void				_RegisterWriter(WriterPlugin* writer,
+ 									const entry_ref& ref);
+@@ -82,7 +83,7 @@ private:
+ 
+ 			bool				_FindDecoder(const media_format& format,
+ 									const BPath& path,
+-									entry_ref* _decoderRef);
++									entry_ref* _decoderRef, int32& index);
+ 
+ 			bool				_FindEncoder(const media_format& format,
+ 									const BPath& path,
+@@ -103,6 +104,7 @@ private:
+ 			struct decoder_info {
+ 				entry_ref			ref;
+ 				List<media_format>	formats;
++				int32				priority;
+ 			};
+ 			struct encoder_info {
+ 				entry_ref			ref;
+diff --git a/src/kits/media/MediaExtractor.cpp b/src/kits/media/MediaExtractor.cpp
+index b17491c07b..6b928d89a4 100644
+--- a/src/kits/media/MediaExtractor.cpp
++++ b/src/kits/media/MediaExtractor.cpp
+@@ -344,42 +344,50 @@ MediaExtractor::CreateDecoder(int32 stream, Decoder** _decoder,
+ 		return status;
+ 	}
+ 
+-	// TODO: Here we should work out a way so that if there is a setup
+-	// failure we can try the next decoder
+-	Decoder* decoder;
+-	status = gPluginManager.CreateDecoder(&decoder,
+-		fStreamInfo[stream].encodedFormat);
+-	if (status != B_OK) {
++	// The decoders for the format in turn, until one can decode the stream
++	// (a hardware decoder may be in use already). Each gets the format as
++	// the reader gave it.
++	const media_format encodedFormat = fStreamInfo[stream].encodedFormat;
++	Decoder* decoder = NULL;
++	status_t setupStatus = B_OK;
++	for (int32 index = 0; ; index++) {
++		fStreamInfo[stream].encodedFormat = encodedFormat;
++		status = gPluginManager.CreateDecoder(&decoder,
++			fStreamInfo[stream].encodedFormat, index);
++		if (status != B_OK) {
+ #if DEBUG
+-		char formatString[256];
+-		string_for_format(fStreamInfo[stream].encodedFormat, formatString,
+-			sizeof(formatString));
++			char formatString[256];
++			string_for_format(fStreamInfo[stream].encodedFormat, formatString,
++				sizeof(formatString));
+ 
+-		ERROR("MediaExtractor::CreateDecoder gPluginManager.CreateDecoder "
+-			"failed for stream %" B_PRId32 ", format: %s: %s\n", stream,
+-			formatString, strerror(status));
++			ERROR("MediaExtractor::CreateDecoder gPluginManager.CreateDecoder "
++				"failed for stream %" B_PRId32 ", format: %s: %s\n", stream,
++				formatString, strerror(status));
+ #endif
+-		return status;
+-	}
++			return index == 0 ? status : setupStatus;
++		}
+ 
+-	ChunkProvider* chunkProvider
+-		= new(std::nothrow) MediaExtractorChunkProvider(this, stream);
+-	if (chunkProvider == NULL) {
+-		gPluginManager.DestroyDecoder(decoder);
+-		ERROR("MediaExtractor::CreateDecoder can't create chunk provider "
+-			"for stream %" B_PRId32 "\n", stream);
+-		return B_NO_MEMORY;
+-	}
++		ChunkProvider* chunkProvider
++			= new(std::nothrow) MediaExtractorChunkProvider(this, stream);
++		if (chunkProvider == NULL) {
++			gPluginManager.DestroyDecoder(decoder);
++			ERROR("MediaExtractor::CreateDecoder can't create chunk provider "
++				"for stream %" B_PRId32 "\n", stream);
++			return B_NO_MEMORY;
++		}
+ 
+-	decoder->SetChunkProvider(chunkProvider);
++		decoder->SetChunkProvider(chunkProvider);
+ 
+-	status = decoder->Setup(&fStreamInfo[stream].encodedFormat,
+-		fStreamInfo[stream].infoBuffer, fStreamInfo[stream].infoBufferSize);
+-	if (status != B_OK) {
++		status = decoder->Setup(&fStreamInfo[stream].encodedFormat,
++			fStreamInfo[stream].infoBuffer,
++			fStreamInfo[stream].infoBufferSize);
++		if (status == B_OK)
++			break;
++
++		setupStatus = status;
+ 		gPluginManager.DestroyDecoder(decoder);
+ 		ERROR("MediaExtractor::CreateDecoder Setup failed for stream %" B_PRId32
+ 			": %s\n", stream, strerror(status));
+-		return status;
+ 	}
+ 
+ 	status = gPluginManager.GetDecoderInfo(decoder, codecInfo);
+diff --git a/src/kits/media/PluginManager.cpp b/src/kits/media/PluginManager.cpp
+index 28141358be..fab36d1747 100644
+--- a/src/kits/media/PluginManager.cpp
++++ b/src/kits/media/PluginManager.cpp
+@@ -293,17 +293,20 @@ PluginManager::DestroyReader(Reader* reader)
+ 
+ 
+ status_t
+-PluginManager::CreateDecoder(Decoder** _decoder, const media_format& format)
++PluginManager::CreateDecoder(Decoder** _decoder, const media_format& format,
++	int32 index)
+ {
+ 	TRACE("PluginManager::CreateDecoder enter\n");
+ 
+ 	// get decoder for this format
+ 	entry_ref ref;
+ 	status_t ret = AddOnManager::GetInstance()->GetDecoderForFormat(
+-		&ref, format);
++		&ref, format, index);
+ 	if (ret != B_OK) {
+-		printf("PluginManager::CreateDecoder: can't get decoder for format: "
+-			"%s\n", strerror(ret));
++		if (index == 0) {
++			printf("PluginManager::CreateDecoder: can't get decoder for "
++				"format: %s\n", strerror(ret));
++		}
+ 		return ret;
+ 	}
+ 

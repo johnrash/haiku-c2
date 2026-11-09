@@ -1,0 +1,3 @@
+job x-vnd.c2-system {
+	launch /bin/sh /boot/system/settings/c2-system.sh
+}

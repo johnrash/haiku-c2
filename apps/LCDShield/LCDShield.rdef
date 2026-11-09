@@ -1,0 +1,18 @@
+/*
+ * Copyright 2026, haiku-odroid-c2 port authors.
+ * Distributed under the terms of the MIT License.
+ */
+
+resource app_signature "application/x-vnd.C2-LCDShield";
+
+resource app_flags B_SINGLE_LAUNCH;
+
+resource app_version {
+	major  = 1,
+	middle = 5,
+	minor  = 0,
+	variety = B_APPV_FINAL,
+	internal = 0,
+	short_info = "LCD Shield",
+	long_info = "LCD Shield 1.5, Copyright 2026, haiku-odroid-c2 port authors."
+};

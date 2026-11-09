@@ -1,0 +1,516 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 11:49:26 -0500
+Subject: [PATCH 212/342] NeoCam: fixes from the tests on the board
+
+The window starts the camera in its own thread (it touched views from
+the application's). The window never waits for the camera controller:
+the node's callbacks lock the window, so quitting deadlocked; the
+controller answers by messages. The still format menu's type is an
+int32. Motion detection fits a gain and an offset of the whole picture
+(the camera's exposure), treats big changes of all of it as the light's,
+waits three seconds for the camera to settle and wants motion in two
+analyses in a row: none for minutes of a still scene, a hand caught.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apps/neocam/CameraConsumer.cpp   | 30 ++++++---
+ src/apps/neocam/CameraController.cpp | 10 +--
+ src/apps/neocam/CameraController.h   |  9 +--
+ src/apps/neocam/MainWindow.cpp       | 70 +++++++++++++--------
+ src/apps/neocam/MainWindow.h         |  2 +
+ src/apps/neocam/MotionDetector.cpp   | 94 +++++++++++++++++++++++-----
+ src/apps/neocam/MotionDetector.h     | 10 ++-
+ src/apps/neocam/NeoCam.cpp           |  2 +-
+ src/apps/neocam/NeoCam.h             |  3 +
+ 9 files changed, 163 insertions(+), 67 deletions(-)
+
+diff --git a/src/apps/neocam/CameraConsumer.cpp b/src/apps/neocam/CameraConsumer.cpp
+index e4f466c773..bf98bf9b71 100644
+--- a/src/apps/neocam/CameraConsumer.cpp
++++ b/src/apps/neocam/CameraConsumer.cpp
+@@ -395,6 +395,12 @@ CameraConsumer::Connected(const media_source& producer,
+ 	SetOutputBuffersFor(producer, fInput.destination, fBuffers, NULL,
+ 		&changeTag, true);
+ 
++	// a new stream: motion detection starts over
++	fLock.Lock();
++	fDetector.Reset();
++	fMotion = false;
++	fLock.Unlock();
++
+ 	fConnected = true;
+ 	return B_OK;
+ }
+@@ -409,12 +415,6 @@ CameraConsumer::Disconnected(const media_source& producer,
+ 
+ 	fConnected = false;
+ 	fInput.source = media_source::null;
+-
+-	// the preview must not draw a bitmap that is going away
+-	if (fWindow->Lock()) {
+-		fView->ClearFrame();
+-		fWindow->Unlock();
+-	}
+ }
+ 
+ 
+@@ -428,10 +428,6 @@ CameraConsumer::FormatChanged(const media_source& producer,
+ 	if (producer != fInput.source)
+ 		return B_MEDIA_BAD_SOURCE;
+ 
+-	if (fWindow->Lock()) {
+-		fView->ClearFrame();
+-		fWindow->Unlock();
+-	}
+ 	fInput.format = format;
+ 	return _CreateBuffers(format);
+ }
+@@ -487,6 +483,20 @@ CameraConsumer::_CreateBuffers(const media_format& format)
+ void
+ CameraConsumer::_DeleteBuffers()
+ {
++	// the preview must not draw a bitmap that goes: it may only be cleared
++	// with the window locked, and the window may be waiting for the media
++	// roster (not for us): it is tried until it works
++	if (fBitmaps[0] != NULL) {
++		status_t status;
++		while ((status = fWindow->LockWithTimeout(100000)) == B_TIMED_OUT)
++			;
++		// (a window that is gone isn't locked)
++		if (status == B_OK) {
++			fView->ClearFrame();
++			fWindow->Unlock();
++		}
++	}
++
+ 	delete fBuffers;
+ 	fBuffers = NULL;
+ 	for (int32 i = 0; i < kBufferCount; i++) {
+diff --git a/src/apps/neocam/CameraController.cpp b/src/apps/neocam/CameraController.cpp
+index 6b9615e749..d49ec1772b 100644
+--- a/src/apps/neocam/CameraController.cpp
++++ b/src/apps/neocam/CameraController.cpp
+@@ -84,7 +84,7 @@ CameraController::MessageReceived(BMessage* message)
+ 				fRoster->StopWatching(BMessenger(this));
+ 				fWatching = false;
+ 			}
+-			message->SendReply(B_OK);
++			fWindow.SendMessage(kMsgCameraReleased);
+ 			break;
+ 
+ 		case kMsgGetWeb:
+@@ -92,10 +92,10 @@ CameraController::MessageReceived(BMessage* message)
+ 			BParameterWeb* web = NULL;
+ 			if (fRoster != NULL && fHasProducer)
+ 				fRoster->GetParameterWebFor(fProducer, &web);
+-			BMessage reply(B_REPLY);
+-			reply.AddPointer("web", web);
+-			reply.AddData("node", B_RAW_TYPE, &fProducer, sizeof(fProducer));
+-			message->SendReply(&reply);
++			BMessage answer(kMsgCameraWeb);
++			answer.AddPointer("web", web);
++			if (fWindow.SendMessage(&answer) != B_OK)
++				delete web;
+ 			break;
+ 		}
+ 
+diff --git a/src/apps/neocam/CameraController.h b/src/apps/neocam/CameraController.h
+index 0126fe4146..c2eac60e03 100644
+--- a/src/apps/neocam/CameraController.h
++++ b/src/apps/neocam/CameraController.h
+@@ -22,7 +22,8 @@ class PreviewView;
+ 
+ /*!	Connects the default video input to NeoCam's node at the frame size
+ 	asked for, and changes it, in a thread of its own: the media roster's
+-	calls wait for the nodes. Tells the window when the camera is ready (with
++	calls wait for the nodes, and the node's callbacks lock the window, so
++	the window never waits for this looper, it hears back by messages. Tells the window when the camera is ready (with
+ 	its frame sizes) or why it isn't. With no camera, it connects when one
+ 	appears.
+ */
+@@ -30,9 +31,9 @@ class CameraController : public BLooper {
+ public:
+ 	enum {
+ 		kMsgConnect			= 'ccon',	// "width", "height"
+-		kMsgDisconnect		= 'cdis',	// replied to when done
+-		kMsgGetWeb			= 'cweb',	// reply: "web" (pointer, the
+-										// caller deletes it), "node"
++		kMsgDisconnect		= 'cdis',	// the window hears
++										// kMsgCameraReleased
++		kMsgGetWeb			= 'gweb',	// the window gets kMsgCameraWeb
+ 		kMsgTakeStill		= 'ctst',	// "trigger"
+ 		kMsgStartRecording	= 'cstr',	// "path", "fps", "trigger"; the
+ 										// window hears how it went
+diff --git a/src/apps/neocam/MainWindow.cpp b/src/apps/neocam/MainWindow.cpp
+index 497cae5a46..5e4df38758 100644
+--- a/src/apps/neocam/MainWindow.cpp
++++ b/src/apps/neocam/MainWindow.cpp
+@@ -197,7 +197,8 @@ MainWindow::MainWindow(const BMessage& settings,
+ 	fRecordEnd(0),
+ 	fNextSchedule(0),
+ 	fNextMotionCapture(0),
+-	fMotionNow(false)
++	fMotionNow(false),
++	fQuitting(false)
+ {
+ 	// the menus
+ 	BMenuBar* menuBar = new BMenuBar("menu");
+@@ -309,13 +310,16 @@ bool
+ MainWindow::QuitRequested()
+ {
+ 	if (fController != NULL) {
+-		// a recording is finished, the camera let go
+-		BMessage reply;
+-		BMessenger(fController).SendMessage(
+-			CameraController::kMsgDisconnect, &reply);
+-		if (fController->Lock())
+-			fController->Quit();
+-		fController = NULL;
++		// a recording is finished and the camera let go first: then the
++		// window quits (kMsgCameraReleased)
++		if (!fQuitting) {
++			fQuitting = true;
++			fRecording = false;
++			fRecordingPending = false;
++			BMessenger(fController).SendMessage(
++				CameraController::kMsgDisconnect);
++		}
++		return false;
+ 	}
+ 	BMessage settings;
+ 	GetSettings(settings);
+@@ -328,6 +332,30 @@ void
+ MainWindow::MessageReceived(BMessage* message)
+ {
+ 	switch (message->what) {
++		case kMsgStart:
++			Start();
++			break;
++
++		case kMsgCameraReleased:
++			if (fController != NULL && fController->Lock())
++				fController->Quit();
++			fController = NULL;
++			PostMessage(B_QUIT_REQUESTED);
++			break;
++
++		case kMsgCameraWeb:
++		{
++			BParameterWeb* web = NULL;
++			message->FindPointer("web", (void**)&web);
++			if (web == NULL) {
++				_SetStatus(B_TRANSLATE("The camera has no settings to show."),
++					true);
++				break;
++			}
++			(new CameraSettingsWindow(web))->Show();
++			break;
++		}
++
+ 		case kMsgSnapshot:
+ 			_TakeStill(kTriggerManual);
+ 			break;
+@@ -721,7 +749,7 @@ MainWindow::_ApplySettings(const BMessage& settings)
+ 	uint32 type = settings.GetUInt32("still type", 'JPEG');
+ 	for (int32 i = 0; BMenuItem* item = fStillFormatMenu->ItemAt(i); i++) {
+ 		if (item->Message() != NULL
+-			&& item->Message()->GetUInt32("be:type", 0) == type) {
++			&& (uint32)item->Message()->GetInt32("be:type", 0) == type) {
+ 			item->SetMarked(true);
+ 			break;
+ 		}
+@@ -778,7 +806,7 @@ MainWindow::GetSettings(BMessage& settings)
+ 	BMenuItem* item = fStillFormatMenu->FindMarked();
+ 	if (item != NULL && item->Message() != NULL) {
+ 		settings.AddUInt32("still type",
+-			item->Message()->GetUInt32("be:type", 'JPEG'));
++			(uint32)item->Message()->GetInt32("be:type", 'JPEG'));
+ 	}
+ 	settings.AddInt32("clip seconds", fClipLength->Value());
+ 	item = fClipRateMenu->FindMarked();
+@@ -819,7 +847,7 @@ MainWindow::_SendDestination()
+ 	BMenuItem* item = fStillFormatMenu->FindMarked();
+ 	if (item != NULL && item->Message() != NULL) {
+ 		destination.AddUInt32("still type",
+-			item->Message()->GetUInt32("be:type", 'JPEG'));
++			(uint32)item->Message()->GetInt32("be:type", 'JPEG'));
+ 		destination.AddInt32("still translator",
+ 			item->Message()->GetInt32("be:translator", 0));
+ 	}
+@@ -857,7 +885,7 @@ MainWindow::_SendMotion()
+ void
+ MainWindow::_TakeStill(const char* trigger)
+ {
+-	if (!fConnected)
++	if (!fConnected || fQuitting)
+ 		return;
+ 	BMessage still(CameraController::kMsgTakeStill);
+ 	still.AddString("trigger", trigger);
+@@ -868,7 +896,7 @@ MainWindow::_TakeStill(const char* trigger)
+ void
+ MainWindow::_StartClip(const char* trigger)
+ {
+-	if (!fConnected || fRecording || fRecordingPending)
++	if (!fConnected || fRecording || fRecordingPending || fQuitting)
+ 		return;
+ 
+ 	BString folder(fFolderControl->Text());
+@@ -1199,20 +1227,8 @@ MainWindow::_SetStatus(const char* text, bool error)
+ void
+ MainWindow::_ShowCameraSettings()
+ {
+-	if (fController == NULL)
+-		return;
+-	BMessage reply;
+-	if (BMessenger(fController).SendMessage(CameraController::kMsgGetWeb,
+-			&reply) != B_OK) {
+-		return;
+-	}
+-	BParameterWeb* web = NULL;
+-	reply.FindPointer("web", (void**)&web);
+-	if (web == NULL) {
+-		_SetStatus(B_TRANSLATE("The camera has no settings to show."), true);
+-		return;
+-	}
+-	(new CameraSettingsWindow(web))->Show();
++	if (fController != NULL)
++		BMessenger(fController).SendMessage(CameraController::kMsgGetWeb);
+ }
+ 
+ 
+diff --git a/src/apps/neocam/MainWindow.h b/src/apps/neocam/MainWindow.h
+index d20a738bef..366cde89d3 100644
+--- a/src/apps/neocam/MainWindow.h
++++ b/src/apps/neocam/MainWindow.h
+@@ -39,6 +39,7 @@ public:
+ 	virtual	void				MessageReceived(BMessage* message);
+ 
+ 			void				Start();
++									// in the window's thread (kMsgStart)
+ 			void				GetSettings(BMessage& settings);
+ 
+ private:
+@@ -129,6 +130,7 @@ private:
+ 			bigtime_t			fNextSchedule;
+ 			bigtime_t			fNextMotionCapture;
+ 			bool				fMotionNow;
++			bool				fQuitting;
+ };
+ 
+ 
+diff --git a/src/apps/neocam/MotionDetector.cpp b/src/apps/neocam/MotionDetector.cpp
+index b5bc56c566..feb1755663 100644
+--- a/src/apps/neocam/MotionDetector.cpp
++++ b/src/apps/neocam/MotionDetector.cpp
+@@ -7,14 +7,23 @@
+ #include "MotionDetector.h"
+ 
+ #include <math.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+ 
+ // pixels sampled in each cell, across and down
+ static const int32 kSamples = 4;
+-// the first analyses only build the background
+-static const int32 kWarmUpFrames = 10;
++// the first analyses only build the background: a camera that starts
++// streaming takes some seconds to settle its exposure and white balance
++static const int32 kWarmUpFrames = 30;
++// motion in this many analyses in a row counts
++static const int32 kPersistence = 2;
++// a change of more of the picture than this is the light's, as is one of
++// all of it by more than this gain or offset
++static const float kRelightShare = 0.7f;
++static const double kRelightGain = 0.25;
++static const double kRelightOffset = 40;
+ 
+ 
+ MotionDetector::MotionDetector()
+@@ -29,6 +38,7 @@ void
+ MotionDetector::Reset()
+ {
+ 	fFrames = 0;
++	fRunning = 0;
+ 	memset(fChanged, 0, sizeof(fChanged));
+ }
+ 
+@@ -60,7 +70,6 @@ MotionDetector::Analyze(const uint8* bits, uint32 width, uint32 height,
+ 		return 0;
+ 
+ 	// the cells' brightness
+-	int32 total = 0;
+ 	for (int32 row = 0; row < kRows; row++) {
+ 		uint32 top = row * height / kRows;
+ 		uint32 cellHeight = (row + 1) * height / kRows - top;
+@@ -79,9 +88,7 @@ MotionDetector::Analyze(const uint8* bits, uint32 width, uint32 height,
+ 						>> 8;
+ 				}
+ 			}
+-			uint8 brightness = sum / (kSamples * kSamples);
+-			fCurrent[row * kColumns + column] = brightness;
+-			total += brightness;
++			fCurrent[row * kColumns + column] = sum / (kSamples * kSamples);
+ 		}
+ 	}
+ 
+@@ -91,31 +98,84 @@ MotionDetector::Analyze(const uint8* bits, uint32 width, uint32 height,
+ 			fBackground[i] = fCurrent[i] * 16;
+ 	}
+ 
+-	// the change of the whole picture is not motion
+-	int32 backgroundTotal = 0;
+-	for (int32 i = 0; i < cells; i++)
+-		backgroundTotal += fBackground[i];
+-	int32 shift = (total * 16 - backgroundTotal) / cells;
++	// a change of the whole picture (the camera's exposure, the light) is
++	// not motion: the picture as the background times a gain plus an
++	// offset, fitted over the cells that aren't clipped
++	double n = 0, sumX = 0, sumY = 0, sumXX = 0, sumXY = 0;
++	for (int32 i = 0; i < cells; i++) {
++		double x = fBackground[i] / 16.0;
++		double y = fCurrent[i];
++		if (x < 8 || x > 247 || y < 8 || y > 247)
++			continue;
++		n++;
++		sumX += x;
++		sumY += y;
++		sumXX += x * x;
++		sumXY += x * y;
++	}
++	double gain = 1;
++	double offset = 0;
++	double spread = n * sumXX - sumX * sumX;
++	if (n >= cells / 4 && spread > n * n * 25) {
++		gain = (n * sumXY - sumX * sumY) / spread;
++		if (gain < 0.5)
++			gain = 0.5;
++		else if (gain > 2)
++			gain = 2;
++		offset = (sumY - gain * sumX) / n;
++	} else if (n > 0)
++		offset = (sumY - sumX) / n;
+ 
+ 	// a step of 12 brightness levels at sensitivity 100, 52 at 1
+-	int32 step = (12 + (100 - fSensitivity) * 40 / 99) * 16;
++	int32 step = 12 + (100 - fSensitivity) * 40 / 99;
+ 	int32 changed = 0;
+ 	for (int32 i = 0; i < cells; i++) {
+-		int32 current = fCurrent[i] * 16;
+-		int32 difference = current - fBackground[i] - shift;
+-		fChanged[i] = abs(difference) > step;
++		// as the camera clips it
++		double expected = gain * fBackground[i] / 16.0 + offset;
++		expected = expected < 0 ? 0 : expected > 255 ? 255 : expected;
++		fChanged[i] = fabs(fCurrent[i] - expected) > step;
+ 		if (fChanged[i])
+ 			changed++;
++	}
++	float share = (float)changed / cells;
++
++	// most of the picture changed in a way the fit didn't catch, or the
++	// whole picture changed a lot at once (a lamp, the camera's contrast):
++	// the light changed, the background starts over
++	bool relight = share > kRelightShare || fabs(gain - 1) > kRelightGain
++		|| fabs(offset) > kRelightOffset;
+ 
++	for (int32 i = 0; i < cells; i++) {
++		int32 current = fCurrent[i] * 16;
++		if (relight) {
++			fBackground[i] = current;
++			continue;
++		}
+ 		// the background follows: quickly where it is still, slowly where
+ 		// something moves (something that stays becomes background within
+ 		// some seconds)
+ 		fBackground[i] += (current - fBackground[i]) / (fChanged[i] ? 32 : 8);
+ 	}
+ 
+-	if (++fFrames <= kWarmUpFrames) {
++	if (getenv("NEOCAM_MOTION_DEBUG") != NULL && share > Threshold() / 3) {
++		printf("motion: %.4f (threshold %.4f), gain %.3f, offset %.1f, "
++			"%d fitted%s\n", share, Threshold(), gain, offset, (int)n,
++			relight ? ", light changed" : "");
++		fflush(stdout);
++	}
++
++	if (++fFrames <= kWarmUpFrames || relight) {
+ 		memset(fChanged, 0, sizeof(fChanged));
++		fRunning = 0;
+ 		return 0;
+ 	}
+-	return (float)changed / cells;
++
++	// a single analysis isn't enough (a frame that came out wrong)
++	if (share >= Threshold())
++		fRunning++;
++	else
++		fRunning = 0;
++	if (fRunning < kPersistence && share >= Threshold())
++		return Threshold() * 0.99f;
++	return share;
+ }
+diff --git a/src/apps/neocam/MotionDetector.h b/src/apps/neocam/MotionDetector.h
+index ecbdc70414..daed784544 100644
+--- a/src/apps/neocam/MotionDetector.h
++++ b/src/apps/neocam/MotionDetector.h
+@@ -12,9 +12,11 @@
+ /*!	Simple motion detection: the picture as a grid of cells, each the
+ 	average brightness of a few pixels, compared with a background that
+ 	follows the picture slowly. A cell whose brightness differs from the
+-	background by more than a step (after taking off the change of the whole
+-	picture, as when the camera adjusts its exposure) has changed; motion is
+-	when more of the picture changed than the sensitivity allows.
++	background by more than a step has changed, after taking off the change
++	of the whole picture (a gain and an offset fitted to the cells, as when
++	the camera adjusts its exposure); motion is when more of the picture
++	changed than the sensitivity allows, in two analyses in a row. A change
++	of most of the picture is the light's: the background starts over.
+ */
+ class MotionDetector {
+ public:
+@@ -43,6 +45,8 @@ public:
+ private:
+ 			int32				fSensitivity;
+ 			int32				fFrames;
++			int32				fRunning;
++				// analyses with motion in a row
+ 			int32				fBackground[kRows * kColumns];
+ 				// brightness * 16
+ 			uint8				fCurrent[kRows * kColumns];
+diff --git a/src/apps/neocam/NeoCam.cpp b/src/apps/neocam/NeoCam.cpp
+index 341da2b3ae..90634f961b 100644
+--- a/src/apps/neocam/NeoCam.cpp
++++ b/src/apps/neocam/NeoCam.cpp
+@@ -80,7 +80,7 @@ public:
+ 		fCaptureManager->SetWindow(BMessenger(window));
+ 		fCaptureManager->Run();
+ 		window->Show();
+-		window->Start();
++		window->PostMessage(kMsgStart);
+ 	}
+ 
+ 	/*!	What is still being saved or uploaded is finished first. */
+diff --git a/src/apps/neocam/NeoCam.h b/src/apps/neocam/NeoCam.h
+index 5d1bb52466..c5a73fa083 100644
+--- a/src/apps/neocam/NeoCam.h
++++ b/src/apps/neocam/NeoCam.h
+@@ -34,6 +34,7 @@ enum {
+ 	kMsgUploadChanged		= 'upch',
+ 	kMsgTestUpload			= 'tstu',
+ 	kMsgPulse				= 'puls',
++	kMsgStart				= 'strt',
+ 
+ 	// from the camera controller to the window
+ 	kMsgCameraReady			= 'crdy',	// "size" (frame sizes), "current",
+@@ -41,6 +42,8 @@ enum {
+ 	kMsgCameraFailed		= 'cfai',	// "text"
+ 
+ 	kMsgRecordingStarted	= 'rsta',	// "status", "path", "trigger"
++	kMsgCameraReleased		= 'crel',	// after a disconnect for quitting
++	kMsgCameraWeb			= 'cweb',	// "web" (pointer, for the window)
+ 
+ 	// from the camera node to the window
+ 	kMsgFrameStats			= 'fsts',	// "fps"

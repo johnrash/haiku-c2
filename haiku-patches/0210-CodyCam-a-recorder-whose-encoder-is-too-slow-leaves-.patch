@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 11:21:07 -0500
+Subject: [PATCH 210/342] CodyCam: a recorder whose encoder is too slow leaves
+ time out
+
+Frames that came late are encoded again for the time they stand for;
+when that took longer than the time itself, the recorder fell further
+behind with every frame. Copies are only made while the frame is at
+most a second old.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apps/codycam/VideoRecorder.cpp | 11 +++++++++++
+ src/apps/codycam/VideoRecorder.h   |  5 ++++-
+ 2 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/src/apps/codycam/VideoRecorder.cpp b/src/apps/codycam/VideoRecorder.cpp
+index 70bbfd7476..10d3283dc9 100644
+--- a/src/apps/codycam/VideoRecorder.cpp
++++ b/src/apps/codycam/VideoRecorder.cpp
+@@ -158,6 +158,7 @@ VideoRecorder::AddFrame(const void* bits, bigtime_t when)
+ 	fLock.Lock();
+ 	memcpy(fPending, bits, fFrameSize);
+ 	fPendingTime = when;
++	fPendingArrival = system_time();
+ 	bool wake = !fHasPending;
+ 	fHasPending = true;
+ 	fLock.Unlock();
+@@ -207,11 +208,14 @@ VideoRecorder::_Thread()
+ {
+ 	// at most this many copies of one frame (a camera that stopped)
+ 	const int64 kMaxRepeat = (int64)(fFrameRate * 10);
++	// and copies only while the frame is at most this old
++	const bigtime_t kMaxLag = 1000000;
+ 
+ 	while (acquire_sem(fFrameSem) == B_OK) {
+ 		fLock.Lock();
+ 		bool hasFrame = fHasPending;
+ 		bigtime_t when = fPendingTime;
++		bigtime_t arrival = fPendingArrival;
+ 		if (hasFrame) {
+ 			uint8* swap = fPending;
+ 			fPending = fWorking;
+@@ -229,6 +233,13 @@ VideoRecorder::_Thread()
+ 			if (target - fFramesWritten > kMaxRepeat)
+ 				target = fFramesWritten + kMaxRepeat;
+ 			while (fFramesWritten < target && fError == B_OK) {
++				if (fFramesWritten > 0
++					&& system_time() - arrival > kMaxLag) {
++					// encoding the copies takes longer than the time they
++					// stand for: the rest of it is left out
++					fFramesWritten = target;
++					break;
++				}
+ 				fError = fTrack->WriteFrames(fWorking, 1,
+ 					fFramesWritten == 0 ? B_MEDIA_KEY_FRAME : 0);
+ 				fFramesWritten++;
+diff --git a/src/apps/codycam/VideoRecorder.h b/src/apps/codycam/VideoRecorder.h
+index 07f3724ba5..4c764f07ee 100644
+--- a/src/apps/codycam/VideoRecorder.h
++++ b/src/apps/codycam/VideoRecorder.h
+@@ -20,7 +20,8 @@ class BMediaTrack;
+ 	for the frames it missed, one that came early is left out, so that the
+ 	video plays at the speed it was taken, also when the camera lowers its
+ 	rate in low light. Encoding runs in a thread of its own; AddFrame() only
+-	copies the frame.
++	copies the frame. An encoder that can't keep up leaves time out of the
++	video rather than falling ever further behind.
+ */
+ class VideoRecorder {
+ public:
+@@ -55,6 +56,8 @@ private:
+ 			uint8*				fPending;
+ 				// the newest frame, under fLock
+ 			bigtime_t			fPendingTime;
++			bigtime_t			fPendingArrival;
++				// system time it was added
+ 			bool				fHasPending;
+ 			uint8*				fWorking;
+ 				// the one being encoded

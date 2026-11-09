@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 4 Nov 2026 15:07:41 -0500
+Subject: [PATCH 294/342] realtekwifi: signal strength in the units net80211
+ counts in
+
+rtwn gave net80211 whole dB above the noise floor, where net80211 and everything
+reading its scan results expect half dB. wpa_supplicant halved the value again and
+saw a 5 GHz access point at a real 31 dB as 15, under the 20 dB at which it prefers
+5 GHz over a stronger 2.4 GHz one. So every cold boot joined 2.4 GHz: 0 of 10 on
+5 GHz before, 9 of 10 now.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn_rx.c     | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn_rx.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn_rx.c
+index 9b7c93fee9..ed5a71049a 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn_rx.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn_rx.c
+@@ -369,7 +369,8 @@ rtwn_rx_common(struct rtwn_softc *sc, struct mbuf *m, void *desc)
+ 
+ 	rxs.r_flags |= IEEE80211_R_NF | IEEE80211_R_RSSI;
+ 	rxs.c_nf = RTWN_NOISE_FLOOR;
+-	rxs.c_rssi = rssi - rxs.c_nf;
++	/* net80211 counts in half dB above the noise floor; se_rssi is 8 bits */
++	rxs.c_rssi = MIN((rssi - rxs.c_nf) * 2, 127);
+ 	(void) ieee80211_add_rx_params(m, &rxs);
+ 
+ 	if (ieee80211_radiotap_active(ic)) {

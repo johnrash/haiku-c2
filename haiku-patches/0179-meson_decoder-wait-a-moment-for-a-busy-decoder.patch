@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 19:03:57 -0400
+Subject: [PATCH 179/342] meson_decoder: wait a moment for a busy decoder
+
+MediaPlayer's playlist reads the duration of a file it hasn't seen yet
+through a BMediaFile of its own, and that track's decoder took the
+hardware for a moment while the player opened the file. When the player's
+Setup() came in that moment, the whole file played through FFmpeg (2 of 8
+first plays of a phone clip). Setup() now tries again for up to a second
+before it leaves the stream to the next decoder. meson_vdec logs a refusal
+once per holder.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../drivers/video/meson_vdec/meson_vdec.cpp   | 10 ++++++--
+ .../video/meson_vdec/meson_vdec_private.h     |  1 +
+ .../meson_decoder/MesonVdecDecoder.cpp        | 24 ++++++++++++-------
+ 3 files changed, 25 insertions(+), 10 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+index 893206c0f0..34596a6733 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+@@ -49,6 +49,7 @@ MesonVdec::MesonVdec(device_node* node)
+ 	fParserIrq(-1),
+ 	fOpen(false),
+ 	fOpener(-1),
++	fBusyLogged(false),
+ 	fRunning(false),
+ 	fEndOfStream(false),
+ 	fWarmedUp(false),
+@@ -1458,11 +1459,16 @@ MesonVdec::Open()
+ 	thread_info thread;
+ 	get_thread_info(find_thread(NULL), &thread);
+ 	if (fOpen) {
+-		INFO("busy: thread \"%s\" of team %" B_PRId32 " has the decoder, "
+-			"\"%s\" asks\n", fOpenerName, fOpener, thread.name);
++		// once per holder: a caller may ask again while it waits
++		if (!fBusyLogged) {
++			INFO("busy: thread \"%s\" of team %" B_PRId32 " has the "
++				"decoder, \"%s\" asks\n", fOpenerName, fOpener, thread.name);
++			fBusyLogged = true;
++		}
+ 		return B_BUSY;
+ 	}
+ 	fOpen = true;
++	fBusyLogged = false;
+ 	fOpener = team_get_current_team_id();
+ 	strlcpy(fOpenerName, thread.name, sizeof(fOpenerName));
+ 	return B_OK;
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
+index f8e708ade8..67c7a996c0 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
+@@ -393,6 +393,7 @@ private:
+ 			bool				fOpen;
+ 			team_id				fOpener;
+ 			char				fOpenerName[B_OS_NAME_LENGTH];
++			bool				fBusyLogged;
+ 			bool				fRunning;
+ 			bool				fEndOfStream;
+ 			bool				fWarmedUp;
+diff --git a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
+index 39f647989b..d261c52e8d 100644
+--- a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
++++ b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
+@@ -12,11 +12,10 @@
+  * instead of B_NV12's copy (VideoFrameReference.h): the overlay then shows
+  * the frame from the decoder's memory.
+  *
+- * Setup() fails when the decoder is in use, the firmware is missing or the
+- * stream is one the hardware can't decode (more than 1920x1088 or
+- * 1088x1920 (portrait), not 4:2:0;
+- * H.264: 10 bits, fields; HEVC: more than 10 bits): the Media Kit then
+- * takes the next decoder (FFmpeg's).
++ * Setup() fails when the decoder is in use (for a second: see Setup()), the
++ * firmware is missing or the stream is one the hardware can't decode (more
++ * than 1920x1088 or 1088x1920, not 4:2:0; H.264: 10 bits, fields; HEVC:
++ * more than 10 bits): the Media Kit then takes the next decoder (FFmpeg's).
+  * MESON_DECODER_DISABLE in the environment makes it fail always (to compare
+  * with FFmpeg); MESON_DECODER_NO_REFERENCES makes it copy every frame;
+  * MESON_DECODER_TRACE logs what it is asked to stderr.
+@@ -60,6 +59,8 @@ static const char* kHevcFirmwarePath = "firmware/meson/vdec/gxl_hevc.bin";
+ static const uint32 kMaxInFlight = 24;
+ 	// chunks written ahead of the frames taken
+ static const bigtime_t kFrameTimeout = 1000000;
++static const bigtime_t kBusyWait = 1000000;
++	// how long Setup() waits for the decoder when another one has it
+ 
+ 
+ /*!	What meson_vdec takes: as many macroblocks as 1920x1088, either way round
+@@ -241,9 +242,16 @@ MesonVdecDecoder::Setup(media_format* ioEncodedFormat, const void* infoBuffer,
+ 	if (status != B_OK)
+ 		return status;
+ 
+-	// one session at a time: if another one has the decoder, the next
+-	// decoder plugin gets the stream
+-	fDevice = open(MESON_VDEC_DEVICE, O_RDWR | O_CLOEXEC);
++	// One session at a time: if another one has the decoder, the next
++	// decoder plugin gets the stream. The holder may only be looking at a
++	// file, briefly: MediaPlayer's playlist reads a new file's duration
++	// through a track of its own while the player opens it. So wait a
++	// moment first.
++	bigtime_t deadline = system_time() + kBusyWait;
++	while ((fDevice = open(MESON_VDEC_DEVICE, O_RDWR | O_CLOEXEC)) < 0
++		&& errno == EBUSY && system_time() < deadline) {
++		snooze(20000);
++	}
+ 	if (fDevice < 0) {
+ 		TRACE("%s: %s\n", MESON_VDEC_DEVICE, strerror(errno));
+ 		return errno == EBUSY ? B_BUSY : B_MEDIA_BAD_FORMAT;

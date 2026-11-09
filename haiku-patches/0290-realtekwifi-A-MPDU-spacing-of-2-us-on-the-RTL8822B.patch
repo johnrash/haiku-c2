@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 4 Nov 2026 12:37:30 -0500
+Subject: [PATCH 290/342] realtekwifi: A-MPDU spacing of 2 us on the RTL8822B
+
+rtwn sets 16 us for all its chips. It goes into the Tx descriptor as a floor over
+the peer's own value, and to the access point as what we need. rtw88 advertises
+2 us for this chip and uses the peer's value. At 80 MHz, 16 us is about 1700 bytes
+of padding, nearly all of a TCP ACK's subframe.
+
+Download 22.4 to 25.0 MB/s on channel 64, 27.3 to 30.3 on channel 136; upload the
+same, no stall in 28 GB.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn.c | 3 ++-
+ .../drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwnvar.h     | 2 ++
+ .../wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_attach.c      | 1 +
+ 3 files changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn.c
+index f03f47cf33..d62388bcaf 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn.c
+@@ -635,7 +635,8 @@ rtwn_vap_create(struct ieee80211com *ic, const char name[IFNAMSIZ], int unit,
+ 	vap->iv_max_aid = sc->macid_limit;
+ 
+ 	/* 802.11n parameters */
+-	vap->iv_ampdu_density = IEEE80211_HTCAP_MPDUDENSITY_16;
++	vap->iv_ampdu_density = sc->ampdu_density != 0 ?
++	    sc->ampdu_density : IEEE80211_HTCAP_MPDUDENSITY_16;
+ 	vap->iv_ampdu_rxmax = IEEE80211_HTCAP_MAXRXAMPDU_64K;
+ 	vap->iv_ampdu_limit = IEEE80211_HTCAP_MAXRXAMPDU_64K;
+ 
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwnvar.h b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwnvar.h
+index 195c705559..bc934d13e7 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwnvar.h
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwnvar.h
+@@ -252,6 +252,8 @@ struct rtwn_softc {
+ 
+ 	int			sc_tx_n_active;
+ 	uint8_t			qfullmsk;
++	/* 802.11n minimum MPDU start spacing; 0: 16 us */
++	uint8_t			ampdu_density;
+ 
+ 	/* Firmware-specific */
+ 	const char		*fwname;
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_attach.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_attach.c
+index 0b9d237682..7683b5c3d3 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_attach.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_attach.c
+@@ -255,6 +255,7 @@ r22bu_attach(struct rtwn_usb_softc *uc)
+ 	/* USB part. */
+ 	uc->uc_align_rx			= r22bu_align_rx;
+ 	uc->tx_agg_desc_num		= 1;	/* TODO: Tx aggregation */
++	sc->ampdu_density		= IEEE80211_HTCAP_MPDUDENSITY_2;
+ 	uc->tx_no_own			= 1;	/* W0 bit 31 is DISQSELSEQ */
+ 	uc->uc_setup_ep_map		= r22bu_setup_ep_map;
+ 

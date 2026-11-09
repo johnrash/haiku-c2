@@ -1,0 +1,1590 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 01:45:41 -0400
+Subject: [PATCH 150/342] meson_gpio: the header's pins through meson_header;
+ periods, edges
+
+The pins and who has them are now meson_header's, so a program's pin,
+the I2C bus and the serial port can't take each other's. New ioctls:
+pulls; PWM with a period and high time in nanoseconds (84 ns to 0.35 s,
+the crystal divided by 1 to 128, at most 65536 counts); information on
+every header pin (pad, function, user and team, direction, level, pull)
+without a claim; and edges.
+
+PWM: the EF controller takes new counts only from a write that changes
+them, and loses a write that follows another one too soon (right after
+a clock change, two count writes in a row left the old counts running
+at the new clock for good). Writes are now 25 us apart, and counts the
+register holds already go in after a value that differs.
+
+Edges come from the GPIO interrupt block's 8 channels (GIC 96 to 103,
+edge-triggered): a channel watches one pad, rising, or falling through
+its polarity bit; the S905 has no "both edges", so a pin's both take two
+channels. Edges are recorded from the moment they're asked for, up to 32
+waiting (older ones dropped and counted), and read by a blocking ioctl
+with a timeout, which a file's other calls don't wait for. The edge the
+switch to a pad can make is dropped. Unused channels are parked on no
+pad: at reset they watch the console's TX, level-triggered. On the
+ODROID-C2 an edge is recorded 3 us after the write that made it, and
+edges 2.6 us apart are all caught.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/drivers/meson_gpio.h          |   88 ++
+ .../drivers/misc/meson_gpio/meson_gpio.cpp    | 1113 ++++++++++++-----
+ 2 files changed, 861 insertions(+), 340 deletions(-)
+
+diff --git a/headers/private/drivers/meson_gpio.h b/headers/private/drivers/meson_gpio.h
+index 5b180837dc..c31fe6eed7 100644
+--- a/headers/private/drivers/meson_gpio.h
++++ b/headers/private/drivers/meson_gpio.h
+@@ -43,6 +43,26 @@ enum {
+ 		// meson_gpio_pwm: a claimed pin as a PWM output (pins 11 and 19)
+ 	MESON_GPIO_GET_PWM,
+ 		// meson_gpio_pwm: in pin, out duty (the last one set, by any file)
++	MESON_GPIO_SET_PULL,
++		// meson_gpio_pull: the pull of claimed pins (GPIO inputs keep it)
++	MESON_GPIO_SET_PWM_PERIOD,
++		// meson_gpio_pwm_period: a claimed pin as a PWM output with that
++		// period and high time; out: what the hardware makes of them
++	MESON_GPIO_GET_PWM_PERIOD,
++		// meson_gpio_pwm_period: in bit, out the period and high time
++	MESON_GPIO_GET_PIN_INFO,
++		// meson_gpio_pin_info: in index (0 up: every header pin with a SoC
++		// pad); B_BAD_INDEX past the last one. No claim needed.
++	MESON_GPIO_SET_EDGES,
++		// meson_gpio_edges: from now on, record a claimed pin's edges (0:
++		// stop); what was recorded before is dropped. Each edge type of a
++		// pin takes one of the 8 interrupt channels: B_BUSY when they are
++		// taken. Outputs too: the pin's own edges.
++	MESON_GPIO_WAIT_EDGE,
++		// meson_gpio_edge: in bit and timeout; out the oldest recorded edge,
++		// which is removed. B_TIMED_OUT; B_INTERRUPTED (a signal);
++		// B_CANCELED: the recording stopped; B_NOT_ALLOWED: none started.
++		// Doesn't block the file's other calls.
+ };
+ 
+ 
+@@ -58,4 +78,72 @@ struct meson_gpio_pwm {
+ };
+ 
+ 
++enum {
++	MESON_GPIO_PULL_NONE,
++	MESON_GPIO_PULL_DOWN,
++	MESON_GPIO_PULL_UP,
++};
++
++
++struct meson_gpio_pull {
++	uint32		bits;			// the claimed pins it is for
++	uint32		pull;			// MESON_GPIO_PULL_*
++};
++
++
++struct meson_gpio_pwm_period {
++	uint32		bit;
++	uint32		period;			// nanoseconds: 84 to 349525333
++	uint32		high;			// nanoseconds: 0 (low) to period (high)
++};
++
++
++enum {
++	MESON_GPIO_EDGE_RISING	= 0x01,
++	MESON_GPIO_EDGE_FALLING	= 0x02,
++};
++
++
++struct meson_gpio_edges {
++	uint32		bit;
++	uint32		edges;			// MESON_GPIO_EDGE_*, or both
++};
++
++
++struct meson_gpio_edge {
++	uint32		bit;			// in
++	bigtime_t	timeout;		// in: relative, or B_INFINITE_TIMEOUT
++	uint32		edge;			// MESON_GPIO_EDGE_RISING or _FALLING
++	uint32		level;			// the pin's level when it was recorded
++	bigtime_t	when;			// system_time() then
++	uint32		missed;			// edges lost before it (32 wait at most)
++};
++
++
++enum {
++	MESON_GPIO_PIN_GPIO		= 0x01,		// offered to programs as GPIO
++	MESON_GPIO_PIN_PWM		= 0x02,
++	MESON_GPIO_PIN_UART		= 0x04,
++	MESON_GPIO_PIN_I2C		= 0x08,
++
++	MESON_GPIO_PIN_OUTPUT	= 0x100,	// now: a GPIO output
++	MESON_GPIO_PIN_LEVEL	= 0x200,	// now: high
++	MESON_GPIO_PIN_PULL_UP	= 0x400,
++	MESON_GPIO_PIN_PULL_DOWN = 0x800,
++	MESON_GPIO_PIN_PWM_ON	= 0x1000,	// now: a PWM output
++	MESON_GPIO_PIN_EDGES	= 0x2000,	// now: its edges are recorded
++};
++
++
++struct meson_gpio_pin_info {
++	uint32		index;			// in
++	uint32		pin;			// the header's number
++	char		pad[16];		// "GPIOX_21"
++	char		function[16];	// "GPIO", or the alternate function
++	char		use[32];		// who has it ("program", "I2C A"); "" if free
++	int32		team;			// that user's team, or -1
++	uint32		flags;			// MESON_GPIO_PIN_*
++};
++
++
+ #endif	// _MESON_GPIO_H
+diff --git a/src/add-ons/kernel/drivers/misc/meson_gpio/meson_gpio.cpp b/src/add-ons/kernel/drivers/misc/meson_gpio/meson_gpio.cpp
+index 0ab918021b..d279c3d98e 100644
+--- a/src/add-ons/kernel/drivers/misc/meson_gpio/meson_gpio.cpp
++++ b/src/add-ons/kernel/drivers/misc/meson_gpio/meson_gpio.cpp
+@@ -2,45 +2,55 @@
+  * Copyright 2026, haiku-odroid-c2 port authors.
+  * Distributed under the terms of the MIT License.
+  *
+- * The ODROID-C2's 40-pin header (J2) as GPIO, on the Amlogic Meson GXBB
+- * (S905): /dev/misc/gpio, used through the "gpio" command.
++ * The ODROID-C2's 40-pin header (J2) as GPIO and PWM, on the Amlogic Meson
++ * GXBB (S905): /dev/misc/gpio, used through the "gpio" command and by
++ * libdevice's GeekPort classes.
+  *
+  * Reading the device gives a table of the header's GPIO pins: the SoC pin,
+  * the function it has (GPIO, or the alternate function its mux selects),
+- * direction, level and pull. Writing it takes commands, one per line:
++ * direction, level, pull, and who has it. Writing it takes commands, one
++ * per line:
+  *
+  *   <pin> out 0|1               a GPIO output at that level
+  *   <pin> in [up|down|none]     a GPIO input, with that pull
++ *   <pin> pwm <0-255>           a PWM output (pins 11 and 19)
+  *   <pin> release               the pin as it was before the first command
+  *
+- * <pin> is the header pin number or the SoC pin's name (GPIOX_21). Only
+- * the header's pins are offered, without pins 3 and 5 (I2C A, the RTC
+- * shield), and the I2C B pins only while I2C B isn't selected. Switching a pin
+- * to GPIO clears the mux bits of its alternate functions; the first command
+- * on a pin saves its mux, direction, output and pull bits for "release".
+- *
+- *   <pin> pwm <0-255>           a PWM output (pins 11 and 19)
++ * <pin> is the header pin number or the SoC pin's name (GPIOX_21). The
++ * pins and who has them are the meson_header module's: a pin another
++ * driver or a program has is left alone. Pins 3 and 5 (I2C A, the RTC
++ * shield) aren't offered. Switching a pin to GPIO turns its alternate
++ * functions off; the first command on a pin saves its state for "release".
+  *
+  * Programs use ioctls instead (headers/private/drivers/meson_gpio.h): an
+- * open file claims pins, and sets, reads and writes them all at once.
+- * The text commands leave claimed pins alone.
++ * open file claims pins, and sets, reads and writes them all at once, sets
++ * their pull, drives PWM, and waits for edges. Closing it makes its GPIO
++ * pins inputs; PWM outputs stay.
++ *
++ * Edges: the GPIO interrupt block (0xc1109880) has 8 channels, each one
++ * pad (its input number: GPIOX_n is 106 + n, GPIOY_n 89 + n, GPIODV_n
++ * 59 + n), rising or falling (its polarity bit inverts the pad), and GIC
++ * interrupt 96 + channel, which must be edge-triggered. It has no status
++ * or mask register, and no "both edges" on the S905: a pin's both edges
++ * take two channels. Its input is the pad, whatever the mux selects, so an
++ * output sees its own edges. Unused channels are parked on input 255 (no
++ * pad): at reset they all watch GPIOAO_0, the console's TX, level-high.
++ * The facts are in the port's docs/m27-irq-uart-i2c-facts.md.
+  *
+  * PWM: pin 11 is the EF controller's slot A (E), pin 19 its slot B (F),
+- * counting the 24 MHz crystal: a period of 255 cycles (94.1 kHz), high for
+- * <duty> of them. 0 and 255 are the pin as a GPIO output, low or high (the
+- * controller can't stay at one level). On the ODROID-C2, PWM B and D drive
+- * the core voltage regulators: their controllers (AB, which also has pin
+- * 33's PWM A, and CD) are never touched, nor anything else that could harm
+- * the board. Pins 3 and 5 (I2C A, the RTC shield) aren't offered at all.
+- * The PWM facts are in the port's docs/m27-geekport-facts.md (from Linux
+- * and the S905 datasheet).
++ * counting the 24 MHz crystal divided by 1 to 128; each phase lasts one
++ * cycle longer than its count says. A constant level (0 % or 100 %) is the
++ * pin as a GPIO output, low or high (the controller can't stay at one
++ * level). On the ODROID-C2, PWM B and D drive the core voltage regulators:
++ * their controllers (AB, which also has pin 33's PWM A, and CD) are never
++ * touched, nor anything else that could harm the board. The PWM facts are
++ * in the port's docs/m27-geekport-facts.md (from Linux and the S905
++ * datasheet).
+  *
+- * Registers (the periphs pin controller at 0xc8834000): the mux at 0x4b0,
+- * the GPIO direction (1 = input), output and input words at 0x430, pull
+- * (1 = up) at 0x4e8, pull enable at 0x520; per bank a word and a first bit
+- * (U-Boot's pinctrl-meson-gxbb.c). Which mux bits select which functions,
+- * and the header's pins (the device tree's gpio-line-names): facts from
+- * Linux's GXBB pin tables.
++ * Registers (the periphs pin controller at 0xc8834000): the GPIO direction
++ * (1 = input), output and input words at 0x430, pull (1 = up) at 0x4e8,
++ * pull enable at 0x520; per bank a word and a first bit (U-Boot's
++ * pinctrl-meson-gxbb.c).
+  */
+ 
+ 
+@@ -50,13 +60,16 @@
+ #include <string.h>
+ 
+ #include <KernelExport.h>
++#include <arch/int.h>
+ #include <bus/FDT.h>
++#include <condition_variable.h>
+ #include <device_manager.h>
+ #include <kernel.h>
+ #include <lock.h>
+ #include <util/AutoLock.h>
+ 
+ #include <meson_gpio.h>
++#include <meson_header.h>
+ 
+ 
+ #define DRIVER_MODULE_NAME	"drivers/misc/meson_gpio/driver_v1"
+@@ -66,7 +79,6 @@
+ 
+ 
+ static const phys_addr_t kPinControllerPage = 0xc8834000;
+-static const uint32 kMuxOffset = 0x4b0;
+ static const uint32 kGpioOffset = 0x430;
+ static const uint32 kPullOffset = 0x4e8;
+ static const uint32 kPullEnableOffset = 0x520;
+@@ -75,13 +87,30 @@ static const uint32 kPullEnableOffset = 0x520;
+ static const phys_addr_t kPwmPage = 0xc1108000;
+ static const uint32 kPwmEF = 0x6c0;
+ static const uint32 kPwmMisc = 0x8;
+-static const uint32 kPwmPeriod = 255;
+-	// crystal cycles; the controller counts each phase one cycle longer
+-	// than its count says
+-
+-
++static const uint64 kCrystal = 24000000;
++static const uint32 kMaxDivider = 128;
++static const uint32 kMaxCycles = 65536;
++	// a period: two phases of 1 to 65535 cycles each (16-bit counts); at
++	// most 65536 in all, so that any split fits
++static const uint32 kDutyPeriod = 255;
++	// the 8-bit duty cycles' period, in crystal cycles (94.1 kHz)
++
++// the GPIO interrupt block: edge bits [7:0] and polarity bits [23:16], then
++// two words of 8-bit input numbers (channels 0 to 3, 4 to 7), then filters
++static const phys_addr_t kInterruptPage = 0xc1109000;
++static const uint32 kInterruptBlock = 0x880;
++static const uint32 kChannelCount = 8;
++static const int32 kFirstChannelVector = 96;
++static const uint32 kNoInput = 255;
++static const uint8 kFirstInput[] = { 106, 89, 59 };
++	// MESON_HEADER_BANK_X, _Y, _DV
++static const uint32 kEdgeQueueSize = 32;
++static const bigtime_t kEdgeSettle = 50;
++	// after a channel's setup, for the edge its switch may make
++
++
++// the GPIO registers of a bank (MESON_HEADER_BANK_*): word and first bit
+ struct Bank {
+-	const char*	prefix;
+ 	uint8		pullEnableWord, pullEnableBit;
+ 	uint8		pullWord, pullBit;
+ 	uint8		directionWord, directionBit;
+@@ -89,83 +118,36 @@ struct Bank {
+ 	uint8		inputWord, inputBit;
+ };
+ 
+-enum {
+-	kBankX,
+-	kBankY,
+-	kBankDV
+-};
+-
+ static const Bank kBanks[] = {
+-	{ "GPIOX_", 4, 0, 4, 0, 12, 0, 13, 0, 14, 0 },
+-	{ "GPIOY_", 1, 0, 1, 0, 3, 0, 4, 0, 5, 0 },
+-	{ "GPIODV_", 0, 0, 0, 0, 0, 0, 1, 0, 2, 0 },
+-};
+-
+-
+-struct MuxBit {
+-	uint8		word;
+-	uint8		bit;
+-	const char*	function;
++	{ 4, 0, 4, 0, 12, 0, 13, 0, 14, 0 },	// X
++	{ 1, 0, 1, 0, 3, 0, 4, 0, 5, 0 },		// Y
++	{ 0, 0, 0, 0, 0, 0, 1, 0, 2, 0 },		// DV
+ };
+ 
+-struct HeaderPin {
+-	uint8		pin;
+-	uint8		bank;
+-	uint8		offset;
+-	MuxBit		functions[3];
+-	bool		i2c;
+-		// not while its I2C function is selected
+-};
+-
+-// Pins 3 and 5 (GPIODV_24 and 25, I2C A) carry the RTC shield: not offered
+-static const HeaderPin kPins[] = {
+-	{ 7, kBankX, 21, {}, false },
+-	{ 8, kBankX, 12, { { 4, 13, "UART A" } }, false },
+-	{ 10, kBankX, 13, { { 4, 12, "UART A" } }, false },
+-	{ 11, kBankX, 19, { { 2, 30, "PWM E" } }, false },
+-	{ 12, kBankX, 10, {}, false },
+-	{ 13, kBankX, 11, {}, false },
+-	{ 15, kBankX, 9, { { 3, 7, "TS B" } }, false },
+-	{ 16, kBankX, 8, { { 3, 10, "TS B" } }, false },
+-	{ 18, kBankX, 5, { { 8, 0, "SDIO" } }, false },
+-	{ 19, kBankX, 7, { { 8, 11, "SDIO" }, { 3, 18, "PWM F" },
+-		{ 3, 8, "TS B" } }, false },
+-	{ 21, kBankX, 4, { { 8, 1, "SDIO" } }, false },
+-	{ 22, kBankX, 3, { { 8, 2, "SDIO" } }, false },
+-	{ 23, kBankX, 2, { { 8, 3, "SDIO" } }, false },
+-	{ 24, kBankX, 1, { { 8, 4, "SDIO" } }, false },
+-	{ 26, kBankY, 14, { { 1, 18, "UART C" } }, false },
+-	{ 27, kBankDV, 26, { { 7, 24, "I2C B" }, { 2, 27, "UART B" } }, true },
+-	{ 28, kBankDV, 27, { { 7, 25, "I2C B" }, { 2, 26, "UART B" } }, true },
+-	{ 29, kBankX, 0, { { 8, 5, "SDIO" } }, false },
+-	{ 31, kBankY, 8, { { 3, 5, "TS A" }, { 1, 5, "I2S" } }, false },
+-	{ 32, kBankY, 13, { { 1, 19, "UART C" } }, false },
+-	{ 33, kBankX, 6, { { 3, 17, "PWM A" }, { 3, 9, "TS B" } }, false },
+-	{ 35, kBankY, 3, { { 3, 4, "TS A" } }, false },
+-	{ 36, kBankY, 7, { { 3, 5, "TS A" } }, false },
+-};
+-static const size_t kPinCount = B_COUNT_OF(kPins);
+-
+ 
+ struct PwmPin {
+ 	uint8		pin;
+-	uint32		controller;
+ 	bool		slotB;
++	const char*	function;
+ };
+ 
+ static const PwmPin kPwmPins[] = {
+-	{ 11, kPwmEF, false },
+-	{ 19, kPwmEF, true },
++	{ 11, false, "PWM E" },
++	{ 19, true, "PWM F" },
+ };
+ 
++static const uint32 kMaxPins = 32;
++static const uint8 kNoChannel = 0xff;
++
+ 
+ static device_manager_info* gDeviceManager;
++static meson_header_module_info* gHeader;
+ 
+ 
+ class MesonGpio;
+ 
+-/*!	An open file: the pins it claimed, as indexes into kPins, in the order
+-	of their bits.
++/*!	An open file: the pins it claimed (indexes into the header module's
++	table), in the order of their bits.
+ */
+ struct gpio_cookie {
+ 	MesonGpio*	gpio;
+@@ -174,6 +156,35 @@ struct gpio_cookie {
+ };
+ 
+ 
++struct EdgeEvent {
++	bigtime_t	when;
++	uint8		edge;
++	uint8		level;
++};
++
++/*!	A pin whose edges are recorded: its channels, rising and falling, and
++	the edges waiting to be read.
++*/
++struct EdgeRecorder {
++	gpio_cookie*		owner;
++	uint8				edges;
++	uint8				channels[2];
++	bool				settling;
++	uint32				first;
++	uint32				count;
++	uint32				missed;
++	EdgeEvent			queue[kEdgeQueueSize];
++	ConditionVariable	condition;
++};
++
++struct EdgeChannel {
++	MesonGpio*	gpio;
++	bool		used;
++	uint8		index;		// the pin's
++	uint8		edge;		// MESON_GPIO_EDGE_*
++};
++
++
+ class MesonGpio {
+ public:
+ 								MesonGpio(device_node* node);
+@@ -187,15 +198,23 @@ public:
+ 			status_t			Write(const char* buffer, size_t length);
+ 			status_t			Control(gpio_cookie* cookie, uint32 op,
+ 									void* buffer, size_t length);
++			void				Close(gpio_cookie* cookie);
+ 			void				Free(gpio_cookie* cookie);
+ 
+ private:
+ 	struct SavedPin {
+ 		bool		saved;
+-		uint32		mux[3];
++		const char*	function;
+ 		bool		input, output, pull, pullEnable;
+ 	};
+ 
++	struct PwmState {
++		bool		active;		// a PWM output, or a constant level for one
++		uint8		duty;		// the 8-bit duty cycle, last set or nearest
++		uint32		period;		// nanoseconds
++		uint32		high;
++	};
++
+ 			volatile uint32&	_Word(uint32 offset, uint32 word)
+ 									{ return fRegisters[(offset + word * 4)
+ 										/ 4]; }
+@@ -203,34 +222,54 @@ private:
+ 									{ return (_Word(offset, word) >> bit) & 1; }
+ 			void				_Set(uint32 offset, uint32 word, uint32 bit,
+ 									bool value);
++			bool				_Input(uint32 index);
++			bool				_Level(uint32 index);
+ 
+-			const char*			_Function(const HeaderPin& pin);
+ 			status_t			_Command(char* line);
+-			status_t			_Configure(size_t index, bool output,
++			status_t			_Configure(uint32 index, bool output,
+ 									bool level, int pull);
+-			status_t			_Release(size_t index);
+-			void				_Save(size_t index);
+-			void				_SetDirection(size_t index, bool output);
+-			const PwmPin*		_PwmPin(size_t index);
+-			void				_DisablePwm(size_t index);
+-			status_t			_SetPwm(size_t index, uint32 duty);
++			status_t			_Release(uint32 index);
++			void				_Save(uint32 index);
++			void				_SetDirection(uint32 index, bool output);
++			void				_SetPull(uint32 index, uint32 pull);
++			void				_SetOutputLevel(uint32 index, bool level);
++			const PwmPin*		_PwmPin(uint32 index);
++			void				_DisablePwm(uint32 index);
++			status_t			_SetPwm(uint32 index, uint32 divider,
++									uint32 cycles, uint32 high);
++			status_t			_SetPwmPeriod(uint32 index, uint32 period,
++									uint32 high);
+ 			status_t			_Claim(gpio_cookie* cookie,
+ 									const meson_gpio_pins& pins);
+-			ssize_t				_Find(const char* name);
+-	static	void				_Name(const HeaderPin& pin, char* buffer,
+-									size_t size);
++			status_t			_PinInfo(meson_gpio_pin_info& info);
++
++			volatile uint32&	_InterruptWord(uint32 word)
++									{ return fInterruptRegisters[
++										kInterruptBlock / 4 + word]; }
++			void				_SetChannel(uint32 channel, uint32 input,
++									bool falling);
++			status_t			_SetEdges(gpio_cookie* cookie, uint32 index,
++									uint32 edges);
++			void				_StopEdges(uint32 index);
++			status_t			_WaitEdge(gpio_cookie* cookie,
++									meson_gpio_edge& edge);
++	static	int32				_EdgeInterrupt(void* data);
+ 
+ 			device_node*		fNode;
+ 			area_id				fArea;
+ 			volatile uint32*	fRegisters;
+-			mutex				fLock;
+-			SavedPin			fSaved[kPinCount];
+-			gpio_cookie*		fOwner[kPinCount];
+ 			area_id				fPwmArea;
+ 			volatile uint32*	fPwmRegisters;
+-			bool				fPwmActive[kPinCount];
+-				// the pin is a PWM output (or a constant level for one)
+-			uint8				fPwmDuty[kPinCount];
++			area_id				fInterruptArea;
++			volatile uint32*	fInterruptRegisters;
++			mutex				fLock;
++			spinlock			fEdgeLock;
++				// the recorders, the channels and the interrupt block
++			uint32				fPinCount;
++			SavedPin			fSaved[kMaxPins];
++			PwmState			fPwm[kMaxPins];
++			EdgeRecorder		fRecorders[kMaxPins];
++			EdgeChannel			fChannels[kChannelCount];
+ };
+ 
+ 
+@@ -240,13 +279,28 @@ MesonGpio::MesonGpio(device_node* node)
+ 	fArea(-1),
+ 	fRegisters(NULL),
+ 	fPwmArea(-1),
+-	fPwmRegisters(NULL)
++	fPwmRegisters(NULL),
++	fInterruptArea(-1),
++	fInterruptRegisters(NULL),
++	fPinCount(0)
+ {
+ 	mutex_init(&fLock, "meson gpio");
++	B_INITIALIZE_SPINLOCK(&fEdgeLock);
+ 	memset(fSaved, 0, sizeof(fSaved));
+-	memset(fOwner, 0, sizeof(fOwner));
+-	memset(fPwmActive, 0, sizeof(fPwmActive));
+-	memset(fPwmDuty, 0, sizeof(fPwmDuty));
++	memset(fPwm, 0, sizeof(fPwm));
++	for (uint32 i = 0; i < kMaxPins; i++) {
++		EdgeRecorder& recorder = fRecorders[i];
++		recorder.owner = NULL;
++		recorder.edges = 0;
++		recorder.channels[0] = recorder.channels[1] = kNoChannel;
++		recorder.settling = false;
++		recorder.first = recorder.count = recorder.missed = 0;
++		recorder.condition.Init(&fRecorders[i], "meson gpio edge");
++	}
++	for (uint32 i = 0; i < kChannelCount; i++) {
++		fChannels[i].gpio = this;
++		fChannels[i].used = false;
++	}
+ }
+ 
+ 
+@@ -256,6 +310,8 @@ MesonGpio::~MesonGpio()
+ 		delete_area(fArea);
+ 	if (fPwmArea >= 0)
+ 		delete_area(fPwmArea);
++	if (fInterruptArea >= 0)
++		delete_area(fInterruptArea);
+ 	mutex_destroy(&fLock);
+ }
+ 
+@@ -263,6 +319,7 @@ MesonGpio::~MesonGpio()
+ status_t
+ MesonGpio::Init()
+ {
++	fPinCount = min_c(gHeader->count_pins(), kMaxPins);
+ 	void* address;
+ 	fArea = map_physical_memory("meson gpio", kPinControllerPage, B_PAGE_SIZE,
+ 		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
+@@ -276,7 +333,16 @@ MesonGpio::Init()
+ 	if (fPwmArea < 0)
+ 		return fPwmArea;
+ 	fPwmRegisters = (volatile uint32*)address;
+-	INFO("%" B_PRIuSIZE " header pins at /dev/misc/gpio\n", kPinCount);
++	fInterruptArea = map_physical_memory("meson gpio interrupts",
++		kInterruptPage, B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++	if (fInterruptArea < 0)
++		return fInterruptArea;
++	fInterruptRegisters = (volatile uint32*)address;
++	// nothing else uses the block; its GIC interrupts are disabled
++	for (uint32 channel = 0; channel < kChannelCount; channel++)
++		_SetChannel(channel, kNoInput, false);
++	INFO("the header's pins at /dev/misc/gpio\n");
+ 	return B_OK;
+ }
+ 
+@@ -292,132 +358,243 @@ MesonGpio::_Set(uint32 offset, uint32 word, uint32 bit, bool value)
+ }
+ 
+ 
+-/*!	The alternate function the pin's mux selects, or NULL: GPIO. */
+-const char*
+-MesonGpio::_Function(const HeaderPin& pin)
+-{
+-	for (size_t i = 0; i < B_COUNT_OF(pin.functions); i++) {
+-		const MuxBit& mux = pin.functions[i];
+-		if (mux.function != NULL && _Get(kMuxOffset, mux.word, mux.bit))
+-			return mux.function;
+-	}
+-	return NULL;
+-}
+-
+-
+-/*static*/ void
+-MesonGpio::_Name(const HeaderPin& pin, char* buffer, size_t size)
++bool
++MesonGpio::_Input(uint32 index)
+ {
+-	snprintf(buffer, size, "%s%u", kBanks[pin.bank].prefix, pin.offset);
++	const meson_header_pin* pin = gHeader->pin_at(index);
++	const Bank& bank = kBanks[pin->bank];
++	return _Get(kGpioOffset, bank.directionWord,
++		bank.directionBit + pin->offset);
+ }
+ 
+ 
+-ssize_t
+-MesonGpio::_Find(const char* name)
++bool
++MesonGpio::_Level(uint32 index)
+ {
+-	char* end;
+-	long number = strtol(name, &end, 10);
+-	for (size_t i = 0; i < kPinCount; i++) {
+-		char pinName[16];
+-		_Name(kPins[i], pinName, sizeof(pinName));
+-		if ((*end == '\0' && end != name && kPins[i].pin == number)
+-			|| strcasecmp(name, pinName) == 0) {
+-			return i;
+-		}
+-	}
+-	return -1;
++	const meson_header_pin* pin = gHeader->pin_at(index);
++	const Bank& bank = kBanks[pin->bank];
++	return _Get(kGpioOffset, bank.inputWord, bank.inputBit + pin->offset);
+ }
+ 
+ 
+ void
+-MesonGpio::_Save(size_t index)
++MesonGpio::_Save(uint32 index)
+ {
+ 	SavedPin& saved = fSaved[index];
+ 	if (saved.saved)
+ 		return;
+-	const HeaderPin& pin = kPins[index];
+-	const Bank& bank = kBanks[pin.bank];
+-	for (size_t i = 0; i < B_COUNT_OF(pin.functions); i++) {
+-		const MuxBit& mux = pin.functions[i];
+-		saved.mux[i] = mux.function != NULL
+-			? _Get(kMuxOffset, mux.word, mux.bit) : 0;
+-	}
+-	saved.input = _Get(kGpioOffset, bank.directionWord,
+-		bank.directionBit + pin.offset);
++	const meson_header_pin* pin = gHeader->pin_at(index);
++	const Bank& bank = kBanks[pin->bank];
++	saved.function = gHeader->selected(index);
++	saved.input = _Input(index);
+ 	saved.output = _Get(kGpioOffset, bank.outputWord,
+-		bank.outputBit + pin.offset);
+-	saved.pull = _Get(kPullOffset, bank.pullWord, bank.pullBit + pin.offset);
++		bank.outputBit + pin->offset);
++	saved.pull = _Get(kPullOffset, bank.pullWord, bank.pullBit + pin->offset);
+ 	saved.pullEnable = _Get(kPullEnableOffset, bank.pullEnableWord,
+-		bank.pullEnableBit + pin.offset);
++		bank.pullEnableBit + pin->offset);
+ 	saved.saved = true;
+ }
+ 
+ 
+-/*!	\a pull: 1 up, 0 down, -1 none, -2 as it is. */
+-status_t
+-MesonGpio::_Configure(size_t index, bool output, bool level, int pull)
++/*!	The pin as GPIO, an output or an input; its output level and pull stay
++	as they are. A PWM output stops.
++*/
++void
++MesonGpio::_SetDirection(uint32 index, bool output)
+ {
+-	const HeaderPin& pin = kPins[index];
+-	const Bank& bank = kBanks[pin.bank];
+-	const char* function = _Function(pin);
+-	if (pin.i2c && function != NULL && strncmp(function, "I2C", 3) == 0) {
+-		INFO("pin %u is in use by %s\n", pin.pin, function);
+-		return B_BUSY;
++	_DisablePwm(index);
++	const meson_header_pin* pin = gHeader->pin_at(index);
++	const Bank& bank = kBanks[pin->bank];
++	_Set(kGpioOffset, bank.directionWord, bank.directionBit + pin->offset,
++		!output);
++	gHeader->select(index, NULL);
++}
++
++
++void
++MesonGpio::_SetOutputLevel(uint32 index, bool level)
++{
++	const meson_header_pin* pin = gHeader->pin_at(index);
++	const Bank& bank = kBanks[pin->bank];
++	_Set(kGpioOffset, bank.outputWord, bank.outputBit + pin->offset, level);
++}
++
++
++void
++MesonGpio::_SetPull(uint32 index, uint32 pull)
++{
++	const meson_header_pin* pin = gHeader->pin_at(index);
++	const Bank& bank = kBanks[pin->bank];
++	if (pull != MESON_GPIO_PULL_NONE) {
++		_Set(kPullOffset, bank.pullWord, bank.pullBit + pin->offset,
++			pull == MESON_GPIO_PULL_UP);
+ 	}
++	_Set(kPullEnableOffset, bank.pullEnableWord,
++		bank.pullEnableBit + pin->offset, pull != MESON_GPIO_PULL_NONE);
++}
++
+ 
++/*!	\a pull: 1 up, 0 down, -1 none, -2 as it is. */
++status_t
++MesonGpio::_Configure(uint32 index, bool output, bool level, int pull)
++{
+ 	_Save(index);
+-	_DisablePwm(index);
+-	uint32 bit = pin.offset;
+ 	if (output) {
+-		_Set(kGpioOffset, bank.outputWord, bank.outputBit + bit, level);
+-		_Set(kGpioOffset, bank.directionWord, bank.directionBit + bit, false);
++		_SetOutputLevel(index, level);
++		_SetDirection(index, true);
+ 	} else {
+-		_Set(kGpioOffset, bank.directionWord, bank.directionBit + bit, true);
+-		if (pull >= 0)
+-			_Set(kPullOffset, bank.pullWord, bank.pullBit + bit, pull == 1);
++		_SetDirection(index, false);
+ 		if (pull >= -1) {
+-			_Set(kPullEnableOffset, bank.pullEnableWord,
+-				bank.pullEnableBit + bit, pull >= 0);
++			_SetPull(index, pull == 1 ? MESON_GPIO_PULL_UP
++				: pull == 0 ? MESON_GPIO_PULL_DOWN : MESON_GPIO_PULL_NONE);
+ 		}
+ 	}
+-	// the GPIO function: the alternate ones off
+-	for (size_t i = 0; i < B_COUNT_OF(pin.functions); i++) {
+-		const MuxBit& mux = pin.functions[i];
+-		if (mux.function != NULL)
+-			_Set(kMuxOffset, mux.word, mux.bit, false);
+-	}
+ 	return B_OK;
+ }
+ 
+ 
+ status_t
+-MesonGpio::_Release(size_t index)
++MesonGpio::_Release(uint32 index)
+ {
+ 	SavedPin& saved = fSaved[index];
+ 	if (!saved.saved)
+ 		return B_OK;
+ 	_DisablePwm(index);
+-	const HeaderPin& pin = kPins[index];
+-	const Bank& bank = kBanks[pin.bank];
+-	uint32 bit = pin.offset;
++	const meson_header_pin* pin = gHeader->pin_at(index);
++	const Bank& bank = kBanks[pin->bank];
++	uint32 bit = pin->offset;
+ 	_Set(kGpioOffset, bank.outputWord, bank.outputBit + bit, saved.output);
+ 	_Set(kGpioOffset, bank.directionWord, bank.directionBit + bit,
+ 		saved.input);
+ 	_Set(kPullOffset, bank.pullWord, bank.pullBit + bit, saved.pull);
+ 	_Set(kPullEnableOffset, bank.pullEnableWord, bank.pullEnableBit + bit,
+ 		saved.pullEnable);
+-	for (size_t i = 0; i < B_COUNT_OF(pin.functions); i++) {
+-		const MuxBit& mux = pin.functions[i];
+-		if (mux.function != NULL)
+-			_Set(kMuxOffset, mux.word, mux.bit, saved.mux[i]);
+-	}
++	gHeader->select(index, saved.function);
+ 	saved.saved = false;
+ 	return B_OK;
+ }
+ 
+ 
++const PwmPin*
++MesonGpio::_PwmPin(uint32 index)
++{
++	const meson_header_pin* pin = gHeader->pin_at(index);
++	for (size_t i = 0; i < B_COUNT_OF(kPwmPins); i++) {
++		if (pin != NULL && kPwmPins[i].pin == pin->pin)
++			return &kPwmPins[i];
++	}
++	return NULL;
++}
++
++
++/*!	Stops the pin's PWM slot, if it has one. Only the slot's own enable bit
++	changes: the MISC word is shared with the other slot.
++*/
++void
++MesonGpio::_DisablePwm(uint32 index)
++{
++	const PwmPin* pwm = _PwmPin(index);
++	fPwm[index].active = false;
++	if (pwm == NULL)
++		return;
++	volatile uint32& misc = fPwmRegisters[(kPwmEF + kPwmMisc) / 4];
++	InterruptsLocker locker;
++	misc &= ~(pwm->slotB ? 1u << 1 : 1u << 0);
++}
++
++
++/*!	The pin as a PWM output: the crystal divided by \a divider (1 to 128),
++	a period of \a cycles of that (2 to 65536), high for \a high of them; a
++	constant level when \a high is 0 or \a cycles: the pin as a GPIO output.
++	The slot takes new counts at the end of its period, from a write that
++	changes them. A write that follows another one to the slot too soon is
++	lost, and so is the earlier one, it seems (on the ODROID-C2: right
++	after a clock change, and two count writes in a row, left the old counts
++	running at the new clock for good; rewriting the same counts then
++	didn't help). So writes are a few ticks of the slowest clock apart, and
++	counts the register holds already go in as a value that differs first.
++*/
++status_t
++MesonGpio::_SetPwm(uint32 index, uint32 divider, uint32 cycles, uint32 high)
++{
++	const PwmPin* pwm = _PwmPin(index);
++	if (pwm == NULL)
++		return B_NOT_SUPPORTED;
++	if (divider < 1 || divider > kMaxDivider || cycles < 2
++		|| cycles > kMaxCycles || high > cycles) {
++		return B_BAD_VALUE;
++	}
++
++	if (high == 0 || high == cycles) {
++		_SetOutputLevel(index, high != 0);
++		_SetDirection(index, true);
++	} else {
++		// the slot (crystal, the divider, its clock on, running), then the
++		// counts, then the pin; each phase lasts its count + 1
++		volatile uint32& misc = fPwmRegisters[(kPwmEF + kPwmMisc) / 4];
++		uint32 fields = pwm->slotB
++			? (1u << 23) | (0x7fu << 16) | (3u << 6) | (1u << 1)
++			: (1u << 15) | (0x7fu << 8) | (3u << 4) | (1u << 0);
++		uint32 value = pwm->slotB
++			? (1u << 23) | ((divider - 1) << 16) | (1u << 1)
++			: (1u << 15) | ((divider - 1) << 8) | (1u << 0);
++		bool changed;
++		{
++			InterruptsLocker locker;
++			changed = (misc & fields) != value;
++			misc = (misc & ~fields) | value;
++		}
++		// four ticks of the slowest clock (128 / 24 MHz each)
++		const bigtime_t kSettle = 25;
++		if (changed)
++			spin(kSettle);
++		volatile uint32& counts
++			= fPwmRegisters[(kPwmEF + (pwm->slotB ? 4 : 0)) / 4];
++		uint32 count = ((high - 1) << 16) | (cycles - high - 1);
++		if (counts == count) {
++			counts = count ^ 1;
++			spin(kSettle);
++		}
++		counts = count;
++		spin(kSettle);
++		gHeader->select(index, pwm->function);
++	}
++
++	PwmState& state = fPwm[index];
++	state.active = true;
++	state.period = (uint32)((uint64)cycles * divider * 1000000000 / kCrystal);
++	state.high = (uint32)((uint64)high * divider * 1000000000 / kCrystal);
++	state.duty = (uint8)(((uint64)high * 255 + cycles / 2) / cycles);
++	return B_OK;
++}
++
++
++/*!	A period and high time in nanoseconds: the finest divider that can
++	count the period.
++*/
++status_t
++MesonGpio::_SetPwmPeriod(uint32 index, uint32 period, uint32 high)
++{
++	if (high > period)
++		return B_BAD_VALUE;
++	for (uint32 divider = 1; divider <= kMaxDivider; divider++) {
++		uint64 rate = kCrystal / divider;
++		uint64 cycles = ((uint64)period * rate + 500000000) / 1000000000;
++		if (cycles > kMaxCycles)
++			continue;
++		if (cycles < 2)
++			return B_BAD_VALUE;
++		uint64 highCycles = ((uint64)high * rate + 500000000) / 1000000000;
++		if (highCycles > cycles)
++			highCycles = cycles;
++		return _SetPwm(index, divider, cycles, highCycles);
++	}
++	return B_BAD_VALUE;
++}
++
++
+ /*!	One command: "<pin> out 0|1", "<pin> in [up|down|none]",
+-	"<pin> release".
++	"<pin> pwm <0-255>", "<pin> release".
+ */
+ status_t
+ MesonGpio::_Command(char* line)
+@@ -434,13 +611,15 @@ MesonGpio::_Command(char* line)
+ 	if (count < 2)
+ 		return B_BAD_VALUE;
+ 
+-	ssize_t index = _Find(words[0]);
+-	if (index < 0) {
++	int32 index = gHeader->find_pin(words[0]);
++	if (index < 0 || (uint32)index >= fPinCount
++		|| !gHeader->pin_at(index)->programs) {
+ 		INFO("no header pin \"%s\"\n", words[0]);
+ 		return B_ENTRY_NOT_FOUND;
+ 	}
+-	if (fOwner[index] != NULL) {
+-		INFO("pin %u is in use by a program\n", kPins[index].pin);
++	char use[32];
++	if (gHeader->user(index, NULL, use, sizeof(use), NULL)) {
++		INFO("pin %u is in use (%s)\n", gHeader->pin_at(index)->pin, use);
+ 		return B_BUSY;
+ 	}
+ 	if (strcmp(words[1], "out") == 0 && count == 3
+@@ -468,142 +647,318 @@ MesonGpio::_Command(char* line)
+ 		long duty = strtol(words[2], &end, 10);
+ 		if (*end != '\0' || end == words[2] || duty < 0 || duty > 255)
+ 			return B_BAD_VALUE;
++		if (_PwmPin(index) == NULL)
++			return B_NOT_SUPPORTED;
+ 		_Save(index);
+-		return _SetPwm(index, duty);
++		return _SetPwm(index, 1, kDutyPeriod, duty);
+ 	}
+ 	return B_BAD_VALUE;
+ }
+ 
+ 
+-/*!	The pin as GPIO, an output or an input; its output level and pull stay
+-	as they are. A PWM output stops.
+-*/
+-void
+-MesonGpio::_SetDirection(size_t index, bool output)
++status_t
++MesonGpio::_Claim(gpio_cookie* cookie, const meson_gpio_pins& pins)
+ {
+-	_DisablePwm(index);
+-	const HeaderPin& pin = kPins[index];
+-	const Bank& bank = kBanks[pin.bank];
+-	_Set(kGpioOffset, bank.directionWord, bank.directionBit + pin.offset,
+-		!output);
+-	for (size_t i = 0; i < B_COUNT_OF(pin.functions); i++) {
+-		const MuxBit& mux = pin.functions[i];
+-		if (mux.function != NULL)
+-			_Set(kMuxOffset, mux.word, mux.bit, false);
++	if (cookie->count != 0 || pins.count == 0
++		|| pins.count > B_COUNT_OF(pins.pins)) {
++		return B_BAD_VALUE;
+ 	}
++	uint8 indexes[B_COUNT_OF(pins.pins)];
++	for (uint32 i = 0; i < pins.count; i++) {
++		char name[8];
++		snprintf(name, sizeof(name), "%u", pins.pins[i]);
++		int32 index = gHeader->find_pin(name);
++		if (index < 0 || (uint32)index >= fPinCount
++			|| !gHeader->pin_at(index)->programs) {
++			return B_ENTRY_NOT_FOUND;
++		}
++		for (uint32 j = 0; j < i; j++) {
++			if (indexes[j] == index)
++				return B_BAD_VALUE;
++		}
++		indexes[i] = index;
++	}
++	// all or none
++	for (uint32 i = 0; i < pins.count; i++) {
++		if (gHeader->claim(indexes[i], cookie, "program") != B_OK) {
++			for (uint32 j = 0; j < i; j++)
++				gHeader->release(indexes[j], cookie);
++			return B_BUSY;
++		}
++	}
++	for (uint32 i = 0; i < pins.count; i++) {
++		// for "release", once the program is done
++		_Save(indexes[i]);
++		cookie->pins[i] = indexes[i];
++	}
++	cookie->count = pins.count;
++	return B_OK;
+ }
+ 
+ 
+-const PwmPin*
+-MesonGpio::_PwmPin(size_t index)
++status_t
++MesonGpio::_PinInfo(meson_gpio_pin_info& info)
+ {
+-	for (size_t i = 0; i < B_COUNT_OF(kPwmPins); i++) {
+-		if (kPwmPins[i].pin == kPins[index].pin)
+-			return &kPwmPins[i];
++	uint32 index = info.index;
++	if (index >= fPinCount)
++		return B_BAD_INDEX;
++	const meson_header_pin* pin = gHeader->pin_at(index);
++	info.pin = pin->pin;
++	gHeader->pad_name(index, info.pad, sizeof(info.pad));
++	const char* function = gHeader->selected(index);
++	strlcpy(info.function, function != NULL ? function : "GPIO",
++		sizeof(info.function));
++	team_id team = -1;
++	if (!gHeader->user(index, NULL, info.use, sizeof(info.use), &team))
++		info.use[0] = '\0';
++	info.team = team;
++
++	info.flags = pin->programs ? MESON_GPIO_PIN_GPIO : 0;
++	for (size_t i = 0; i < B_COUNT_OF(pin->functions); i++) {
++		const char* name = pin->functions[i].name;
++		if (name == NULL)
++			continue;
++		if (strncmp(name, "UART", 4) == 0)
++			info.flags |= MESON_GPIO_PIN_UART;
++		else if (strncmp(name, "I2C", 3) == 0)
++			info.flags |= MESON_GPIO_PIN_I2C;
+ 	}
+-	return NULL;
++	if (_PwmPin(index) != NULL)
++		info.flags |= MESON_GPIO_PIN_PWM;
++	const Bank& bank = kBanks[pin->bank];
++	if (function == NULL && !_Input(index))
++		info.flags |= MESON_GPIO_PIN_OUTPUT;
++	if (_Level(index))
++		info.flags |= MESON_GPIO_PIN_LEVEL;
++	if (_Get(kPullEnableOffset, bank.pullEnableWord,
++			bank.pullEnableBit + pin->offset)) {
++		info.flags |= _Get(kPullOffset, bank.pullWord,
++				bank.pullBit + pin->offset)
++			? MESON_GPIO_PIN_PULL_UP : MESON_GPIO_PIN_PULL_DOWN;
++	}
++	if (fPwm[index].active && function != NULL
++		&& strncmp(function, "PWM", 3) == 0) {
++		info.flags |= MESON_GPIO_PIN_PWM_ON;
++	}
++	if (fRecorders[index].edges != 0)
++		info.flags |= MESON_GPIO_PIN_EDGES;
++	return B_OK;
+ }
+ 
+ 
+-/*!	Stops the pin's PWM slot, if it has one. Only the slot's own enable bit
+-	changes: the MISC word is shared with the other slot.
++//	#pragma mark - edges
++
++
++/*!	Points a channel of the interrupt block at an input (kNoInput: none),
++	edge-triggered, rising or (the pad inverted) falling, unfiltered. With
++	fEdgeLock held, or before there are interrupts.
+ */
+ void
+-MesonGpio::_DisablePwm(size_t index)
++MesonGpio::_SetChannel(uint32 channel, uint32 input, bool falling)
+ {
+-	const PwmPin* pwm = _PwmPin(index);
+-	fPwmActive[index] = false;
+-	if (pwm == NULL)
+-		return;
+-	volatile uint32& misc = fPwmRegisters[(pwm->controller + kPwmMisc) / 4];
+-	InterruptsLocker locker;
+-	misc &= ~(pwm->slotB ? 1u << 1 : 1u << 0);
++	volatile uint32& inputs = _InterruptWord(1 + channel / 4);
++	uint32 shift = channel % 4 * 8;
++	inputs = (inputs & ~(0xffu << shift)) | (input << shift);
++	volatile uint32& modes = _InterruptWord(0);
++	uint32 mode = (modes | (1u << channel)) & ~(1u << (16 + channel));
++	if (falling)
++		mode |= 1u << (16 + channel);
++	modes = mode;
++	volatile uint32& filters = _InterruptWord(3);
++	filters &= ~(7u << (channel * 4));
+ }
+ 
+ 
+-/*!	The pin as a PWM output, high for \a duty of every 255 crystal cycles;
+-	0 and 255 as a GPIO output, low or high.
++/*!	Records a claimed pin's edges from now on (\a edges 0: stops). The
++	channels' interrupts are on before the channels point at the pin: the
++	switch makes an edge when the pad is at the level the edge leads to,
++	and that one comes while the recorder settles, which drops it.
+ */
+ status_t
+-MesonGpio::_SetPwm(size_t index, uint32 duty)
++MesonGpio::_SetEdges(gpio_cookie* cookie, uint32 index, uint32 edges)
+ {
+-	const PwmPin* pwm = _PwmPin(index);
+-	if (pwm == NULL)
+-		return B_NOT_SUPPORTED;
+-	if (duty > 255)
++	_StopEdges(index);
++	if (edges == 0)
++		return B_OK;
++	if ((edges & ~(uint32)(MESON_GPIO_EDGE_RISING | MESON_GPIO_EDGE_FALLING))
++			!= 0) {
+ 		return B_BAD_VALUE;
+-	const HeaderPin& pin = kPins[index];
++	}
+ 
+-	if (duty == 0 || duty == 255) {
+-		const Bank& bank = kBanks[pin.bank];
+-		_Set(kGpioOffset, bank.outputWord, bank.outputBit + pin.offset,
+-			duty == 255);
+-		_SetDirection(index, true);
+-	} else {
+-		// the counts first, then the slot (crystal, no divider, its clock
+-		// on, running), then the pin
+-		fPwmRegisters[(pwm->controller + (pwm->slotB ? 4 : 0)) / 4]
+-			= ((duty - 1) << 16) | (kPwmPeriod - 1 - duty);
+-		volatile uint32& misc
+-			= fPwmRegisters[(pwm->controller + kPwmMisc) / 4];
+-		uint32 fields = pwm->slotB
+-			? (1u << 23) | (0x7fu << 16) | (3u << 6) | (1u << 1)
+-			: (1u << 15) | (0x7fu << 8) | (3u << 4) | (1u << 0);
+-		uint32 enable = pwm->slotB ? (1u << 23) | (1u << 1)
+-			: (1u << 15) | (1u << 0);
+-		{
+-			InterruptsLocker locker;
+-			misc = (misc & ~fields) | enable;
+-		}
+-		for (size_t i = 0; i < B_COUNT_OF(pin.functions); i++) {
+-			const MuxBit& mux = pin.functions[i];
+-			if (mux.function != NULL) {
+-				_Set(kMuxOffset, mux.word, mux.bit,
+-					strncmp(mux.function, "PWM", 3) == 0);
++	// a channel for each edge type: [0] rising, [1] falling
++	EdgeRecorder& recorder = fRecorders[index];
++	uint8 channels[2] = { kNoChannel, kNoChannel };
++	{
++		InterruptsSpinLocker locker(fEdgeLock);
++		uint32 next = 0;
++		for (uint32 type = 0; type < 2; type++) {
++			if ((edges & (1u << type)) == 0)
++				continue;
++			while (next < kChannelCount && fChannels[next].used)
++				next++;
++			if (next == kChannelCount) {
++				if (channels[0] != kNoChannel)
++					fChannels[channels[0]].used = false;
++				return B_BUSY;
+ 			}
++			channels[type] = next;
++			fChannels[next].used = true;
++			fChannels[next].index = index;
++			fChannels[next].edge = 1u << type;
+ 		}
++		recorder.owner = cookie;
++		recorder.edges = edges;
++		recorder.channels[0] = channels[0];
++		recorder.channels[1] = channels[1];
++		recorder.settling = true;
++		recorder.first = recorder.count = recorder.missed = 0;
+ 	}
+-	fPwmActive[index] = true;
+-	fPwmDuty[index] = duty;
++
++	for (uint32 type = 0; type < 2; type++) {
++		if (channels[type] == kNoChannel)
++			continue;
++		int32 vector = kFirstChannelVector + channels[type];
++		arch_int_configure_io_interrupt(vector, B_EDGE_TRIGGERED,
++			B_RISING_EDGE_POLARITY);
++		status_t status = install_io_interrupt_handler(vector,
++			&_EdgeInterrupt, &fChannels[channels[type]], 0);
++		if (status != B_OK) {
++			_StopEdges(index);
++			return status;
++		}
++	}
++
++	const meson_header_pin* pin = gHeader->pin_at(index);
++	uint32 input = kFirstInput[pin->bank] + pin->offset;
++	{
++		InterruptsSpinLocker locker(fEdgeLock);
++		for (uint32 type = 0; type < 2; type++) {
++			if (channels[type] != kNoChannel)
++				_SetChannel(channels[type], input, type == 1);
++		}
++	}
++	spin(kEdgeSettle);
++	InterruptsSpinLocker locker(fEdgeLock);
++	recorder.first = recorder.count = recorder.missed = 0;
++	recorder.settling = false;
+ 	return B_OK;
+ }
+ 
+ 
++/*!	Stops recording a pin's edges: its channels are parked and free again,
++	and whoever waits for one gets B_CANCELED.
++*/
++void
++MesonGpio::_StopEdges(uint32 index)
++{
++	EdgeRecorder& recorder = fRecorders[index];
++	uint8 channels[2];
++	{
++		InterruptsSpinLocker locker(fEdgeLock);
++		if (recorder.edges == 0)
++			return;
++		for (uint32 type = 0; type < 2; type++) {
++			channels[type] = recorder.channels[type];
++			if (channels[type] != kNoChannel)
++				_SetChannel(channels[type], kNoInput, false);
++			recorder.channels[type] = kNoChannel;
++		}
++		recorder.owner = NULL;
++		recorder.edges = 0;
++		recorder.count = 0;
++		recorder.condition.NotifyAll(B_CANCELED);
++	}
++	for (uint32 type = 0; type < 2; type++) {
++		if (channels[type] == kNoChannel)
++			continue;
++		remove_io_interrupt_handler(kFirstChannelVector + channels[type],
++			&_EdgeInterrupt, &fChannels[channels[type]]);
++		InterruptsSpinLocker locker(fEdgeLock);
++		fChannels[channels[type]].used = false;
++	}
++}
++
++
++/*!	The oldest recorded edge of one of the file's pins, waiting for one
++	\a edge.timeout long. Without fLock: the file's other calls go on.
++*/
+ status_t
+-MesonGpio::_Claim(gpio_cookie* cookie, const meson_gpio_pins& pins)
++MesonGpio::_WaitEdge(gpio_cookie* cookie, meson_gpio_edge& edge)
+ {
+-	if (cookie->count != 0 || pins.count == 0
+-		|| pins.count > B_COUNT_OF(pins.pins)) {
+-		return B_BAD_VALUE;
++	uint32 index;
++	{
++		MutexLocker locker(fLock);
++		if (edge.bit >= cookie->count)
++			return B_BAD_VALUE;
++		index = cookie->pins[edge.bit];
+ 	}
+-	uint8 indexes[B_COUNT_OF(pins.pins)];
+-	for (uint32 i = 0; i < pins.count; i++) {
+-		ssize_t index = -1;
+-		for (size_t j = 0; j < kPinCount; j++) {
+-			if (kPins[j].pin == pins.pins[i])
+-				index = j;
+-		}
+-		if (index < 0)
+-			return B_ENTRY_NOT_FOUND;
+-		for (uint32 j = 0; j < i; j++) {
+-			if (indexes[j] == index)
+-				return B_BAD_VALUE;
+-		}
+-		const char* function = _Function(kPins[index]);
+-		if (fOwner[index] != NULL || (kPins[index].i2c && function != NULL
+-				&& strncmp(function, "I2C", 3) == 0)) {
+-			return B_BUSY;
++	bool forever = edge.timeout == B_INFINITE_TIMEOUT;
++	bigtime_t deadline = forever ? 0
++		: system_time() + max_c(edge.timeout, (bigtime_t)0);
++
++	EdgeRecorder& recorder = fRecorders[index];
++	InterruptsSpinLocker locker(fEdgeLock);
++	bool waited = false;
++	while (true) {
++		if (recorder.owner != cookie || recorder.edges == 0)
++			return waited ? B_CANCELED : B_NOT_ALLOWED;
++		if (recorder.count > 0 && !recorder.settling) {
++			const EdgeEvent& event = recorder.queue[recorder.first];
++			edge.edge = event.edge;
++			edge.level = event.level;
++			edge.when = event.when;
++			edge.missed = recorder.missed;
++			recorder.missed = 0;
++			recorder.first = (recorder.first + 1) % kEdgeQueueSize;
++			recorder.count--;
++			return B_OK;
+ 		}
+-		indexes[i] = index;
++		if (!forever && system_time() >= deadline)
++			return B_TIMED_OUT;
++
++		ConditionVariableEntry entry;
++		recorder.condition.Add(&entry);
++		locker.Unlock();
++		status_t status = entry.Wait(
++			forever ? B_CAN_INTERRUPT : B_CAN_INTERRUPT | B_ABSOLUTE_TIMEOUT,
++			deadline);
++		locker.Lock();
++		waited = true;
++		if (status == B_INTERRUPTED)
++			return status;
+ 	}
+-	for (uint32 i = 0; i < pins.count; i++) {
+-		// for "release", once the program is done
+-		_Save(indexes[i]);
+-		fOwner[indexes[i]] = cookie;
+-		cookie->pins[i] = indexes[i];
++}
++
++
++/*!	A channel's edge: when, and the pin's level just after it. When the
++	queue is full the oldest edge goes, counted as missed.
++*/
++/*static*/ int32
++MesonGpio::_EdgeInterrupt(void* data)
++{
++	EdgeChannel* channel = (EdgeChannel*)data;
++	MesonGpio* gpio = channel->gpio;
++	bigtime_t when = system_time();
++
++	SpinLocker locker(gpio->fEdgeLock);
++	if (!channel->used)
++		return B_HANDLED_INTERRUPT;
++	EdgeRecorder& recorder = gpio->fRecorders[channel->index];
++	if (recorder.edges == 0 || recorder.settling)
++		return B_HANDLED_INTERRUPT;
++	if (recorder.count == kEdgeQueueSize) {
++		recorder.first = (recorder.first + 1) % kEdgeQueueSize;
++		recorder.count--;
++		recorder.missed++;
+ 	}
+-	cookie->count = pins.count;
+-	return B_OK;
++	EdgeEvent& event = recorder.queue[(recorder.first + recorder.count)
++		% kEdgeQueueSize];
++	event.when = when;
++	event.edge = channel->edge;
++	event.level = gpio->_Level(channel->index);
++	recorder.count++;
++	recorder.condition.NotifyAll();
++	return B_INVOKE_SCHEDULER;
+ }
+ 
+ 
+@@ -611,6 +966,16 @@ status_t
+ MesonGpio::Control(gpio_cookie* cookie, uint32 op, void* buffer,
+ 	size_t length)
+ {
++	if (op == MESON_GPIO_WAIT_EDGE) {
++		meson_gpio_edge edge;
++		if (user_memcpy(&edge, buffer, sizeof(edge)) != B_OK)
++			return B_BAD_ADDRESS;
++		status_t status = _WaitEdge(cookie, edge);
++		if (status != B_OK)
++			return status;
++		return user_memcpy(buffer, &edge, sizeof(edge));
++	}
++
+ 	MutexLocker locker(fLock);
+ 	switch (op) {
+ 		case MESON_GPIO_CLAIM:
+@@ -636,23 +1001,39 @@ MesonGpio::Control(gpio_cookie* cookie, uint32 op, void* buffer,
+ 		{
+ 			uint32 bits = 0;
+ 			for (uint32 i = 0; i < cookie->count; i++) {
+-				const HeaderPin& pin = kPins[cookie->pins[i]];
+-				const Bank& bank = kBanks[pin.bank];
+-				bool set;
+-				if (op == MESON_GPIO_READ) {
+-					set = _Get(kGpioOffset, bank.inputWord,
+-						bank.inputBit + pin.offset);
+-				} else {
+-					set = _Function(pin) == NULL
+-						&& !_Get(kGpioOffset, bank.directionWord,
+-							bank.directionBit + pin.offset);
+-				}
++				uint32 index = cookie->pins[i];
++				bool set = op == MESON_GPIO_READ ? _Level(index)
++					: gHeader->selected(index) == NULL && !_Input(index);
+ 				if (set)
+ 					bits |= 1u << i;
+ 			}
+ 			return user_memcpy(buffer, &bits, sizeof(bits));
+ 		}
+ 
++		case MESON_GPIO_WRITE:
++		{
++			uint32 levels;
++			if (user_memcpy(&levels, buffer, sizeof(levels)) != B_OK)
++				return B_BAD_ADDRESS;
++			for (uint32 i = 0; i < cookie->count; i++)
++				_SetOutputLevel(cookie->pins[i], (levels >> i) & 1);
++			return B_OK;
++		}
++
++		case MESON_GPIO_SET_PULL:
++		{
++			meson_gpio_pull pull;
++			if (user_memcpy(&pull, buffer, sizeof(pull)) != B_OK)
++				return B_BAD_ADDRESS;
++			if (pull.pull > MESON_GPIO_PULL_UP)
++				return B_BAD_VALUE;
++			for (uint32 i = 0; i < cookie->count; i++) {
++				if ((pull.bits >> i) & 1)
++					_SetPull(cookie->pins[i], pull.pull);
++			}
++			return B_OK;
++		}
++
+ 		case MESON_GPIO_SET_PWM:
+ 		case MESON_GPIO_GET_PWM:
+ 		{
+@@ -661,45 +1042,90 @@ MesonGpio::Control(gpio_cookie* cookie, uint32 op, void* buffer,
+ 				return B_BAD_ADDRESS;
+ 			if (pwm.bit >= cookie->count)
+ 				return B_BAD_VALUE;
+-			size_t index = cookie->pins[pwm.bit];
+-			if (op == MESON_GPIO_SET_PWM)
+-				return _SetPwm(index, pwm.duty);
++			uint32 index = cookie->pins[pwm.bit];
++			if (op == MESON_GPIO_SET_PWM) {
++				if (pwm.duty > 255)
++					return B_BAD_VALUE;
++				return _SetPwm(index, 1, kDutyPeriod, pwm.duty);
++			}
+ 			if (_PwmPin(index) == NULL)
+ 				return B_NOT_SUPPORTED;
+-			pwm.duty = fPwmDuty[index];
++			pwm.duty = fPwm[index].duty;
+ 			return user_memcpy(buffer, &pwm, sizeof(pwm));
+ 		}
+ 
+-		case MESON_GPIO_WRITE:
++		case MESON_GPIO_SET_PWM_PERIOD:
++		case MESON_GPIO_GET_PWM_PERIOD:
+ 		{
+-			uint32 levels;
+-			if (user_memcpy(&levels, buffer, sizeof(levels)) != B_OK)
++			meson_gpio_pwm_period period;
++			if (user_memcpy(&period, buffer, sizeof(period)) != B_OK)
+ 				return B_BAD_ADDRESS;
+-			for (uint32 i = 0; i < cookie->count; i++) {
+-				const HeaderPin& pin = kPins[cookie->pins[i]];
+-				const Bank& bank = kBanks[pin.bank];
+-				_Set(kGpioOffset, bank.outputWord, bank.outputBit + pin.offset,
+-					(levels >> i) & 1);
++			if (period.bit >= cookie->count)
++				return B_BAD_VALUE;
++			uint32 index = cookie->pins[period.bit];
++			if (_PwmPin(index) == NULL)
++				return B_NOT_SUPPORTED;
++			if (op == MESON_GPIO_SET_PWM_PERIOD) {
++				status_t status = _SetPwmPeriod(index, period.period,
++					period.high);
++				if (status != B_OK)
++					return status;
+ 			}
+-			return B_OK;
++			period.period = fPwm[index].period;
++			period.high = fPwm[index].high;
++			return user_memcpy(buffer, &period, sizeof(period));
++		}
++
++		case MESON_GPIO_SET_EDGES:
++		{
++			meson_gpio_edges edges;
++			if (user_memcpy(&edges, buffer, sizeof(edges)) != B_OK)
++				return B_BAD_ADDRESS;
++			if (edges.bit >= cookie->count)
++				return B_BAD_VALUE;
++			return _SetEdges(cookie, cookie->pins[edges.bit], edges.edges);
++		}
++
++		case MESON_GPIO_GET_PIN_INFO:
++		{
++			meson_gpio_pin_info info;
++			if (user_memcpy(&info, buffer, sizeof(info)) != B_OK)
++				return B_BAD_ADDRESS;
++			status_t status = _PinInfo(info);
++			if (status != B_OK)
++				return status;
++			return user_memcpy(buffer, &info, sizeof(info));
+ 		}
+ 	}
+ 	return B_DEV_INVALID_IOCTL;
+ }
+ 
+ 
+-/*!	The file is closed: its GPIO pins become inputs, its PWM outputs stay,
+-	and the pins are free again.
++/*!	The file is closed, but calls may still be under way: waits for edges
++	end (B_CANCELED).
++*/
++void
++MesonGpio::Close(gpio_cookie* cookie)
++{
++	MutexLocker locker(fLock);
++	for (uint32 i = 0; i < cookie->count; i++)
++		_StopEdges(cookie->pins[i]);
++}
++
++
++/*!	The file's calls are done: its GPIO pins become inputs, its PWM outputs
++	stay, and the pins are free again.
+ */
+ void
+ MesonGpio::Free(gpio_cookie* cookie)
+ {
+ 	MutexLocker locker(fLock);
+ 	for (uint32 i = 0; i < cookie->count; i++) {
+-		size_t index = cookie->pins[i];
+-		if (!fPwmActive[index] && _Function(kPins[index]) == NULL)
++		uint32 index = cookie->pins[i];
++		_StopEdges(index);
++		if (!fPwm[index].active)
+ 			_SetDirection(index, false);
+-		fOwner[index] = NULL;
++		gHeader->release(index, cookie);
+ 	}
+ 	cookie->count = 0;
+ }
+@@ -730,29 +1156,33 @@ MesonGpio::Write(const char* buffer, size_t length)
+ status_t
+ MesonGpio::Read(off_t position, char* buffer, size_t* _length)
+ {
+-	char text[2048];
++	char text[3072];
+ 	size_t length = snprintf(text, sizeof(text),
+-		"pin  gpio       function  dir  level  pull\n");
++		"pin  gpio       function  dir  level  pull  user\n");
+ 
+ 	MutexLocker locker(fLock);
+-	for (size_t i = 0; i < kPinCount && length < sizeof(text); i++) {
+-		const HeaderPin& pin = kPins[i];
+-		const Bank& bank = kBanks[pin.bank];
+-		char name[16];
+-		_Name(pin, name, sizeof(name));
+-		const char* function = _Function(pin);
+-		bool input = _Get(kGpioOffset, bank.directionWord,
+-			bank.directionBit + pin.offset);
+-		bool level = _Get(kGpioOffset, bank.inputWord,
+-			bank.inputBit + pin.offset);
+-		bool pullEnable = _Get(kPullEnableOffset, bank.pullEnableWord,
+-			bank.pullEnableBit + pin.offset);
+-		bool pullUp = _Get(kPullOffset, bank.pullWord,
+-			bank.pullBit + pin.offset);
++	for (uint32 i = 0; i < fPinCount && length < sizeof(text); i++) {
++		meson_gpio_pin_info info;
++		info.index = i;
++		if (_PinInfo(info) != B_OK
++			|| (info.flags & MESON_GPIO_PIN_GPIO) == 0) {
++			continue;
++		}
++		char user[48] = "-";
++		if (info.use[0] != '\0') {
++			if (info.team >= 0 && strcmp(info.use, "program") == 0)
++				snprintf(user, sizeof(user), "team %" B_PRId32, info.team);
++			else
++				strlcpy(user, info.use, sizeof(user));
++		}
++		const char* pull = (info.flags & MESON_GPIO_PIN_PULL_UP) != 0 ? "up"
++			: (info.flags & MESON_GPIO_PIN_PULL_DOWN) != 0 ? "down" : "none";
+ 		length += snprintf(text + length, sizeof(text) - length,
+-			"%3u  %-9s  %-8s  %-3s  %-5d  %s\n", pin.pin, name,
+-			function != NULL ? function : "gpio", input ? "in" : "out",
+-			level ? 1 : 0, pullEnable ? (pullUp ? "up" : "down") : "none");
++			"%3" B_PRIu32 "  %-9s  %-8s  %-3s  %-5d  %-4s  %s\n", info.pin,
++			info.pad, strcmp(info.function, "GPIO") == 0 ? "gpio"
++				: info.function,
++			(info.flags & MESON_GPIO_PIN_OUTPUT) != 0 ? "out" : "in",
++			(info.flags & MESON_GPIO_PIN_LEVEL) != 0 ? 1 : 0, pull, user);
+ 	}
+ 	locker.Unlock();
+ 	if (length > sizeof(text) - 1)
+@@ -868,8 +1298,10 @@ device_open(void* deviceCookie, const char* path, int openMode,
+ 
+ 
+ static status_t
+-device_close(void* cookie)
++device_close(void* _cookie)
+ {
++	gpio_cookie* cookie = (gpio_cookie*)_cookie;
++	cookie->gpio->Close(cookie);
+ 	return B_OK;
+ }
+ 
+@@ -914,6 +1346,7 @@ device_control(void* _cookie, uint32 op, void* buffer, size_t length)
+ 
+ module_dependency module_dependencies[] = {
+ 	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&gDeviceManager },
++	{ MESON_HEADER_MODULE_NAME, (module_info**)&gHeader },
+ 	{}
+ };
+ 

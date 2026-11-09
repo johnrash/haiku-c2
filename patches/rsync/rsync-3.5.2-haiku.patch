@@ -1,0 +1,42 @@
+From HaikuPorts' rsync-3.2.7.patchset (Jerome Duval, "Haiku patch"),
+carried forward to 3.5.2 without its testsuite hunk: libnetwork and
+libbsd, Linux-style xattrs for Haiku's attributes, no device numbers.
+
+--- a/configure.ac
++++ b/configure.ac
+@@ -786,6 +786,9 @@
+ fi
+ 
+ AC_SEARCH_LIBS(inet_ntop, resolv)
++AC_SEARCH_LIBS(socket, network)
++AC_SEARCH_LIBS(getpass, bsd)
++AC_SEARCH_LIBS(getxattr, gnu)
+ 
+ # For OS X, Solaris, HP-UX, etc.: figure out if -liconv is needed.  We'll
+ # accept either iconv_open or libiconv_open, since some include files map
+@@ -1484,6 +1487,12 @@
+ 	AC_DEFINE(SUPPORT_XATTRS, 1)
+ 	AC_DEFINE(NO_SYMLINK_XATTRS, 1, [True if symlinks do not support xattrs])
+ 	;;
++    *haiku*)
++	AC_MSG_RESULT(Using Linux xattrs)
++	AC_DEFINE(HAVE_LINUX_XATTRS, 1, [True if you have Linux xattrs])
++	AC_DEFINE(SUPPORT_XATTRS, 1)
++	AC_DEFINE(NO_DEVICE_XATTRS, 1, [True if device files do not support xattrs])
++	;;
+     *)
+ 	if test x"$enable_xattr_support" = x"yes"; then
+ 	    AC_MSG_ERROR(Failed to find extended attribute support)
+--- a/rsync.h
++++ b/rsync.h
+@@ -544,7 +544,9 @@
+ #define MAKEDEV(devmajor,devminor) makedev(0,devmajor,devminor)
+ #else
+ #ifndef __TANDEM
+-#define MAKEDEV(devmajor,devminor) makedev(devmajor,devminor)
++#define MAKEDEV(devmajor,devminor) ((dev_t)0)
++#define major(dev) (0)
++#define minor(dev) (0)
+ #else
+ # define major DEV_TO_MAJOR
+ # define minor DEV_TO_MINOR

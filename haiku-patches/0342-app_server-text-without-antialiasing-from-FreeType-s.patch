@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 8 Nov 2026 17:46:26 -0500
+Subject: [PATCH 342/342] app_server: text without antialiasing from FreeType's
+ monochrome glyphs
+
+B_DISABLE_ANTIALIASING sent glyphs down the outline path, drawn by AGG
+with a coverage threshold: unhinted, it lost strokes (Terminal's
+Courier Prime), and a font's own bitmaps have no outline, so Terminus
+TTF at its bitmap sizes (12 to 32) drew nothing. Such text now uses
+glyph_ren_native_mono: loaded with FT_LOAD_TARGET_MONO, rendered by
+FreeType in FT_RENDER_MODE_MONO, kept as gray8 with every pixel fully
+on or off so that the text renderer draws it in the view's colour and
+drawing mode (the binary renderer has no colour set up). Rotated,
+sheared and false-bold text still takes the outlines.
+
+The gray8 path also read a font's one-bit bitmaps as eight-bit gray;
+both now go through _DecomposeBitmapToGray8(), which knows the pixel
+mode.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/servers/app/font/FontCacheEntry.cpp | 21 +++++----
+ src/servers/app/font/FontEngine.cpp     | 60 ++++++++++++++++---------
+ src/servers/app/font/FontEngine.h       |  1 +
+ 3 files changed, 51 insertions(+), 31 deletions(-)
+
+diff --git a/src/servers/app/font/FontCacheEntry.cpp b/src/servers/app/font/FontCacheEntry.cpp
+index 3a1704ddba..d232aeb5b2 100644
+--- a/src/servers/app/font/FontCacheEntry.cpp
++++ b/src/servers/app/font/FontCacheEntry.cpp
+@@ -454,16 +454,19 @@ FontCacheEntry::UpdateUsage()
+ /*static*/ glyph_rendering
+ FontCacheEntry::_RenderTypeFor(const ServerFont& font, bool forceVector)
+ {
+-	glyph_rendering renderingType = gSubpixelAntialiasing ?
+-		glyph_ren_subpix : glyph_ren_native_gray8;
+-
+ 	if (forceVector || font.Rotation() != 0.0 || font.Shear() != 90.0
+-		|| font.FalseBoldWidth() != 0.0
+-		|| (font.Flags() & B_DISABLE_ANTIALIASING) != 0
+-		|| font.Size() > 30
+-		|| !font.Hinting()) {
+-		renderingType = glyph_ren_outline;
++		|| font.FalseBoldWidth() != 0.0) {
++		return glyph_ren_outline;
+ 	}
+ 
+-	return renderingType;
++	// Without antialiasing, FreeType's monochrome glyphs: hinted for that,
++	// and a font's own bitmaps where it has them (outlines drawn without
++	// antialiasing lost strokes, and a font's bitmaps have no outline).
++	if ((font.Flags() & B_DISABLE_ANTIALIASING) != 0)
++		return glyph_ren_native_mono;
++
++	if (font.Size() > 30 || !font.Hinting())
++		return glyph_ren_outline;
++
++	return gSubpixelAntialiasing ? glyph_ren_subpix : glyph_ren_native_gray8;
+ }
+diff --git a/src/servers/app/font/FontEngine.cpp b/src/servers/app/font/FontEngine.cpp
+index 3833416f94..492805910b 100644
+--- a/src/servers/app/font/FontEngine.cpp
++++ b/src/servers/app/font/FontEngine.cpp
+@@ -631,8 +631,12 @@ bool
+ FontEngine::PrepareGlyph(uint32 glyphIndex)
+ {
+ 	FT_Int32 loadFlags = fHinting ? FT_LOAD_DEFAULT : FT_LOAD_NO_HINTING;
+-	loadFlags |= fGlyphRendering == glyph_ren_subpix ?
+-		FT_LOAD_TARGET_LCD : FT_LOAD_TARGET_NORMAL;
++	if (fGlyphRendering == glyph_ren_subpix)
++		loadFlags |= FT_LOAD_TARGET_LCD;
++	else if (fGlyphRendering == glyph_ren_native_mono)
++		loadFlags |= FT_LOAD_TARGET_MONO;
++	else
++		loadFlags |= FT_LOAD_TARGET_NORMAL;
+ 	if (FT_HAS_COLOR(fFace))
+ 		loadFlags |= FT_LOAD_COLOR;
+ 
+@@ -668,18 +672,13 @@ FontEngine::PrepareGlyph(uint32 glyphIndex)
+ 
+ 	switch(fGlyphRendering) {
+ 		case glyph_ren_native_mono:
++			// Text without antialiasing: FreeType's own monochrome glyphs,
++			// hinted for that, or the font's bitmaps where it has them.
++			// They're kept as gray8 with every pixel fully on or off, which
++			// the text renderer draws in the view's colour and drawing mode.
+ 			fLastError = FT_Render_Glyph(fFace->glyph, FT_RENDER_MODE_MONO);
+ 			if (fLastError == 0) {
+-				decompose_ft_bitmap_mono(fFace->glyph->bitmap,
+-					fFace->glyph->bitmap_left, kFlipY ?
+-					-fFace->glyph->bitmap_top : fFace->glyph->bitmap_top,
+-					kFlipY, fScanlineBin, fScanlineStorageBin);
+-				fBounds.x1 = fScanlineStorageBin.min_x();
+-				fBounds.y1 = fScanlineStorageBin.min_y();
+-				fBounds.x2 = fScanlineStorageBin.max_x();
+-				fBounds.y2 = fScanlineStorageBin.max_y();
+-				fDataSize = fScanlineStorageBin.byte_size();
+-				fDataType = glyph_data_mono;
++				_DecomposeBitmapToGray8();
+ 				return true;
+ 			}
+ 			break;
+@@ -693,16 +692,7 @@ FontEngine::PrepareGlyph(uint32 glyphIndex)
+ 				return _PrepareColorGlyph(1.0);
+ 			}
+ 			if (fLastError == 0) {
+-				decompose_ft_bitmap_gray8(fFace->glyph->bitmap,
+-					fFace->glyph->bitmap_left, kFlipY ?
+-					-fFace->glyph->bitmap_top : fFace->glyph->bitmap_top,
+-					kFlipY, fScanlineAA, fScanlineStorageAA);
+-				fBounds.x1 = fScanlineStorageAA.min_x();
+-				fBounds.y1 = fScanlineStorageAA.min_y();
+-				fBounds.x2 = fScanlineStorageAA.max_x();
+-				fBounds.y2 = fScanlineStorageAA.max_y();
+-				fDataSize = fScanlineStorageAA.byte_size();
+-				fDataType = glyph_data_gray8;
++				_DecomposeBitmapToGray8();
+ 				return true;
+ 			}
+ 			break;
+@@ -743,6 +733,32 @@ FontEngine::PrepareGlyph(uint32 glyphIndex)
+ 	return false;
+ }
+ 
++/*!	The rendered glyph's bitmap as gray8 scanlines: a font's own one-bit
++	bitmaps (embedded strikes, which FreeType hands back as they are, in
++	any render mode) and FreeType's monochrome glyphs with every pixel fully
++	on, the others as their gray levels.
++*/
++void
++FontEngine::_DecomposeBitmapToGray8()
++{
++	const FT_Bitmap& bitmap = fFace->glyph->bitmap;
++	int top = kFlipY ? -fFace->glyph->bitmap_top : fFace->glyph->bitmap_top;
++	if (bitmap.pixel_mode == FT_PIXEL_MODE_MONO) {
++		decompose_ft_bitmap_mono(bitmap, fFace->glyph->bitmap_left, top,
++			kFlipY, fScanlineAA, fScanlineStorageAA);
++	} else {
++		decompose_ft_bitmap_gray8(bitmap, fFace->glyph->bitmap_left, top,
++			kFlipY, fScanlineAA, fScanlineStorageAA);
++	}
++	fBounds.x1 = fScanlineStorageAA.min_x();
++	fBounds.y1 = fScanlineStorageAA.min_y();
++	fBounds.x2 = fScanlineStorageAA.max_x();
++	fBounds.y2 = fScanlineStorageAA.max_y();
++	fDataSize = fScanlineStorageAA.byte_size();
++	fDataType = glyph_data_gray8;
++}
++
++
+ // #pragma mark -
+ 
+ // WriteGlyphTo
+diff --git a/src/servers/app/font/FontEngine.h b/src/servers/app/font/FontEngine.h
+index f9af04b615..9024da2916 100644
+--- a/src/servers/app/font/FontEngine.h
++++ b/src/servers/app/font/FontEngine.h
+@@ -132,6 +132,7 @@ class FontEngine {
+ 			const FontEngine&	operator=(const FontEngine&);
+ 
+ 			bool				_PrepareColorGlyph(double scale);
++			void				_DecomposeBitmapToGray8();
+ 
+ 			int					fLastError;
+ 			bool				fLibraryInitialized;

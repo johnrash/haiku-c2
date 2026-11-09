@@ -1,0 +1,156 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 09:10:39 -0400
+Subject: [PATCH 165/342] Remote Control add-on: receivers published after the
+ input_server starts
+
+meson_ir is probed on demand and may publish its device after the
+input_server has loaded its add-ons; the add-on watches
+/dev/input/remote, as the keyboard add-on watches its directory.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../remote_control/RemoteControlDevice.cpp    | 92 ++++++++++++-------
+ .../remote_control/RemoteControlDevice.h      |  2 +
+ 2 files changed, 61 insertions(+), 33 deletions(-)
+
+diff --git a/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.cpp b/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.cpp
+index 46c1a81548..1c7fb7d1ba 100644
+--- a/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.cpp
++++ b/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.cpp
+@@ -32,6 +32,7 @@
+ #include <Path.h>
+ 
+ #include <AutoDeleter.h>
++#include <NodeMonitor.h>
+ 
+ 
+ using RemoteControl::Button;
+@@ -195,6 +196,10 @@ RemoteControlDevice::RemoteControlDevice()
+ 	fProfiles(10)
+ {
+ 	fKeymap.SetToCurrent();
++	_LoadProfiles();
++	// receivers can be published after the input_server starts
++	StartMonitoringDevice(kRemoteDirectory);
++	_ScanDevices(kRemoteDirectory);
+ }
+ 
+ 
+@@ -207,42 +212,47 @@ RemoteControlDevice::~RemoteControlDevice()
+ status_t
+ RemoteControlDevice::InitCheck()
+ {
+-	// /dev/input/remote/<driver>/<n>
+-	BDirectory remotes(kRemoteDirectory);
+-	if (remotes.InitCheck() != B_OK)
+-		return B_ERROR;
+-
+-	BEntry driverEntry;
+-	while (remotes.GetNextEntry(&driverEntry) == B_OK) {
+-		BDirectory driver(&driverEntry);
+-		BEntry entry;
+-		while (driver.InitCheck() == B_OK
+-			&& driver.GetNextEntry(&entry) == B_OK) {
+-			BPath path;
+-			if (entry.GetPath(&path) != B_OK)
+-				continue;
+-			BString name(RemoteControl::kDeviceName);
+-			if (fReceivers.CountItems() > 0)
+-				name << " " << fReceivers.CountItems() + 1;
+-			RemoteReceiver* receiver = new(std::nothrow) RemoteReceiver(this,
+-				path.Path(), name.String());
+-			if (receiver == NULL || !fReceivers.AddItem(receiver))
+-				delete receiver;
+-		}
++	return BInputServerDevice::InitCheck();
++}
++
++
++/*!	/dev/input/remote/<driver>/<n> */
++void
++RemoteControlDevice::_ScanDevices(const char* directory)
++{
++	BDirectory dir(directory);
++	BEntry entry;
++	while (dir.GetNextEntry(&entry) == B_OK) {
++		BPath path;
++		if (entry.GetPath(&path) != B_OK)
++			continue;
++		if (entry.IsDirectory())
++			_ScanDevices(path.Path());
++		else
++			_AddDevice(path.Path());
+ 	}
+-	if (fReceivers.IsEmpty())
+-		return B_ERROR;
++}
+ 
+-	input_device_ref** refs = new(std::nothrow)
+-		input_device_ref*[fReceivers.CountItems() + 1];
+-	if (refs == NULL)
+-		return B_NO_MEMORY;
+-	ArrayDeleter<input_device_ref*> refsDeleter(refs);
+-	for (int32 i = 0; i < fReceivers.CountItems(); i++)
+-		refs[i] = fReceivers.ItemAt(i)->Ref();
+-	refs[fReceivers.CountItems()] = NULL;
+ 
+-	_LoadProfiles();
++status_t
++RemoteControlDevice::_AddDevice(const char* path)
++{
++	BAutolock locker(fLock);
++	for (int32 i = 0; i < fReceivers.CountItems(); i++) {
++		if (fReceivers.ItemAt(i)->fPath == path)
++			return B_OK;
++	}
++	BString name(RemoteControl::kDeviceName);
++	if (fReceivers.CountItems() > 0)
++		name << " " << fReceivers.CountItems() + 1;
++	RemoteReceiver* receiver = new(std::nothrow) RemoteReceiver(this, path,
++		name.String());
++	if (receiver == NULL || !fReceivers.AddItem(receiver)) {
++		delete receiver;
++		return B_NO_MEMORY;
++	}
++	input_device_ref* refs[2] = { receiver->Ref(), NULL };
++	locker.Unlock();
+ 	return RegisterDevices(refs);
+ }
+ 
+@@ -271,6 +281,22 @@ RemoteControlDevice::Control(const char* name, void* cookie, uint32 command,
+ 	(void)name;
+ 	(void)cookie;
+ 	switch (command) {
++		case B_NODE_MONITOR:
++		{
++			int32 opcode;
++			const char* path;
++			if (message != NULL && message->FindInt32("opcode", &opcode) == B_OK
++				&& opcode == B_ENTRY_CREATED
++				&& message->FindString("path", &path) == B_OK) {
++				BEntry entry(path);
++				if (entry.IsDirectory())
++					_ScanDevices(path);
++				else
++					_AddDevice(path);
++			}
++			return B_OK;
++		}
++
+ 		case B_KEY_MAP_CHANGED:
+ 		{
+ 			BAutolock locker(fLock);
+diff --git a/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.h b/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.h
+index 28f0319e5f..c6301dcde3 100644
+--- a/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.h
++++ b/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.h
+@@ -41,6 +41,8 @@ private:
+ 	friend class RemoteReceiver;
+ 
+ 			void				_LoadProfiles();
++			void				_ScanDevices(const char* directory);
++			status_t			_AddDevice(const char* path);
+ 			void				_KeyMessage(uint32 key, uint32 modifiers,
+ 									bool down, int32 repeat);
+ 			void				_ModifiersMessage(uint32 oldModifiers,

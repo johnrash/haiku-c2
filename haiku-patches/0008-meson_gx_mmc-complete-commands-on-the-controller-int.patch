@@ -1,0 +1,266 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 00:46:57 -0400
+Subject: [PATCH 008/342] meson_gx_mmc: complete commands on the controller
+ interrupt
+
+Enable the controller IRQ (GIC SPI 218 for sd_emmc_c) for end-of-chain and
+all error/timeout status bits; the handler collects and clears them and
+wakes the issuing thread through a condition variable. Polling remains as
+fallback when no interrupt is available (or MESON_GX_MMC_FORCE_POLLING).
+
+On the ODROID-C2 eMMC (25 MHz, 4-bit) raw reads run at 11.7 MB/s either
+way; the bus is the limit for large transfers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/busses/mmc/meson_gx_mmc.cpp        | 152 ++++++++++++++----
+ 1 file changed, 119 insertions(+), 33 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp b/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
+index e23d928066..b182be9860 100644
+--- a/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
++++ b/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
+@@ -10,7 +10,8 @@
+  * needed for the ODROID-C2's eMMC.
+  *
+  * This first version is deliberately simple:
+- * - completion is polled, interrupts stay disabled;
++ * - completion is signalled by the controller interrupt (polling is the
++ *   fallback when no interrupt is available);
+  * - every command is a single descriptor written straight into the CMD_*
+  *   registers (writing CMD_ARG starts it), data goes by DMA from one
+  *   contiguous buffer, multi-block transfers are ended with CMD12;
+@@ -33,6 +34,7 @@
+ 
+ #include <AutoDeleterDrivers.h>
+ #include <arch/arm64/arch_kernel.h>
++#include <condition_variable.h>
+ #include <lock.h>
+ #include <util/AutoLock.h>
+ 
+@@ -167,7 +169,8 @@ dcache_maintain(phys_addr_t physical, size_t length, bool invalidate)
+ class MesonMmc {
+ public:
+ 								MesonMmc(area_id area, volatile uint32* registers,
+-									phys_addr_t physicalBase, bool readOnly);
++									phys_addr_t physicalBase, int32 irq,
++									bool readOnly);
+ 								~MesonMmc();
+ 
+ 			void				Init();
+@@ -194,11 +197,21 @@ private:
+ 			status_t			_Execute(uint8 command, uint32 argument,
+ 									uint32* result, phys_addr_t data,
+ 									uint32 blockCount, bool write);
++			uint32				_WaitPolled(bigtime_t timeout);
++			uint32				_WaitInterrupt(ConditionVariableEntry& entry,
++									bigtime_t timeout);
++
++	static	int32				_InterruptHandler(void* data);
+ 
+ private:
+ 			area_id				fArea;
+ 			volatile uint32*	fRegisters;
+ 			phys_addr_t			fPhysicalBase;
++			int32				fIrq;
++			bool				fUseInterrupts;
++			ConditionVariable	fCommandDone;
++			int32				fIrqStatus;
++				// status bits collected by the interrupt handler
+ 			bool				fReadOnly;
+ 			mutex				fLock;
+ 			card_type			fCardType;
+@@ -208,22 +221,30 @@ private:
+ 
+ 
+ MesonMmc::MesonMmc(area_id area, volatile uint32* registers,
+-	phys_addr_t physicalBase, bool readOnly)
++	phys_addr_t physicalBase, int32 irq, bool readOnly)
+ 	:
+ 	fArea(area),
+ 	fRegisters(registers),
+ 	fPhysicalBase(physicalBase),
++	fIrq(irq),
++	fUseInterrupts(false),
++	fIrqStatus(0),
+ 	fReadOnly(readOnly),
+ 	fCardType(CARD_TYPE_UNKNOWN),
+ 	fAppCommand(false),
+ 	fScanSemaphore(-1)
+ {
+ 	mutex_init(&fLock, "meson_gx_mmc");
++	fCommandDone.Init(this, "meson_gx_mmc command");
+ }
+ 
+ 
+ MesonMmc::~MesonMmc()
+ {
++	if (fUseInterrupts) {
++		_Write(kIrqEnable, 0);
++		remove_io_interrupt_handler(fIrq, _InterruptHandler, this);
++	}
+ 	mutex_destroy(&fLock);
+ 	delete_area(fArea);
+ }
+@@ -244,10 +265,88 @@ MesonMmc::Init()
+ 		| (8 << CONFIG_RESP_TIMEOUT_SHIFT) | (9 << CONFIG_BLOCK_LEN_SHIFT)
+ 		| CONFIG_BUS_WIDTH_1);
+ 
++	if (fIrq > 0 && install_io_interrupt_handler(fIrq, _InterruptHandler, this,
++			0) == B_OK) {
++		fUseInterrupts = true;
++		_Write(kIrqEnable, STATUS_CLEAR_MASK);
++	}
++	INFO("%#" B_PRIxPHYSADDR ": %s\n", fPhysicalBase, fUseInterrupts
++		? "interrupt driven" : "polled (no interrupt)");
++
+ 	SetClock(400);
+ }
+ 
+ 
++/*static*/ int32
++MesonMmc::_InterruptHandler(void* data)
++{
++	MesonMmc* self = (MesonMmc*)data;
++	uint32 status = self->_Read(kStatus) & STATUS_CLEAR_MASK;
++	if (status == 0)
++		return B_UNHANDLED_INTERRUPT;
++
++	// The line is level triggered: clear what we saw, keep it for the
++	// waiting thread.
++	self->_Write(kStatus, status);
++	atomic_or(&self->fIrqStatus, status);
++	self->fCommandDone.NotifyAll();
++	return B_INVOKE_SCHEDULER;
++}
++
++
++uint32
++MesonMmc::_WaitPolled(bigtime_t timeout)
++{
++	bigtime_t deadline = system_time() + timeout;
++	uint32 status;
++	for (int32 round = 0; ; round++) {
++		status = _Read(kStatus);
++		if ((status & STATUS_DONE_MASK) != 0 || system_time() > deadline)
++			break;
++		if (round > 50)
++			snooze(10);
++		else
++			spin(1);
++	}
++
++	if ((status & STATUS_DONE_MASK) != 0
++		&& (status & STATUS_END_OF_CHAIN) == 0) {
++		// An error was flagged first; give the aborted descriptor a moment
++		// to finish before the next command is issued.
++		bigtime_t end = system_time() + 10000;
++		while ((_Read(kStatus) & STATUS_END_OF_CHAIN) == 0
++			&& system_time() < end) {
++			spin(10);
++		}
++	}
++	return status;
++}
++
++
++uint32
++MesonMmc::_WaitInterrupt(ConditionVariableEntry& entry, bigtime_t timeout)
++{
++	entry.Wait(B_RELATIVE_TIMEOUT, timeout);
++	uint32 status = atomic_get(&fIrqStatus);
++
++	if ((status & STATUS_DONE_MASK) != 0
++		&& (status & STATUS_END_OF_CHAIN) == 0) {
++		// error first: wait briefly for the end of the aborted descriptor
++		bigtime_t end = system_time() + 10000;
++		while ((atomic_get(&fIrqStatus) & STATUS_END_OF_CHAIN) == 0
++			&& system_time() < end) {
++			snooze(100);
++		}
++		status = atomic_get(&fIrqStatus);
++	}
++	if ((status & STATUS_DONE_MASK) == 0) {
++		// timed out, or the interrupt was lost: look at the hardware
++		status |= _Read(kStatus);
++	}
++	return status;
++}
++
++
+ status_t
+ MesonMmc::SetClock(uint32 kilohertz)
+ {
+@@ -402,6 +501,12 @@ MesonMmc::_Execute(uint8 command, uint32 argument, uint32* result,
+ 	if (blockCount > 0)
+ 		dcache_maintain(data, dataLength, !write);
+ 
++	ConditionVariableEntry entry;
++	if (fUseInterrupts) {
++		atomic_set(&fIrqStatus, 0);
++		fCommandDone.Add(&entry);
++	}
++
+ 	_Write(kStart, 0);
+ 	_Write(kStatus, STATUS_CLEAR_MASK);
+ 	_Write(kCommandConfig, config);
+@@ -411,38 +516,12 @@ MesonMmc::_Execute(uint8 command, uint32 argument, uint32* result,
+ 	_Write(kCommandArg, argument);
+ 		// starts the command
+ 
+-	bigtime_t started = system_time();
+-	bigtime_t deadline = started + timeout;
+-	uint32 status;
++	[[maybe_unused]] bigtime_t started = system_time();
+ 	TRACE("CMD%u arg %#" B_PRIx32 " %s %" B_PRIu32 " blocks at %#"
+ 		B_PRIxPHYSADDR " cfg %#" B_PRIx32 "\n", command, argument,
+ 		write ? "write" : "read", blockCount, data, config);
+-	for (int32 round = 0; ; round++) {
+-		status = _Read(kStatus);
+-		if ((status & STATUS_DONE_MASK) != 0)
+-			break;
+-		if (system_time() > deadline)
+-			break;
+-		if (round % 100000 == 99999) {
+-			TRACE("CMD%u still running, status %#" B_PRIx32 "\n", command,
+-				status);
+-		}
+-		if (round > 50)
+-			snooze(10);
+-		else
+-			spin(1);
+-	}
+-
+-	if ((status & STATUS_DONE_MASK) != 0
+-		&& (status & STATUS_END_OF_CHAIN) == 0) {
+-		// An error was flagged first; give the aborted descriptor a moment
+-		// to finish before the next command is issued.
+-		bigtime_t end = system_time() + 10000;
+-		while ((_Read(kStatus) & STATUS_END_OF_CHAIN) == 0
+-			&& system_time() < end) {
+-			spin(10);
+-		}
+-	}
++	uint32 status = fUseInterrupts
++		? _WaitInterrupt(entry, timeout) : _WaitPolled(timeout);
+ 	_Write(kStatus, STATUS_CLEAR_MASK);
+ 
+ 	TRACE("CMD%u done: status %#" B_PRIx32 " after %" B_PRIdBIGTIME
+@@ -804,8 +883,15 @@ init_driver(device_node* node, void** _cookie)
+ 	if (area < 0)
+ 		return area;
+ 
++	uint64 irq = 0;
++	if (!fdtModule->get_interrupt(fdtDevice, 0, NULL, &irq))
++		irq = 0;
++#ifdef MESON_GX_MMC_FORCE_POLLING
++	irq = 0;
++#endif
++
+ 	MesonMmc* controller = new(std::nothrow) MesonMmc(area,
+-		(volatile uint32*)mapped, registers, removable);
++		(volatile uint32*)mapped, registers, (int32)irq, removable);
+ 	if (controller == NULL) {
+ 		delete_area(area);
+ 		return B_NO_MEMORY;

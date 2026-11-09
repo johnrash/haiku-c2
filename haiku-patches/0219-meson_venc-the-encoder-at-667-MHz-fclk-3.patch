@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 13:19:52 -0500
+Subject: [PATCH 219/342] meson_venc: the encoder at 667 MHz (fclk/3)
+
+At 500 MHz a 1920x1080 picture from the C920 took 21 ms with the copy
+into the input area in turn, and NeoCam's clips came out at 26 frames a
+second. At 667 MHz (the vendor's level 6, the decoder's clock) the
+hardware takes 75% of the time: 18 ms for the camera's pictures, 30
+frames a second, the output the same (53.8 dB on the test picture). The
+log gives the average time a session.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../drivers/video/meson_vdec/meson_vdec_private.h     |  1 +
+ .../kernel/drivers/video/meson_vdec/meson_venc.cpp    | 11 ++++++++---
+ 2 files changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
+index a0565ee3d4..c9b5c2a732 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
+@@ -631,6 +631,7 @@ private:
+ 			dma_buffer			fDump;
+ 
+ 			bigtime_t			fLastEncodeTime;
++			bigtime_t			fTotalEncodeTime;
+ 			uint32				fLastSize;
+ 			uint32				fPictures;
+ 
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_venc.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_venc.cpp
+index 25784b0bf8..ee789d3f9a 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_venc.cpp
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_venc.cpp
+@@ -28,6 +28,7 @@ enum {
+ // HHI_VDEC_CLK_CNTL's upper half: HCODEC's clock (§2.3)
+ #define HCODEC_CLOCK_MASK			0xffff0000
+ #define HCODEC_CLOCK_500MHZ			0x01000000	// fclk/4, gate on
++#define HCODEC_CLOCK_667MHZ			0x03000000	// fclk/3, gate on
+ #define HCODEC_CLOCK_GATE			(1 << 24)
+ 
+ // DOS (byte offsets)
+@@ -275,6 +276,7 @@ MesonVenc::MesonVenc()
+ 	fNeedIdr(true),
+ 	fReconstruction(0),
+ 	fLastEncodeTime(0),
++	fTotalEncodeTime(0),
+ 	fLastSize(0),
+ 	fPictures(0),
+ 	fIrqLogCount(0)
+@@ -502,6 +504,7 @@ MesonVenc::_Start(meson_venc_start& start, const void* userFirmware)
+ 	fNeedIdr = true;
+ 	fReconstruction = 0;
+ 	fPictures = 0;
++	fTotalEncodeTime = 0;
+ 	while (acquire_sem_etc(fDoneSem, 1, B_RELATIVE_TIMEOUT, 0) == B_OK)
+ 		;
+ 
+@@ -539,8 +542,9 @@ MesonVenc::_Stop()
+ 	_SetDos(HCODEC_ASSIST_MBOX2_MASK, 0);
+ 	_PowerDown();
+ 	fRunning = false;
+-	TRACE("stopped after %" B_PRIu32 " pictures, %" B_PRId32
+-		" interrupts\n", fPictures, fInterrupts);
++	TRACE("stopped after %" B_PRIu32 " pictures (%" B_PRId64 " us each in "
++		"the hardware), %" B_PRId32 " interrupts\n", fPictures,
++		fPictures > 0 ? fTotalEncodeTime / fPictures : 0, fInterrupts);
+ }
+ 
+ 
+@@ -599,6 +603,7 @@ MesonVenc::_Encode(meson_venc_encode& encode)
+ 		idr ? ENCODER_IDR_DONE : ENCODER_NON_IDR_DONE,
+ 		encode.timeout > 0 ? encode.timeout : 1000000);
+ 	fLastEncodeTime = system_time() - start;
++	fTotalEncodeTime += fLastEncodeTime;
+ 	if (status != B_OK) {
+ 		// the reference may be lost: the next picture starts over
+ 		fNeedIdr = true;
+@@ -645,7 +650,7 @@ MesonVenc::_PowerUp()
+ 		_SetDos(DOS_SW_RESET1, kResetAll);
+ 		_SetDos(DOS_SW_RESET1, 0);
+ 		fHhi[HHI_VDEC_CLK_CNTL / 4] = (fHhi[HHI_VDEC_CLK_CNTL / 4]
+-			& ~HCODEC_CLOCK_MASK) | HCODEC_CLOCK_500MHZ;
++			& ~HCODEC_CLOCK_MASK) | HCODEC_CLOCK_667MHZ;
+ 		_SetDos(DOS_GCLK_EN0, _Dos(DOS_GCLK_EN0) | HCODEC_GCLK_MASK);
+ 		_SetDos(DOS_MEM_PD_HCODEC, 0);
+ 		fAo[AO_RTI_GEN_PWR_ISO0 / 4] &= ~AO_ISO_HCODEC;

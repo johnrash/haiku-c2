@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 4 Nov 2026 19:46:11 -0500
+Subject: [PATCH 299/342] meson_dwmac: the stall's explanation is an inference,
+ and OSF cured it
+
+With operate on second frame: 16 fresh boots, 24 GB, no stall, where builds without it
+stalled within their first two boots, and sending at 64 MB/s against 51.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../drivers/network/ether/meson_dwmac/meson_dwmac.cpp  | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp b/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
+index 08626b7406..58967a562e 100644
+--- a/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
++++ b/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
+@@ -896,11 +896,11 @@ MesonDwmac::_ConfigureEee()
+ }
+ 
+ 
+-/*!	The transmit engine can stay suspended with frames waiting, whatever the
+-	poll demands say: it read ahead while the last frame was still going out,
+-	and that frame's status then closed the next descriptor instead of its own.
+-	One slot is left owned by the engine behind its position, the next one has
+-	lost its OWN bit, and the engine rightly won't go on from it.
++/*!	Without OPERATION_OSF the transmit engine stayed suspended with frames
++	waiting, whatever the poll demands said: the slot behind its position was
++	still its own, the one at its position had lost OWN with its length intact,
++	as if a frame's status had closed the next descriptor. Not seen since OSF is
++	set; this stays for anything like it.
+ 
+ 	After 2 s of that, gives the ring back to the engine in order, from the
+ 	oldest frame. A frame that had gone out may go out again, which TCP copes

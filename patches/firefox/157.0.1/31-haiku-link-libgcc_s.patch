@@ -1,0 +1,19 @@
+Firefox on Haiku: link libxul with libgcc_s
+
+The Rust standard library in gkrust needs the _Unwind_* functions. haiku-pi's rebuilt gcc_syslibs
+has libstdc++ depend on libgcc_s; the bootstrap package the C2 image has does not (libstdc++ needs
+only libroot, tools/haiku-arm64-env.sh: HAIKU_CXX_LIBS). MPL 2.0, like the file it changes.
+
+diff -ruN a/toolkit/library/moz.build b/toolkit/library/moz.build
+--- a/toolkit/library/moz.build	2026-11-03 08:55:42.857406078 -0500
++++ b/toolkit/library/moz.build	2026-11-03 08:55:42.869059755 -0500
+@@ -113,6 +113,9 @@
+         "be",
+         "game",
+         "GL",
++        # the Rust standard library in gkrust unwinds with _Unwind_*; the C2
++        # image's libstdc++ doesn't bring libgcc_s along
++        "gcc_s",
+     ]
+ 
+ # The real libxul definition is in ./build/moz.build, but we define a

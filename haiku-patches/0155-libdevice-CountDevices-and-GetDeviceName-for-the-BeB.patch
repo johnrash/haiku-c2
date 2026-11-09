@@ -1,0 +1,195 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 01:45:41 -0400
+Subject: [PATCH 155/342] libdevice: CountDevices() and GetDeviceName() for the
+ BeBox classes
+
+BDigitalPort, BA2D and BD2A list what they can open, as BSerialPort and
+BJoystick do ("DigitalA", "A2D1", "D2A1"). New non-virtual methods: the
+classes' layout stays.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/os/device/A2D.h         |  5 +++++
+ headers/os/device/D2A.h         |  5 +++++
+ headers/os/device/DigitalPort.h |  5 +++++
+ src/kits/device/A2D.cpp         | 20 ++++++++++++++++++++
+ src/kits/device/D2A.cpp         | 20 ++++++++++++++++++++
+ src/kits/device/DigitalPort.cpp | 19 +++++++++++++++++++
+ 6 files changed, 74 insertions(+)
+
+diff --git a/headers/os/device/A2D.h b/headers/os/device/A2D.h
+index bf7f3050b0..2d5ab5bb9c 100644
+--- a/headers/os/device/A2D.h
++++ b/headers/os/device/A2D.h
+@@ -6,6 +6,7 @@
+ #define	_A2D_H
+ 
+ #include <BeBuild.h>
++#include <OS.h>
+ #include <SupportDefs.h>
+ 
+ #include <stddef.h>
+@@ -21,6 +22,10 @@ public:
+ 
+ 			ssize_t			Read(ushort* buf);
+ 
++			int32			CountDevices();
++			status_t		GetDeviceName(int32 index, char* name,
++								size_t bufSize = B_OS_NAME_LENGTH);
++
+ private:
+ 	virtual	void			_ReservedA2D1();
+ 	virtual	void			_ReservedA2D2();
+diff --git a/headers/os/device/D2A.h b/headers/os/device/D2A.h
+index 03c4d25118..07d099519e 100644
+--- a/headers/os/device/D2A.h
++++ b/headers/os/device/D2A.h
+@@ -6,6 +6,7 @@
+ #define	_D2A_H
+ 
+ #include <BeBuild.h>
++#include <OS.h>
+ #include <SupportDefs.h>
+ 
+ #include <stddef.h>
+@@ -22,6 +23,10 @@ public:
+ 			ssize_t			Read(uint8* buf);
+ 			ssize_t			Write(uint8 value);
+ 
++			int32			CountDevices();
++			status_t		GetDeviceName(int32 index, char* name,
++								size_t bufSize = B_OS_NAME_LENGTH);
++
+ private:
+ 	virtual	void			_ReservedD2A1();
+ 	virtual	void			_ReservedD2A2();
+diff --git a/headers/os/device/DigitalPort.h b/headers/os/device/DigitalPort.h
+index b357e7b8d6..49fa8ff1e5 100644
+--- a/headers/os/device/DigitalPort.h
++++ b/headers/os/device/DigitalPort.h
+@@ -6,6 +6,7 @@
+ #define	_DIGITAL_PORT_H
+ 
+ #include <BeBuild.h>
++#include <OS.h>
+ #include <SupportDefs.h>
+ 
+ #include <stddef.h>
+@@ -29,6 +30,10 @@ public:
+ 			status_t		SetAsInput();
+ 			bool			IsInput();
+ 
++			int32			CountDevices();
++			status_t		GetDeviceName(int32 index, char* name,
++								size_t bufSize = B_OS_NAME_LENGTH);
++
+ private:
+ 	virtual	void		_ReservedDigitalPort1();
+ 	virtual	void		_ReservedDigitalPort2();
+diff --git a/src/kits/device/A2D.cpp b/src/kits/device/A2D.cpp
+index 5d6de7e2e6..80d9046d21 100644
+--- a/src/kits/device/A2D.cpp
++++ b/src/kits/device/A2D.cpp
+@@ -15,6 +15,7 @@
+ 
+ #include <fcntl.h>
+ #include <stdio.h>
++#include <string.h>
+ #include <strings.h>
+ #include <unistd.h>
+ 
+@@ -94,6 +95,25 @@ BA2D::Read(ushort* buf)
+ }
+ 
+ 
++int32
++BA2D::CountDevices()
++{
++	return B_COUNT_OF(kChannels);
++}
++
++
++status_t
++BA2D::GetDeviceName(int32 index, char* name, size_t bufSize)
++{
++	if (name == NULL || index < 0)
++		return B_BAD_VALUE;
++	if (index >= CountDevices())
++		return B_BAD_INDEX;
++	strlcpy(name, kChannels[index], bufSize);
++	return B_OK;
++}
++
++
+ void
+ BA2D::_ReservedA2D1()
+ {
+diff --git a/src/kits/device/D2A.cpp b/src/kits/device/D2A.cpp
+index c81649c0b5..67e3cf5ade 100644
+--- a/src/kits/device/D2A.cpp
++++ b/src/kits/device/D2A.cpp
+@@ -17,6 +17,7 @@
+ #include <D2A.h>
+ 
+ #include <fcntl.h>
++#include <string.h>
+ #include <strings.h>
+ #include <unistd.h>
+ 
+@@ -127,6 +128,25 @@ BD2A::Write(uint8 value)
+ }
+ 
+ 
++int32
++BD2A::CountDevices()
++{
++	return B_COUNT_OF(kChannels);
++}
++
++
++status_t
++BD2A::GetDeviceName(int32 index, char* name, size_t bufSize)
++{
++	if (name == NULL || index < 0)
++		return B_BAD_VALUE;
++	if (index >= CountDevices())
++		return B_BAD_INDEX;
++	strlcpy(name, kChannels[index].name, bufSize);
++	return B_OK;
++}
++
++
+ void
+ BD2A::_ReservedD2A1()
+ {
+diff --git a/src/kits/device/DigitalPort.cpp b/src/kits/device/DigitalPort.cpp
+index 75438f5a7d..4b3bbce545 100644
+--- a/src/kits/device/DigitalPort.cpp
++++ b/src/kits/device/DigitalPort.cpp
+@@ -176,6 +176,25 @@ BDigitalPort::IsInput()
+ }
+ 
+ 
++int32
++BDigitalPort::CountDevices()
++{
++	return B_COUNT_OF(kPorts);
++}
++
++
++status_t
++BDigitalPort::GetDeviceName(int32 index, char* name, size_t bufSize)
++{
++	if (name == NULL || index < 0)
++		return B_BAD_VALUE;
++	if (index >= CountDevices())
++		return B_BAD_INDEX;
++	strlcpy(name, kPorts[index].name, bufSize);
++	return B_OK;
++}
++
++
+ void
+ BDigitalPort::_ReservedDigitalPort1()
+ {

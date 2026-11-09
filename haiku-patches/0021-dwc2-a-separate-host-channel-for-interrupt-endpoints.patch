@@ -1,0 +1,733 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 08:55:45 -0400
+Subject: [PATCH 021/342] dwc2: a separate host channel for interrupt endpoints
+
+All transfers ran one at a time on channel 0, so polling HID devices
+waited behind bulk data: with a USB flash drive writing, keyboard and
+mouse polls came up to 188 ms late. Transfers now go to one of two
+lanes, each a host channel with its own queue, worker thread and part
+of the bounce buffer: control/bulk on channel 0, interrupt endpoints on
+channel 1. The interrupt handler wakes the lane whose channel halted.
+
+Measured on the ODROID-C2 with 256 MiB written to and read from a flash
+drive while a keyboard and mouse are attached: worst poll delay 7 ms
+(was 188 ms), about 197 polls/s (was 150-184), throughput unchanged
+(21.6 MB/s write, 41.7 MB/s read; the drive varies). A statistic in the
+interrupt lane reports polls that come 20 ms or more late under load.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/busses/usb/dwc2.cpp | 264 +++++++++++++++----------
+ src/add-ons/kernel/busses/usb/dwc2.h   |  88 +++++----
+ 2 files changed, 217 insertions(+), 135 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.cpp b/src/add-ons/kernel/busses/usb/dwc2.cpp
+index dd8dc838e4..a37ede7fe8 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2.cpp
+@@ -187,7 +187,11 @@ static const uint32 kPhyAdpBc = 0x0c;
+ #define PHY_ADP_BC_ACA_ENABLE		(1 << 16)
+ #define PHY_ADP_BC_ACA_FLOATING		(1 << 26)
+ 
+-static const size_t kBounceSize = 64 * 1024;
++static const size_t kBounceSize = 64 * 1024;		// control/bulk lane
++static const size_t kInterruptBounceSize = 4096;
++static const uint32 kControlLane = 0;
++static const uint32 kInterruptLane = 1;
++static const uint32 kLaneCount = 2;
+ static const uint32 kDataOffset = 64;		// control data after the SETUP
+ static const bigtime_t kInterruptRetryDelay = 10000;
+ 
+@@ -262,21 +266,28 @@ DWC2::DWC2(Stack* stack, device_node* node, phys_addr_t registers,
+ 	fIrq(irq),
+ 	fInterruptInstalled(false),
+ 	fBounceArea(-1),
+-	fBounce(NULL),
+-	fBouncePhysical(0),
+ 	fChannelCount(0),
+ 	fRootHubAddress(0),
+ 	fRootHub(NULL),
+ 	fPortResetChange(0),
+-	fWorkSemaphore(-1),
+-	fWorkerThread(-1),
+ 	fStopWorker(false),
+-	fCurrent(NULL),
+-	fChannelStatus(0),
+-	fWarnedSplit(false)
++	fWarnedSplit(false),
++	fStatBulkBytes(0)
+ {
+ 	mutex_init(&fQueueLock, "dwc2 queue");
+-	fChannelHalted.Init(this, "dwc2 channel");
++	for (uint32 i = 0; i < kLaneCount; i++) {
++		dwc2_lane& lane = fLanes[i];
++		lane.dwc2 = this;
++		lane.channel = i;
++		lane.bounce = NULL;
++		lane.bouncePhysical = 0;
++		lane.bounceSize = i == kControlLane ? kBounceSize : kInterruptBounceSize;
++		lane.current = NULL;
++		lane.workSemaphore = -1;
++		lane.thread = -1;
++		lane.halted.Init(this, "dwc2 channel");
++		lane.status = 0;
++	}
+ 
+ 	if (!fInitOK)
+ 		return;
+@@ -290,18 +301,25 @@ DWC2::DWC2(Stack* stack, device_node* node, phys_addr_t registers,
+ 		return;
+ 	fRegisters = (volatile uint32*)mapped;
+ 
+-	fBounceArea = create_area("dwc2 bounce", (void**)&fBounce,
+-		B_ANY_KERNEL_ADDRESS, kBounceSize, B_32_BIT_CONTIGUOUS,
+-		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
++	// one contiguous bounce area, split between the lanes
++	uint8* bounce;
++	fBounceArea = create_area("dwc2 bounce", (void**)&bounce,
++		B_ANY_KERNEL_ADDRESS, kBounceSize + kInterruptBounceSize,
++		B_32_BIT_CONTIGUOUS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
+ 	if (fBounceArea < 0)
+ 		return;
+ 	physical_entry entry;
+-	get_memory_map(fBounce, B_PAGE_SIZE, &entry, 1);
+-	fBouncePhysical = entry.address;
+-
+-	fWorkSemaphore = create_sem(0, "dwc2 work");
+-	if (fWorkSemaphore < 0)
+-		return;
++	get_memory_map(bounce, B_PAGE_SIZE, &entry, 1);
++	size_t offset = 0;
++	for (uint32 i = 0; i < kLaneCount; i++) {
++		fLanes[i].bounce = bounce + offset;
++		fLanes[i].bouncePhysical = entry.address + offset;
++		offset += fLanes[i].bounceSize;
++
++		fLanes[i].workSemaphore = create_sem(0, "dwc2 work");
++		if (fLanes[i].workSemaphore < 0)
++			return;
++	}
+ 
+ 	if (_InitPlatform() != B_OK || _InitCore() != B_OK)
+ 		return;
+@@ -313,11 +331,13 @@ DWC2::DWC2(Stack* stack, device_node* node, phys_addr_t registers,
+ DWC2::~DWC2()
+ {
+ 	fStopWorker = true;
+-	if (fWorkSemaphore >= 0)
+-		delete_sem(fWorkSemaphore);
+-	if (fWorkerThread >= 0) {
+-		status_t result;
+-		wait_for_thread(fWorkerThread, &result);
++	for (uint32 i = 0; i < kLaneCount; i++) {
++		if (fLanes[i].workSemaphore >= 0)
++			delete_sem(fLanes[i].workSemaphore);
++		if (fLanes[i].thread >= 0) {
++			status_t result;
++			wait_for_thread(fLanes[i].thread, &result);
++		}
+ 	}
+ 	if (fRegisters != NULL) {
+ 		_Write(kGahbCfg, 0);
+@@ -495,9 +515,9 @@ DWC2::_InitCore()
+ 	}
+ 
+ 	// all interrupt sources masked before the handler is installed; then
+-	// only channel 0 halts are signalled
++	// only halts of the lanes' channels are signalled
+ 	_Write(kGintSts, 0xffffffff);
+-	_Write(kHaintMsk, 1);
++	_Write(kHaintMsk, (1 << kLaneCount) - 1);
+ 	if (fIrq > 0 && install_io_interrupt_handler(fIrq, _InterruptHandler, this,
+ 			0) == B_OK) {
+ 		fInterruptInstalled = true;
+@@ -520,11 +540,14 @@ DWC2::_InitCore()
+ status_t
+ DWC2::Start()
+ {
+-	fWorkerThread = spawn_kernel_thread(_WorkerThread, "dwc2 worker",
+-		B_URGENT_DISPLAY_PRIORITY, this);
+-	if (fWorkerThread < 0)
+-		return fWorkerThread;
+-	resume_thread(fWorkerThread);
++	for (uint32 i = 0; i < kLaneCount; i++) {
++		fLanes[i].thread = spawn_kernel_thread(_WorkerThread,
++			i == kControlLane ? "dwc2 control/bulk" : "dwc2 interrupt",
++			B_URGENT_DISPLAY_PRIORITY, &fLanes[i]);
++		if (fLanes[i].thread < 0)
++			return fLanes[i].thread;
++		resume_thread(fLanes[i].thread);
++	}
+ 
+ 	fRootHubAddress = AllocateAddress();
+ 	fRootHub = new(std::nothrow) DWC2RootHub(RootObject(), fRootHubAddress);
+@@ -713,10 +736,12 @@ DWC2::SubmitTransfer(Transfer* transfer)
+ 	entry->due = 0;
+ 	entry->canceled = false;
+ 
++	dwc2_lane* lane = &fLanes[(pipe->Type() & USB_OBJECT_INTERRUPT_PIPE) != 0
++		? kInterruptLane : kControlLane];
+ 	MutexLocker locker(fQueueLock);
+-	fQueue.Add(entry);
++	lane->queue.Add(entry);
+ 	locker.Unlock();
+-	release_sem_etc(fWorkSemaphore, 1, B_DO_NOT_RESCHEDULE);
++	release_sem_etc(lane->workSemaphore, 1, B_DO_NOT_RESCHEDULE);
+ 	return B_OK;
+ }
+ 
+@@ -727,19 +752,26 @@ DWC2::CancelQueuedTransfers(Pipe* pipe, bool force)
+ 	dwc2_transfer_list canceled;
+ 
+ 	MutexLocker locker(fQueueLock);
+-	dwc2_transfer* entry = fQueue.First();
+-	while (entry != NULL) {
+-		dwc2_transfer* next = fQueue.GetNext(entry);
+-		if (entry->transfer->TransferPipe() == pipe) {
+-			fQueue.Remove(entry);
+-			canceled.Add(entry);
++	for (uint32 i = 0; i < kLaneCount; i++) {
++		dwc2_lane& lane = fLanes[i];
++		dwc2_transfer* entry = lane.queue.First();
++		while (entry != NULL) {
++			dwc2_transfer* next = lane.queue.GetNext(entry);
++			if (entry->transfer->TransferPipe() == pipe) {
++				lane.queue.Remove(entry);
++				canceled.Add(entry);
++			}
++			entry = next;
++		}
++		if (lane.current != NULL
++			&& lane.current->transfer->TransferPipe() == pipe) {
++			lane.current->canceled = true;
+ 		}
+-		entry = next;
+ 	}
+-	if (fCurrent != NULL && fCurrent->transfer->TransferPipe() == pipe)
+-		fCurrent->canceled = true;
+ 	locker.Unlock();
+ 
++	dwc2_transfer* entry;
++
+ 	while ((entry = canceled.RemoveHead()) != NULL) {
+ 		if (!force)
+ 			entry->transfer->Finished(B_CANCELED, 0);
+@@ -762,22 +794,44 @@ DWC2::NotifyPipeChange(Pipe* pipe, usb_change change)
+ /*static*/ status_t
+ DWC2::_WorkerThread(void* data)
+ {
+-	((DWC2*)data)->_Worker();
++	dwc2_lane* lane = (dwc2_lane*)data;
++	lane->dwc2->_Worker(lane);
+ 	return B_OK;
+ }
+ 
+ 
+ void
+-DWC2::_Worker()
++DWC2::_Worker(dwc2_lane* lane)
+ {
++	// Latency statistics (interrupt lane): how late NAKed interrupt endpoints
++	// (HID) are polled again. Reported when a poll came 20 ms or more late
++	// while bulk data moved, i.e. when input would stutter.
++	bigtime_t statStart = system_time();
++	int32 statPolls = 0;
++	bigtime_t statWorstLate = 0;
++	uint64 statBulkBytes = 0;
++
+ 	while (!fStopWorker) {
+ 		bigtime_t now = system_time();
++		if (lane->channel == kInterruptLane && now - statStart >= 10000000) {
++			statBulkBytes = atomic_get_and_set64(&fStatBulkBytes, 0);
++			if (statBulkBytes >= 1024 * 1024 && statWorstLate >= 20000) {
++				INFO("last %" B_PRIdBIGTIME " s: %" B_PRIu64 " KiB bulk, %" B_PRId32
++					" interrupt polls, worst poll delay %" B_PRIdBIGTIME " ms\n",
++					(now - statStart) / 1000000, statBulkBytes / 1024, statPolls,
++					statWorstLate / 1000);
++			}
++			statStart = now;
++			statPolls = 0;
++			statWorstLate = 0;
++			statBulkBytes = 0;
++		}
+ 		bigtime_t nextDue = now + 1000000;
+ 
+ 		MutexLocker locker(fQueueLock);
+ 		dwc2_transfer* entry = NULL;
+-		for (dwc2_transfer* candidate = fQueue.First(); candidate != NULL;
+-				candidate = fQueue.GetNext(candidate)) {
++		for (dwc2_transfer* candidate = lane->queue.First(); candidate != NULL;
++				candidate = lane->queue.GetNext(candidate)) {
+ 			if (candidate->due <= now) {
+ 				entry = candidate;
+ 				break;
+@@ -786,34 +840,40 @@ DWC2::_Worker()
+ 		}
+ 		if (entry == NULL) {
+ 			locker.Unlock();
+-			if (acquire_sem_etc(fWorkSemaphore, 1, B_ABSOLUTE_TIMEOUT, nextDue)
+-					== B_BAD_SEM_ID) {
++			if (acquire_sem_etc(lane->workSemaphore, 1, B_ABSOLUTE_TIMEOUT,
++					nextDue) == B_BAD_SEM_ID) {
+ 				return;
+ 			}
+ 			continue;
+ 		}
+-		fQueue.Remove(entry);
+-		fCurrent = entry;
++		lane->queue.Remove(entry);
++		lane->current = entry;
+ 		locker.Unlock();
+ 
+ 		bool retry = false;
+ 		size_t actual = 0;
+ 		Transfer* transfer = entry->transfer;
++		Pipe* pipe = transfer->TransferPipe();
++		if (entry->due != 0) {
++			statPolls++;
++			statWorstLate = max_c(statWorstLate, now - entry->due);
++		}
+ 		status_t status = transfer->PrepareKernelAccess();
+ 		if (status == B_OK) {
+-			Pipe* pipe = transfer->TransferPipe();
+ 			if ((pipe->Type() & USB_OBJECT_CONTROL_PIPE) != 0)
+-				status = _ControlTransfer(transfer, &actual);
++				status = _ControlTransfer(lane, transfer, &actual);
+ 			else {
+ 				bool nak = false;
+-				status = _DataTransfer(transfer, pipe->Direction() == Pipe::In,
+-					&actual, &nak);
++				status = _DataTransfer(lane, transfer,
++					pipe->Direction() == Pipe::In, &actual, &nak);
+ 				retry = status == B_OK && nak;
+ 			}
+ 		}
++		if ((pipe->Type() & USB_OBJECT_BULK_PIPE) != 0 && status == B_OK)
++			atomic_add64(&fStatBulkBytes, actual);
+ 
+ 		locker.Lock();
+-		fCurrent = NULL;
++		lane->current = NULL;
+ 		if (entry->canceled) {
+ 			retry = false;
+ 			status = B_CANCELED;
+@@ -821,7 +881,7 @@ DWC2::_Worker()
+ 		}
+ 		if (retry) {
+ 			entry->due = system_time() + kInterruptRetryDelay;
+-			fQueue.Add(entry);
++			lane->queue.Add(entry);
+ 			continue;
+ 		}
+ 		locker.Unlock();
+@@ -834,7 +894,7 @@ DWC2::_Worker()
+ 
+ 
+ status_t
+-DWC2::_ControlTransfer(Transfer* transfer, size_t* _actual)
++DWC2::_ControlTransfer(dwc2_lane* lane, Transfer* transfer, size_t* _actual)
+ {
+ 	Pipe* pipe = transfer->TransferPipe();
+ 	usb_request_data* request = transfer->RequestData();
+@@ -845,8 +905,8 @@ DWC2::_ControlTransfer(Transfer* transfer, size_t* _actual)
+ 	size_t actual = 0;
+ 	bool nak;
+ 
+-	memcpy(fBounce, request, sizeof(usb_request_data));
+-	status_t status = _Transaction(pipe, PID_SETUP, false, 0,
++	memcpy(lane->bounce, request, sizeof(usb_request_data));
++	status_t status = _Transaction(lane, pipe, PID_SETUP, false, 0,
+ 		sizeof(usb_request_data), &nextPid, &actual, &nak);
+ 	if (status != B_OK)
+ 		return status;
+@@ -854,13 +914,13 @@ DWC2::_ControlTransfer(Transfer* transfer, size_t* _actual)
+ 	size_t dataActual = 0;
+ 	if (length > 0) {
+ 		if (!in) {
+-			status = _CopyToBounce(transfer, 0, kDataOffset, length);
++			status = _CopyToBounce(lane, transfer, 0, kDataOffset, length);
+ 			if (status != B_OK)
+ 				return status;
+ 		}
+ 		for (int32 tries = 0; ; tries++) {
+ 			nak = false;
+-			status = _Transaction(pipe, PID_DATA1, in, kDataOffset, length,
++			status = _Transaction(lane, pipe, PID_DATA1, in, kDataOffset, length,
+ 				&nextPid, &dataActual, &nak);
+ 			if (status != B_OK || !nak)
+ 				break;
+@@ -872,7 +932,7 @@ DWC2::_ControlTransfer(Transfer* transfer, size_t* _actual)
+ 			return status;
+ 		if (in) {
+ 			dataActual = min_c(dataActual, length);
+-			status = _CopyFromBounce(transfer, 0, kDataOffset, dataActual);
++			status = _CopyFromBounce(lane, transfer, 0, kDataOffset, dataActual);
+ 			if (status != B_OK)
+ 				return status;
+ 		}
+@@ -883,7 +943,7 @@ DWC2::_ControlTransfer(Transfer* transfer, size_t* _actual)
+ 	bool statusIn = length == 0 || !in;
+ 	for (int32 tries = 0; ; tries++) {
+ 		nak = false;
+-		status = _Transaction(pipe, PID_DATA1, statusIn, kDataOffset, 0,
++		status = _Transaction(lane, pipe, PID_DATA1, statusIn, kDataOffset, 0,
+ 			&nextPid, &actual, &nak);
+ 		if (status != B_OK || !nak)
+ 			break;
+@@ -900,7 +960,8 @@ DWC2::_ControlTransfer(Transfer* transfer, size_t* _actual)
+ 
+ 
+ status_t
+-DWC2::_DataTransfer(Transfer* transfer, bool in, size_t* _actual, bool* _nak)
++DWC2::_DataTransfer(dwc2_lane* lane, Transfer* transfer, bool in,
++	size_t* _actual, bool* _nak)
+ {
+ 	Pipe* pipe = transfer->TransferPipe();
+ 	size_t length = transfer_length(transfer);
+@@ -908,14 +969,15 @@ DWC2::_DataTransfer(Transfer* transfer, bool in, size_t* _actual, bool* _nak)
+ 	if (maxPacket == 0)
+ 		maxPacket = 8;
+ 	// whole packets per piece, so only the last one can be short
+-	size_t pieceSize = (kBounceSize - kDataOffset) / maxPacket * maxPacket;
++	size_t pieceSize = (lane->bounceSize - kDataOffset) / maxPacket
++		* maxPacket;
+ 
+ 	uint32 pid = pipe->DataToggle() ? PID_DATA1 : PID_DATA0;
+ 	size_t done = 0;
+ 	do {
+ 		size_t piece = min_c(length - done, pieceSize);
+ 		if (!in) {
+-			status_t status = _CopyToBounce(transfer, done, kDataOffset,
++			status_t status = _CopyToBounce(lane, transfer, done, kDataOffset,
+ 				piece);
+ 			if (status != B_OK)
+ 				return status;
+@@ -924,7 +986,7 @@ DWC2::_DataTransfer(Transfer* transfer, bool in, size_t* _actual, bool* _nak)
+ 		uint32 nextPid = pid;
+ 		size_t actual = 0;
+ 		bool nak = false;
+-		status_t status = _Transaction(pipe, pid, in, kDataOffset, piece,
++		status_t status = _Transaction(lane, pipe, pid, in, kDataOffset, piece,
+ 			&nextPid, &actual, &nak);
+ 		if (status != B_OK)
+ 			return status;
+@@ -941,7 +1003,7 @@ DWC2::_DataTransfer(Transfer* transfer, bool in, size_t* _actual, bool* _nak)
+ 
+ 		if (in) {
+ 			actual = min_c(actual, piece);
+-			status = _CopyFromBounce(transfer, done, kDataOffset, actual);
++			status = _CopyFromBounce(lane, transfer, done, kDataOffset, actual);
+ 			if (status != B_OK)
+ 				return status;
+ 		}
+@@ -998,37 +1060,38 @@ DWC2::_ChannelCharacteristics(Pipe* pipe, bool in, bool split)
+ 	\a packets packets at \a offset in the bounce buffer.
+ */
+ status_t
+-DWC2::_RunChannel(uint32 character, uint32 split, uint32 size,
++DWC2::_RunChannel(dwc2_lane* lane, uint32 character, uint32 split,
++	uint32 size,
+ 	uint32 packets, uint32 pid, uint32 offset, bool in, uint32* _status,
+ 	uint32* _transferSize)
+ {
+-	phys_addr_t physical = fBouncePhysical + offset;
++	phys_addr_t physical = lane->bouncePhysical + offset;
+ 	dcache_maintain(physical, size, in);
+ 
+ 	ConditionVariableEntry entry;
+-	atomic_set(&fChannelStatus, 0);
+-	fChannelHalted.Add(&entry);
++	atomic_set(&lane->status, 0);
++	lane->halted.Add(&entry);
+ 
+-	_Write(HC_SPLT(0), split);
+-	_Write(HC_INT(0), HCINT_ALL);
+-	_Write(HC_INTMSK(0), HCINT_CHHLTD);
+-	_Write(HC_TSIZ(0), size | (packets << HCTSIZ_PKTCNT_SHIFT)
++	_Write(HC_SPLT(lane->channel), split);
++	_Write(HC_INT(lane->channel), HCINT_ALL);
++	_Write(HC_INTMSK(lane->channel), HCINT_CHHLTD);
++	_Write(HC_TSIZ(lane->channel), size | (packets << HCTSIZ_PKTCNT_SHIFT)
+ 		| (pid << HCTSIZ_PID_SHIFT));
+-	_Write(HC_DMA(0), (uint32)physical);
++	_Write(HC_DMA(lane->channel), (uint32)physical);
+ 	asm volatile("dsb sy" : : : "memory");
+-	_Write(HC_CHAR(0), character | HCCHAR_CHENA);
++	_Write(HC_CHAR(lane->channel), character | HCCHAR_CHENA);
+ 
+ 	entry.Wait(B_RELATIVE_TIMEOUT, 2000000);
+-	uint32 status = atomic_get(&fChannelStatus);
++	uint32 status = atomic_get(&lane->status);
+ 	if ((status & HCINT_CHHLTD) == 0) {
+-		_HaltChannel();
++		_HaltChannel(lane);
+ 		return B_DEV_TIMEOUT;
+ 	}
+ 
+ 	if (in)
+ 		dcache_maintain(physical, size, true);
+ 	*_status = status;
+-	*_transferSize = _Read(HC_TSIZ(0));
++	*_transferSize = _Read(HC_TSIZ(lane->channel));
+ 	return B_OK;
+ }
+ 
+@@ -1053,11 +1116,12 @@ channel_error(uint32 status)
+ 	nothing was transferred.
+ */
+ status_t
+-DWC2::_Transaction(Pipe* pipe, uint32 pid, bool in, uint32 offset,
+-	uint32 length, uint32* _nextPid, size_t* _actual, bool* _nak)
++DWC2::_Transaction(dwc2_lane* lane, Pipe* pipe, uint32 pid, bool in,
++	uint32 offset, uint32 length, uint32* _nextPid, size_t* _actual,
++	bool* _nak)
+ {
+ 	if (_NeedsSplit(pipe)) {
+-		return _SplitTransaction(pipe, pid, in, offset, length, _nextPid,
++		return _SplitTransaction(lane, pipe, pid, in, offset, length, _nextPid,
+ 			_actual, _nak);
+ 	}
+ 
+@@ -1066,12 +1130,12 @@ DWC2::_Transaction(Pipe* pipe, uint32 pid, bool in, uint32 offset,
+ 		maxPacket = 8;
+ 	uint32 packets = length == 0 ? 1 : (length + maxPacket - 1) / maxPacket;
+ 	uint32 size = in ? packets * maxPacket : length;
+-	if (offset + size > kBounceSize)
++	if (offset + size > lane->bounceSize)
+ 		return B_BAD_VALUE;
+ 
+ 	uint32 status;
+ 	uint32 transferSize;
+-	status_t result = _RunChannel(_ChannelCharacteristics(pipe, in, false), 0,
++	status_t result = _RunChannel(lane, _ChannelCharacteristics(pipe, in, false), 0,
+ 		size, packets, pid, offset, in, &status, &transferSize);
+ 	if (result != B_OK) {
+ 		ERROR("device %d endpoint %d: no response\n", pipe->DeviceAddress(),
+@@ -1100,13 +1164,14 @@ DWC2::_Transaction(Pipe* pipe, uint32 pid, bool in, uint32 offset,
+ 	packet per start-split/complete-split pair.
+ */
+ status_t
+-DWC2::_SplitTransaction(Pipe* pipe, uint32 pid, bool in, uint32 offset,
+-	uint32 length, uint32* _nextPid, size_t* _actual, bool* _nak)
++DWC2::_SplitTransaction(dwc2_lane* lane, Pipe* pipe, uint32 pid, bool in,
++	uint32 offset, uint32 length, uint32* _nextPid, size_t* _actual,
++	bool* _nak)
+ {
+ 	uint32 maxPacket = pipe->MaxPacketSize();
+ 	if (maxPacket == 0)
+ 		maxPacket = 8;
+-	if (offset + length + maxPacket > kBounceSize)
++	if (offset + length + maxPacket > lane->bounceSize)
+ 		return B_BAD_VALUE;
+ 
+ 	uint32 character = _ChannelCharacteristics(pipe, in, true);
+@@ -1124,7 +1189,7 @@ DWC2::_SplitTransaction(Pipe* pipe, uint32 pid, bool in, uint32 offset,
+ 		uint32 transferSize;
+ 
+ 		// start-split: the hub's transaction translator takes the request
+-		status_t result = _RunChannel(character, split, size, 1, currentPid,
++		status_t result = _RunChannel(lane, character, split, size, 1, currentPid,
+ 			offset + done, in, &status, &transferSize);
+ 		if (result != B_OK)
+ 			return result;
+@@ -1156,7 +1221,7 @@ DWC2::_SplitTransaction(Pipe* pipe, uint32 pid, bool in, uint32 offset,
+ 				spin(5);
+ 			}
+ 
+-			result = _RunChannel(character, split | HCSPLT_COMPSPLT, size, 1,
++			result = _RunChannel(lane, character, split | HCSPLT_COMPSPLT, size, 1,
+ 				currentPid, offset + done, in, &status, &transferSize);
+ 			if (result != B_OK)
+ 				return result;
+@@ -1202,11 +1267,11 @@ DWC2::_SplitTransaction(Pipe* pipe, uint32 pid, bool in, uint32 offset,
+ 
+ 
+ void
+-DWC2::_HaltChannel()
++DWC2::_HaltChannel(dwc2_lane* lane)
+ {
+ 	ConditionVariableEntry entry;
+-	fChannelHalted.Add(&entry);
+-	_Write(HC_CHAR(0), _Read(HC_CHAR(0)) | HCCHAR_CHDIS | HCCHAR_CHENA);
++	lane->halted.Add(&entry);
++	_Write(HC_CHAR(lane->channel), _Read(HC_CHAR(lane->channel)) | HCCHAR_CHDIS | HCCHAR_CHENA);
+ 	entry.Wait(B_RELATIVE_TIMEOUT, 100000);
+ }
+ 
+@@ -1216,8 +1281,8 @@ DWC2::_HaltChannel()
+ 	vectors are either kernel addresses or physical (queue_bulk_v_physical).
+ */
+ status_t
+-DWC2::_CopyBounce(Transfer* transfer, size_t dataOffset, uint32 bounceOffset,
+-	size_t length, bool toBounce)
++DWC2::_CopyBounce(dwc2_lane* lane, Transfer* transfer, size_t dataOffset,
++	uint32 bounceOffset, size_t length, bool toBounce)
+ {
+ 	generic_io_vec* vector = transfer->Vector();
+ 	size_t position = 0;
+@@ -1231,7 +1296,7 @@ DWC2::_CopyBounce(Transfer* transfer, size_t dataOffset, uint32 bounceOffset,
+ 		size_t skip = dataOffset > position ? dataOffset - position : 0;
+ 		size_t chunk = min_c(vectorLength - skip, length - done);
+ 		generic_addr_t address = vector[i].base + skip;
+-		uint8* bounce = fBounce + bounceOffset + done;
++		uint8* bounce = lane->bounce + bounceOffset + done;
+ 
+ 		status_t status = B_OK;
+ 		if (transfer->IsPhysical()) {
+@@ -1267,10 +1332,11 @@ DWC2::_InterruptHandler(void* data)
+ 				continue;
+ 			uint32 channelStatus = self->_Read(HC_INT(channel));
+ 			self->_Write(HC_INT(channel), channelStatus);
+-			if (channel == 0) {
+-				atomic_or(&self->fChannelStatus, channelStatus);
++			if (channel < kLaneCount) {
++				dwc2_lane& lane = self->fLanes[channel];
++				atomic_or(&lane.status, channelStatus);
+ 				if ((channelStatus & HCINT_CHHLTD) != 0)
+-					self->fChannelHalted.NotifyAll();
++					lane.halted.NotifyAll();
+ 			}
+ 		}
+ 	}
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.h b/src/add-ons/kernel/busses/usb/dwc2.h
+index b23ec2711d..3a548c6672 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.h
++++ b/src/add-ons/kernel/busses/usb/dwc2.h
+@@ -13,6 +13,7 @@
+ #include <util/DoublyLinkedList.h>
+ 
+ 
++class DWC2;
+ class DWC2RootHub;
+ 
+ 
+@@ -25,6 +26,25 @@ struct dwc2_transfer : DoublyLinkedListLinkImpl<dwc2_transfer> {
+ typedef DoublyLinkedList<dwc2_transfer> dwc2_transfer_list;
+ 
+ 
++/*!	One host channel with its own transfer queue, worker thread and part of
++	the bounce buffer. Interrupt endpoints have a lane of their own, so
++	polling HID devices never waits behind bulk data.
++*/
++struct dwc2_lane {
++	DWC2*				dwc2;
++	uint32				channel;
++	uint8*				bounce;
++	phys_addr_t			bouncePhysical;
++	size_t				bounceSize;
++	dwc2_transfer_list	queue;
++	dwc2_transfer*		current;
++	sem_id				workSemaphore;
++	thread_id			thread;
++	ConditionVariable	halted;
++	int32				status;
++};
++
++
+ /*!	Synopsys DesignWare "DWC2" USB 2.0 host controller as found on the
+ 	Amlogic Meson GXBB (S905, ODROID-C2), in buffer DMA mode.
+ */
+@@ -65,45 +85,48 @@ private:
+ 			uint32				_PortBits();
+ 			status_t			_ResetPort();
+ 
+-			status_t			_Process(dwc2_transfer* entry, bool* retry);
+-			status_t			_ControlTransfer(Transfer* transfer,
+-									size_t* actual);
+-			status_t			_DataTransfer(Transfer* transfer, bool in,
++			status_t			_ControlTransfer(dwc2_lane* lane,
++									Transfer* transfer, size_t* actual);
++			status_t			_DataTransfer(dwc2_lane* lane,
++									Transfer* transfer, bool in,
+ 									size_t* actual, bool* nak);
+-			status_t			_Transaction(Pipe* pipe, uint32 pid, bool in,
++			status_t			_Transaction(dwc2_lane* lane, Pipe* pipe,
++									uint32 pid, bool in, uint32 offset,
++									uint32 length, uint32* nextPid,
++									size_t* actual, bool* nak);
++			status_t			_SplitTransaction(dwc2_lane* lane,
++									Pipe* pipe, uint32 pid, bool in,
+ 									uint32 offset, uint32 length,
+ 									uint32* nextPid, size_t* actual,
+ 									bool* nak);
+-			status_t			_SplitTransaction(Pipe* pipe, uint32 pid,
+-									bool in, uint32 offset, uint32 length,
+-									uint32* nextPid, size_t* actual,
+-									bool* nak);
+ 			bool				_NeedsSplit(Pipe* pipe);
+ 			uint32				_ChannelCharacteristics(Pipe* pipe, bool in,
+ 									bool split);
+-			status_t			_RunChannel(uint32 character, uint32 split,
++			status_t			_RunChannel(dwc2_lane* lane,
++									uint32 character, uint32 split,
+ 									uint32 size, uint32 packets, uint32 pid,
+ 									uint32 offset, bool in, uint32* status,
+ 									uint32* transferSize);
+-			void				_HaltChannel();
+-
+-			status_t			_CopyBounce(Transfer* transfer,
+-									size_t dataOffset, uint32 bounceOffset,
+-									size_t length, bool toBounce);
+-			status_t			_CopyToBounce(Transfer* transfer,
+-									size_t dataOffset, uint32 bounceOffset,
+-									size_t length)
+-								{ return _CopyBounce(transfer, dataOffset,
+-									bounceOffset, length, true); }
+-			status_t			_CopyFromBounce(Transfer* transfer,
+-									size_t dataOffset, uint32 bounceOffset,
+-									size_t length)
+-								{ return _CopyBounce(transfer, dataOffset,
+-									bounceOffset, length, false); }
++			void				_HaltChannel(dwc2_lane* lane);
++
++			status_t			_CopyBounce(dwc2_lane* lane,
++									Transfer* transfer, size_t dataOffset,
++									uint32 bounceOffset, size_t length,
++									bool toBounce);
++			status_t			_CopyToBounce(dwc2_lane* lane,
++									Transfer* transfer, size_t dataOffset,
++									uint32 bounceOffset, size_t length)
++								{ return _CopyBounce(lane, transfer,
++									dataOffset, bounceOffset, length, true); }
++			status_t			_CopyFromBounce(dwc2_lane* lane,
++									Transfer* transfer, size_t dataOffset,
++									uint32 bounceOffset, size_t length)
++								{ return _CopyBounce(lane, transfer,
++									dataOffset, bounceOffset, length, false); }
+ 
+ 	static	int32				_InterruptHandler(void* data);
+ 	static	status_t			_WorkerThread(void* data);
+-			void				_Worker();
++			void				_Worker(dwc2_lane* lane);
+ 
+ private:
+ 			area_id				fRegisterArea;
+@@ -113,24 +136,17 @@ private:
+ 			bool				fInterruptInstalled;
+ 
+ 			area_id				fBounceArea;
+-			uint8*				fBounce;
+-			phys_addr_t			fBouncePhysical;
+ 
+ 			uint32				fChannelCount;
+ 			int8				fRootHubAddress;
+ 			DWC2RootHub*		fRootHub;
+ 			uint8				fPortResetChange;
+ 
+-			mutex				fQueueLock;
+-			dwc2_transfer_list	fQueue;
+-			sem_id				fWorkSemaphore;
+-			thread_id			fWorkerThread;
++			mutex				fQueueLock;		// both lanes' queues
++			dwc2_lane			fLanes[2];		// control/bulk, interrupt
+ 			bool				fStopWorker;
+-			dwc2_transfer*		fCurrent;
+-
+-			ConditionVariable	fChannelHalted;
+-			int32				fChannelStatus;
+ 			bool				fWarnedSplit;
++			int64				fStatBulkBytes;
+ };
+ 
+ 

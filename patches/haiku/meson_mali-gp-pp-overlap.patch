@@ -1,0 +1,611 @@
+diff --git a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali.cpp b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali.cpp
+index 942d634bb5..16353b4b23 100644
+--- a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali.cpp
++++ b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali.cpp
+@@ -9,9 +9,9 @@
+  * GPU's address space (the load balancer's page mapped at its fixed
+  * address), the load balancer (DLBU) and broadcast units, and the ten
+  * interrupts, checked with the reset-completed interrupts; and it takes
+- * the jobs' interrupts. meson_mali_jobs.cpp has the buffers, the address
+- * space, lima's ioctls (headers/private/drivers/meson_mali.h) and the job
+- * thread.
++ * the jobs' interrupts, the GP's and the PPs' apart (a GP job may run beside
++ * a PP job). meson_mali_jobs.cpp has the buffers, the address space, lima's
++ * ioctls (headers/private/drivers/meson_mali.h) and the job threads.
+  *
+  * The facts are in the port's docs/m43-mali-facts.md (the GPU) and
+  * docs/m43-gxbb-mali-integration-facts.md (its clock and interrupts on the
+@@ -119,15 +119,8 @@ MesonMali::MesonMali(device_node* node)
+ 	fRanges(NULL),
+ 	fRangeCount(0),
+ 	fRangeSlots(0),
+-	fQueueHead(NULL),
+-	fQueueTail(NULL),
+ 	fNextSequence(1),
+-	fCompleted(0),
+-	fJobThread(-1),
+ 	fQuit(false),
+-	fJobDone(-1),
+-	fRunningPipe(-1),
+-	fJobError(0),
+ 	fPpPending(0),
+ 	fPpDone(0),
+ 	fPpCount(0),
+@@ -141,6 +134,17 @@ MesonMali::MesonMali(device_node* node)
+ 	}
+ 	mutex_init(&fLock, "meson_mali");
+ 	mutex_init(&fQueueLock, "meson_mali queue");
++	for (int32 pipe = 0; pipe < 2; pipe++) {
++		fQueueHead[pipe] = NULL;
++		fQueueTail[pipe] = NULL;
++		fRunning[pipe] = NULL;
++		fPipeCompleted[pipe] = 0;
++		fJobThread[pipe] = -1;
++		fJobDone[pipe] = -1;
++		fPipeBusy[pipe] = false;
++		fJobError[pipe] = 0;
++		fOverlapped[pipe] = 0;
++	}
+ 	fQueueCondition.Init(this, "meson_mali queue");
+ 	fCompletion.Init(this, "meson_mali completion");
+ 	B_INITIALIZE_SPINLOCK(&fJobLock);
+@@ -156,16 +160,18 @@ MesonMali::MesonMali(device_node* node)
+ 
+ MesonMali::~MesonMali()
+ {
+-	if (fJobThread >= 0) {
+-		mutex_lock(&fQueueLock);
+-		fQuit = true;
+-		fQueueCondition.NotifyAll();
+-		mutex_unlock(&fQueueLock);
+-		status_t result;
+-		wait_for_thread(fJobThread, &result);
++	mutex_lock(&fQueueLock);
++	fQuit = true;
++	fQueueCondition.NotifyAll();
++	mutex_unlock(&fQueueLock);
++	for (int32 pipe = 0; pipe < 2; pipe++) {
++		if (fJobThread[pipe] >= 0) {
++			status_t result;
++			wait_for_thread(fJobThread[pipe], &result);
++		}
++		if (fJobDone[pipe] >= 0)
++			delete_sem(fJobDone[pipe]);
+ 	}
+-	if (fJobDone >= 0)
+-		delete_sem(fJobDone);
+ 	if (fRegisters != NULL) {
+ 		// quiet: no interrupts from the blocks
+ 		_Write(kGp + GP_INT_MASK, 0);
+@@ -594,14 +600,19 @@ MesonMali::Init(phys_addr_t base, const int32* interrupts)
+ 	_InstallInterrupts(interrupts);
+ 	_TestInterrupts();
+ 
+-	fJobDone = create_sem(0, "meson_mali job done");
+-	if (fJobDone < 0)
+-		return fJobDone;
+-	fJobThread = spawn_kernel_thread(_JobThread, "meson_mali jobs",
+-		B_URGENT_DISPLAY_PRIORITY, this);
+-	if (fJobThread < 0)
+-		return fJobThread;
+-	resume_thread(fJobThread);
++	for (int32 pipe = 0; pipe < 2; pipe++) {
++		fJobDone[pipe] = create_sem(0, pipe == MALI_PIPE_GP
++			? "meson_mali GP job done" : "meson_mali PP job done");
++		if (fJobDone[pipe] < 0)
++			return fJobDone[pipe];
++		fJobThread[pipe] = spawn_kernel_thread(pipe == MALI_PIPE_GP
++				? _GpJobThread : _PpJobThread,
++			pipe == MALI_PIPE_GP ? "meson_mali GP jobs" : "meson_mali PP jobs",
++			B_URGENT_DISPLAY_PRIORITY, this);
++		if (fJobThread[pipe] < 0)
++			return fJobThread[pipe];
++		resume_thread(fJobThread[pipe]);
++	}
+ 	return B_OK;
+ }
+ 
+@@ -673,13 +684,13 @@ MesonMali::_HandleInterrupt(interrupt_line& line)
+ {
+ 	// a running job's
+ 	SpinLocker jobLocker(fJobLock);
+-	if (fRunningPipe == MALI_PIPE_GP && line.index == kIrqGp) {
++	if (fPipeBusy[MALI_PIPE_GP] && line.index == kIrqGp) {
+ 		int32 result = _GpJobInterrupt();
+ 		if (result == B_HANDLED_INTERRUPT)
+ 			atomic_add(&line.count, 1);
+ 		return result;
+ 	}
+-	if (fRunningPipe == MALI_PIPE_PP && line.index == kIrqPp) {
++	if (fPipeBusy[MALI_PIPE_PP] && line.index == kIrqPp) {
+ 		int32 result = _PpJobInterrupt();
+ 		if (result == B_HANDLED_INTERRUPT)
+ 			atomic_add(&line.count, 1);
+@@ -736,9 +747,9 @@ MesonMali::_HandleInterrupt(interrupt_line& line)
+ 			SpinLocker locker(fJobLock);
+ 			int32 pipe = line.index == kIrqGpMmu
+ 				? MALI_PIPE_GP : MALI_PIPE_PP;
+-			if (fRunningPipe == pipe && fJobError == 0) {
+-				fJobError = 0x80000000 | status;
+-				release_sem_etc(fJobDone, 1, B_DO_NOT_RESCHEDULE);
++			if (fPipeBusy[pipe] && fJobError[pipe] == 0) {
++				fJobError[pipe] = 0x80000000 | status;
++				release_sem_etc(fJobDone[pipe], 1, B_DO_NOT_RESCHEDULE);
+ 			}
+ 			break;
+ 		}
+@@ -769,7 +780,7 @@ MesonMali::_GpJobInterrupt()
+ 	uint32 state = _Read(kGp + GP_STATUS);
+ 	bool done = false;
+ 	if ((status & kGpInterruptsError) != 0) {
+-		fJobError = status;
++		fJobError[MALI_PIPE_GP] = status;
+ 		_Write(kGp + GP_INT_MASK, 0);
+ 		done = true;
+ 	} else if ((status & (kGpVsEnd | kGpPlbuEnd)) != 0
+@@ -778,8 +789,8 @@ MesonMali::_GpJobInterrupt()
+ 	}
+ 	_Write(kGp + GP_INT_CLEAR, status);
+ 	if (done) {
+-		fRunningPipe = -1;
+-		release_sem_etc(fJobDone, 1, B_DO_NOT_RESCHEDULE);
++		fPipeBusy[MALI_PIPE_GP] = false;
++		release_sem_etc(fJobDone[MALI_PIPE_GP], 1, B_DO_NOT_RESCHEDULE);
+ 	}
+ 	return B_HANDLED_INTERRUPT;
+ }
+@@ -801,7 +812,7 @@ MesonMali::_PpJobInterrupt()
+ 		uint32 status = _Read(base + PP_INT_STATUS);
+ 		if (status != 0) {
+ 			if ((status & kPpInterruptsError) != 0) {
+-				fJobError = status;
++				fJobError[MALI_PIPE_PP] = status;
+ 				_Write(base + PP_INT_MASK, 0);
+ 			}
+ 			_Write(base + PP_INT_CLEAR, status);
+@@ -811,9 +822,9 @@ MesonMali::_PpJobInterrupt()
+ 		fPpDone |= 1u << i;
+ 		fPpPending--;
+ 	}
+-	if (fPpPending == 0 && fRunningPipe == MALI_PIPE_PP) {
+-		fRunningPipe = -1;
+-		release_sem_etc(fJobDone, 1, B_DO_NOT_RESCHEDULE);
++	if (fPpPending == 0 && fPipeBusy[MALI_PIPE_PP]) {
++		fPipeBusy[MALI_PIPE_PP] = false;
++		release_sem_etc(fJobDone[MALI_PIPE_PP], 1, B_DO_NOT_RESCHEDULE);
+ 		handled = true;
+ 	}
+ 	return handled ? B_HANDLED_INTERRUPT : B_UNHANDLED_INTERRUPT;
+@@ -849,9 +860,13 @@ MesonMali::Dump()
+ 		_Read(kGpL2 + L2_STATUS), _Read(kGpL2 + L2_ENABLE),
+ 		_Read(kPpL2 + L2_STATUS), _Read(kPpL2 + L2_ENABLE));
+ 	kprintf("  jobs: %" B_PRIu32 " (%" B_PRIu32 " failed), sequence %"
+-		B_PRIu64 " done of %" B_PRIu64 ", running pipe %" B_PRId32
+-		", heaps grown %" B_PRIu32 " times\n", fJobs, fFailedJobs,
+-		fCompleted, fNextSequence - 1, fRunningPipe, fHeapGrowths);
++		B_PRIu64 " (GP done to %" B_PRIu64 ", PP to %" B_PRIu64 "), running:"
++		" GP %d, PP %d; heaps grown %" B_PRIu32 " times\n", fJobs,
++		fFailedJobs, fNextSequence - 1, fPipeCompleted[MALI_PIPE_GP],
++		fPipeCompleted[MALI_PIPE_PP], fPipeBusy[MALI_PIPE_GP],
++		fPipeBusy[MALI_PIPE_PP], fHeapGrowths);
++	kprintf("  started beside the other pipe's job: GP %" B_PRIu32 ", PP %"
++		B_PRIu32 "\n", fOverlapped[MALI_PIPE_GP], fOverlapped[MALI_PIPE_PP]);
+ 	for (int i = 0; i < 2; i++) {
+ 		uint32 jobs = max_c(fTimedJobs[i], 1);
+ 		kprintf("  %s jobs: %" B_PRIu32 ", us each: cleaning before %"
+diff --git a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_jobs.cpp b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_jobs.cpp
+index e66de76151..761f8fba21 100644
+--- a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_jobs.cpp
++++ b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_jobs.cpp
+@@ -3,14 +3,18 @@
+  * Distributed under the terms of the MIT License.
+  *
+  * meson_mali's buffers, the GPU's address space, lima's ioctls and the job
+- * thread (PLAN.md M43 stage 3; docs/m43-mali-facts.md §3-5,
++ * threads (PLAN.md M43 stage 3; docs/m43-mali-facts.md §3-5,
+  * docs/m43-mesa-lima-haiku.md §1.8).
+  *
+  * This first version keeps it simple:
+  * - one address space for every open file, the one the MMUs hold;
+- * - one job at a time, in the order they were submitted, GP and PP alike:
+- *   that orders a PP job after the GP job whose output it reads, as lima
+- *   expects, without fences on the buffers;
++ * - a job thread for each pipe, which runs its jobs in the order they were
++ *   submitted. A GP job runs beside a PP job (the next frame's geometry
++ *   while the last one's pixels are drawn, PLAN.md M61) unless one writes a
++ *   buffer the other uses: each buffer keeps the last job of each pipe that
++ *   read or wrote it, and a job waits for the other pipe's jobs it depends
++ *   on so (what Linux's implicit fences on lima's buffers do). A PP job
++ *   reads what its GP job wrote, so it waits for it;
+  * - buffers are cached for the CPU (userland clones their areas): their
+  *   lines are written back and invalidated before a job, and those of the
+  *   buffers it writes again after it; for a client that says which buffers
+@@ -673,9 +677,11 @@ MesonMali::_GemWait(mali_file* file, void* buffer)
+ 
+ 	MutexLocker locker(fQueueLock);
+ 	// to read: the jobs that write it; to write: all that use it
+-	uint64 target = object->lastWrite;
+-	if ((wait.op & MALI_GEM_WAIT_WRITE) != 0)
+-		target = max_c(target, object->lastRead);
++	uint64 target = max_c(object->lastWrite[0], object->lastWrite[1]);
++	if ((wait.op & MALI_GEM_WAIT_WRITE) != 0) {
++		target = max_c(target, max_c(object->lastRead[0],
++			object->lastRead[1]));
++	}
+ 	locker.Unlock();
+ 	_ReleaseBuffer(object);
+ 
+@@ -694,7 +700,7 @@ MesonMali::_WaitFor(uint64 sequence, int64 timeoutNs, bool poll)
+ 	bigtime_t deadline = timeoutNs == INT64_MAX
+ 		? B_INFINITE_TIMEOUT : timeoutNs / 1000;
+ 	MutexLocker locker(fQueueLock);
+-	while (fCompleted < sequence) {
++	while (!_Done(sequence)) {
+ 		if (poll || (deadline != B_INFINITE_TIMEOUT
+ 				&& deadline <= system_time())) {
+ 			return poll ? B_BUSY : B_TIMED_OUT;
+@@ -791,23 +797,49 @@ MesonMali::_GemSubmit(mali_file* file, void* buffer)
+ 		return status;
+ 	}
+ 
+-	// queued in order; the in_sync objects are signalled by then
++	// the in_sync objects: what they wait for, done before it runs
++	{
++		MutexLocker locker(file->lock);
++		for (uint32 i = 0; i < 2; i++) {
++			uint32 handle = submit.in_sync[i];
++			if (handle != 0 && handle <= file->syncobjSlots
++				&& file->syncobjsUsed[handle - 1]) {
++				task->waitAll = max_c(task->waitAll,
++					file->syncobjs[handle - 1]);
++			}
++		}
++	}
++
++	// queued in order on its pipe, after what it depends on on the other
+ 	MutexLocker queueLocker(fQueueLock);
+ 	task->sequence = fNextSequence++;
+ 	task->tracksCpuMaps = file->tracksCpuMaps;
++	for (uint32 i = 0; i < task->bufferCount; i++) {
++		mali_buffer* buffer = task->buffers[i];
++		bool writes = (task->bufferFlags[i] & MALI_SUBMIT_BO_WRITE) != 0;
++		for (uint32 pipe = 0; pipe < 2; pipe++) {
++			task->dependsOn[pipe] = max_c(task->dependsOn[pipe],
++				buffer->lastWrite[pipe]);
++			if (writes) {
++				task->dependsOn[pipe] = max_c(task->dependsOn[pipe],
++					buffer->lastRead[pipe]);
++			}
++		}
++	}
+ 	for (uint32 i = 0; i < task->bufferCount; i++) {
+ 		if ((task->bufferFlags[i] & MALI_SUBMIT_BO_WRITE) != 0)
+-			task->buffers[i]->lastWrite = task->sequence;
++			task->buffers[i]->lastWrite[task->pipe] = task->sequence;
+ 		else
+-			task->buffers[i]->lastRead = task->sequence;
++			task->buffers[i]->lastRead[task->pipe] = task->sequence;
+ 	}
+-	if (fQueueTail != NULL)
+-		fQueueTail->next = task;
++	uint32 pipe = task->pipe;
++	if (fQueueTail[pipe] != NULL)
++		fQueueTail[pipe]->next = task;
+ 	else
+-		fQueueHead = task;
+-	fQueueTail = task;
++		fQueueHead[pipe] = task;
++	fQueueTail[pipe] = task;
+ 	uint64 sequence = task->sequence;
+-	fQueueCondition.NotifyOne();
++	fQueueCondition.NotifyAll();
+ 	queueLocker.Unlock();
+ 
+ 	if (submit.out_sync != 0) {
+@@ -834,42 +866,92 @@ MesonMali::_FreeTask(mali_task* task)
+ }
+ 
+ 
++/*!	Whether the task with \a sequence and every one before it are done:
++	neither pipe has one at or before it still queued or running. With
++	fQueueLock held.
++*/
++bool
++MesonMali::_Done(uint64 sequence) const
++{
++	for (int32 pipe = 0; pipe < 2; pipe++) {
++		const mali_task* oldest = fRunning[pipe] != NULL
++			? fRunning[pipe] : fQueueHead[pipe];
++		if (oldest != NULL && oldest->sequence <= sequence)
++			return false;
++	}
++	return true;
++}
++
++
+ /*static*/ status_t
+-MesonMali::_JobThread(void* data)
++MesonMali::_GpJobThread(void* data)
+ {
+-	MesonMali* device = (MesonMali*)data;
+-	MutexLocker locker(device->fQueueLock);
++	return ((MesonMali*)data)->_PipeThread(MALI_PIPE_GP);
++}
++
++
++/*static*/ status_t
++MesonMali::_PpJobThread(void* data)
++{
++	return ((MesonMali*)data)->_PipeThread(MALI_PIPE_PP);
++}
++
++
++/*!	Runs \a pipe's tasks in order, each once the other pipe has done the
++	tasks it depends on (and every task up to its in_sync objects' is done).
++*/
++status_t
++MesonMali::_PipeThread(int32 pipe)
++{
++	int32 other = 1 - pipe;
++	MutexLocker locker(fQueueLock);
+ 	while (true) {
+-		while (device->fQueueHead == NULL && !device->fQuit) {
++		mali_task* task;
++		while (true) {
++			task = fQueueHead[pipe];
++			if (task == NULL && fQuit)
++				return B_OK;
++			if (task != NULL && (fQuit
++					|| (fPipeCompleted[other] >= task->dependsOn[other]
++						&& _Done(task->waitAll)))) {
++				break;
++			}
+ 			ConditionVariableEntry entry;
+-			device->fQueueCondition.Add(&entry);
++			fQueueCondition.Add(&entry);
+ 			locker.Unlock();
+ 			entry.Wait();
+ 			locker.Lock();
+ 		}
+-		mali_task* task = device->fQueueHead;
+-		if (task == NULL)
+-			break;
+-		device->fQueueHead = task->next;
+-		if (device->fQueueHead == NULL)
+-			device->fQueueTail = NULL;
++		fQueueHead[pipe] = task->next;
++		if (fQueueHead[pipe] == NULL)
++			fQueueTail[pipe] = NULL;
++		task->next = NULL;
++		fRunning[pipe] = task;
++		if (fRunning[other] != NULL)
++			fOverlapped[pipe]++;
+ 		locker.Unlock();
+ 
+-		if (!device->fQuit)
+-			device->_RunTask(task);
++		bool done = true;
++		if (!fQuit)
++			done = _RunTask(task);
+ 
+ 		locker.Lock();
+-		device->fCompleted = task->sequence;
+-		device->fCompletion.NotifyAll();
++		fJobs++;
++		if (!done)
++			fFailedJobs++;
++		fRunning[pipe] = NULL;
++		fPipeCompleted[pipe] = task->sequence;
++		fCompletion.NotifyAll();
++		// the other pipe's next task may wait for this one
++		fQueueCondition.NotifyAll();
+ 		locker.Unlock();
+-		device->_FreeTask(task);
++		_FreeTask(task);
+ 		locker.Lock();
+ 	}
+-	return B_OK;
+ }
+ 
+ 
+-void
++bool
+ MesonMali::_RunTask(mali_task* task)
+ {
+ 	bigtime_t start = system_time();
+@@ -881,9 +963,6 @@ MesonMali::_RunTask(mali_task* task)
+ 	bigtime_t cleaned = system_time();
+ 
+ 	bool done = task->pipe == MALI_PIPE_GP ? _RunGp(task) : _RunPp(task);
+-	fJobs++;
+-	if (!done)
+-		fFailedJobs++;
+ 	bigtime_t ran = system_time();
+ 
+ 	for (uint32 i = 0; i < task->bufferCount; i++) {
+@@ -899,6 +978,7 @@ MesonMali::_RunTask(mali_task* task)
+ 	fTimeRun[pipe] += ran - cleaned;
+ 	fTimeCleanAfter[pipe] += system_time() - ran;
+ 	fTimedJobs[pipe]++;
++	return done;
+ }
+ 
+ 
+@@ -918,12 +998,13 @@ MesonMali::_RunGp(mali_task* task)
+ 	_FlushL2(kGpL2);
+ 	_ZapMmu(kGpMmu);
+ 	_ResetGp();
+-	while (acquire_sem_etc(fJobDone, 1, B_RELATIVE_TIMEOUT, 0) == B_OK)
++	sem_id jobDone = fJobDone[MALI_PIPE_GP];
++	while (acquire_sem_etc(jobDone, 1, B_RELATIVE_TIMEOUT, 0) == B_OK)
+ 		;
+ 
+ 	InterruptsSpinLocker locker(fJobLock);
+-	fJobError = 0;
+-	fRunningPipe = MALI_PIPE_GP;
++	fJobError[MALI_PIPE_GP] = 0;
++	fPipeBusy[MALI_PIPE_GP] = true;
+ 	for (uint32 i = 0; i < 6; i++)
+ 		_Write(kGp + i * 4, frame[i]);
+ 	_Write(kGp + GP_CMD, kGpUpdatePlbuAlloc);
+@@ -933,11 +1014,11 @@ MesonMali::_RunGp(mali_task* task)
+ 	status_t status;
+ 	uint32 error;
+ 	while (true) {
+-		status = acquire_sem_etc(fJobDone, 1, B_RELATIVE_TIMEOUT,
++		status = acquire_sem_etc(jobDone, 1, B_RELATIVE_TIMEOUT,
+ 			kJobTimeout);
+ 		locker.Lock();
+-		error = fJobError;
+-		fRunningPipe = -1;
++		error = fJobError[MALI_PIPE_GP];
++		fPipeBusy[MALI_PIPE_GP] = false;
+ 		locker.Unlock();
+ 
+ 		// out of heap memory, and nothing else: more, and the GP goes on
+@@ -951,8 +1032,8 @@ MesonMali::_RunGp(mali_task* task)
+ 		_FlushL2(kGpL2);
+ 		_ZapMmu(kGpMmu);
+ 		locker.Lock();
+-		fJobError = 0;
+-		fRunningPipe = MALI_PIPE_GP;
++		fJobError[MALI_PIPE_GP] = 0;
++		fPipeBusy[MALI_PIPE_GP] = true;
+ 		_Write(kGp + GP_INT_MASK, kGpInterruptsUsed);
+ 		_Write(kGp + GP_PLBU_ALLOC_START, frame[5]);
+ 		frame[5] = heap->va + heap->backedPages * B_PAGE_SIZE;
+@@ -1006,7 +1087,8 @@ MesonMali::_RunPp(mali_task* task)
+ 		if (_ResetPp(i) != B_OK)
+ 			INFO("PP%" B_PRIu32 ": no soft reset\n", i);
+ 	}
+-	while (acquire_sem_etc(fJobDone, 1, B_RELATIVE_TIMEOUT, 0) == B_OK)
++	sem_id jobDone = fJobDone[MALI_PIPE_PP];
++	while (acquire_sem_etc(jobDone, 1, B_RELATIVE_TIMEOUT, 0) == B_OK)
+ 		;
+ 
+ 	// the load balancer hands out the tile lists, or each PP has its own
+@@ -1035,19 +1117,19 @@ MesonMali::_RunPp(mali_task* task)
+ 	}
+ 
+ 	InterruptsSpinLocker locker(fJobLock);
+-	fJobError = 0;
++	fJobError[MALI_PIPE_PP] = 0;
+ 	fPpCount = count;
+ 	fPpPending = count;
+ 	fPpDone = 0;
+-	fRunningPipe = MALI_PIPE_PP;
++	fPipeBusy[MALI_PIPE_PP] = true;
+ 	_Write(kPpBroadcast + PP_CTRL, kPpStartRendering);
+ 	locker.Unlock();
+ 
+-	status_t status = acquire_sem_etc(fJobDone, 1, B_RELATIVE_TIMEOUT,
++	status_t status = acquire_sem_etc(jobDone, 1, B_RELATIVE_TIMEOUT,
+ 		kJobTimeout);
+ 	locker.Lock();
+-	uint32 error = fJobError;
+-	fRunningPipe = -1;
++	uint32 error = fJobError[MALI_PIPE_PP];
++	fPipeBusy[MALI_PIPE_PP] = false;
+ 	locker.Unlock();
+ 	if (status == B_OK && error == 0)
+ 		return true;
+diff --git a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_private.h b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_private.h
+index 52dab4c116..bd1dea03d0 100644
+--- a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_private.h
++++ b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_private.h
+@@ -203,8 +203,8 @@ struct mali_buffer {
+ 	bool		heap;
+ 	uint32		heapAreaCount;	// the areas after the first
+ 	area_id		heapAreas[kMaxHeapAreas];
+-	uint64		lastRead;	// the last tasks that use it (sequence numbers)
+-	uint64		lastWrite;
++	uint64		lastRead[2];	// the last tasks of each pipe (GP, PP) that
++	uint64		lastWrite[2];	// read or write it (sequence numbers)
+ 	bool		cpuMapped;
+ 		// a client mapped it (MALI_IOCTL_HAIKU_CPU_MAPPED): its lines are
+ 		// cleaned around jobs; never once it is the GPU's alone
+@@ -225,7 +225,7 @@ struct mali_file {
+ };
+ 
+ 
+-/*!	A job for one pipe, queued until the job thread runs it. */
++/*!	A job for one pipe, queued until its pipe's job thread runs it. */
+ struct mali_task {
+ 	mali_task*		next;
+ 	uint32			pipe;
+@@ -238,6 +238,12 @@ struct mali_task {
+ 	uint32*			bufferFlags;
+ 	mali_buffer*	heap;		// a GP job's tile heap, if a heap buffer
+ 	uint64			sequence;
++	uint64			dependsOn[2];
++		// the other pipe's last task this one may not run beside: one that
++		// writes a buffer this one uses, or uses one this one writes (on
++		// its own pipe, the tasks run in order)
++	uint64			waitAll;
++		// its in_sync objects': every task up to it done first
+ 	bool			tracksCpuMaps;	// its file's, when submitted
+ };
+ 
+@@ -326,9 +332,12 @@ private:
+ 			status_t			_WaitFor(uint64 sequence, int64 timeoutNs,
+ 									bool poll);
+ 
+-			// the job thread
+-	static	status_t			_JobThread(void* data);
+-			void				_RunTask(mali_task* task);
++			// the job threads, one a pipe
++	static	status_t			_GpJobThread(void* data);
++	static	status_t			_PpJobThread(void* data);
++			status_t			_PipeThread(int32 pipe);
++			bool				_Done(uint64 sequence) const;
++			bool				_RunTask(mali_task* task);
+ 			bool				_RunGp(mali_task* task);
+ 			bool				_RunPp(mali_task* task);
+ 			void				_FreeTask(mali_task* task);
+@@ -356,29 +365,34 @@ private:
+ 			uint32				fRangeCount;
+ 			uint32				fRangeSlots;
+ 
+-			// the queue and the sequence numbers: under fQueueLock
++			// the queues (GP [0], PP [1]) and the sequence numbers: under
++			// fQueueLock
+ 			mutex				fQueueLock;
+ 			ConditionVariable	fQueueCondition;
+ 			ConditionVariable	fCompletion;
+-			mali_task*			fQueueHead;
+-			mali_task*			fQueueTail;
++			mali_task*			fQueueHead[2];
++			mali_task*			fQueueTail[2];
++			mali_task*			fRunning[2];
++			uint64				fPipeCompleted[2];
++				// the pipe's last task done (they finish in order)
+ 			uint64				fNextSequence;
+-			uint64				fCompleted;
+-			thread_id			fJobThread;
++			thread_id			fJobThread[2];
+ 			bool				fQuit;
+ 
+-			// the running job: under fJobLock (also from interrupts)
++			// the running jobs: under fJobLock (also from interrupts)
+ 			spinlock			fJobLock;
+-			sem_id				fJobDone;
+-			int32				fRunningPipe;	// -1: none
+-			uint32				fJobError;
++			sem_id				fJobDone[2];
++			bool				fPipeBusy[2];
++			uint32				fJobError[2];
+ 			uint32				fPpPending;
+ 			uint32				fPpDone;
+ 			uint32				fPpCount;		// of the running job
+-			uint32				fJobs;
++			uint32				fJobs;			// under fQueueLock
+ 			uint32				fFailedJobs;
+-			uint32				fHeapGrowths;
+-			// GP [0] and PP [1] jobs: the job thread's time
++			uint32				fHeapGrowths;	// the GP's job thread
++			uint32				fOverlapped[2];
++				// jobs started while the other pipe ran one (fQueueLock)
++			// GP [0] and PP [1] jobs: their job thread's time
+ 			bigtime_t			fTimeCleanBefore[2];
+ 			bigtime_t			fTimeRun[2];
+ 			bigtime_t			fTimeCleanAfter[2];

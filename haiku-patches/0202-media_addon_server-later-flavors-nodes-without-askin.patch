@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 02:44:14 -0500
+Subject: [PATCH 202/342] media_addon_server: later flavors' nodes without
+ asking itself (M45)
+
+The physical nodes of flavors that come later are made in the control
+thread, which answers the server's own requests; a global flavor's
+BMediaRoster::InstantiateDormantNode() would have sent it one and waited
+for itself. They are made as that request's handler makes them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/servers/media_addon/MediaAddonServer.cpp | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/src/servers/media_addon/MediaAddonServer.cpp b/src/servers/media_addon/MediaAddonServer.cpp
+index 0b4c53537b..abe92cf937 100644
+--- a/src/servers/media_addon/MediaAddonServer.cpp
++++ b/src/servers/media_addon/MediaAddonServer.cpp
+@@ -755,8 +755,20 @@ MediaAddonServer::_InstantiatePhysicalInputsAndOutputs(AddOnInfo& info,
+ 
+ 			TRACE("MediaAddonServer::InstantiatePhysialInputsAndOutputs: "
+ 				"\"%s\" is a physical input/output\n", flavorinfo->name);
+-			status_t status = fMediaRoster->InstantiateDormantNode(
+-				dormantNodeInfo, &node);
++			status_t status;
++			if (onlyNew) {
++				// this runs in the control thread, the one that answers
++				// the add-on server's requests: a global flavor's request
++				// would wait for itself, so it is instantiated here as that
++				// request's handler does
++				status = MediaRosterEx(fMediaRoster)->InstantiateDormantNode(
++					info.id, flavorinfo->internal_id,
++					(flavorinfo->flavor_flags & B_FLAVOR_IS_GLOBAL) != 0
++						? Team() : -1, &node);
++			} else {
++				status = fMediaRoster->InstantiateDormantNode(
++					dormantNodeInfo, &node);
++			}
+ 			if (status != B_OK) {
+ 				ERROR("MediaAddonServer::InstantiatePhysialInputsAndOutputs "
+ 					"Couldn't instantiate node flavor, internal_id %" B_PRId32

@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 13:46:31 -0400
+Subject: [PATCH 099/342] arm64 KDL: say that an interrupt's iframe has a stale
+ ESR and FAR
+
+Tested on the ODROID-C2 (+107) with busy threads holding known values
+in x19 and v31: "bt" traced the two running on CPUs 0 and 1 from the
+inter-CPU interrupt that halted them, through its iframe, into their
+loop; "iframe -f" of the third showed its x19 and v31. The interrupt's
+frame showed the last page fault's ESR (instruction abort), which
+looked like the reason for the frame.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/kernel/arch/arm64/arch_debug.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/system/kernel/arch/arm64/arch_debug.cpp b/src/system/kernel/arch/arm64/arch_debug.cpp
+index 3063f0e38c..38adb21368 100644
+--- a/src/system/kernel/arch/arm64/arch_debug.cpp
++++ b/src/system/kernel/arch/arm64/arch_debug.cpp
+@@ -425,7 +425,6 @@ print_iframe(struct iframe* frame, bool fpu)
+ 		")  far %016" B_PRIx64 "\n", frame->esr, exceptionClass,
+ 		exception_class_name(exceptionClass), frame->esr & 0x1ffffff,
+ 		frame->far);
+-		// an interrupt's frame has the last exception's ESR and FAR
+ 
+ 	if (!fpu)
+ 		return;
+@@ -473,7 +472,8 @@ dump_iframes(int argc, char** argv)
+ 	struct iframe_stack* frameStack = thread != NULL
+ 		? &thread->arch_info.iframes : &gBootFrameStack;
+ 	if (thread != NULL) {
+-		kprintf("iframes of thread %" B_PRId32 " \"%s\", the latest last\n",
++		kprintf("iframes of thread %" B_PRId32 " \"%s\", the latest last (an "
++			"interrupt's shows the ESR and FAR of the last exception)\n",
+ 			thread->id, thread->name);
+ 	}
+ 	if (frameStack->index == 0)

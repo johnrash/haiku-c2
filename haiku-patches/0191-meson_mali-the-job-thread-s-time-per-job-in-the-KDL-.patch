@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 01:01:43 -0400
+Subject: [PATCH 191/342] meson_mali: the job thread's time per job in the KDL
+ "mali" command
+
+For GP and PP jobs: how long the CPU cache cleaning before and after a
+job takes, and the job itself, on average. They showed where a full
+screen OpenGL frame goes on the Mali-450 (a screen saver's Mali
+version): the PPs' 7 ms, half of it the depth buffer's write-back.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/drivers/misc/meson_mali/meson_mali.cpp    | 12 ++++++++++++
+ .../drivers/misc/meson_mali/meson_mali_jobs.cpp      |  8 ++++++++
+ .../drivers/misc/meson_mali/meson_mali_private.h     |  5 +++++
+ 3 files changed, 25 insertions(+)
+
+diff --git a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali.cpp b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali.cpp
+index cd32ab3055..942d634bb5 100644
+--- a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali.cpp
++++ b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali.cpp
+@@ -135,6 +135,10 @@ MesonMali::MesonMali(device_node* node)
+ 	fFailedJobs(0),
+ 	fHeapGrowths(0)
+ {
++	for (int i = 0; i < 2; i++) {
++		fTimeCleanBefore[i] = fTimeRun[i] = fTimeCleanAfter[i] = 0;
++		fTimedJobs[i] = 0;
++	}
+ 	mutex_init(&fLock, "meson_mali");
+ 	mutex_init(&fQueueLock, "meson_mali queue");
+ 	fQueueCondition.Init(this, "meson_mali queue");
+@@ -848,6 +852,14 @@ MesonMali::Dump()
+ 		B_PRIu64 " done of %" B_PRIu64 ", running pipe %" B_PRId32
+ 		", heaps grown %" B_PRIu32 " times\n", fJobs, fFailedJobs,
+ 		fCompleted, fNextSequence - 1, fRunningPipe, fHeapGrowths);
++	for (int i = 0; i < 2; i++) {
++		uint32 jobs = max_c(fTimedJobs[i], 1);
++		kprintf("  %s jobs: %" B_PRIu32 ", us each: cleaning before %"
++			B_PRId64 ", running %" B_PRId64 ", cleaning after %" B_PRId64
++			"\n", i == 0 ? "GP" : "PP", fTimedJobs[i],
++			fTimeCleanBefore[i] / jobs, fTimeRun[i] / jobs,
++			fTimeCleanAfter[i] / jobs);
++	}
+ 	kprintf("  interrupts:");
+ 	for (int32 i = 0; i < kIrqCount; i++) {
+ 		kprintf(" %s(%" B_PRId32 ") %" B_PRId32, kInterruptNames[i],
+diff --git a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_jobs.cpp b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_jobs.cpp
+index 13329353d0..9a5e1174ba 100644
+--- a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_jobs.cpp
++++ b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_jobs.cpp
+@@ -835,15 +835,18 @@ MesonMali::_JobThread(void* data)
+ void
+ MesonMali::_RunTask(mali_task* task)
+ {
++	bigtime_t start = system_time();
+ 	for (uint32 i = 0; i < task->bufferCount; i++) {
+ 		if (!task->buffers[i]->heap)
+ 			_CleanBuffer(task->buffers[i]);
+ 	}
++	bigtime_t cleaned = system_time();
+ 
+ 	bool done = task->pipe == MALI_PIPE_GP ? _RunGp(task) : _RunPp(task);
+ 	fJobs++;
+ 	if (!done)
+ 		fFailedJobs++;
++	bigtime_t ran = system_time();
+ 
+ 	for (uint32 i = 0; i < task->bufferCount; i++) {
+ 		if ((task->bufferFlags[i] & MALI_SUBMIT_BO_WRITE) != 0
+@@ -851,6 +854,11 @@ MesonMali::_RunTask(mali_task* task)
+ 			_CleanBuffer(task->buffers[i]);
+ 		}
+ 	}
++	int pipe = task->pipe == MALI_PIPE_GP ? 0 : 1;
++	fTimeCleanBefore[pipe] += cleaned - start;
++	fTimeRun[pipe] += ran - cleaned;
++	fTimeCleanAfter[pipe] += system_time() - ran;
++	fTimedJobs[pipe]++;
+ }
+ 
+ 
+diff --git a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_private.h b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_private.h
+index fbe7f88728..a56e2225d2 100644
+--- a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_private.h
++++ b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_private.h
+@@ -371,6 +371,11 @@ private:
+ 			uint32				fJobs;
+ 			uint32				fFailedJobs;
+ 			uint32				fHeapGrowths;
++			// GP [0] and PP [1] jobs: the job thread's time
++			bigtime_t			fTimeCleanBefore[2];
++			bigtime_t			fTimeRun[2];
++			bigtime_t			fTimeCleanAfter[2];
++			uint32				fTimedJobs[2];
+ };
+ 
+ 

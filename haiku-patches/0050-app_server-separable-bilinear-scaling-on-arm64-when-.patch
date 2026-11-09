@@ -1,0 +1,301 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 02:40:37 -0400
+Subject: [PATCH 050/342] app_server: separable bilinear scaling on arm64 when
+ scaling up
+
+BilinearSeparableNeon interpolates each source row horizontally once,
+into 16 bit sums per channel (the same intermediate values as the per
+pixel loop), keeps the two rows a destination row needs, and blends them
+vertically 8 channels at a time. The weights are loaded rather than
+moved from general registers for every pixel. When scaling up,
+consecutive destination rows share source rows, so the source is read
+about a third as often; scaling down, the per pixel loop stays (it was
+faster: 12.7 instead of 13.7 ms for 1280x720 to 960x540).
+
+1280x720 on the ODROID-C2, same results byte for byte:
+- to 1920x1080: 47.1 -> 34.7 ms (52.2 before Advanced SIMD)
+- to 1600x900: 33.1 -> 27.1 ms (41.5)
+- to 1919x1079: 46.0 -> 34.5 ms (58.9)
+
+On screen through clipping (a covering window, small invalidated areas),
+the result equals the same scaling done offscreen at six sizes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../bitmap_painter/DrawBitmapBilinear.h       | 152 +++++++++++++++++-
+ .../painter_bilinear_scale_neon.c             |  63 ++++++++
+ 2 files changed, 212 insertions(+), 3 deletions(-)
+
+diff --git a/src/servers/app/drawing/Painter/bitmap_painter/DrawBitmapBilinear.h b/src/servers/app/drawing/Painter/bitmap_painter/DrawBitmapBilinear.h
+index ea866d473c..12d86b219b 100644
+--- a/src/servers/app/drawing/Painter/bitmap_painter/DrawBitmapBilinear.h
++++ b/src/servers/app/drawing/Painter/bitmap_painter/DrawBitmapBilinear.h
+@@ -19,6 +19,10 @@ extern "C" {
+ 		void* xWeights, uint32 xmin, uint32 xmax, uint32 wTop, uint32 srcBPR);
+ 	void bilinear_scale_xloop_neon(const uint8* src, void* dst,
+ 		void* xWeights, uint32 xmin, uint32 xmax, uint32 wTop, uint32 srcBPR);
++	void bilinear_scale_hrow_neon(const uint8* src, uint16* sums,
++		const void* xWeights, uint32 xmin, uint32 xmax);
++	void bilinear_scale_vblend_neon(const uint16* top, const uint16* bottom,
++		void* dst, uint32 count, uint32 wTop);
+ }
+ 
+ #if defined(__i386__)
+@@ -488,6 +492,134 @@ struct BilinearSimd : DrawBitmapBilinearOptimized<BilinearSimd> {
+ #endif	// BILINEAR_SCALE_XLOOP
+ 
+ 
++#if defined(__aarch64__)
++
++/*!	BilinearSimd done separably: each source row is interpolated
++	horizontally once, into 16 bit sums per channel, and kept while the
++	following destination rows use it; pairs of those rows are then blended
++	vertically. Same results as BilinearSimd, with fewer reads of the
++	source when scaling up vertically, where consecutive destination rows
++	share source rows.
++*/
++struct BilinearSeparableNeon
++	: DrawBitmapBilinearOptimized<BilinearSeparableNeon> {
++	void DrawToClipRect(int32 xIndexL, int32 xIndexR, int32 y1, int32 y2)
++	{
++		// The last column/row handling is as in BilinearSimd.
++		int32 yMax = y2;
++		if (fWeightsY[yMax].weight == 255)
++			yMax--;
++		int32 xIndexMax = xIndexR;
++		if (fWeightsX[xIndexMax].weight == 255)
++			xIndexMax--;
++
++		int32 count = xIndexMax - xIndexL + 1;
++		uint16* rows = NULL;
++		if (count > 0 && y1 <= yMax) {
++			rows = (uint16*)malloc(count * 4 * sizeof(uint16) * 2);
++			if (rows == NULL) {
++				_DrawRowsUnseparated(xIndexL, xIndexR, xIndexMax, y1, yMax);
++				_DrawLastRow(xIndexL, xIndexR, xIndexMax, yMax, y2);
++				return;
++			}
++		}
++		uint16* slots[2] = { rows, rows + count * 4 };
++		int32 slotRow[2] = { -1, -1 };
++
++		for (; y1 <= yMax; y1++) {
++			const uint16 wTop = fWeightsY[y1].weight;
++			const uint16 wBottom = 255 - wTop;
++			const int32 top = fWeightsY[y1].index;
++			const uint8* src = fSource->row_ptr(top);
++			uint8* d = fDestination;
++
++			if (count > 0) {
++				int32 topSlot = slotRow[0] == top ? 0
++					: slotRow[1] == top ? 1 : -1;
++				if (topSlot < 0) {
++					topSlot = slotRow[0] == top + 1 ? 1 : 0;
++					bilinear_scale_hrow_neon(src, slots[topSlot], fWeightsX,
++						xIndexL, xIndexMax);
++					slotRow[topSlot] = top;
++				}
++				int32 bottomSlot = 1 - topSlot;
++				if (slotRow[bottomSlot] != top + 1) {
++					bilinear_scale_hrow_neon(src + fSourceBytesPerRow,
++						slots[bottomSlot], fWeightsX, xIndexL, xIndexMax);
++					slotRow[bottomSlot] = top + 1;
++				}
++				bilinear_scale_vblend_neon(slots[topSlot], slots[bottomSlot],
++					d, count, wTop);
++				d += count * 4;
++			}
++
++			// last column of pixels if necessary
++			if (xIndexMax < xIndexR) {
++				const uint8* s = src + fWeightsX[xIndexR].index;
++				const uint8* sBottom = s + fSourceBytesPerRow;
++				d[0] = (s[0] * wTop + sBottom[0] * wBottom) >> 8;
++				d[1] = (s[1] * wTop + sBottom[1] * wBottom) >> 8;
++				d[2] = (s[2] * wTop + sBottom[2] * wBottom) >> 8;
++			}
++
++			fDestination += fDestinationBytesPerRow;
++		}
++		free(rows);
++
++		_DrawLastRow(xIndexL, xIndexR, xIndexMax, yMax, y2);
++	}
++
++private:
++	void _DrawRowsUnseparated(int32 xIndexL, int32 xIndexR, int32 xIndexMax,
++		int32 y1, int32 yMax)
++	{
++		for (; y1 <= yMax; y1++) {
++			const uint16 wTop = fWeightsY[y1].weight;
++			const uint16 wBottom = 255 - wTop;
++			const uint8* src = fSource->row_ptr(fWeightsY[y1].index);
++			uint8* d = fDestination;
++			bilinear_scale_xloop_neon(src, fDestination, fWeightsX, xIndexL,
++				xIndexMax, wTop, fSourceBytesPerRow);
++			d += (xIndexMax - xIndexL + 1) * 4;
++			if (xIndexMax < xIndexR) {
++				const uint8* s = src + fWeightsX[xIndexR].index;
++				const uint8* sBottom = s + fSourceBytesPerRow;
++				d[0] = (s[0] * wTop + sBottom[0] * wBottom) >> 8;
++				d[1] = (s[1] * wTop + sBottom[1] * wBottom) >> 8;
++				d[2] = (s[2] * wTop + sBottom[2] * wBottom) >> 8;
++			}
++			fDestination += fDestinationBytesPerRow;
++		}
++	}
++
++	void _DrawLastRow(int32 xIndexL, int32 xIndexR, int32 xIndexMax,
++		int32 yMax, int32 y2)
++	{
++		if (yMax >= y2)
++			return;
++		// buffer offset into source (bottom row)
++		const uint8* src = fSource->row_ptr(fWeightsY[y2].index);
++		uint8* d = fDestination;
++		for (int32 x = xIndexL; x <= xIndexMax; x++) {
++			const uint8* s = src + fWeightsX[x].index;
++			const uint16 wLeft = fWeightsX[x].weight;
++			const uint16 wRight = 255 - wLeft;
++			d[0] = (s[0] * wLeft + s[4] * wRight) >> 8;
++			d[1] = (s[1] * wLeft + s[5] * wRight) >> 8;
++			d[2] = (s[2] * wLeft + s[6] * wRight) >> 8;
++			d += 4;
++		}
++		// pixel in bottom right corner if necessary
++		if (xIndexMax < xIndexR) {
++			const uint8* s = src + fWeightsX[xIndexR].index;
++			*(uint32*)d = *(uint32*)s;
++		}
++	}
++};
++
++#endif	// __aarch64__
++
++
+ template<class ColorType, class DrawMode>
+ struct DrawBitmapBilinear {
+ 	void
+@@ -601,7 +733,8 @@ struct DrawBitmapBilinear {
+ 		enum {
+ 			kOptimizeForLowFilterRatio = 0,
+ 			kUseDefaultVersion,
+-			kUseSIMDVersion
++			kUseSIMDVersion,
++			kUseSeparableSIMDVersion
+ 		};
+ 
+ 		int codeSelect = kUseDefaultVersion;
+@@ -609,11 +742,13 @@ struct DrawBitmapBilinear {
+ 		if (typeid(ColorType) == typeid(ColorTypeRgb)
+ 			&& typeid(DrawMode) == typeid(DrawModeCopy)) {
+ #if defined(__aarch64__)
+-			if (true)
++			// separably when scaling up (scaling down it was slower:
++			// 1280x720 to 960x540 in 13.7 instead of 12.7 ms)
++			codeSelect = scaleY >= 1.0
++				? kUseSeparableSIMDVersion : kUseSIMDVersion;
+ #else
+ 			uint32 neededSIMDFlags = APPSERVER_SIMD_MMX | APPSERVER_SIMD_SSE;
+ 			if ((gSIMDFlags & neededSIMDFlags) == neededSIMDFlags)
+-#endif
+ 				codeSelect = kUseSIMDVersion;
+ 			else {
+ 				if (scaleX == scaleY && (scaleX == 1.5 || scaleX == 2.0
+@@ -621,6 +756,7 @@ struct DrawBitmapBilinear {
+ 					codeSelect = kOptimizeForLowFilterRatio;
+ 				}
+ 			}
++#endif
+ 		}
+ 
+ 		switch (codeSelect) {
+@@ -649,6 +785,16 @@ struct DrawBitmapBilinear {
+ 				break;
+ 			}
+ #endif	// BILINEAR_SCALE_XLOOP
++
++#if defined(__aarch64__)
++			case kUseSeparableSIMDVersion:
++			{
++				BilinearSeparableNeon bilinearPainter;
++				bilinearPainter.Draw(aggInterface, destinationRect, &bitmap,
++					filterData);
++				break;
++			}
++#endif
+ 		}
+ 
+ #ifdef FILTER_INFOS_ON_HEAP
+diff --git a/src/servers/app/drawing/Painter/bitmap_painter/painter_bilinear_scale_neon.c b/src/servers/app/drawing/Painter/bitmap_painter/painter_bilinear_scale_neon.c
+index 13efd7f8d8..385ca30358 100644
+--- a/src/servers/app/drawing/Painter/bitmap_painter/painter_bilinear_scale_neon.c
++++ b/src/servers/app/drawing/Painter/bitmap_painter/painter_bilinear_scale_neon.c
+@@ -67,3 +67,66 @@ bilinear_scale_xloop_neon(const uint8* src, void* dst, void* xWeights,
+ 		d++;
+ 	}
+ }
++
++
++void bilinear_scale_hrow_neon(const uint8* src, uint16* sums,
++	const void* xWeights, uint32 xmin, uint32 xmax);
++void bilinear_scale_vblend_neon(const uint16* top, const uint16* bottom,
++	void* dst, uint32 count, uint32 wTop);
++
++
++/*!	The horizontal half of the above for one source row: for each channel
++	of the pixels xmin to xmax, left * wLeft + right * wRight (at most
++	255 * 255, so 16 bits), into \a sums.
++*/
++void
++bilinear_scale_hrow_neon(const uint8* src, uint16* sums, const void* xWeights,
++	uint32 xmin, uint32 xmax)
++{
++	const FilterWeight* weights = (const FilterWeight*)xWeights;
++	const uint16x4_t full = vdup_n_u16(255);
++
++	for (uint32 x = xmin; x <= xmax; x++) {
++		uint16x8_t pixels = vmovl_u8(vld1_u8(src + weights[x].index));
++		uint16x4_t wLeft = vld1_dup_u16(&weights[x].weight);
++		uint16x4_t wRight = vsub_u16(full, wLeft);
++		uint16x4_t sum = vmul_u16(vget_low_u16(pixels), wLeft);
++		sum = vmla_u16(sum, vget_high_u16(pixels), wRight);
++		vst1_u16(sums, sum);
++		sums += 4;
++	}
++}
++
++
++/*!	The vertical half: \a count pixels of
++	(top * wTop + bottom * (255 - wTop)) >> 16 from two rows of
++	bilinear_scale_hrow_neon() sums.
++*/
++void
++bilinear_scale_vblend_neon(const uint16* top, const uint16* bottom, void* dst,
++	uint32 count, uint32 wTop)
++{
++	const uint16 wBottom = 255 - wTop;
++	uint8* d = (uint8*)dst;
++
++	for (; count >= 2; count -= 2) {
++		uint16x8_t t = vld1q_u16(top);
++		uint16x8_t b = vld1q_u16(bottom);
++		uint32x4_t low = vmull_n_u16(vget_low_u16(t), wTop);
++		low = vmlal_n_u16(low, vget_low_u16(b), wBottom);
++		uint32x4_t high = vmull_high_n_u16(t, wTop);
++		high = vmlal_high_n_u16(high, b, wBottom);
++		uint16x8_t result = vshrn_high_n_u32(vshrn_n_u32(low, 16), high, 16);
++		vst1_u8(d, vmovn_u16(result));
++		top += 8;
++		bottom += 8;
++		d += 8;
++	}
++	if (count > 0) {
++		uint32x4_t sum = vmull_n_u16(vld1_u16(top), wTop);
++		sum = vmlal_n_u16(sum, vld1_u16(bottom), wBottom);
++		uint16x4_t result = vshrn_n_u32(sum, 16);
++		uint8x8_t bytes = vmovn_u16(vcombine_u16(result, result));
++		vst1_lane_u32((uint32*)d, vreinterpret_u32_u8(bytes), 0);
++	}
++}

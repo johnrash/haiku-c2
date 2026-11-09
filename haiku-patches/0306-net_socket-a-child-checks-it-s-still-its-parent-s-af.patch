@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 5 Nov 2026 11:15:32 -0500
+Subject: [PATCH 306/342] net_socket: a child checks it's still its parent's
+ after taking the lock
+
+socket_aborted() and socket_connected() read the parent, then waited for its
+lock. If the parent accepted the socket meanwhile, or dropped it from the
+backlog, they went on to remove it from the parent's list although its links
+were on another one, and to release the parent's reference a second time. A
+fault at 0x170 in socket_aborted(), within seconds, from any host that connects
+and resets right away while a program is accepting.
+
+The parent link now changes and is read under sSocketLock, as readers don't
+hold the parent's lock yet.
+
+tcpchurn with the client resetting: 3.56 million connections in 10 minutes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/network/stack/net_socket.cpp       | 45 ++++++++++++++++---
+ 1 file changed, 39 insertions(+), 6 deletions(-)
+
+diff --git a/src/add-ons/kernel/network/stack/net_socket.cpp b/src/add-ons/kernel/network/stack/net_socket.cpp
+index e09e6008c5..8b3efec46a 100644
+--- a/src/add-ons/kernel/network/stack/net_socket.cpp
++++ b/src/add-ons/kernel/network/stack/net_socket.cpp
+@@ -55,6 +55,8 @@ struct net_socket_private : net_socket,
+ 	~net_socket_private();
+ 
+ 	void RemoveFromParent();
++	BReference<net_socket_private> GetParent();
++	bool IsChildOf(net_socket_private* parent);
+ 
+ 	BWeakReference<net_socket_private> parent;
+ 	team_id						owner;
+@@ -147,9 +149,8 @@ net_socket_private::RemoveFromParent()
+ {
+ 	ASSERT(!is_in_socket_list && parent != NULL);
+ 
+-	parent = NULL;
+-
+ 	mutex_lock(&sSocketLock);
++	parent = NULL;
+ 	sSocketList.Add(this);
+ 	mutex_unlock(&sSocketLock);
+ 
+@@ -159,6 +160,29 @@ net_socket_private::RemoveFromParent()
+ }
+ 
+ 
++/*!	The parent link only ever goes from a socket to none, with the parent's lock
++	and sSocketLock held. Without the parent's lock, this is the way to read it.
++*/
++BReference<net_socket_private>
++net_socket_private::GetParent()
++{
++	MutexLocker _(sSocketLock);
++	return parent.GetReference();
++}
++
++
++/*!	Whether this socket is still a child of \a parent, whose lock the caller
++	holds: while the caller was waiting for that lock, the socket may have been
++	accepted or dropped from the backlog. Its links are on another list then,
++	and the parent's reference to it is gone.
++*/
++bool
++net_socket_private::IsChildOf(net_socket_private* parent)
++{
++	return GetParent().Get() == parent;
++}
++
++
+ //	#pragma mark -
+ 
+ 
+@@ -741,6 +765,7 @@ bool
+ socket_has_parent(net_socket* _socket)
+ {
+ 	net_socket_private* socket = (net_socket_private*)_socket;
++	MutexLocker _(sSocketLock);
+ 	return socket->parent != NULL;
+ }
+ 
+@@ -755,17 +780,22 @@ socket_connected(net_socket* _socket)
+ 
+ 	TRACE("socket_connected(%p)\n", socket);
+ 
+-	if (socket->parent == NULL) {
++	if (!socket_has_parent(socket)) {
+ 		socket->is_connected = true;
+ 		return B_OK;
+ 	}
+ 
+-	BReference<net_socket_private> parent = socket->parent.GetReference();
++	BReference<net_socket_private> parent = socket->GetParent();
+ 	if (!parent.IsSet())
+ 		return B_BAD_VALUE;
+ 
+ 	MutexLocker _(parent->lock);
+ 
++	if (!socket->IsChildOf(parent.Get())) {
++		socket->is_connected = true;
++		return B_OK;
++	}
++
+ 	parent->pending_children.Remove(socket);
+ 	parent->connected_children.Add(socket);
+ 	socket->is_connected = true;
+@@ -788,12 +818,15 @@ socket_aborted(net_socket* _socket)
+ 
+ 	TRACE("socket_aborted(%p)\n", socket);
+ 
+-	BReference<net_socket_private> parent = socket->parent.GetReference();
++	BReference<net_socket_private> parent = socket->GetParent();
+ 	if (!parent.IsSet())
+ 		return B_BAD_VALUE;
+ 
+ 	MutexLocker _(parent->lock);
+ 
++	if (!socket->IsChildOf(parent.Get()))
++		return B_BAD_VALUE;
++
+ 	if (socket->is_connected)
+ 		parent->connected_children.Remove(socket);
+ 	else
+@@ -1003,7 +1036,7 @@ socket_getpeername(net_socket* _socket, struct sockaddr* address,
+ 	socklen_t* _addressLength)
+ {
+ 	net_socket_private* socket = (net_socket_private*)_socket;
+-	BReference<net_socket_private> parent = socket->parent.GetReference();
++	BReference<net_socket_private> parent = socket->GetParent();
+ 
+ 	if ((!parent.IsSet() && !socket->is_connected) || socket->peer.ss_len == 0
+ 		|| socket->peer.ss_family == AF_UNSPEC) {

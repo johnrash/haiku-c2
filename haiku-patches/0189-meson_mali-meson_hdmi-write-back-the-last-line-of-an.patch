@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 23:37:31 -0400
+Subject: [PATCH 189/342] meson_mali, meson_hdmi: write back the last line of
+ an unaligned range
+
+flush_cache_range() stepped from the range's first byte by the line
+size, so a range that didn't start on a line missed its last line. For
+meson_mali that was page-table entries: a buffer or a heap's new pages
+whose entries spanned a line boundary could stay unmapped for the GPU,
+and the GP or PPs faulted (the GP MMU faults of the M43 long run, and,
+with growable heaps, a fault right after each growth). The loop now
+starts at the line that holds the first byte, as meson_vdec's and the
+other drivers' do. meson_hdmi's copy had the same loop; its ranges are
+page-aligned, so it didn't show.
+
+Also: a failed GP job logs its lists, its heap, and the buffers near an
+MMU fault's address; a submit whose buffer isn't found no longer reads
+through the missing buffer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../graphics/meson_hdmi/meson_hdmi.cpp        |  7 ++++--
+ .../drivers/misc/meson_mali/meson_mali.cpp    |  7 ++++--
+ .../misc/meson_mali/meson_mali_jobs.cpp       | 23 +++++++++++++++++--
+ 3 files changed, 31 insertions(+), 6 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+index da1fe97407..9712255a77 100644
+--- a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
++++ b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+@@ -990,8 +990,11 @@ flush_cache_range(phys_addr_t physical, size_t size)
+ 	uint64 ctr;
+ 	asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
+ 	const addr_t lineSize = 4 << ((ctr >> 16) & 0xf);
+-	for (addr_t line = KERNEL_PMAP_BASE + physical;
+-			line < KERNEL_PMAP_BASE + physical + size; line += lineSize) {
++	// from the line that holds the first byte: else an unaligned range
++	// misses its last line
++	addr_t start = (KERNEL_PMAP_BASE + physical) & ~(lineSize - 1);
++	for (addr_t line = start; line < KERNEL_PMAP_BASE + physical + size;
++			line += lineSize) {
+ 		asm volatile("dc civac, %0" : : "r"(line) : "memory");
+ 	}
+ 	asm volatile("dsb sy" : : : "memory");
+diff --git a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali.cpp b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali.cpp
+index 202c912abd..cd32ab3055 100644
+--- a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali.cpp
++++ b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali.cpp
+@@ -80,8 +80,11 @@ flush_cache_range(phys_addr_t physical, size_t size)
+ 	uint64 ctr;
+ 	asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
+ 	const addr_t lineSize = 4 << ((ctr >> 16) & 0xf);
+-	for (addr_t line = KERNEL_PMAP_BASE + physical;
+-			line < KERNEL_PMAP_BASE + physical + size; line += lineSize) {
++	// from the line that holds the first byte: else an unaligned range
++	// misses its last line
++	addr_t start = (KERNEL_PMAP_BASE + physical) & ~(lineSize - 1);
++	for (addr_t line = start; line < KERNEL_PMAP_BASE + physical + size;
++			line += lineSize) {
+ 		asm volatile("dc civac, %0" : : "r"(line) : "memory");
+ 	}
+ 	asm volatile("dsb sy" : : : "memory");
+diff --git a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_jobs.cpp b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_jobs.cpp
+index 97ee331a13..13329353d0 100644
+--- a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_jobs.cpp
++++ b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_jobs.cpp
+@@ -743,7 +743,8 @@ MesonMali::_GemSubmit(mali_file* file, void* buffer)
+ 		task->bufferFlags[i] = objects[i].flags;
+ 		task->bufferCount = i + 1;
+ 		// a GP job's tile heap: its end is where its memory ends
+-		if (submit.pipe == MALI_PIPE_GP && task->buffers[i]->heap
++		if (submit.pipe == MALI_PIPE_GP && task->buffers[i] != NULL
++			&& task->buffers[i]->heap
+ 			&& task->buffers[i]->va == task->frame.gp.frame[4]) {
+ 			task->heap = task->buffers[i];
+ 		}
+@@ -914,11 +915,29 @@ MesonMali::_RunGp(mali_task* task)
+ 	if (status == B_OK && error == 0)
+ 		return true;
+ 
++	uint32 fault = _Read(kGpMmu + MMU_PAGE_FAULT_ADDR);
+ 	INFO("GP job %" B_PRIu64 ": %s, error %#" B_PRIx32 ", status %#" B_PRIx32
+ 		", raw %#" B_PRIx32 ", MMU status %#" B_PRIx32 " fault at %#" B_PRIx32
+ 		"\n", task->sequence, status == B_OK ? "failed" : "timed out", error,
+ 		_Read(kGp + GP_STATUS), _Read(kGp + GP_INT_RAWSTAT),
+-		_Read(kGpMmu + MMU_STATUS), _Read(kGpMmu + MMU_PAGE_FAULT_ADDR));
++		_Read(kGpMmu + MMU_STATUS), fault);
++	INFO("GP job %" B_PRIu64 ": lists %#" B_PRIx32 "-%#" B_PRIx32 ", %#"
++		B_PRIx32 "-%#" B_PRIx32 ", heap %#" B_PRIx32 "-%#" B_PRIx32 " (%s)\n",
++		task->sequence, frame[0], frame[1], frame[2], frame[3], frame[4],
++		frame[5], heap != NULL ? "growable" : "fixed");
++	if ((error & 0x80000000) != 0) {
++		for (uint32 i = 0; i < task->bufferCount; i++) {
++			mali_buffer* buffer = task->buffers[i];
++			if (fault + 0x10000 >= buffer->va
++				&& fault < buffer->va + buffer->size + 0x10000) {
++				INFO("GP job %" B_PRIu64 ": near buffer %#" B_PRIx32
++					", %#zx bytes (%" B_PRIu32 " pages backed%s), flags %#"
++					B_PRIx32 "\n", task->sequence, buffer->va, buffer->size,
++					buffer->backedPages, buffer->heap ? ", a heap" : "",
++					task->bufferFlags[i]);
++			}
++		}
++	}
+ 	_HardResetGp();
+ 	_RecoverMmu(kGpMmu);
+ 	return false;

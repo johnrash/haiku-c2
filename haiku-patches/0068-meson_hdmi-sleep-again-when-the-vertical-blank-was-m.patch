@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 18:34:20 -0400
+Subject: [PATCH 068/342] meson_hdmi: sleep again when the vertical blank was
+ missed
+
+_WaitForVerticalBlank() slept once, until shortly before the active
+area's end, and then polled the line counter. Woken too late on a busy
+system (decoding 1080p), it had missed the 0.67 ms blank and spun on a
+core through the whole next frame, taking time from the decoder. It now
+sleeps again for the next blank instead, and gives up after three frames
+rather than two.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../drivers/graphics/meson_hdmi/meson_hdmi.cpp   | 16 +++++++---------
+ 1 file changed, 7 insertions(+), 9 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+index fbaad0ad5a..28db4513af 100644
+--- a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
++++ b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+@@ -1207,21 +1207,19 @@ MesonHdmi::_WaitForVerticalBlank()
+ 	bigtime_t lineTime = (bigtime_t)timing.h_total * 1000000
+ 		/ timing.pixel_clock;
+ 	bigtime_t deadline = system_time()
+-		+ 2 * (timing.v_total * lineTime / 1000);
+-	bool slept = false;
++		+ 3 * (timing.v_total * lineTime / 1000);
+ 	while (true) {
+ 		uint32 line = (_Vpu(ENCP_INFO_READ) >> 16) & 0x1fff;
+ 		if (line > activeEnd || line < blankEnd)
+ 			return;
+-		bigtime_t now = system_time();
+-		if (now >= deadline)
++		if (system_time() >= deadline)
+ 			return;
++		// Sleep until shortly before the active area ends, then poll. Woken
++		// too late (a busy system), the blank may be over: then sleep again
++		// for the next one rather than spin through a frame.
+ 		bigtime_t toBlank = (activeEnd + 1 - line) * lineTime / 1000;
+-		if (!slept && toBlank > 300) {
+-			// sleep until shortly before the active area ends
+-			snooze(toBlank - 200);
+-			slept = true;
+-		}
++		if (toBlank > 400)
++			snooze(toBlank - 300);
+ 	}
+ }
+ 

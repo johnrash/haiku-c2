@@ -1,0 +1,674 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 21:31:02 -0400
+Subject: [PATCH 139/342] meson_decoder: HEVC
+
+The plugin takes what FFmpeg's reader calls HEVC too, when its first
+sequence parameter set says 4:2:0, 8 or 10 bits, up to 1920x1088: the
+hvcC record's parameter sets go ahead of the stream, its length-prefixed
+NAL units become Annex B ones. Frames start where the driver says
+(meson_vdec_frame.offset), and the clones of the driver's frame areas
+are kept per area.
+
+On the ODROID-C2, MediaPlayer plays 1080p30 8-bit and 10-bit and 1080p60
+HEVC without dropped frames at 8-25% CPU; FFmpeg can't play the 10-bit
+or the 1080p60 one. Seeks and moving through a playlist keep the
+hardware decoder.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../media/plugins/meson_decoder/H265.cpp      | 242 ++++++++++++++++++
+ .../media/plugins/meson_decoder/H265.h        |  42 +++
+ .../media/plugins/meson_decoder/Jamfile       |   1 +
+ .../meson_decoder/MesonVdecDecoder.cpp        | 140 ++++++----
+ .../plugins/meson_decoder/MesonVdecDecoder.h  |   4 +-
+ .../plugins/meson_decoder/MesonVdecPlugin.cpp |  37 +--
+ 6 files changed, 397 insertions(+), 69 deletions(-)
+ create mode 100644 src/add-ons/media/plugins/meson_decoder/H265.cpp
+ create mode 100644 src/add-ons/media/plugins/meson_decoder/H265.h
+
+diff --git a/src/add-ons/media/plugins/meson_decoder/H265.cpp b/src/add-ons/media/plugins/meson_decoder/H265.cpp
+new file mode 100644
+index 0000000000..3312e0441b
+--- /dev/null
++++ b/src/add-ons/media/plugins/meson_decoder/H265.cpp
+@@ -0,0 +1,242 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * The little of HEVC's syntax (ITU-T H.265, 7.3.2.2 and 7.3.3) and of its
++ * MP4 storage (ISO/IEC 14496-15, the HEVCDecoderConfigurationRecord) the
++ * hardware decoder's plugin needs.
++ */
++
++
++#include "H265.h"
++
++#include <string.h>
++
++
++namespace {
++
++
++/*!	Reads the bits of a NAL unit's payload, skipping the emulation
++	prevention bytes (00 00 03 -> 00 00).
++*/
++class BitReader {
++public:
++	BitReader(const uint8* data, size_t size)
++		:
++		fData(data),
++		fSize(size),
++		fPosition(0),
++		fBit(0),
++		fZeros(0),
++		fByte(0),
++		fError(false)
++	{
++	}
++
++	bool Error() const { return fError; }
++
++	uint32 Bit()
++	{
++		if (fBit == 0 && !_NextByte())
++			return 0;
++		uint32 bit = (fByte >> (7 - fBit)) & 1;
++		fBit = (fBit + 1) % 8;
++		return bit;
++	}
++
++	uint32 Bits(uint32 count)
++	{
++		uint32 value = 0;
++		while (count-- > 0)
++			value = (value << 1) | Bit();
++		return value;
++	}
++
++	void Skip(uint32 count)
++	{
++		while (count-- > 0)
++			Bit();
++	}
++
++	uint32 UnsignedGolomb()
++	{
++		uint32 zeros = 0;
++		while (Bit() == 0) {
++			if (fError || ++zeros > 31) {
++				fError = true;
++				return 0;
++			}
++		}
++		return ((1u << zeros) - 1) + Bits(zeros);
++	}
++
++private:
++	bool _NextByte()
++	{
++		while (fPosition < fSize) {
++			uint8 byte = fData[fPosition++];
++			if (fZeros >= 2 && byte == 3) {
++				fZeros = 0;
++				continue;
++			}
++			fZeros = byte == 0 ? fZeros + 1 : 0;
++			fByte = byte;
++			return true;
++		}
++		fError = true;
++		return false;
++	}
++
++	const uint8*	fData;
++	size_t			fSize;
++	size_t			fPosition;
++	uint32			fBit;
++	uint32			fZeros;
++	uint8			fByte;
++	bool			fError;
++};
++
++
++inline uint32
++read_be(const uint8* data, uint32 length)
++{
++	uint32 value = 0;
++	for (uint32 i = 0; i < length; i++)
++		value = (value << 8) | data[i];
++	return value;
++}
++
++
++}	// namespace
++
++
++bool
++h265_parse_sequence(const uint8* nal, size_t size, h265_sequence& sequence)
++{
++	if (size < 4 || ((nal[0] >> 1) & 0x3f) != 33)
++		return false;
++
++	BitReader reader(nal + 2, size - 2);
++	memset(&sequence, 0, sizeof(sequence));
++	reader.Skip(4);		// sps_video_parameter_set_id
++	uint32 subLayers = reader.Bits(3);	// sps_max_sub_layers_minus1
++	reader.Skip(1);		// sps_temporal_id_nesting_flag
++
++	// profile_tier_level: the general part, then the sub-layers'
++	reader.Skip(2 + 1);	// general_profile_space, general_tier_flag
++	sequence.profile = reader.Bits(5);
++	reader.Skip(32);	// general_profile_compatibility_flags
++	reader.Skip(48);	// the source and constraint flags
++	sequence.level = reader.Bits(8);
++	bool profilePresent[8];
++	bool levelPresent[8];
++	for (uint32 i = 0; i < subLayers; i++) {
++		profilePresent[i] = reader.Bit() != 0;
++		levelPresent[i] = reader.Bit() != 0;
++	}
++	if (subLayers > 0) {
++		for (uint32 i = subLayers; i < 8; i++)
++			reader.Skip(2);
++	}
++	for (uint32 i = 0; i < subLayers; i++) {
++		if (profilePresent[i])
++			reader.Skip(88);
++		if (levelPresent[i])
++			reader.Skip(8);
++	}
++
++	reader.UnsignedGolomb();	// sps_seq_parameter_set_id
++	sequence.chroma_format = reader.UnsignedGolomb();
++	if (sequence.chroma_format == 3)
++		reader.Skip(1);			// separate_colour_plane_flag
++	sequence.coded_width = reader.UnsignedGolomb();
++	sequence.coded_height = reader.UnsignedGolomb();
++	sequence.width = sequence.coded_width;
++	sequence.height = sequence.coded_height;
++	if (reader.Bit()) {
++		// conformance_window_flag: in chroma samples
++		uint32 left = reader.UnsignedGolomb();
++		uint32 right = reader.UnsignedGolomb();
++		uint32 top = reader.UnsignedGolomb();
++		uint32 bottom = reader.UnsignedGolomb();
++		uint32 unitX = sequence.chroma_format == 1
++			|| sequence.chroma_format == 2 ? 2 : 1;
++		uint32 unitY = sequence.chroma_format == 1 ? 2 : 1;
++		uint32 cropX = (left + right) * unitX;
++		uint32 cropY = (top + bottom) * unitY;
++		if (cropX >= sequence.coded_width || cropY >= sequence.coded_height)
++			return false;
++		sequence.width -= cropX;
++		sequence.height -= cropY;
++	}
++	uint32 lumaDepth = reader.UnsignedGolomb() + 8;
++	uint32 chromaDepth = reader.UnsignedGolomb() + 8;
++	sequence.bit_depth = lumaDepth == chromaDepth ? lumaDepth : 0;
++	return !reader.Error() && sequence.coded_width > 0
++		&& sequence.coded_height > 0 && sequence.coded_width <= 16384
++		&& sequence.coded_height <= 16384;
++}
++
++
++bool
++h265_parse_hvcc(const uint8* data, size_t size, uint8* annexB,
++	size_t* _annexBSize, size_t annexBCapacity, uint32* _lengthSize)
++{
++	// version 1; profile, compatibility, constraints, level, ... (22 bytes);
++	// the length size - 1 in the low bits of byte 21; byte 22: the arrays
++	if (size < 23 || data[0] != 1)
++		return false;
++	*_lengthSize = (data[21] & 3) + 1;
++
++	uint32 arrays = data[22];
++	size_t position = 23;
++	size_t written = 0;
++	for (uint32 array = 0; array < arrays; array++) {
++		// completeness and the NAL unit type, the count
++		if (position + 3 > size)
++			return false;
++		uint32 count = read_be(data + position + 1, 2);
++		position += 3;
++		for (uint32 i = 0; i < count; i++) {
++			if (position + 2 > size)
++				return false;
++			uint32 length = read_be(data + position, 2);
++			position += 2;
++			if (position + length > size
++				|| written + 4 + length > annexBCapacity) {
++				return false;
++			}
++			static const uint8 kStartCode[4] = { 0, 0, 0, 1 };
++			memcpy(annexB + written, kStartCode, 4);
++			memcpy(annexB + written + 4, data + position, length);
++			written += 4 + length;
++			position += length;
++		}
++	}
++	*_annexBSize = written;
++	return true;
++}
++
++
++const uint8*
++h265_find_sps(const uint8* data, size_t size, size_t* _nalSize)
++{
++	for (size_t i = 0; i + 4 < size; i++) {
++		if (data[i] != 0 || data[i + 1] != 0 || data[i + 2] != 1
++			|| ((data[i + 3] >> 1) & 0x3f) != 33) {
++			continue;
++		}
++		const uint8* nal = data + i + 3;
++		size_t end = i + 3;
++		while (end + 2 < size
++			&& !(data[end] == 0 && data[end + 1] == 0
++				&& (data[end + 2] == 1 || data[end + 2] == 0))) {
++			end++;
++		}
++		if (end + 2 >= size)
++			end = size;
++		*_nalSize = data + end - nal;
++		return nal;
++	}
++	return NULL;
++}
+diff --git a/src/add-ons/media/plugins/meson_decoder/H265.h b/src/add-ons/media/plugins/meson_decoder/H265.h
+new file mode 100644
+index 0000000000..bf5988e753
+--- /dev/null
++++ b/src/add-ons/media/plugins/meson_decoder/H265.h
+@@ -0,0 +1,42 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef H265_H
++#define H265_H
++
++
++#include <SupportDefs.h>
++
++
++/*!	What the decoder needs to know of an HEVC stream before decoding it:
++	from its first sequence parameter set.
++*/
++struct h265_sequence {
++	uint32	profile;			// general_profile_idc: 1 Main, 2 Main 10
++	uint32	level;				// general_level_idc
++	uint32	chroma_format;		// 1: 4:2:0
++	uint32	bit_depth;			// luma and chroma (0 if they differ)
++	uint32	coded_width;
++	uint32	coded_height;
++	uint32	width;				// after cropping
++	uint32	height;
++};
++
++
++bool	h265_parse_sequence(const uint8* nal, size_t size,
++			h265_sequence& sequence);
++			// nal: from its 2-byte header, without the start code
++
++/*!	The parameter sets of an MP4/Matroska "hvcC" record as Annex B NAL units
++	(each after 00 00 00 01), and the length of the length prefix of the
++	stream's NAL units. Returns false if \a data is not an hvcC record.
++*/
++bool	h265_parse_hvcc(const uint8* data, size_t size, uint8* annexB,
++			size_t* _annexBSize, size_t annexBCapacity, uint32* _lengthSize);
++
++/*!	The first sequence parameter set in Annex B data. */
++const uint8* h265_find_sps(const uint8* data, size_t size, size_t* _nalSize);
++
++
++#endif	// H265_H
+diff --git a/src/add-ons/media/plugins/meson_decoder/Jamfile b/src/add-ons/media/plugins/meson_decoder/Jamfile
+index f9eeac2587..dc1f7f35ce 100644
+--- a/src/add-ons/media/plugins/meson_decoder/Jamfile
++++ b/src/add-ons/media/plugins/meson_decoder/Jamfile
+@@ -4,6 +4,7 @@ UsePrivateHeaders media drivers ;
+ 
+ local sources =
+ 	H264.cpp
++	H265.cpp
+ 	MesonVdecDecoder.cpp
+ 	MesonVdecPlugin.cpp
+ 	nv12_neon.c
+diff --git a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
+index 06a708879a..7966858f01 100644
+--- a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
++++ b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
+@@ -2,15 +2,16 @@
+  * Copyright 2026, haiku-odroid-c2 port authors.
+  * Distributed under the terms of the MIT License.
+  *
+- * Decodes H.264 with the S905's video decoder, through the meson_vdec
+- * driver (headers/private/drivers/meson_vdec.h): the chunks go to the
+- * driver as an Annex B stream, the decoded NV12 frames come back in display
+- * order and are written to the caller's buffer as B_YCbCr422 (for the video
+- * overlay) or B_RGB32.
++ * Decodes H.264 and HEVC with the S905's video decoder, through the
++ * meson_vdec driver (headers/private/drivers/meson_vdec.h): the chunks go
++ * to the driver as an Annex B stream, the decoded NV12 frames (8 bits, also
++ * for 10-bit HEVC) come back in display order and are written to the
++ * caller's buffer as B_YCbCr422 (for the video overlay) or B_RGB32.
+  *
+  * Setup() fails when the decoder is in use, the firmware is missing or the
+- * stream is one the hardware can't decode (beyond 1920x1088, 4:2:2, 10
+- * bits, fields): the Media Kit then takes the next decoder (FFmpeg's).
++ * stream is one the hardware can't decode (beyond 1920x1088, not 4:2:0;
++ * H.264: 10 bits, fields; HEVC: more than 10 bits): the Media Kit then
++ * takes the next decoder (FFmpeg's).
+  * MESON_DECODER_DISABLE in the environment makes it fail always (to compare
+  * with FFmpeg); MESON_DECODER_TRACE logs what it is asked to stderr.
+  */
+@@ -45,7 +46,8 @@ static bool sTrace = getenv("MESON_DECODER_TRACE") != NULL;
+ #define ERROR(x...)		fprintf(stderr, "meson_vdec: " x)
+ 
+ 
+-static const char* kFirmwarePath = "firmware/meson/vdec/gxbb_h264.bin";
++static const char* kH264FirmwarePath = "firmware/meson/vdec/gxbb_h264.bin";
++static const char* kHevcFirmwarePath = "firmware/meson/vdec/gxl_hevc.bin";
+ 	// in the system data directory
+ static const uint32 kMaxInFlight = 24;
+ 	// chunks written ahead of the frames taken
+@@ -84,7 +86,7 @@ MesonVdecDecoder::MesonVdecDecoder()
+ 	fFrameNumber(0),
+ 	fFieldRate(0)
+ {
+-	memset(&fSequence, 0, sizeof(fSequence));
++	fWidth = fHeight = 0;
+ 	memset(&fFrame, 0, sizeof(fFrame));
+ }
+ 
+@@ -107,11 +109,12 @@ MesonVdecDecoder::~MesonVdecDecoder()
+ void
+ MesonVdecDecoder::GetCodecInfo(media_codec_info* info)
+ {
++	bool hevc = fCodec == MESON_VDEC_HEVC;
+ 	strlcpy(info->short_name, "meson_vdec", sizeof(info->short_name));
+-	strlcpy(info->pretty_name, "H.264 (Amlogic S905 video decoder)",
+-		sizeof(info->pretty_name));
++	strlcpy(info->pretty_name, hevc ? "HEVC (Amlogic S905 video decoder)"
++		: "H.264 (Amlogic S905 video decoder)", sizeof(info->pretty_name));
+ 	info->id = 0;
+-	info->sub_id = AV_CODEC_ID_H264;
++	info->sub_id = hevc ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264;
+ }
+ 
+ 
+@@ -130,14 +133,17 @@ MesonVdecDecoder::Setup(media_format* ioEncodedFormat, const void* infoBuffer,
+ 	if (formats.GetCodeFor(*ioEncodedFormat, B_MISC_FORMAT_FAMILY,
+ 			&description) != B_OK
+ 		|| description.u.misc.file_format != 'ffmp'
+-		|| description.u.misc.codec != AV_CODEC_ID_H264) {
++		|| (description.u.misc.codec != AV_CODEC_ID_H264
++			&& description.u.misc.codec != AV_CODEC_ID_HEVC)) {
+ 		return B_MEDIA_BAD_FORMAT;
+ 	}
++	bool hevc = description.u.misc.codec == AV_CODEC_ID_HEVC;
++	fCodec = hevc ? MESON_VDEC_HEVC : MESON_VDEC_H264;
+ 	fInputFormat = *ioEncodedFormat;
+ 	fFieldRate = ioEncodedFormat->u.encoded_video.output.field_rate;
+ 
+-	// the parameter sets: an avcC record (MP4, Matroska) or Annex B (the
+-	// stream itself has them then too)
++	// the parameter sets: an avcC or hvcC record (MP4, Matroska) or Annex B
++	// (the stream itself has them then too)
+ 	const uint8* info = (const uint8*)infoBuffer;
+ 	free(fHeaders);
+ 	fHeadersSize = infoSize * 2 + 64;
+@@ -145,9 +151,13 @@ MesonVdecDecoder::Setup(media_format* ioEncodedFormat, const void* infoBuffer,
+ 	if (fHeaders == NULL)
+ 		return B_NO_MEMORY;
+ 	if (infoSize > 0 && info[0] == 1) {
+-		if (!h264_parse_avcc(info, infoSize, fHeaders, &fHeadersSize,
+-				fHeadersSize, &fLengthSize)) {
+-			ERROR("bad avcC record\n");
++		bool parsed = hevc
++			? h265_parse_hvcc(info, infoSize, fHeaders, &fHeadersSize,
++				fHeadersSize, &fLengthSize)
++			: h264_parse_avcc(info, infoSize, fHeaders, &fHeadersSize,
++				fHeadersSize, &fLengthSize);
++		if (!parsed) {
++			ERROR("bad %s record\n", hevc ? "hvcC" : "avcC");
+ 			return B_MEDIA_BAD_FORMAT;
+ 		}
+ 	} else {
+@@ -157,26 +167,53 @@ MesonVdecDecoder::Setup(media_format* ioEncodedFormat, const void* infoBuffer,
+ 	}
+ 
+ 	size_t spsSize;
+-	const uint8* sps = h264_find_sps(fHeaders, fHeadersSize, &spsSize);
+-	if (sps == NULL || !h264_parse_sequence(sps, spsSize, fSequence)) {
+-		TRACE("no sequence parameter set before the stream\n");
+-		return B_MEDIA_BAD_FORMAT;
+-	}
+-	TRACE("profile %" B_PRIu32 ", level %" B_PRIu32 ", %" B_PRIu32 "x%"
+-		B_PRIu32 " (coded %" B_PRIu32 "x%" B_PRIu32 "), %" B_PRIu32
+-		" reference frames\n", fSequence.profile, fSequence.level,
+-		fSequence.width, fSequence.height, fSequence.coded_width,
+-		fSequence.coded_height, fSequence.reference_frames);
+-	bool profileOkay = fSequence.profile == 66 || fSequence.profile == 77
+-		|| fSequence.profile == 100;
+-	if (!profileOkay || fSequence.chroma_format != 1
+-		|| fSequence.bit_depth != 8 || !fSequence.frame_only
+-		|| fSequence.coded_width > 1920 || fSequence.coded_height > 1088) {
+-		TRACE("not for the hardware: profile %" B_PRIu32 ", chroma %" B_PRIu32
+-			", %" B_PRIu32 " bits%s\n", fSequence.profile,
+-			fSequence.chroma_format, fSequence.bit_depth,
+-			fSequence.frame_only ? "" : ", fields");
+-		return B_MEDIA_BAD_FORMAT;
++	if (hevc) {
++		h265_sequence sequence;
++		const uint8* sps = h265_find_sps(fHeaders, fHeadersSize, &spsSize);
++		if (sps == NULL || !h265_parse_sequence(sps, spsSize, sequence)) {
++			TRACE("no sequence parameter set before the stream\n");
++			return B_MEDIA_BAD_FORMAT;
++		}
++		TRACE("HEVC profile %" B_PRIu32 ", level %" B_PRIu32 ", %" B_PRIu32
++			"x%" B_PRIu32 " (coded %" B_PRIu32 "x%" B_PRIu32 "), chroma %"
++			B_PRIu32 ", %" B_PRIu32 " bits\n", sequence.profile,
++			sequence.level, sequence.width, sequence.height,
++			sequence.coded_width, sequence.coded_height,
++			sequence.chroma_format, sequence.bit_depth);
++		// the profile number doesn't matter, what it takes does
++		if (sequence.chroma_format != 1
++			|| (sequence.bit_depth != 8 && sequence.bit_depth != 10)
++			|| sequence.coded_width > 1920 || sequence.coded_height > 1088) {
++			TRACE("not for the hardware\n");
++			return B_MEDIA_BAD_FORMAT;
++		}
++		fWidth = sequence.width;
++		fHeight = sequence.height;
++	} else {
++		h264_sequence sequence;
++		const uint8* sps = h264_find_sps(fHeaders, fHeadersSize, &spsSize);
++		if (sps == NULL || !h264_parse_sequence(sps, spsSize, sequence)) {
++			TRACE("no sequence parameter set before the stream\n");
++			return B_MEDIA_BAD_FORMAT;
++		}
++		TRACE("profile %" B_PRIu32 ", level %" B_PRIu32 ", %" B_PRIu32 "x%"
++			B_PRIu32 " (coded %" B_PRIu32 "x%" B_PRIu32 "), %" B_PRIu32
++			" reference frames\n", sequence.profile, sequence.level,
++			sequence.width, sequence.height, sequence.coded_width,
++			sequence.coded_height, sequence.reference_frames);
++		bool profileOkay = sequence.profile == 66 || sequence.profile == 77
++			|| sequence.profile == 100;
++		if (!profileOkay || sequence.chroma_format != 1
++			|| sequence.bit_depth != 8 || !sequence.frame_only
++			|| sequence.coded_width > 1920 || sequence.coded_height > 1088) {
++			TRACE("not for the hardware: profile %" B_PRIu32 ", chroma %"
++				B_PRIu32 ", %" B_PRIu32 " bits%s\n", sequence.profile,
++				sequence.chroma_format, sequence.bit_depth,
++				sequence.frame_only ? "" : ", fields");
++			return B_MEDIA_BAD_FORMAT;
++		}
++		fWidth = sequence.width;
++		fHeight = sequence.height;
+ 	}
+ 
+ 	status_t status = _LoadFirmware();
+@@ -203,7 +240,8 @@ MesonVdecDecoder::_LoadFirmware()
+ 		return B_ENTRY_NOT_FOUND;
+ 	}
+ 	strlcat(path, "/", sizeof(path));
+-	strlcat(path, kFirmwarePath, sizeof(path));
++	strlcat(path, fCodec == MESON_VDEC_HEVC ? kHevcFirmwarePath
++		: kH264FirmwarePath, sizeof(path));
+ 
+ 	int fd = open(path, O_RDONLY | O_CLOEXEC);
+ 	if (fd < 0) {
+@@ -236,8 +274,8 @@ MesonVdecDecoder::_StartSession()
+ 	start.codec = fCodec;
+ 	start.firmware = fFirmware;
+ 	start.firmware_size = fFirmwareSize;
+-	start.width = fSequence.width;
+-	start.height = fSequence.height;
++	start.width = fWidth;
++	start.height = fHeight;
+ 	if (ioctl(fDevice, MESON_VDEC_START, &start, sizeof(start)) != 0) {
+ 		ERROR("start: %s\n", strerror(errno));
+ 		return errno;
+@@ -526,7 +564,7 @@ MesonVdecDecoder::NegotiateOutputFormat(media_format* ioDecodedFormat)
+ 		= ioDecodedFormat->u.raw_video.display.format == B_YCbCr422
+ 			? B_YCbCr422 : B_RGB32;
+ 	uint32 bytesPerRow = fOutputColorSpace == B_YCbCr422
+-		? (fSequence.width + 1) / 2 * 4 : fSequence.width * 4;
++		? (fWidth + 1) / 2 * 4 : fWidth * 4;
+ 	if (ioDecodedFormat->u.raw_video.display.bytes_per_row > bytesPerRow)
+ 		bytesPerRow = ioDecodedFormat->u.raw_video.display.bytes_per_row;
+ 	fOutputBytesPerRow = bytesPerRow;
+@@ -545,12 +583,12 @@ MesonVdecDecoder::NegotiateOutputFormat(media_format* ioDecodedFormat)
+ 	ioDecodedFormat->u.raw_video = fInputFormat.u.encoded_video.output;
+ 	ioDecodedFormat->u.raw_video.interlace = 1;
+ 	ioDecodedFormat->u.raw_video.first_active = 0;
+-	ioDecodedFormat->u.raw_video.last_active = fSequence.height - 1;
++	ioDecodedFormat->u.raw_video.last_active = fHeight - 1;
+ 	if (fFieldRate > 0 && fFieldRate < 70)
+ 		ioDecodedFormat->u.raw_video.field_rate = fFieldRate;
+ 	ioDecodedFormat->u.raw_video.display.format = fOutputColorSpace;
+-	ioDecodedFormat->u.raw_video.display.line_width = fSequence.width;
+-	ioDecodedFormat->u.raw_video.display.line_count = fSequence.height;
++	ioDecodedFormat->u.raw_video.display.line_width = fWidth;
++	ioDecodedFormat->u.raw_video.display.line_count = fHeight;
+ 	ioDecodedFormat->u.raw_video.display.bytes_per_row = fOutputBytesPerRow;
+ 	ioDecodedFormat->u.raw_video.display.pixel_offset = 0;
+ 	ioDecodedFormat->u.raw_video.display.line_offset = 0;
+@@ -590,8 +628,8 @@ MesonVdecDecoder::_Convert(void* buffer)
+ 	base += fFrame.offset;
+ 	const uint8* luma = base;
+ 	const uint8* chroma = base + fFrame.chroma_offset;
+-	uint32 width = min_c(fFrame.width, fSequence.width);
+-	uint32 height = min_c(fFrame.height, fSequence.height);
++	uint32 width = min_c(fFrame.width, fWidth);
++	uint32 height = min_c(fFrame.height, fHeight);
+ 
+ 	if (fOutputColorSpace == B_YCbCr422) {
+ 		nv12_to_ycbcr422_neon(luma, chroma, fFrame.bytes_per_row,
+@@ -621,14 +659,14 @@ MesonVdecDecoder::_FillHeader(media_header* header)
+ 	memset(header, 0, sizeof(*header));
+ 	header->type = B_MEDIA_RAW_VIDEO;
+ 	header->start_time = _TakeTime(fFrame.stream_offset);
+-	header->size_used = (size_t)fOutputBytesPerRow * fSequence.height;
+-	header->u.raw_video.display_line_width = fSequence.width;
+-	header->u.raw_video.display_line_count = fSequence.height;
++	header->size_used = (size_t)fOutputBytesPerRow * fHeight;
++	header->u.raw_video.display_line_width = fWidth;
++	header->u.raw_video.display_line_count = fHeight;
+ 	header->u.raw_video.bytes_per_row = fOutputBytesPerRow;
+ 	header->u.raw_video.field_gamma = 1.0;
+ 	header->u.raw_video.field_sequence = fFrameNumber;
+ 	header->u.raw_video.first_active_line = 1;
+-	header->u.raw_video.line_count = fSequence.height;
++	header->u.raw_video.line_count = fHeight;
+ 	header->u.raw_video.pixel_width_aspect
+ 		= fInputFormat.u.encoded_video.output.pixel_width_aspect;
+ 	header->u.raw_video.pixel_height_aspect
+diff --git a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h
+index 17c8a870d5..45895be563 100644
+--- a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h
++++ b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h
+@@ -13,6 +13,7 @@
+ 
+ #include "DecoderPlugin.h"
+ #include "H264.h"
++#include "H265.h"
+ 
+ 
+ struct SwsContext;
+@@ -56,7 +57,8 @@ private:
+ 			uint8*				fFirmware;
+ 			size_t				fFirmwareSize;
+ 			media_format		fInputFormat;
+-			h264_sequence		fSequence;
++			uint32				fWidth;			// the picture's, cropped
++			uint32				fHeight;
+ 
+ 			// the parameter sets of an MP4 stream ("avcC"), as Annex B, for
+ 			// the start of each session; the length of its NAL lengths (0:
+diff --git a/src/add-ons/media/plugins/meson_decoder/MesonVdecPlugin.cpp b/src/add-ons/media/plugins/meson_decoder/MesonVdecPlugin.cpp
+index f1ac4cf219..35416ba8a5 100644
+--- a/src/add-ons/media/plugins/meson_decoder/MesonVdecPlugin.cpp
++++ b/src/add-ons/media/plugins/meson_decoder/MesonVdecPlugin.cpp
+@@ -3,8 +3,8 @@
+  * Distributed under the terms of the MIT License.
+  *
+  * meson_decoder: a decoder plugin for the S905's video decoder (PLAN.md M26).
+- * It takes the streams FFmpeg's reader describes as H.264, and comes first
+- * among the decoders (media_decoder_priority).
++ * It takes the streams FFmpeg's reader describes as H.264 or HEVC, and
++ * comes first among the decoders (media_decoder_priority).
+  */
+ 
+ 
+@@ -28,7 +28,7 @@ public:
+ };
+ 
+ 
+-static media_format sFormats[1];
++static media_format sFormats[2];
+ 
+ 
+ Decoder*
+@@ -46,22 +46,25 @@ MesonVdecPlugin::GetSupportedFormats(media_format** _formats, size_t* _count)
+ 		return B_ERROR;
+ 
+ 	// as AVFormatReader describes them
+-	media_format_description description;
+-	memset(&description, 0, sizeof(description));
+-	description.family = B_MISC_FORMAT_FAMILY;
+-	description.u.misc.file_format = 'ffmp';
+-	description.u.misc.codec = AV_CODEC_ID_H264;
+-
+-	media_format format;
+-	format.type = B_MEDIA_ENCODED_VIDEO;
+-	format.require_flags = 0;
+-	format.deny_flags = B_MEDIA_MAUI_UNDEFINED_FLAGS;
+-	if (mediaFormats.MakeFormatFor(&description, 1, &format) != B_OK)
+-		return B_ERROR;
+-	sFormats[0] = format;
++	static const int kCodecs[] = { AV_CODEC_ID_H264, AV_CODEC_ID_HEVC };
++	for (size_t i = 0; i < B_COUNT_OF(kCodecs); i++) {
++		media_format_description description;
++		memset(&description, 0, sizeof(description));
++		description.family = B_MISC_FORMAT_FAMILY;
++		description.u.misc.file_format = 'ffmp';
++		description.u.misc.codec = kCodecs[i];
++
++		media_format format;
++		format.type = B_MEDIA_ENCODED_VIDEO;
++		format.require_flags = 0;
++		format.deny_flags = B_MEDIA_MAUI_UNDEFINED_FLAGS;
++		if (mediaFormats.MakeFormatFor(&description, 1, &format) != B_OK)
++			return B_ERROR;
++		sFormats[i] = format;
++	}
+ 
+ 	*_formats = sFormats;
+-	*_count = 1;
++	*_count = B_COUNT_OF(sFormats);
+ 	return B_OK;
+ }
+ 

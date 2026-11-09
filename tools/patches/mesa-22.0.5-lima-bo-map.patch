@@ -1,0 +1,30 @@
+--- a/src/gallium/drivers/lima/lima_bo.c
++++ b/src/gallium/drivers/lima/lima_bo.c
+@@ -341,10 +341,15 @@
+ void *lima_bo_map(struct lima_bo *bo)
+ {
+    if (!bo->map) {
++#ifdef __HAIKU__
++      /* a device can't be mmap()ed: the offset is an area to clone */
++      bo->map = drmHaikuMap(bo->screen->fd, bo->offset, bo->size);
++#else
+       bo->map = os_mmap(0, bo->size, PROT_READ | PROT_WRITE,
+                         MAP_SHARED, bo->screen->fd, bo->offset);
+       if (bo->map == MAP_FAILED)
+           bo->map = NULL;
++#endif
+    }
+ 
+    return bo->map;
+@@ -353,7 +358,11 @@
+ void lima_bo_unmap(struct lima_bo *bo)
+ {
+    if (bo->map) {
++#ifdef __HAIKU__
++      drmHaikuUnmap(bo->map, bo->size);
++#else
+       os_munmap(bo->map, bo->size);
++#endif
+       bo->map = NULL;
+    }
+ }

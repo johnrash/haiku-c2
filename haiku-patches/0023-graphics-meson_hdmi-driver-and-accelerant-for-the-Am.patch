@@ -1,0 +1,1839 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 09:49:28 -0400
+Subject: [PATCH 023/342] graphics: meson_hdmi driver and accelerant for the
+ Amlogic GXBB
+
+A native display driver for the Meson GXBB (S905, ODROID-C2) HDMI
+output. U-Boot leaves the display pipeline running (power, clocks,
+resets, HDMI controller and PHY setup) through ExitBootServices, so the
+driver only reprograms what depends on the mode: the OSD1 canvas and
+window, the VPP postblend width, the ENCP timing generator, the HDMI
+PLL's OD2 post-divider (U-Boot's 5940 MHz VCO: /2 for 74.25 MHz, /1 for
+148.5 MHz), the DesignWare frame composer (with a TMDS soft reset) and a
+PHY reset.
+
+At attach it compares U-Boot's live registers with the values computed
+for its mode (all match for 1280x720), reads the EDID over the
+controller's DDC master (two identical reads required), saves the boot
+state, and allocates a contiguous write-combining frame buffer for
+1920x1080. Modes: 1280x720@60, 1920x1080@30 and @60, as far as the EDID
+lists them (detailed timings or CTA video codes); 1080p60 is preferred.
+A failed mode set restores the boot mode; so does "meson_hdmi restore"
+in KDL. "mode_setting off" in the driver settings leaves the device
+unpublished, so app_server keeps the framebuffer driver.
+
+The accelerant passes mode requests to the driver and exposes its mode
+list, preferred mode and EDID.
+
+Tested on the ODROID-C2 with an HDMI capture device: the desktop comes up
+at 1920x1080@60; 720p60 and 1080p30 work; 10 switches between 720p and
+1080p without a fault; the KDL restore brings back U-Boot's picture.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/jam/packages/Haiku                      |    2 +
+ .../graphics/meson_hdmi/meson_hdmi_info.h     |   45 +
+ src/add-ons/accelerants/Jamfile               |    1 +
+ src/add-ons/accelerants/meson_hdmi/Jamfile    |   12 +
+ .../accelerants/meson_hdmi/accelerant.cpp     |  289 ++++
+ src/add-ons/kernel/drivers/graphics/Jamfile   |    1 +
+ .../drivers/graphics/meson_hdmi/Jamfile       |   10 +
+ .../graphics/meson_hdmi/meson_hdmi.cpp        | 1360 +++++++++++++++++
+ 8 files changed, 1720 insertions(+)
+ create mode 100644 headers/private/graphics/meson_hdmi/meson_hdmi_info.h
+ create mode 100644 src/add-ons/accelerants/meson_hdmi/Jamfile
+ create mode 100644 src/add-ons/accelerants/meson_hdmi/accelerant.cpp
+ create mode 100644 src/add-ons/kernel/drivers/graphics/meson_hdmi/Jamfile
+ create mode 100644 src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index c2ce2f9b12..53368fdc1f 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -138,6 +138,7 @@ AddNewDriversToPackage disk virtual :
+ 	;
+ AddNewDriversToPackage graphics :
+ 	virtio_gpu
++	meson_hdmi@arm64
+ 	;
+ AddNewDriversToPackage power
+ 	: $(SYSTEM_ADD_ONS_DRIVERS_POWER) ;
+@@ -375,6 +376,7 @@ AddBootModuleSymlinksToPackage
+ AddFilesToPackage add-ons accelerants :
+ 	framebuffer.accelerant
+ 	virtio_gpu.accelerant
++	meson_hdmi.accelerant@arm64
+ 	$(SYSTEM_ADD_ONS_ACCELERANTS) ;
+ AddFilesToPackage add-ons locale catalogs :
+ 	$(SYSTEM_ADD_ONS_LOCALE_CATALOGS) ;
+diff --git a/headers/private/graphics/meson_hdmi/meson_hdmi_info.h b/headers/private/graphics/meson_hdmi/meson_hdmi_info.h
+new file mode 100644
+index 0000000000..539052db2a
+--- /dev/null
++++ b/headers/private/graphics/meson_hdmi/meson_hdmi_info.h
+@@ -0,0 +1,45 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef MESON_HDMI_INFO_H
++#define MESON_HDMI_INFO_H
++
++
++#include <Accelerant.h>
++#include <Drivers.h>
++
++
++#define MESON_HDMI_ACCELERANT_NAME	"meson_hdmi.accelerant"
++#define MESON_HDMI_MAX_MODES		8
++#define MESON_HDMI_EDID_SIZE		256
++
++
++// ioctls of graphics/meson_hdmi/0
++enum {
++	MESON_HDMI_GET_SHARED_INFO = B_DEVICE_OP_CODES_END + 1,
++		// area_id of the shared info
++	MESON_HDMI_CLONE_FRAME_BUFFER,
++		// clones the frame buffer into the calling team; area_info
++	MESON_HDMI_SET_DISPLAY_MODE,
++		// display_mode; must be one of the modes in the shared info
++	MESON_HDMI_GET_DEVICE_NAME,
++		// char[B_PATH_NAME_LENGTH], for clone accelerants
++};
++
++
++struct meson_hdmi_shared_info {
++	display_mode	current_mode;
++	uint32			bytes_per_row;
++
++	uint32			mode_count;
++	display_mode	modes[MESON_HDMI_MAX_MODES];
++	uint32			preferred_mode;		// index into modes
++
++	uint32			edid_size;			// 0: no EDID
++	uint8			edid[MESON_HDMI_EDID_SIZE];
++		// raw: the base block and the first extension
++};
++
++
++#endif	// MESON_HDMI_INFO_H
+diff --git a/src/add-ons/accelerants/Jamfile b/src/add-ons/accelerants/Jamfile
+index 9b6a99e650..b8a31c6e81 100644
+--- a/src/add-ons/accelerants/Jamfile
++++ b/src/add-ons/accelerants/Jamfile
+@@ -8,6 +8,7 @@ SubInclude HAIKU_TOP src add-ons accelerants framebuffer ;
+ SubInclude HAIKU_TOP src add-ons accelerants intel_810 ;
+ SubInclude HAIKU_TOP src add-ons accelerants intel_extreme ;
+ SubInclude HAIKU_TOP src add-ons accelerants matrox ;
++SubInclude HAIKU_TOP src add-ons accelerants meson_hdmi ;
+ SubInclude HAIKU_TOP src add-ons accelerants neomagic ;
+ SubInclude HAIKU_TOP src add-ons accelerants nvidia ;
+ SubInclude HAIKU_TOP src add-ons accelerants radeon ;
+diff --git a/src/add-ons/accelerants/meson_hdmi/Jamfile b/src/add-ons/accelerants/meson_hdmi/Jamfile
+new file mode 100644
+index 0000000000..90bf3cfefe
+--- /dev/null
++++ b/src/add-ons/accelerants/meson_hdmi/Jamfile
+@@ -0,0 +1,12 @@
++SubDir HAIKU_TOP src add-ons accelerants meson_hdmi ;
++
++UsePrivateHeaders graphics ;
++UsePrivateHeaders [ FDirName graphics common ] ;
++UsePrivateHeaders [ FDirName graphics meson_hdmi ] ;
++
++if $(TARGET_ARCH) = arm64 {
++	Addon meson_hdmi.accelerant :
++		accelerant.cpp
++		: libaccelerantscommon.a
++	;
++}
+diff --git a/src/add-ons/accelerants/meson_hdmi/accelerant.cpp b/src/add-ons/accelerants/meson_hdmi/accelerant.cpp
+new file mode 100644
+index 0000000000..3a41e8d09e
+--- /dev/null
++++ b/src/add-ons/accelerants/meson_hdmi/accelerant.cpp
+@@ -0,0 +1,289 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++/*!	Accelerant for the meson_hdmi driver (Amlogic Meson GXBB HDMI). The
++	kernel driver owns the hardware: it builds the mode list from the
++	modes it can set and the EDID, and sets modes. This side only clones
++	the shared info and the frame buffer and passes requests on.
++*/
++
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++
++#include <Accelerant.h>
++#include <OS.h>
++#include <edid.h>
++
++#include "meson_hdmi_info.h"
++
++
++struct accelerant_info {
++	int						device;
++	bool					is_clone;
++	area_id					shared_area;
++	meson_hdmi_shared_info*	shared;
++	area_id					frame_buffer_area;
++	uint8*					frame_buffer;
++	size_t					frame_buffer_size;
++};
++
++static accelerant_info sInfo = { -1, false, -1, NULL, -1, NULL, 0 };
++
++
++static status_t
++init_common(int device, bool isClone)
++{
++	sInfo.device = device;
++	sInfo.is_clone = isClone;
++
++	area_id sharedArea;
++	if (ioctl(device, MESON_HDMI_GET_SHARED_INFO, &sharedArea,
++			sizeof(sharedArea)) != 0) {
++		return B_ERROR;
++	}
++	sInfo.shared_area = clone_area("meson_hdmi shared info",
++		(void**)&sInfo.shared, B_ANY_ADDRESS, B_READ_AREA, sharedArea);
++	if (sInfo.shared_area < 0)
++		return sInfo.shared_area;
++
++	area_info info;
++	if (ioctl(device, MESON_HDMI_CLONE_FRAME_BUFFER, &info, sizeof(info))
++			!= 0) {
++		delete_area(sInfo.shared_area);
++		return B_ERROR;
++	}
++	sInfo.frame_buffer_area = info.area;
++	sInfo.frame_buffer = (uint8*)info.address;
++	sInfo.frame_buffer_size = info.size;
++	return B_OK;
++}
++
++
++static status_t
++meson_init_accelerant(int device)
++{
++	return init_common(device, false);
++}
++
++
++static void
++meson_uninit_accelerant(void)
++{
++	delete_area(sInfo.frame_buffer_area);
++	delete_area(sInfo.shared_area);
++	if (sInfo.is_clone)
++		close(sInfo.device);
++	sInfo.shared = NULL;
++}
++
++
++static ssize_t
++meson_accelerant_clone_info_size(void)
++{
++	return B_PATH_NAME_LENGTH;
++}
++
++
++static void
++meson_get_accelerant_clone_info(void* data)
++{
++	ioctl(sInfo.device, MESON_HDMI_GET_DEVICE_NAME, data, B_PATH_NAME_LENGTH);
++}
++
++
++static status_t
++meson_clone_accelerant(void* data)
++{
++	char path[B_PATH_NAME_LENGTH];
++	snprintf(path, sizeof(path), "/dev/%s", (const char*)data);
++	int device = open(path, B_READ_WRITE);
++	if (device < 0)
++		return errno;
++	status_t status = init_common(device, true);
++	if (status != B_OK)
++		close(device);
++	return status;
++}
++
++
++static status_t
++meson_get_accelerant_device_info(accelerant_device_info* info)
++{
++	info->version = B_ACCELERANT_VERSION;
++	strcpy(info->name, "Amlogic Meson GXBB HDMI");
++	strcpy(info->chipset, "S905");
++	strcpy(info->serial_no, "");
++	info->memory = sInfo.frame_buffer_size;
++	info->dac_speed = 0;
++	return B_OK;
++}
++
++
++static sem_id
++meson_accelerant_retrace_semaphore(void)
++{
++	return B_ERROR;
++}
++
++
++static uint32
++meson_accelerant_mode_count(void)
++{
++	return sInfo.shared->mode_count;
++}
++
++
++static status_t
++meson_get_mode_list(display_mode* modes)
++{
++	memcpy(modes, sInfo.shared->modes,
++		sInfo.shared->mode_count * sizeof(display_mode));
++	return B_OK;
++}
++
++
++static uint32
++refresh_rate(const display_mode& mode)
++{
++	uint32 total = (uint32)mode.timing.h_total * mode.timing.v_total;
++	return total == 0 ? 0 : mode.timing.pixel_clock * 1000 / total;
++}
++
++
++/*!	Picks the listed mode with the requested size whose refresh rate is
++	closest to the requested one.
++*/
++static status_t
++meson_propose_display_mode(display_mode* target, const display_mode* low,
++	const display_mode* high)
++{
++	const display_mode* best = NULL;
++	uint32 wanted = refresh_rate(*target);
++	for (uint32 i = 0; i < sInfo.shared->mode_count; i++) {
++		const display_mode& mode = sInfo.shared->modes[i];
++		if (mode.timing.h_display != target->timing.h_display
++			|| mode.timing.v_display != target->timing.v_display) {
++			continue;
++		}
++		if (best == NULL || abs((int32)refresh_rate(mode) - (int32)wanted)
++				< abs((int32)refresh_rate(*best) - (int32)wanted)) {
++			best = &mode;
++		}
++	}
++	if (best == NULL)
++		return B_BAD_VALUE;
++	*target = *best;
++	return B_OK;
++}
++
++
++static status_t
++meson_set_display_mode(display_mode* mode)
++{
++	if (ioctl(sInfo.device, MESON_HDMI_SET_DISPLAY_MODE, mode,
++			sizeof(display_mode)) != 0) {
++		return errno;
++	}
++	return B_OK;
++}
++
++
++static status_t
++meson_get_display_mode(display_mode* mode)
++{
++	*mode = sInfo.shared->current_mode;
++	return B_OK;
++}
++
++
++static status_t
++meson_get_preferred_display_mode(display_mode* mode)
++{
++	if (sInfo.shared->mode_count == 0)
++		return B_ERROR;
++	*mode = sInfo.shared->modes[sInfo.shared->preferred_mode];
++	return B_OK;
++}
++
++
++static status_t
++meson_get_edid_info(void* info, size_t size, uint32* _version)
++{
++	if (sInfo.shared->edid_size < 128)
++		return B_ERROR;
++	if (size < sizeof(edid1_info))
++		return B_BUFFER_OVERFLOW;
++	edid_decode((edid1_info*)info, (const edid1_raw*)sInfo.shared->edid);
++	*_version = EDID_VERSION_1;
++	return B_OK;
++}
++
++
++static status_t
++meson_get_frame_buffer_config(frame_buffer_config* config)
++{
++	config->frame_buffer = sInfo.frame_buffer;
++	config->frame_buffer_dma = NULL;
++	config->bytes_per_row = sInfo.shared->bytes_per_row;
++	return B_OK;
++}
++
++
++static status_t
++meson_get_pixel_clock_limits(display_mode* mode, uint32* _low, uint32* _high)
++{
++	uint32 total = (uint32)mode->timing.h_total * mode->timing.v_total;
++	*_low = total * 24 / 1000;		// 24 Hz
++	*_high = 148500;
++	return *_low <= *_high ? B_OK : B_ERROR;
++}
++
++
++extern "C" void*
++get_accelerant_hook(uint32 feature, void* data)
++{
++	switch (feature) {
++		case B_INIT_ACCELERANT:
++			return (void*)meson_init_accelerant;
++		case B_UNINIT_ACCELERANT:
++			return (void*)meson_uninit_accelerant;
++		case B_CLONE_ACCELERANT:
++			return (void*)meson_clone_accelerant;
++		case B_ACCELERANT_CLONE_INFO_SIZE:
++			return (void*)meson_accelerant_clone_info_size;
++		case B_GET_ACCELERANT_CLONE_INFO:
++			return (void*)meson_get_accelerant_clone_info;
++		case B_GET_ACCELERANT_DEVICE_INFO:
++			return (void*)meson_get_accelerant_device_info;
++		case B_ACCELERANT_RETRACE_SEMAPHORE:
++			return (void*)meson_accelerant_retrace_semaphore;
++
++		case B_ACCELERANT_MODE_COUNT:
++			return (void*)meson_accelerant_mode_count;
++		case B_GET_MODE_LIST:
++			return (void*)meson_get_mode_list;
++		case B_PROPOSE_DISPLAY_MODE:
++			return (void*)meson_propose_display_mode;
++		case B_SET_DISPLAY_MODE:
++			return (void*)meson_set_display_mode;
++		case B_GET_DISPLAY_MODE:
++			return (void*)meson_get_display_mode;
++		case B_GET_PREFERRED_DISPLAY_MODE:
++			return (void*)meson_get_preferred_display_mode;
++		case B_GET_EDID_INFO:
++			return (void*)meson_get_edid_info;
++		case B_GET_FRAME_BUFFER_CONFIG:
++			return (void*)meson_get_frame_buffer_config;
++		case B_GET_PIXEL_CLOCK_LIMITS:
++			return (void*)meson_get_pixel_clock_limits;
++	}
++	return NULL;
++}
+diff --git a/src/add-ons/kernel/drivers/graphics/Jamfile b/src/add-ons/kernel/drivers/graphics/Jamfile
+index cfaa4e4878..5574ecafa2 100644
+--- a/src/add-ons/kernel/drivers/graphics/Jamfile
++++ b/src/add-ons/kernel/drivers/graphics/Jamfile
+@@ -8,6 +8,7 @@ SubInclude HAIKU_TOP src add-ons kernel drivers graphics framebuffer ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics intel_810 ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics intel_extreme ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics matrox ;
++SubInclude HAIKU_TOP src add-ons kernel drivers graphics meson_hdmi ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics neomagic ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics nvidia ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics radeon ;
+diff --git a/src/add-ons/kernel/drivers/graphics/meson_hdmi/Jamfile b/src/add-ons/kernel/drivers/graphics/meson_hdmi/Jamfile
+new file mode 100644
+index 0000000000..87f50ce744
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/graphics/meson_hdmi/Jamfile
+@@ -0,0 +1,10 @@
++SubDir HAIKU_TOP src add-ons kernel drivers graphics meson_hdmi ;
++
++UsePrivateKernelHeaders ;
++UsePrivateHeaders [ FDirName graphics meson_hdmi ] ;
++
++if $(TARGET_ARCH) = arm64 {
++	KernelAddon meson_hdmi :
++		meson_hdmi.cpp
++	;
++}
+diff --git a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+new file mode 100644
+index 0000000000..613ba69d91
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+@@ -0,0 +1,1360 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++/*!	HDMI display on the Amlogic Meson GXBB (S905, ODROID-C2).
++
++	U-Boot's video driver leaves the whole pipeline running (power domain,
++	clocks, resets, pin mux, the HDMI controller and PHY setup), and it
++	survives ExitBootServices. This driver therefore only changes what
++	depends on the mode: the frame buffer canvas, the OSD1 window, the ENCP
++	timing generator, the HDMI PLL post-divider and the DesignWare frame
++	composer. It never resets or powers down these blocks.
++
++	At attach it logs the controller IDs and how U-Boot's live registers
++	compare with the values computed for its mode, reads the EDID over the
++	controller's DDC master, and saves every register it may write, so the
++	boot mode can be restored (on a failed mode set, or with the KDL command
++	"meson_hdmi restore"). Modes: 1280x720@60, 1920x1080@30 and @60, as far
++	as the EDID lists them; all three run from U-Boot's PLL setting with
++	only the OD2 post-divider changed. "mode_setting off" in the driver
++	settings (~/config/settings/kernel/drivers/meson_hdmi) keeps the device
++	unpublished, so app_server stays on the "framebuffer" driver.
++
++	Sources: the S905 and S905X datasheets (VPU, ENCP, HHI, HDMI TX top),
++	NetBSD's dw_hdmi (BSD-2) for the DesignWare controller, and register
++	facts listed in docs/m6-hdmi-design.md of the port's project folder.
++*/
++
++
++#include <new>
++#include <stdio.h>
++#include <string.h>
++
++#include <KernelExport.h>
++#include <boot_item.h>
++#include <debug.h>
++#include <device_manager.h>
++#include <driver_settings.h>
++#include <drivers/bus/FDT.h>
++#include <frame_buffer_console.h>
++#include <graphic_driver.h>
++#include <lock.h>
++#include <util/AutoLock.h>
++#include <vm/vm.h>
++#include <arch/arm64/arch_kernel.h>
++
++#include "meson_hdmi_info.h"
++
++
++#define DRIVER_MODULE_NAME	"drivers/graphics/meson_hdmi/driver_v1"
++#define DEVICE_MODULE_NAME	"drivers/graphics/meson_hdmi/device_v1"
++
++#define INFO(x...)			dprintf("meson_hdmi: " x)
++
++
++// GXBB addresses (meson-gx.dtsi; this driver only matches GXBB)
++static const phys_addr_t kVpuBase = 0xd0100000;
++static const size_t kVpuSize = 0x10000;		// registers used: words < 0x2800
++static const phys_addr_t kHhiBase = 0xc883c000;
++static const phys_addr_t kHdmiTxBase = 0xc883a000;
++static const phys_addr_t kDmcBase = 0xc8838000;
++
++static const uint32 kMaxWidth = 1920;
++static const uint32 kMaxHeight = 1080;
++static const uint32 kOsdCanvas = 0x4e;		// U-Boot's OSD1 canvas
++
++// VPU registers (word numbers; byte offset = word * 4)
++enum {
++	VIU_OSD1_CTRL_STAT			= 0x1a10,
++	VIU_OSD1_BLK0_CFG_W4		= 0x1a13,
++	VIU_OSD1_BLK0_CFG_W0		= 0x1a1b,
++	VIU_OSD1_BLK0_CFG_W1		= 0x1a1c,
++	VIU_OSD1_BLK0_CFG_W2		= 0x1a1d,
++	VIU_OSD1_BLK0_CFG_W3		= 0x1a1e,
++	VIU_OSD1_CTRL_STAT2			= 0x1a2d,
++	VENC_DVI_SETTING			= 0x1b62,
++	ENCP_VIDEO_EN				= 0x1b80,
++	ENCP_VIDEO_MODE				= 0x1b8d,
++	ENCP_VIDEO_MODE_ADV			= 0x1b8e,
++	ENCP_VIDEO_MAX_PXCNT		= 0x1b97,
++	ENCP_VIDEO_HAVON_END		= 0x1ba3,
++	ENCP_VIDEO_HAVON_BEGIN		= 0x1ba4,
++	ENCP_VIDEO_VAVON_BLINE		= 0x1ba6,
++	ENCP_VIDEO_HSO_BEGIN		= 0x1ba7,
++	ENCP_VIDEO_HSO_END			= 0x1ba8,
++	ENCP_VIDEO_VSO_BEGIN		= 0x1ba9,
++	ENCP_VIDEO_VSO_END			= 0x1baa,
++	ENCP_VIDEO_VSO_BLINE		= 0x1bab,
++	ENCP_VIDEO_VSO_ELINE		= 0x1bac,
++	ENCP_VIDEO_MAX_LNCNT		= 0x1bae,
++	ENCP_VIDEO_VAVON_ELINE		= 0x1baf,
++	ENCP_DVI_HSO_BEGIN			= 0x1c30,
++	ENCP_DVI_HSO_END			= 0x1c31,
++	ENCP_DVI_VSO_BLINE_EVN		= 0x1c32,
++	ENCP_DVI_VSO_ELINE_EVN		= 0x1c34,
++	ENCP_DVI_VSO_BEGIN_EVN		= 0x1c36,
++	ENCP_DVI_VSO_END_EVN		= 0x1c38,
++	ENCP_DE_H_BEGIN				= 0x1c3a,
++	ENCP_DE_H_END				= 0x1c3b,
++	ENCP_DE_V_BEGIN_EVEN		= 0x1c3c,
++	ENCP_DE_V_END_EVEN			= 0x1c3d,
++	VPP_POSTBLEND_H_SIZE		= 0x1d21,
++	VPP_MISC					= 0x1d26,
++	VPP_OSD_VSC_CTRL0			= 0x1dc2,
++	VPP_OSD_HSC_CTRL0			= 0x1dc5,
++	VPP_OSD_SC_CTRL0			= 0x1dc8,
++	VPU_VIU_VENC_MUX_CTRL		= 0x271a,
++	VPU_HDMI_SETTING			= 0x271b,
++};
++
++#define OSD_ENABLE					(1 << 21)	// VIU_OSD1_CTRL_STAT
++
++// HHI registers (byte offsets)
++enum {
++	HHI_VID_CLK_DIV				= 0x164,
++	HHI_VID_CLK_CNTL			= 0x17c,
++	HHI_VID_CLK_CNTL2			= 0x194,
++	HHI_VID_PLL_CLK_DIV			= 0x1a0,
++	HHI_HDMI_CLK_CNTL			= 0x1cc,
++	HHI_HDMI_PLL_CNTL			= 0x320,
++	HHI_HDMI_PLL_CNTL2			= 0x324,
++	HHI_HDMI_PHY_CNTL0			= 0x3a0,
++	HHI_HDMI_PHY_CNTL1			= 0x3a4,
++	HHI_HDMI_PHY_CNTL3			= 0x3ac,
++};
++
++#define HDMI_PLL_LOCK				(1u << 31)	// HHI_HDMI_PLL_CNTL
++#define HDMI_PLL_OD2_SHIFT			22			// HHI_HDMI_PLL_CNTL2
++#define HDMI_PLL_OD2_MASK			(3 << HDMI_PLL_OD2_SHIFT)
++
++// DMC canvas lookup table (byte offsets)
++enum {
++	DMC_CAV_LUT_DATAL			= 0x48,
++	DMC_CAV_LUT_DATAH			= 0x4c,
++	DMC_CAV_LUT_ADDR			= 0x50,
++};
++
++#define CANVAS_LUT_WRITE			(1 << 9)
++
++// HDMI TX: indirect ports to the Amlogic "top" glue and the DesignWare core
++enum {
++	HDMITX_TOP_ADDR				= 0x00,
++	HDMITX_TOP_DATA				= 0x04,
++	HDMITX_DWC_ADDR				= 0x10,
++	HDMITX_DWC_DATA				= 0x14,
++
++	HDMITX_TOP_STAT0			= 0x0e,	// bit 0: filtered HPD
++};
++
++// DesignWare HDMI TX registers (8 bits wide through the port)
++enum {
++	DW_DESIGN_ID				= 0x0000,
++	DW_REVISION_ID				= 0x0001,
++	DW_PRODUCT_ID0				= 0x0002,
++	DW_PRODUCT_ID1				= 0x0003,
++	DW_IH_I2CM_STAT0			= 0x0105,
++	DW_FC_INVIDCONF				= 0x1000,
++	DW_FC_INHACTV0				= 0x1001,
++	DW_FC_INHACTV1				= 0x1002,
++	DW_FC_INHBLANK0				= 0x1003,
++	DW_FC_INHBLANK1				= 0x1004,
++	DW_FC_INVACTV0				= 0x1005,
++	DW_FC_INVACTV1				= 0x1006,
++	DW_FC_INVBLANK				= 0x1007,
++	DW_FC_HSYNCINDELAY0			= 0x1008,
++	DW_FC_HSYNCINDELAY1			= 0x1009,
++	DW_FC_HSYNCINWIDTH0			= 0x100a,
++	DW_FC_HSYNCINWIDTH1			= 0x100b,
++	DW_FC_VSYNCINDELAY			= 0x100c,
++	DW_FC_VSYNCINWIDTH			= 0x100d,
++	DW_MC_SWRSTZ				= 0x4002,
++	DW_I2CM_SLAVE				= 0x7e00,
++	DW_I2CM_ADDRESS				= 0x7e01,
++	DW_I2CM_DATAI				= 0x7e03,
++	DW_I2CM_OPERATION			= 0x7e04,
++	DW_I2CM_SEGADDR				= 0x7e08,
++	DW_I2CM_SEGPTR				= 0x7e0a,
++};
++
++#define I2CM_OPERATION_READ			(1 << 0)
++#define I2CM_OPERATION_READ_EXT		(1 << 1)
++#define IH_I2CM_STAT0_ERROR			(1 << 0)
++#define IH_I2CM_STAT0_DONE			(1 << 1)
++#define FC_INVIDCONF_VSYNC_HIGH		(1 << 6)
++#define FC_INVIDCONF_HSYNC_HIGH		(1 << 5)
++#define MC_SWRSTZ_TMDS				(1 << 1)	// active low
++
++
++/*!	A mode as CEA-861 describes it; the register values follow from it. */
++struct meson_mode {
++	uint32	pixelClock;		// kHz
++	uint16	hActive, hFront, hSync, hBack;
++	uint16	vActive, vFront, vSync, vBack;
++	bool	hSyncPositive, vSyncPositive;
++	uint8	vic;			// CEA-861 video identification code
++};
++
++// U-Boot's HDMI PLL runs the VCO at 5940 MHz: OD2 /2 gives a 74.25 MHz
++// pixel clock, /1 148.5 MHz. These modes need nothing else from the clock
++// tree.
++static const meson_mode kModes[] = {
++	{ 74250, 1280, 110, 40, 220, 720, 5, 5, 20, true, true, 4 },
++	{ 74250, 1920, 88, 44, 148, 1080, 4, 5, 36, true, true, 34 },
++	{ 148500, 1920, 88, 44, 148, 1080, 4, 5, 36, true, true, 16 },
++};
++static const uint8 kPreferredVic = 16;
++
++
++static void
++mode_to_display_mode(const meson_mode& mode, display_mode& displayMode)
++{
++	memset(&displayMode, 0, sizeof(displayMode));
++	display_timing& timing = displayMode.timing;
++	timing.pixel_clock = mode.pixelClock;
++	timing.h_display = mode.hActive;
++	timing.h_sync_start = mode.hActive + mode.hFront;
++	timing.h_sync_end = timing.h_sync_start + mode.hSync;
++	timing.h_total = timing.h_sync_end + mode.hBack;
++	timing.v_display = mode.vActive;
++	timing.v_sync_start = mode.vActive + mode.vFront;
++	timing.v_sync_end = timing.v_sync_start + mode.vSync;
++	timing.v_total = timing.v_sync_end + mode.vBack;
++	timing.flags = (mode.hSyncPositive ? B_POSITIVE_HSYNC : 0)
++		| (mode.vSyncPositive ? B_POSITIVE_VSYNC : 0);
++	displayMode.space = B_RGB32;
++	displayMode.virtual_width = mode.hActive;
++	displayMode.virtual_height = mode.vActive;
++	displayMode.flags = B_8_BIT_DAC;
++}
++
++
++static bool
++display_mode_matches(const display_mode& displayMode, const meson_mode& mode)
++{
++	const display_timing& timing = displayMode.timing;
++	return timing.h_display == mode.hActive
++		&& timing.v_display == mode.vActive
++		&& timing.h_total == mode.hActive + mode.hFront + mode.hSync
++			+ mode.hBack
++		&& timing.v_total == mode.vActive + mode.vFront + mode.vSync
++			+ mode.vBack
++		&& timing.pixel_clock >= mode.pixelClock - 100
++		&& timing.pixel_clock <= mode.pixelClock + 100;
++}
++
++
++struct encp_timing {
++	uint32	maxPixel, maxLine;
++	uint32	havonBegin, havonEnd, vavonBegin, vavonEnd;
++	uint32	hsoEnd, vsoEnd;
++	uint32	deHBegin, deHEnd, deVBegin, deVEnd;
++	uint32	dviHsoBegin, dviHsoEnd, dviVsoBegin, dviVsoEnd;
++};
++
++
++/*!	The ENCP timing generator for a progressive mode. The DE window starts
++	two pixels after the active video (encoder latency); the HDMI syncs
++	follow DE by the front porch.
++*/
++static void
++compute_encp(const meson_mode& mode, encp_timing& timing)
++{
++	uint32 hTotal = mode.hActive + mode.hFront + mode.hSync + mode.hBack;
++	uint32 vTotal = mode.vActive + mode.vFront + mode.vSync + mode.vBack;
++	timing.maxPixel = hTotal - 1;
++	timing.maxLine = vTotal - 1;
++	timing.havonBegin = mode.hSync + mode.hBack;
++	timing.havonEnd = timing.havonBegin + mode.hActive - 1;
++	timing.vavonBegin = mode.vSync + mode.vBack;
++	timing.vavonEnd = timing.vavonBegin + mode.vActive - 1;
++	timing.hsoEnd = mode.hSync;
++	timing.vsoEnd = mode.vSync;
++	timing.deHBegin = timing.havonBegin + 2;
++	timing.deHEnd = timing.deHBegin + mode.hActive;
++	timing.deVBegin = timing.vavonBegin;
++	timing.deVEnd = timing.deVBegin + mode.vActive;
++	timing.dviHsoBegin = (timing.deHEnd + mode.hFront) % hTotal;
++	timing.dviHsoEnd = (timing.dviHsoBegin + mode.hSync) % hTotal;
++	timing.dviVsoBegin = (timing.deVEnd + mode.vFront) % vTotal;
++	timing.dviVsoEnd = timing.dviVsoBegin + mode.vSync;
++}
++
++
++device_manager_info* gDeviceManager;
++
++
++class MesonHdmi {
++public:
++								MesonHdmi(device_node* node);
++								~MesonHdmi();
++
++			status_t			Init();
++			device_node*		Node() const { return fNode; }
++			bool				Publish() const { return fPublish; }
++
++			area_id				SharedArea() const { return fSharedArea; }
++			area_id				FrameBufferArea() const
++									{ return fFrameBufferMapArea; }
++			status_t			SetDisplayMode(const display_mode& mode);
++			void				RestoreBootMode();
++			void				DumpState();
++
++private:
++			uint32				_Vpu(uint32 word)
++									{ return fVpu[word]; }
++			void				_SetVpu(uint32 word, uint32 value)
++									{ fVpu[word] = value; }
++			uint32				_Hhi(uint32 offset)
++									{ return fHhi[offset / 4]; }
++			void				_SetHhi(uint32 offset, uint32 value)
++									{ fHhi[offset / 4] = value; }
++			uint32				_TopRead(uint32 reg);
++			uint8				_DwRead(uint32 reg);
++			uint32				_DwRead16(uint32 lowReg)
++									{ return _DwRead(lowReg)
++										| ((uint32)_DwRead(lowReg + 1) << 8); }
++			void				_DwWrite(uint32 reg, uint8 value);
++
++			status_t			_ReadEdidBlock(uint32 block, uint8* data);
++			status_t			_ReadEdid();
++			bool				_EdidLists(const meson_mode& mode);
++			void				_CheckBootMode();
++			void				_SaveBootState();
++			status_t			_AllocateFrameBuffer();
++			void				_BuildModeList();
++
++			void				_SetCanvas(phys_addr_t address,
++									uint32 bytesPerRow, uint32 height);
++			void				_ResetPhy();
++			status_t			_WaitForPllLock();
++			status_t			_ProgramMode(const meson_mode& mode,
++									phys_addr_t frameBuffer,
++									uint32 bytesPerRow);
++
++private:
++			device_node*		fNode;
++			area_id				fVpuArea;
++			area_id				fHhiArea;
++			area_id				fHdmiTxArea;
++			volatile uint32*	fVpu;
++			volatile uint32*	fHhi;
++			volatile uint32*	fHdmiTx;
++			area_id				fDmcArea;
++			volatile uint32*	fDmc;
++			spinlock			fPortLock;
++			mutex				fModeLock;
++			bool				fPublish;
++
++			area_id				fFrameBufferArea;		// the pages
++			area_id				fFrameBufferMapArea;	// write combining
++			uint8*				fFrameBuffer;
++			phys_addr_t			fFrameBufferPhysical;
++			size_t				fFrameBufferSize;
++
++			area_id				fSharedArea;
++			meson_hdmi_shared_info* fShared;
++
++			uint32				fBootWidth;
++			uint32				fBootHeight;
++			uint32				fBootBytesPerRow;
++			phys_addr_t			fBootFrameBuffer;
++
++			uint8				fEdid[256];
++			uint32				fEdidSize;
++
++			// registers a mode set writes, as U-Boot left them
++			struct saved_register {
++				uint32			word;
++				uint32			value;
++			};
++			saved_register		fBootVpu[48];
++			uint32				fBootVpuCount;
++			uint32				fBootPllCntl2;
++			uint8				fBootComposer[14];
++			bool				fBootStateSaved;
++};
++
++
++static const uint32 kSavedVpuWords[] = {
++	VIU_OSD1_CTRL_STAT, VIU_OSD1_BLK0_CFG_W1, VIU_OSD1_BLK0_CFG_W2,
++	VIU_OSD1_BLK0_CFG_W3, VIU_OSD1_BLK0_CFG_W4, VPP_POSTBLEND_H_SIZE,
++	ENCP_VIDEO_MAX_PXCNT, ENCP_VIDEO_MAX_LNCNT, ENCP_VIDEO_HAVON_BEGIN,
++	ENCP_VIDEO_HAVON_END, ENCP_VIDEO_VAVON_BLINE, ENCP_VIDEO_VAVON_ELINE,
++	ENCP_VIDEO_HSO_BEGIN, ENCP_VIDEO_HSO_END, ENCP_VIDEO_VSO_BEGIN,
++	ENCP_VIDEO_VSO_END, ENCP_VIDEO_VSO_BLINE, ENCP_VIDEO_VSO_ELINE,
++	ENCP_DE_H_BEGIN, ENCP_DE_H_END, ENCP_DE_V_BEGIN_EVEN, ENCP_DE_V_END_EVEN,
++	ENCP_DVI_HSO_BEGIN, ENCP_DVI_HSO_END, ENCP_DVI_VSO_BLINE_EVN,
++	ENCP_DVI_VSO_ELINE_EVN, ENCP_DVI_VSO_BEGIN_EVN, ENCP_DVI_VSO_END_EVN,
++};
++
++static const uint32 kSavedComposer[] = {
++	DW_FC_INVIDCONF, DW_FC_INHACTV0, DW_FC_INHACTV1, DW_FC_INHBLANK0,
++	DW_FC_INHBLANK1, DW_FC_INVACTV0, DW_FC_INVACTV1, DW_FC_INVBLANK,
++	DW_FC_HSYNCINDELAY0, DW_FC_HSYNCINDELAY1, DW_FC_HSYNCINWIDTH0,
++	DW_FC_HSYNCINWIDTH1, DW_FC_VSYNCINDELAY, DW_FC_VSYNCINWIDTH,
++};
++
++
++static MesonHdmi* sDevice;
++
++
++MesonHdmi::MesonHdmi(device_node* node)
++	:
++	fNode(node),
++	fVpuArea(-1),
++	fHhiArea(-1),
++	fHdmiTxArea(-1),
++	fVpu(NULL),
++	fHhi(NULL),
++	fHdmiTx(NULL),
++	fDmcArea(-1),
++	fDmc(NULL),
++	fPublish(true),
++	fFrameBufferArea(-1),
++	fFrameBufferMapArea(-1),
++	fFrameBuffer(NULL),
++	fFrameBufferPhysical(0),
++	fFrameBufferSize(0),
++	fSharedArea(-1),
++	fShared(NULL),
++	fBootWidth(0),
++	fBootHeight(0),
++	fBootBytesPerRow(0),
++	fBootFrameBuffer(0),
++	fEdidSize(0),
++	fBootVpuCount(0),
++	fBootPllCntl2(0),
++	fBootStateSaved(false)
++{
++	B_INITIALIZE_SPINLOCK(&fPortLock);
++	mutex_init(&fModeLock, "meson_hdmi mode");
++}
++
++
++MesonHdmi::~MesonHdmi()
++{
++	if (fVpuArea >= 0)
++		delete_area(fVpuArea);
++	if (fHhiArea >= 0)
++		delete_area(fHhiArea);
++	if (fHdmiTxArea >= 0)
++		delete_area(fHdmiTxArea);
++	if (fDmcArea >= 0)
++		delete_area(fDmcArea);
++	if (fSharedArea >= 0)
++		delete_area(fSharedArea);
++	// the frame buffer stays: the kernel console may still draw into it
++	mutex_destroy(&fModeLock);
++}
++
++
++status_t
++MesonHdmi::Init()
++{
++	void* address;
++	fVpuArea = map_physical_memory("meson_hdmi vpu", kVpuBase, kVpuSize,
++		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++		&address);
++	if (fVpuArea < 0)
++		return fVpuArea;
++	fVpu = (volatile uint32*)address;
++	fHhiArea = map_physical_memory("meson_hdmi hhi", kHhiBase, B_PAGE_SIZE,
++		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++		&address);
++	if (fHhiArea < 0)
++		return fHhiArea;
++	fHhi = (volatile uint32*)address;
++	fHdmiTxArea = map_physical_memory("meson_hdmi hdmitx", kHdmiTxBase,
++		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++	if (fHdmiTxArea < 0)
++		return fHdmiTxArea;
++	fHdmiTx = (volatile uint32*)address;
++	fDmcArea = map_physical_memory("meson_hdmi dmc", kDmcBase, B_PAGE_SIZE,
++		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++		&address);
++	if (fDmcArea < 0)
++		return fDmcArea;
++	fDmc = (volatile uint32*)address;
++
++	void* settings = load_driver_settings("meson_hdmi");
++	if (settings != NULL) {
++		fPublish = get_driver_boolean_parameter(settings, "mode_setting",
++			true, true);
++		unload_driver_settings(settings);
++	}
++
++	frame_buffer_boot_info* boot = (frame_buffer_boot_info*)get_boot_item(
++		FRAME_BUFFER_BOOT_INFO, NULL);
++	if (boot != NULL) {
++		fBootWidth = boot->width;
++		fBootHeight = boot->height;
++		fBootBytesPerRow = boot->bytes_per_row;
++		fBootFrameBuffer = boot->physical_frame_buffer;
++	}
++	INFO("controller %02x.%02x, product %02x%02x; HPD %s; boot mode %"
++		B_PRIu32 "x%" B_PRIu32 ", %" B_PRIu32 " bytes per row, frame buffer %#"
++		B_PRIxPHYSADDR "\n", _DwRead(DW_DESIGN_ID), _DwRead(DW_REVISION_ID),
++		_DwRead(DW_PRODUCT_ID0), _DwRead(DW_PRODUCT_ID1),
++		(_TopRead(HDMITX_TOP_STAT0) & 1) != 0 ? "high" : "low",
++		fBootWidth, fBootHeight, fBootBytesPerRow, fBootFrameBuffer);
++
++	_CheckBootMode();
++	_ReadEdid();
++	if (!fPublish) {
++		INFO("mode setting off in the driver settings\n");
++		return B_OK;
++	}
++	if (fBootWidth == 0) {
++		INFO("no boot frame buffer, nothing to take over\n");
++		fPublish = false;
++		return B_OK;
++	}
++
++	_SaveBootState();
++	status_t status = _AllocateFrameBuffer();
++	if (status != B_OK)
++		return status;
++
++	fSharedArea = create_area("meson_hdmi shared info", (void**)&fShared,
++		B_ANY_KERNEL_ADDRESS,
++		(sizeof(meson_hdmi_shared_info) + B_PAGE_SIZE - 1) & ~(B_PAGE_SIZE - 1),
++		B_FULL_LOCK, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA
++			| B_CLONEABLE_AREA);
++	if (fSharedArea < 0)
++		return fSharedArea;
++	memset(fShared, 0, sizeof(meson_hdmi_shared_info));
++	fShared->edid_size = fEdidSize;
++	memcpy(fShared->edid, fEdid, fEdidSize);
++	_BuildModeList();
++
++	// until app_server sets a mode, the boot mode is current (in U-Boot's
++	// frame buffer)
++	for (uint32 i = 0; i < fShared->mode_count; i++) {
++		if (fShared->modes[i].virtual_width == fBootWidth
++			&& fShared->modes[i].virtual_height == fBootHeight) {
++			fShared->current_mode = fShared->modes[i];
++			break;
++		}
++	}
++	fShared->bytes_per_row = fBootBytesPerRow;
++	return B_OK;
++}
++
++
++/*!	One buffer for the largest mode, allocated while memory is still
++	unfragmented. The VPU does not snoop caches: the pages are written
++	back and invalidated through their cached alias, then used only
++	through a write-combining mapping.
++*/
++status_t
++MesonHdmi::_AllocateFrameBuffer()
++{
++	fFrameBufferSize = (kMaxWidth * kMaxHeight * 4 + B_PAGE_SIZE - 1)
++		& ~(B_PAGE_SIZE - 1);
++	void* pages;
++	fFrameBufferArea = create_area("meson_hdmi frame buffer pages", &pages,
++		B_ANY_KERNEL_ADDRESS, fFrameBufferSize, B_32_BIT_CONTIGUOUS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
++	if (fFrameBufferArea < 0)
++		return fFrameBufferArea;
++	physical_entry entry;
++	get_memory_map(pages, B_PAGE_SIZE, &entry, 1);
++	fFrameBufferPhysical = entry.address;
++
++	uint64 ctr;
++	asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
++	const addr_t lineSize = 4 << ((ctr >> 16) & 0xf);
++	for (addr_t line = KERNEL_PMAP_BASE + fFrameBufferPhysical;
++			line < KERNEL_PMAP_BASE + fFrameBufferPhysical + fFrameBufferSize;
++			line += lineSize) {
++		asm volatile("dc civac, %0" : : "r"(line) : "memory");
++	}
++	asm volatile("dsb sy" : : : "memory");
++
++	fFrameBufferMapArea = map_physical_memory("meson_hdmi frame buffer",
++		fFrameBufferPhysical, fFrameBufferSize, B_ANY_KERNEL_ADDRESS,
++		B_READ_AREA | B_WRITE_AREA, (void**)&fFrameBuffer);
++	if (fFrameBufferMapArea < 0)
++		return fFrameBufferMapArea;
++	vm_set_area_memory_type(fFrameBufferMapArea, fFrameBufferPhysical,
++		B_WRITE_COMBINING_MEMORY);
++	memset(fFrameBuffer, 0, fFrameBufferSize);
++	INFO("frame buffer %#" B_PRIxPHYSADDR ", %" B_PRIuSIZE " bytes\n",
++		fFrameBufferPhysical, fFrameBufferSize);
++	return B_OK;
++}
++
++
++/*!	The modes of kModes that the EDID lists (as a detailed timing or a CTA
++	video code); all of them without an EDID.
++*/
++void
++MesonHdmi::_BuildModeList()
++{
++	fShared->mode_count = 0;
++	fShared->preferred_mode = 0;
++	for (size_t i = 0; i < B_COUNT_OF(kModes); i++) {
++		if (fEdidSize > 0 && !_EdidLists(kModes[i]))
++			continue;
++		uint32 index = fShared->mode_count++;
++		mode_to_display_mode(kModes[i], fShared->modes[index]);
++		if (kModes[i].vic == kPreferredVic
++			|| (kModes[i].hActive == fBootWidth
++				&& kModes[i].vActive == fBootHeight
++				&& kModes[fShared->preferred_mode].vic != kPreferredVic)) {
++			fShared->preferred_mode = index;
++		}
++		INFO("mode %ux%u, %" B_PRIu32 " kHz (VIC %u)\n", kModes[i].hActive,
++			kModes[i].vActive, kModes[i].pixelClock, kModes[i].vic);
++	}
++}
++
++
++static bool
++dtd_matches(const uint8* dtd, const meson_mode& mode)
++{
++	uint32 clock = dtd[0] | (dtd[1] << 8);		// 10 kHz units
++	uint32 hActive = dtd[2] | ((dtd[4] & 0xf0) << 4);
++	uint32 vActive = dtd[5] | ((dtd[7] & 0xf0) << 4);
++	return clock == mode.pixelClock / 10 && hActive == mode.hActive
++		&& vActive == mode.vActive;
++}
++
++
++bool
++MesonHdmi::_EdidLists(const meson_mode& mode)
++{
++	// detailed timings of the base block (descriptors with a zero clock
++	// are monitor descriptors)
++	for (uint32 offset = 54; offset <= 108; offset += 18) {
++		if (dtd_matches(fEdid + offset, mode))
++			return true;
++	}
++	if (fEdidSize < 256 || fEdid[128] != 0x02)
++		return false;
++
++	// CTA-861 extension: data blocks from byte 4, detailed timings from
++	// the offset in byte 2
++	const uint8* cta = fEdid + 128;
++	uint32 dtdOffset = cta[2];
++	if (dtdOffset < 4 || dtdOffset > 127)
++		return false;
++	for (uint32 i = 4; i < dtdOffset;) {
++		uint8 header = cta[i];
++		uint32 length = header & 0x1f;
++		if ((header >> 5) == 2) {	// video data block
++			for (uint32 j = 1; j <= length && i + j < dtdOffset; j++) {
++				uint8 vic = cta[i + j];
++				if (vic >= 129 && vic <= 192)
++					vic &= 0x7f;	// "native" flag
++				if (vic == mode.vic)
++					return true;
++			}
++		}
++		i += length + 1;
++	}
++	for (uint32 offset = dtdOffset; offset + 18 <= 127; offset += 18) {
++		if (cta[offset] == 0 && cta[offset + 1] == 0)
++			break;
++		if (dtd_matches(cta + offset, mode))
++			return true;
++	}
++	return false;
++}
++
++
++void
++MesonHdmi::_SaveBootState()
++{
++	fBootVpuCount = 0;
++	for (size_t i = 0; i < B_COUNT_OF(kSavedVpuWords); i++) {
++		fBootVpu[fBootVpuCount].word = kSavedVpuWords[i];
++		fBootVpu[fBootVpuCount].value = _Vpu(kSavedVpuWords[i]);
++		fBootVpuCount++;
++	}
++	fBootPllCntl2 = _Hhi(HHI_HDMI_PLL_CNTL2);
++	for (size_t i = 0; i < B_COUNT_OF(kSavedComposer); i++)
++		fBootComposer[i] = _DwRead(kSavedComposer[i]);
++	fBootStateSaved = true;
++}
++
++
++void
++MesonHdmi::_SetCanvas(phys_addr_t address, uint32 bytesPerRow, uint32 height)
++{
++	uint32 width = (bytesPerRow + 7) / 8;
++	fDmc[DMC_CAV_LUT_DATAL / 4] = ((address + 7) / 8) | (width << 29);
++	fDmc[DMC_CAV_LUT_DATAH / 4] = (width >> 3) | (height << 9);
++	fDmc[DMC_CAV_LUT_ADDR / 4] = CANVAS_LUT_WRITE | kOsdCanvas;
++	(void)fDmc[DMC_CAV_LUT_DATAH / 4];	// flush
++}
++
++
++void
++MesonHdmi::_ResetPhy()
++{
++	// PHY_CNTL1 bit 0 is the soft reset; three pulses, as at power-up
++	uint32 control = _Hhi(HHI_HDMI_PHY_CNTL1) & ~0xfu;
++	for (int32 i = 0; i < 3; i++) {
++		_SetHhi(HHI_HDMI_PHY_CNTL1, control | 0xf);
++		spin(2000);
++		_SetHhi(HHI_HDMI_PHY_CNTL1, control | 0xe);
++		spin(2000);
++	}
++}
++
++
++status_t
++MesonHdmi::_WaitForPllLock()
++{
++	for (int32 i = 0; i < 100; i++) {
++		if ((_Hhi(HHI_HDMI_PLL_CNTL) & HDMI_PLL_LOCK) != 0)
++			return B_OK;
++		spin(100);
++	}
++	return B_TIMED_OUT;
++}
++
++
++/*!	Blanks, programs a mode from kModes and shows \a frameBuffer in it. */
++status_t
++MesonHdmi::_ProgramMode(const meson_mode& mode, phys_addr_t frameBuffer,
++	uint32 bytesPerRow)
++{
++	encp_timing timing;
++	compute_encp(mode, timing);
++
++	_SetVpu(VIU_OSD1_CTRL_STAT, _Vpu(VIU_OSD1_CTRL_STAT) & ~OSD_ENABLE);
++	_SetVpu(ENCP_VIDEO_EN, 0);
++
++	uint32 od2 = mode.pixelClock == 148500 ? 0 : 1;
++	uint32 cntl2 = _Hhi(HHI_HDMI_PLL_CNTL2);
++	if ((cntl2 & HDMI_PLL_OD2_MASK) != (od2 << HDMI_PLL_OD2_SHIFT)) {
++		_SetHhi(HHI_HDMI_PLL_CNTL2, (cntl2 & ~HDMI_PLL_OD2_MASK)
++			| (od2 << HDMI_PLL_OD2_SHIFT));
++	}
++	if (_WaitForPllLock() != B_OK) {
++		INFO("HDMI PLL does not lock\n");
++		return B_ERROR;
++	}
++
++	_SetVpu(ENCP_VIDEO_MAX_PXCNT, timing.maxPixel);
++	_SetVpu(ENCP_VIDEO_MAX_LNCNT, timing.maxLine);
++	_SetVpu(ENCP_VIDEO_HAVON_BEGIN, timing.havonBegin);
++	_SetVpu(ENCP_VIDEO_HAVON_END, timing.havonEnd);
++	_SetVpu(ENCP_VIDEO_VAVON_BLINE, timing.vavonBegin);
++	_SetVpu(ENCP_VIDEO_VAVON_ELINE, timing.vavonEnd);
++	_SetVpu(ENCP_VIDEO_HSO_BEGIN, 0);
++	_SetVpu(ENCP_VIDEO_HSO_END, timing.hsoEnd);
++	_SetVpu(ENCP_VIDEO_VSO_BEGIN, 30);
++	_SetVpu(ENCP_VIDEO_VSO_END, 50);
++	_SetVpu(ENCP_VIDEO_VSO_BLINE, 0);
++	_SetVpu(ENCP_VIDEO_VSO_ELINE, timing.vsoEnd);
++	_SetVpu(ENCP_DE_H_BEGIN, timing.deHBegin);
++	_SetVpu(ENCP_DE_H_END, timing.deHEnd);
++	_SetVpu(ENCP_DE_V_BEGIN_EVEN, timing.deVBegin);
++	_SetVpu(ENCP_DE_V_END_EVEN, timing.deVEnd);
++	_SetVpu(ENCP_DVI_HSO_BEGIN, timing.dviHsoBegin);
++	_SetVpu(ENCP_DVI_HSO_END, timing.dviHsoEnd);
++	_SetVpu(ENCP_DVI_VSO_BLINE_EVN, timing.dviVsoBegin);
++	_SetVpu(ENCP_DVI_VSO_ELINE_EVN, timing.dviVsoEnd);
++	_SetVpu(ENCP_DVI_VSO_BEGIN_EVN, timing.dviHsoBegin);
++	_SetVpu(ENCP_DVI_VSO_END_EVN, timing.dviHsoBegin);
++
++	uint32 hBlank = mode.hFront + mode.hSync + mode.hBack;
++	uint32 vBlank = mode.vFront + mode.vSync + mode.vBack;
++	uint8 videoConfig = (_DwRead(DW_FC_INVIDCONF)
++			& ~(FC_INVIDCONF_VSYNC_HIGH | FC_INVIDCONF_HSYNC_HIGH))
++		| (mode.vSyncPositive ? FC_INVIDCONF_VSYNC_HIGH : 0)
++		| (mode.hSyncPositive ? FC_INVIDCONF_HSYNC_HIGH : 0);
++	_DwWrite(DW_FC_INVIDCONF, videoConfig);
++	_DwWrite(DW_FC_INHACTV0, mode.hActive & 0xff);
++	_DwWrite(DW_FC_INHACTV1, mode.hActive >> 8);
++	_DwWrite(DW_FC_INHBLANK0, hBlank & 0xff);
++	_DwWrite(DW_FC_INHBLANK1, hBlank >> 8);
++	_DwWrite(DW_FC_INVACTV0, mode.vActive & 0xff);
++	_DwWrite(DW_FC_INVACTV1, mode.vActive >> 8);
++	_DwWrite(DW_FC_INVBLANK, vBlank);
++	_DwWrite(DW_FC_HSYNCINDELAY0, mode.hFront & 0xff);
++	_DwWrite(DW_FC_HSYNCINDELAY1, mode.hFront >> 8);
++	_DwWrite(DW_FC_HSYNCINWIDTH0, mode.hSync & 0xff);
++	_DwWrite(DW_FC_HSYNCINWIDTH1, mode.hSync >> 8);
++	_DwWrite(DW_FC_VSYNCINDELAY, mode.vFront);
++	_DwWrite(DW_FC_VSYNCINWIDTH, mode.vSync);
++	// TMDS soft reset, then the video configuration again: some controller
++	// versions stall the frame composer after a reset otherwise
++	_DwWrite(DW_MC_SWRSTZ, (uint8)~MC_SWRSTZ_TMDS);
++	for (int32 i = 0; i < 4; i++)
++		_DwWrite(DW_FC_INVIDCONF, videoConfig);
++
++	_ResetPhy();
++	_SetVpu(ENCP_VIDEO_EN, 1);
++
++	_SetCanvas(frameBuffer, bytesPerRow, mode.vActive);
++	_SetVpu(VIU_OSD1_BLK0_CFG_W1, (uint32)(mode.hActive - 1) << 16);
++	_SetVpu(VIU_OSD1_BLK0_CFG_W2, (uint32)(mode.vActive - 1) << 16);
++	_SetVpu(VIU_OSD1_BLK0_CFG_W3, (uint32)(mode.hActive - 1) << 16);
++	_SetVpu(VIU_OSD1_BLK0_CFG_W4, (uint32)(mode.vActive - 1) << 16);
++	_SetVpu(VPP_POSTBLEND_H_SIZE, mode.hActive);
++	_SetVpu(VIU_OSD1_CTRL_STAT, _Vpu(VIU_OSD1_CTRL_STAT) | OSD_ENABLE);
++
++	if ((_TopRead(HDMITX_TOP_STAT0) & 1) == 0)
++		INFO("HPD low after the mode set\n");
++	return B_OK;
++}
++
++
++status_t
++MesonHdmi::SetDisplayMode(const display_mode& displayMode)
++{
++	const meson_mode* mode = NULL;
++	for (size_t i = 0; i < B_COUNT_OF(kModes); i++) {
++		if (display_mode_matches(displayMode, kModes[i])) {
++			mode = &kModes[i];
++			break;
++		}
++	}
++	if (mode == NULL || displayMode.space != B_RGB32)
++		return B_BAD_VALUE;
++
++	MutexLocker locker(fModeLock);
++	uint32 bytesPerRow = mode->hActive * 4;
++	memset(fFrameBuffer, 0, bytesPerRow * mode->vActive);
++	status_t status = _ProgramMode(*mode, fFrameBufferPhysical, bytesPerRow);
++	if (status != B_OK) {
++		RestoreBootMode();
++		return status;
++	}
++
++	mode_to_display_mode(*mode, fShared->current_mode);
++	fShared->bytes_per_row = bytesPerRow;
++	frame_buffer_update((addr_t)fFrameBuffer, mode->hActive, mode->vActive,
++		32, bytesPerRow);
++	INFO("mode %ux%u, %" B_PRIu32 " kHz\n", mode->hActive, mode->vActive,
++		mode->pixelClock);
++	return B_OK;
++}
++
++
++/*!	Puts U-Boot's registers and frame buffer back; works from KDL too. */
++void
++MesonHdmi::RestoreBootMode()
++{
++	if (!fBootStateSaved)
++		return;
++	_SetVpu(VIU_OSD1_CTRL_STAT, _Vpu(VIU_OSD1_CTRL_STAT) & ~OSD_ENABLE);
++	_SetVpu(ENCP_VIDEO_EN, 0);
++	_SetHhi(HHI_HDMI_PLL_CNTL2, fBootPllCntl2);
++	_WaitForPllLock();
++	for (uint32 i = 0; i < fBootVpuCount; i++) {
++		if (fBootVpu[i].word != VIU_OSD1_CTRL_STAT)
++			_SetVpu(fBootVpu[i].word, fBootVpu[i].value);
++	}
++	for (size_t i = 0; i < B_COUNT_OF(kSavedComposer); i++)
++		_DwWrite(kSavedComposer[i], fBootComposer[i]);
++	_DwWrite(DW_MC_SWRSTZ, (uint8)~MC_SWRSTZ_TMDS);
++	for (int32 i = 0; i < 4; i++)
++		_DwWrite(DW_FC_INVIDCONF, fBootComposer[0]);
++	_ResetPhy();
++	_SetVpu(ENCP_VIDEO_EN, 1);
++	_SetCanvas(fBootFrameBuffer, fBootBytesPerRow, fBootHeight);
++	_SetVpu(VIU_OSD1_CTRL_STAT, fBootVpu[0].value);
++}
++
++
++/*!	The ports take an address, then data. On GXBB the address has to be
++	written twice, and the data read twice (the first read returns stale
++	data). One spinlock covers both ports.
++*/
++uint32
++MesonHdmi::_TopRead(uint32 reg)
++{
++	InterruptsSpinLocker locker(fPortLock);
++	fHdmiTx[HDMITX_TOP_ADDR / 4] = reg;
++	fHdmiTx[HDMITX_TOP_ADDR / 4] = reg;
++	uint32 value = fHdmiTx[HDMITX_TOP_DATA / 4];
++	value = fHdmiTx[HDMITX_TOP_DATA / 4];
++	return value;
++}
++
++
++uint8
++MesonHdmi::_DwRead(uint32 reg)
++{
++	InterruptsSpinLocker locker(fPortLock);
++	fHdmiTx[HDMITX_DWC_ADDR / 4] = reg;
++	fHdmiTx[HDMITX_DWC_ADDR / 4] = reg;
++	uint32 value = fHdmiTx[HDMITX_DWC_DATA / 4];
++	value = fHdmiTx[HDMITX_DWC_DATA / 4];
++	return value & 0xff;
++}
++
++
++void
++MesonHdmi::_DwWrite(uint32 reg, uint8 value)
++{
++	InterruptsSpinLocker locker(fPortLock);
++	fHdmiTx[HDMITX_DWC_ADDR / 4] = reg;
++	fHdmiTx[HDMITX_DWC_ADDR / 4] = reg;
++	fHdmiTx[HDMITX_DWC_DATA / 4] = value;
++}
++
++
++/*!	One 128-byte EDID block over DDC, a byte per I2C operation; blocks 2
++	and up go through the E-DDC segment pointer.
++*/
++status_t
++MesonHdmi::_ReadEdidBlock(uint32 block, uint8* data)
++{
++	uint8 segment = block / 2;
++	for (uint32 i = 0; i < 128; i++) {
++		_DwWrite(DW_I2CM_SLAVE, 0x50);
++		_DwWrite(DW_I2CM_ADDRESS, (block % 2) * 128 + i);
++		_DwWrite(DW_IH_I2CM_STAT0, IH_I2CM_STAT0_ERROR | IH_I2CM_STAT0_DONE);
++		if (segment != 0) {
++			_DwWrite(DW_I2CM_SEGADDR, 0x30);
++			_DwWrite(DW_I2CM_SEGPTR, segment);
++			_DwWrite(DW_I2CM_OPERATION, I2CM_OPERATION_READ_EXT);
++		} else
++			_DwWrite(DW_I2CM_OPERATION, I2CM_OPERATION_READ);
++
++		bigtime_t deadline = system_time() + 10000;
++		uint8 status;
++		while (((status = _DwRead(DW_IH_I2CM_STAT0))
++				& (IH_I2CM_STAT0_ERROR | IH_I2CM_STAT0_DONE)) == 0) {
++			if (system_time() > deadline)
++				return B_TIMED_OUT;
++			spin(20);
++		}
++		_DwWrite(DW_IH_I2CM_STAT0, IH_I2CM_STAT0_ERROR | IH_I2CM_STAT0_DONE);
++		if ((status & IH_I2CM_STAT0_ERROR) != 0)
++			return B_IO_ERROR;
++		data[i] = _DwRead(DW_I2CM_DATAI);
++	}
++
++	uint8 sum = 0;
++	for (uint32 i = 0; i < 128; i++)
++		sum += data[i];
++	return sum == 0 ? B_OK : B_BAD_DATA;
++}
++
++
++/*!	The capture dongle serves a half-initialized EDID right after power-up:
++	accept it only when two reads agree.
++*/
++status_t
++MesonHdmi::_ReadEdid()
++{
++	uint8 first[256];
++	uint8 second[256];
++	status_t status = B_ERROR;
++	for (int32 attempt = 0; attempt < 5; attempt++) {
++		if (attempt > 0)
++			snooze(500000);
++		status = _ReadEdidBlock(0, first);
++		if (status == B_OK)
++			status = _ReadEdidBlock(0, second);
++		if (status != B_OK || memcmp(first, second, 128) != 0) {
++			INFO("EDID read %" B_PRId32 ": %s\n", attempt,
++				status != B_OK ? strerror(status) : "two reads differ");
++			continue;
++		}
++		break;
++	}
++	if (status != B_OK)
++		return status;
++
++	fEdidSize = 128;
++	memcpy(fEdid, first, 128);
++	if (first[126] > 0 && _ReadEdidBlock(1, fEdid + 128) == B_OK)
++		fEdidSize = 256;
++
++	INFO("EDID: %" B_PRIu32 " bytes, %u extension(s)\n", fEdidSize, first[126]);
++	for (uint32 offset = 0; offset < fEdidSize; offset += 32) {
++		char line[32 * 2 + 1];
++		for (uint32 i = 0; i < 32; i++)
++			snprintf(line + i * 2, 3, "%02x", fEdid[offset + i]);
++		INFO("EDID %03" B_PRIx32 ": %s\n", offset, line);
++	}
++	return B_OK;
++}
++
++
++/*!	Compares what U-Boot left in the registers with the values computed for
++	its mode, so the register model can be trusted before anything is
++	written.
++*/
++void
++MesonHdmi::_CheckBootMode()
++{
++	const meson_mode* mode = NULL;
++	for (size_t i = 0; i < B_COUNT_OF(kModes); i++) {
++		if (kModes[i].hActive == fBootWidth && kModes[i].vActive == fBootHeight
++			&& kModes[i].pixelClock == 74250) {
++			mode = &kModes[i];
++			break;
++		}
++	}
++	if (mode == NULL) {
++		INFO("boot mode not in the table, nothing to compare\n");
++		return;
++	}
++
++	encp_timing timing;
++	compute_encp(*mode, timing);
++	struct {
++		const char*	name;
++		uint32		word;
++		uint32		expected;
++	} checks[] = {
++		{ "MAX_PXCNT", ENCP_VIDEO_MAX_PXCNT, timing.maxPixel },
++		{ "MAX_LNCNT", ENCP_VIDEO_MAX_LNCNT, timing.maxLine },
++		{ "HAVON_BEGIN", ENCP_VIDEO_HAVON_BEGIN, timing.havonBegin },
++		{ "HAVON_END", ENCP_VIDEO_HAVON_END, timing.havonEnd },
++		{ "VAVON_BLINE", ENCP_VIDEO_VAVON_BLINE, timing.vavonBegin },
++		{ "VAVON_ELINE", ENCP_VIDEO_VAVON_ELINE, timing.vavonEnd },
++		{ "HSO_END", ENCP_VIDEO_HSO_END, timing.hsoEnd },
++		{ "VSO_ELINE", ENCP_VIDEO_VSO_ELINE, timing.vsoEnd },
++		{ "DE_H_BEGIN", ENCP_DE_H_BEGIN, timing.deHBegin },
++		{ "DE_H_END", ENCP_DE_H_END, timing.deHEnd },
++		{ "DE_V_BEGIN", ENCP_DE_V_BEGIN_EVEN, timing.deVBegin },
++		{ "DE_V_END", ENCP_DE_V_END_EVEN, timing.deVEnd },
++		{ "DVI_HSO_BEGIN", ENCP_DVI_HSO_BEGIN, timing.dviHsoBegin },
++		{ "DVI_HSO_END", ENCP_DVI_HSO_END, timing.dviHsoEnd },
++		{ "DVI_VSO_BLINE", ENCP_DVI_VSO_BLINE_EVN, timing.dviVsoBegin },
++		{ "DVI_VSO_ELINE", ENCP_DVI_VSO_ELINE_EVN, timing.dviVsoEnd },
++	};
++	int32 mismatches = 0;
++	for (size_t i = 0; i < B_COUNT_OF(checks); i++) {
++		uint32 live = _Vpu(checks[i].word);
++		if (live != checks[i].expected) {
++			INFO("ENCP %s: live %" B_PRIu32 ", computed %" B_PRIu32 "\n",
++				checks[i].name, live, checks[i].expected);
++			mismatches++;
++		}
++	}
++
++	uint32 hBlank = mode->hFront + mode->hSync + mode->hBack;
++	uint32 vBlank = mode->vFront + mode->vSync + mode->vBack;
++	struct {
++		const char*	name;
++		uint32		live;
++		uint32		expected;
++	} composer[] = {
++		{ "INHACTV", _DwRead16(DW_FC_INHACTV0), mode->hActive },
++		{ "INHBLANK", _DwRead16(DW_FC_INHBLANK0), hBlank },
++		{ "INVACTV", _DwRead16(DW_FC_INVACTV0), mode->vActive },
++		{ "INVBLANK", _DwRead(DW_FC_INVBLANK), vBlank },
++		{ "HSYNCINDELAY", _DwRead16(DW_FC_HSYNCINDELAY0), mode->hFront },
++		{ "HSYNCINWIDTH", _DwRead16(DW_FC_HSYNCINWIDTH0), mode->hSync },
++		{ "VSYNCINDELAY", _DwRead(DW_FC_VSYNCINDELAY), mode->vFront },
++		{ "VSYNCINWIDTH", _DwRead(DW_FC_VSYNCINWIDTH), mode->vSync },
++	};
++	for (size_t i = 0; i < B_COUNT_OF(composer); i++) {
++		if (composer[i].live != composer[i].expected) {
++			INFO("FC %s: live %" B_PRIu32 ", computed %" B_PRIu32 "\n",
++				composer[i].name, composer[i].live, composer[i].expected);
++			mismatches++;
++		}
++	}
++	INFO("boot mode %ux%u: %" B_PRId32 " register(s) differ from the "
++		"computed values\n", mode->hActive, mode->vActive, mismatches);
++}
++
++
++void
++MesonHdmi::DumpState()
++{
++	kprintf("meson_hdmi: boot mode %" B_PRIu32 "x%" B_PRIu32 ", frame buffer %#"
++		B_PRIxPHYSADDR "\n", fBootWidth, fBootHeight, fBootFrameBuffer);
++	kprintf("  HPD %" B_PRIu32 ", FC_INVIDCONF %#x\n",
++		_TopRead(HDMITX_TOP_STAT0) & 1, _DwRead(DW_FC_INVIDCONF));
++	kprintf("  HDMI PLL %#" B_PRIx32 " %#" B_PRIx32 ", VID_PLL_DIV %#" B_PRIx32
++		", VID_CLK_DIV %#" B_PRIx32 ", VID_CLK_CNTL %#" B_PRIx32 "/%#" B_PRIx32
++		", HDMI_CLK %#" B_PRIx32 "\n", _Hhi(HHI_HDMI_PLL_CNTL),
++		_Hhi(HHI_HDMI_PLL_CNTL2), _Hhi(HHI_VID_PLL_CLK_DIV),
++		_Hhi(HHI_VID_CLK_DIV), _Hhi(HHI_VID_CLK_CNTL), _Hhi(HHI_VID_CLK_CNTL2),
++		_Hhi(HHI_HDMI_CLK_CNTL));
++	kprintf("  PHY %#" B_PRIx32 " %#" B_PRIx32 " %#" B_PRIx32 "\n",
++		_Hhi(HHI_HDMI_PHY_CNTL0), _Hhi(HHI_HDMI_PHY_CNTL1),
++		_Hhi(HHI_HDMI_PHY_CNTL3));
++	kprintf("  OSD1 ctrl %#" B_PRIx32 "/%#" B_PRIx32 ", W0 %#" B_PRIx32 ", W1 %#"
++		B_PRIx32 ", W2 %#" B_PRIx32 ", W3 %#" B_PRIx32 ", W4 %#" B_PRIx32 "\n",
++		_Vpu(VIU_OSD1_CTRL_STAT), _Vpu(VIU_OSD1_CTRL_STAT2),
++		_Vpu(VIU_OSD1_BLK0_CFG_W0), _Vpu(VIU_OSD1_BLK0_CFG_W1),
++		_Vpu(VIU_OSD1_BLK0_CFG_W2), _Vpu(VIU_OSD1_BLK0_CFG_W3),
++		_Vpu(VIU_OSD1_BLK0_CFG_W4));
++	kprintf("  VPP postblend %" B_PRIu32 ", misc %#" B_PRIx32 ", scaler %#"
++		B_PRIx32 "/%#" B_PRIx32 "/%#" B_PRIx32 "\n",
++		_Vpu(VPP_POSTBLEND_H_SIZE), _Vpu(VPP_MISC), _Vpu(VPP_OSD_SC_CTRL0),
++		_Vpu(VPP_OSD_VSC_CTRL0), _Vpu(VPP_OSD_HSC_CTRL0));
++	kprintf("  ENCP en %" B_PRIu32 ", mode %#" B_PRIx32 "/%#" B_PRIx32
++		", DVI setting %#" B_PRIx32 ", HDMI setting %#" B_PRIx32 ", mux %#"
++		B_PRIx32 "\n", _Vpu(ENCP_VIDEO_EN), _Vpu(ENCP_VIDEO_MODE),
++		_Vpu(ENCP_VIDEO_MODE_ADV), _Vpu(VENC_DVI_SETTING),
++		_Vpu(VPU_HDMI_SETTING), _Vpu(VPU_VIU_VENC_MUX_CTRL));
++	kprintf("  ENCP px %" B_PRIu32 " ln %" B_PRIu32 ", havon %" B_PRIu32 "-%"
++		B_PRIu32 ", vavon %" B_PRIu32 "-%" B_PRIu32 ", hso %" B_PRIu32 "-%"
++		B_PRIu32 ", vso %" B_PRIu32 "-%" B_PRIu32 " lines %" B_PRIu32 "-%"
++		B_PRIu32 "\n", _Vpu(ENCP_VIDEO_MAX_PXCNT), _Vpu(ENCP_VIDEO_MAX_LNCNT),
++		_Vpu(ENCP_VIDEO_HAVON_BEGIN), _Vpu(ENCP_VIDEO_HAVON_END),
++		_Vpu(ENCP_VIDEO_VAVON_BLINE), _Vpu(ENCP_VIDEO_VAVON_ELINE),
++		_Vpu(ENCP_VIDEO_HSO_BEGIN), _Vpu(ENCP_VIDEO_HSO_END),
++		_Vpu(ENCP_VIDEO_VSO_BEGIN), _Vpu(ENCP_VIDEO_VSO_END),
++		_Vpu(ENCP_VIDEO_VSO_BLINE), _Vpu(ENCP_VIDEO_VSO_ELINE));
++	kprintf("  DE h %" B_PRIu32 "-%" B_PRIu32 " v %" B_PRIu32 "-%" B_PRIu32
++		", DVI hso %" B_PRIu32 "-%" B_PRIu32 " vso lines %" B_PRIu32 "-%"
++		B_PRIu32 " begin/end %" B_PRIu32 "/%" B_PRIu32 "\n",
++		_Vpu(ENCP_DE_H_BEGIN), _Vpu(ENCP_DE_H_END), _Vpu(ENCP_DE_V_BEGIN_EVEN),
++		_Vpu(ENCP_DE_V_END_EVEN), _Vpu(ENCP_DVI_HSO_BEGIN),
++		_Vpu(ENCP_DVI_HSO_END), _Vpu(ENCP_DVI_VSO_BLINE_EVN),
++		_Vpu(ENCP_DVI_VSO_ELINE_EVN), _Vpu(ENCP_DVI_VSO_BEGIN_EVN),
++		_Vpu(ENCP_DVI_VSO_END_EVN));
++}
++
++
++static int
++dump_meson_hdmi(int argc, char** argv)
++{
++	if (sDevice == NULL) {
++		kprintf("meson_hdmi: no device\n");
++		return 0;
++	}
++	if (argc > 1 && strcmp(argv[1], "restore") == 0) {
++		sDevice->RestoreBootMode();
++		kprintf("meson_hdmi: boot mode restored (U-Boot's frame buffer)\n");
++		return 0;
++	}
++	sDevice->DumpState();
++	return 0;
++}
++
++
++//	#pragma mark - driver module
++
++
++static float
++supports_device(device_node* parent)
++{
++	const char* bus;
++	if (gDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false)
++			!= B_OK || strcmp(bus, "fdt") != 0) {
++		return 0.0f;
++	}
++	const char* compatible;
++	if (gDeviceManager->get_attr_string(parent, "fdt/compatible", &compatible,
++			false) != B_OK
++		|| strcmp(compatible, "amlogic,meson-gxbb-vpu") != 0) {
++		return 0.0f;
++	}
++	return 0.8f;
++}
++
++
++static status_t
++register_device(device_node* parent)
++{
++	device_attr attrs[] = {
++		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE,
++			{ .string = "Amlogic Meson GXBB HDMI" } },
++		{ NULL }
++	};
++	return gDeviceManager->register_node(parent, DRIVER_MODULE_NAME, attrs,
++		NULL, NULL);
++}
++
++
++static status_t
++init_driver(device_node* node, void** _cookie)
++{
++	MesonHdmi* device = new(std::nothrow) MesonHdmi(node);
++	if (device == NULL)
++		return B_NO_MEMORY;
++	status_t status = device->Init();
++	if (status != B_OK) {
++		delete device;
++		return status;
++	}
++	sDevice = device;
++	add_debugger_command("meson_hdmi", &dump_meson_hdmi,
++		"Show the Meson HDMI display state; \"restore\": U-Boot's mode");
++	*_cookie = device;
++	return B_OK;
++}
++
++
++static void
++uninit_driver(void* cookie)
++{
++	remove_debugger_command("meson_hdmi", &dump_meson_hdmi);
++	sDevice = NULL;
++	delete (MesonHdmi*)cookie;
++}
++
++
++static status_t
++register_child_devices(void* cookie)
++{
++	MesonHdmi* device = (MesonHdmi*)cookie;
++	if (!device->Publish())
++		return B_OK;
++	return gDeviceManager->publish_device(device->Node(),
++		"graphics/meson_hdmi/0", DEVICE_MODULE_NAME);
++}
++
++
++//	#pragma mark - device module
++
++
++static status_t
++device_init(void* driverCookie, void** _deviceCookie)
++{
++	*_deviceCookie = driverCookie;
++	return B_OK;
++}
++
++
++static void
++device_uninit(void* deviceCookie)
++{
++}
++
++
++static status_t
++device_open(void* deviceCookie, const char* path, int openMode,
++	void** _cookie)
++{
++	*_cookie = deviceCookie;
++	return B_OK;
++}
++
++
++static status_t
++device_close(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++device_free(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++device_read(void* cookie, off_t position, void* buffer, size_t* _length)
++{
++	*_length = 0;
++	return B_NOT_ALLOWED;
++}
++
++
++static status_t
++device_write(void* cookie, off_t position, const void* buffer,
++	size_t* _length)
++{
++	*_length = 0;
++	return B_NOT_ALLOWED;
++}
++
++
++static status_t
++device_control(void* cookie, uint32 op, void* buffer, size_t length)
++{
++	MesonHdmi* device = (MesonHdmi*)cookie;
++	switch (op) {
++		case B_GET_ACCELERANT_SIGNATURE:
++			return user_strlcpy((char*)buffer, MESON_HDMI_ACCELERANT_NAME,
++				B_FILE_NAME_LENGTH) < 0 ? B_BAD_ADDRESS : B_OK;
++
++		case MESON_HDMI_GET_SHARED_INFO:
++		{
++			area_id area = device->SharedArea();
++			return user_memcpy(buffer, &area, sizeof(area_id));
++		}
++
++		case MESON_HDMI_CLONE_FRAME_BUFFER:
++		{
++			void* address;
++			area_id area = vm_clone_area(B_CURRENT_TEAM,
++				"meson_hdmi frame buffer", &address, B_ANY_ADDRESS,
++				B_READ_AREA | B_WRITE_AREA, REGION_NO_PRIVATE_MAP,
++				device->FrameBufferArea(), true);
++			if (area < 0)
++				return area;
++			return _user_get_area_info(area, (area_info*)buffer);
++		}
++
++		case MESON_HDMI_SET_DISPLAY_MODE:
++		{
++			display_mode mode;
++			if (user_memcpy(&mode, buffer, sizeof(mode)) != B_OK)
++				return B_BAD_ADDRESS;
++			return device->SetDisplayMode(mode);
++		}
++
++		case MESON_HDMI_GET_DEVICE_NAME:
++			return user_strlcpy((char*)buffer, "graphics/meson_hdmi/0",
++				B_PATH_NAME_LENGTH) < 0 ? B_BAD_ADDRESS : B_OK;
++	}
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++module_dependency module_dependencies[] = {
++	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&gDeviceManager },
++	{}
++};
++
++
++static struct driver_module_info sMesonHdmiDriver = {
++	{
++		DRIVER_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	supports_device,
++	register_device,
++	init_driver,
++	uninit_driver,
++	register_child_devices,
++	NULL,	// rescan
++	NULL,	// device_removed
++};
++
++
++static struct device_module_info sMesonHdmiDevice = {
++	{
++		DEVICE_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	device_init,
++	device_uninit,
++	NULL,	// device_removed
++
++	device_open,
++	device_close,
++	device_free,
++	device_read,
++	device_write,
++	NULL,	// io
++	device_control,
++
++	NULL,	// select
++	NULL,	// deselect
++};
++
++
++module_info* modules[] = {
++	(module_info*)&sMesonHdmiDriver,
++	(module_info*)&sMesonHdmiDevice,
++	NULL
++};

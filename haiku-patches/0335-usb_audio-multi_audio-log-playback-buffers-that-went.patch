@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 7 Nov 2026 03:30:53 -0500
+Subject: [PATCH 335/342] usb_audio, multi_audio: log playback buffers that
+ went out again
+
+A recording of an MP3 played through MediaPlayer on the test board (AB13X at
+44.1 kHz, no load) had 80 ms of the song played twice, the last two
+buffers' worth, with nothing logged: no lost packet, no buffer missing
+in the node. usb_audio queues a playback buffer again (the host
+controller copies its data) as soon as it is done, and the client fills
+it after taking the buffer done before; a client a buffer's time late
+leaves it as it was, and it repeats. usb_audio now counts and logs such
+buffers (once a second at most, a summary at the stop), and the node
+logs exchanges that came back over 15 ms after the device was done with
+the buffer. Test tones of whole periods per buffer could not show it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/drivers/audio/usb/Stream.cpp       | 32 ++++++++++++++++++-
+ src/add-ons/kernel/drivers/audio/usb/Stream.h |  8 +++++
+ .../multi_audio/MultiAudioNode.cpp            | 32 +++++++++++++++++++
+ 3 files changed, 71 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Stream.cpp b/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
+index 0f88f2b7f8..4d9b3c8eda 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
++++ b/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
+@@ -37,7 +37,10 @@ Stream::Stream(Device* device, size_t interface, usb_interface_list* List)
+ 	fCompletedLock(B_SPINLOCK_INITIALIZER),
+ 	fCompletedFirst(0),
+ 	fCompletedCount(0),
+-	fLostBuffers(0)
++	fLostBuffers(0),
++	fRepeatedBuffers(0),
++	fWorstLateness(0),
++	fRepeatLogged(0)
+ {
+ }
+ 
+@@ -336,6 +339,9 @@ Stream::Start()
+ 		fProcessedBuffers = 0;
+ 		fCompletedFirst = 0;
+ 		fCompletedCount = 0;
++		fRepeatedBuffers = 0;
++		fWorstLateness = 0;
++		fRepeatLogged = 0;
+ 		for (size_t i = 0; i < fBufferCount; i++) {
+ 			result = _QueueNextTransfer(i, i == 0);
+ 			if (result != B_OK) {
+@@ -361,6 +367,11 @@ Stream::Stop()
+ 		while (atomic_get(&fInsideNotify) != 0)
+ 			snooze(100);
+ 		fIsRunning = false;
++		if (!fIsInput && fRepeatedBuffers > 0) {
++			TRACE(ERR, "playback: %" B_PRIu32 " buffers went out again, the "
++				"client up to %" B_PRIdBIGTIME " us late\n", fRepeatedBuffers,
++				fWorstLateness);
++		}
+ 	}
+ 	gUSBModule->cancel_queued_transfers(fStreamEndpoint);
+ 
+@@ -418,8 +429,27 @@ Stream::_TransferCallback(void* cookie, status_t status, void* data,
+ 
+ 	uint32 count = stream->fBufferCount;
+ 	uint32 completed = (stream->fCurrentBuffer + 1) % count;
++	bigtime_t before = stream->fRealTime;
+ 	stream->fRealTime = system_time();
+ 
++	// Playback: the client fills a buffer after taking the one done before
++	// it, and the buffer is queued again (its data copied) right here. A
++	// client that has not taken that one yet has not refilled this one: it
++	// goes out again as it was, a repeat of the sound the buffers held.
++	if (!stream->fIsInput && atomic_get(&stream->fProcessedBuffers) > 0) {
++		bigtime_t late = stream->fRealTime - before;
++		stream->fRepeatedBuffers++;
++		if (late > stream->fWorstLateness)
++			stream->fWorstLateness = late;
++		if (stream->fRealTime - stream->fRepeatLogged > 1000000) {
++			TRACE(ERR, "playback: the client is late (%" B_PRIdBIGTIME " us "
++				"since the buffer before was done), buffer %" B_PRIu32 " goes "
++				"out again; %" B_PRIu32 " so far\n", late, completed,
++				stream->fRepeatedBuffers);
++			stream->fRepeatLogged = stream->fRealTime;
++		}
++	}
++
+ 	// Recording: the buffer joins those the client has yet to take. When the
+ 	// client is so late that all of them wait, the oldest is this one,
+ 	// recorded into again: it is lost (and its place in the semaphore count
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Stream.h b/src/add-ons/kernel/drivers/audio/usb/Stream.h
+index 7ea92def42..2968b26c53 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Stream.h
++++ b/src/add-ons/kernel/drivers/audio/usb/Stream.h
+@@ -75,6 +75,14 @@ protected:
+ 			uint32			fCompletedCount;
+ 			uint32			fLostBuffers;
+ 
++			// playback: buffers sent again with what they held before,
++			// because the client had not even taken the buffer done before
++			// them, so had not refilled them; how late it was at worst, and
++			// when that was last logged
++			uint32			fRepeatedBuffers;
++			bigtime_t		fWorstLateness;
++			bigtime_t		fRepeatLogged;
++
+ private:
+ 			status_t		_ChooseAlternate();
+ 			status_t		_SetupBuffers();
+diff --git a/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp b/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp
+index 262dd09358..3c010c281f 100644
+--- a/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp
++++ b/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp
+@@ -52,6 +52,11 @@ public:
+ 	int32				fOldBufferCycle;
+ 	int32				fMissed;
+ 	bigtime_t			fMissedLogged;
++	// exchanges that came back long after the device was done with the
++	// buffer: the slot to fill next may already have gone out again
++	int32				fLate;
++	bigtime_t			fWorstLate;
++	bigtime_t			fLateLogged;
+ 	Resampler			*fResampler;
+ 
+ 	// The producer's buffers wait here, oldest first, for the output thread
+@@ -152,6 +157,9 @@ node_input::node_input(media_input& input, media_format preferredFormat)
+ 	fOldBufferCycle = -1;
+ 	fMissed = 0;
+ 	fMissedLogged = 0;
++	fLate = 0;
++	fWorstLate = 0;
++	fLateLogged = 0;
+ 	fPendingCount = 0;
+ 	fResampler = NULL;
+ }
+@@ -1863,6 +1871,30 @@ MultiAudioNode::_OutputThread()
+ 
+ 				input->fOldBufferCycle = bufferInfo.playback_buffer_cycle;
+ 
++				// The device sends the slot filled now once the buffer
++				// playing ends: an exchange that comes back a buffer's time
++				// after the last one was done is too late, and the slot goes
++				// out again with what it held before
++				bigtime_t taken = system_time();
++				if (input->fChannelId == 0 && bufferInfo.played_real_time > 0
++					&& RunState() == BMediaEventLooper::B_STARTED) {
++					bigtime_t late = taken - bufferInfo.played_real_time;
++					if (late > 15000) {
++						input->fLate++;
++						input->fWorstLate = max_c(input->fWorstLate, late);
++						if (taken - input->fLateLogged > 1000000) {
++							syslog(LOG_WARNING, "multi_audio %s: buffer taken "
++								"%" B_PRIdBIGTIME " us after the device was done "
++								"with it (%" B_PRId32 " over 15 ms since the last "
++								"message, worst %" B_PRIdBIGTIME " us)\n", Name(),
++								late, input->fLate, input->fWorstLate);
++							input->fLate = 0;
++							input->fWorstLate = 0;
++							input->fLateLogged = taken;
++						}
++					}
++				}
++
+ 				BBuffer* buffer = input->PopPending();
+ 				if (buffer != NULL) {
+ 					_FillNextBuffer(*input, buffer);

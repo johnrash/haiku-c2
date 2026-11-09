@@ -1,0 +1,141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 10:53:00 -0400
+Subject: [PATCH 056/342] dwc2: isochronous slots by packet size, worker at
+ real-time priority
+
+* OUT packets take as much room in the bounce slot as the largest of the
+  transfer, not the endpoint's maximum: at 44.1 kHz usb_audio queues 46
+  packets of 176 bytes, which with 384 bytes each did not fit 16 KiB and
+  were refused.
+* The thread that hands finished transfers back runs at real-time
+  priority: audio drivers queue their next transfer and take the time
+  stamps of their media node's clock in its callbacks. At display
+  priority, a busy app_server (a VNC server reading the screen) delayed
+  it, which made the clock jitter.
+* The summary counts underruns (the class driver's next transfer came
+  too late) and tells how long finished transfers waited for the thread.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/busses/usb/dwc2.cpp        |  4 +-
+ src/add-ons/kernel/busses/usb/dwc2.h          |  3 ++
+ .../kernel/busses/usb/dwc2_isochronous.cpp    | 39 ++++++++++++++-----
+ 3 files changed, 35 insertions(+), 11 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.cpp b/src/add-ons/kernel/busses/usb/dwc2.cpp
+index 495974a78a..5a18629cd8 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2.cpp
+@@ -469,8 +469,10 @@ DWC2::Start()
+ 			return fLanes[i].thread;
+ 		resume_thread(fLanes[i].thread);
+ 	}
++	// the class driver's callbacks run in it, and audio drivers take their
++	// time stamps there (the media nodes' clocks): above everything else
+ 	fIsoThread = spawn_kernel_thread(_IsoThread, "dwc2 isochronous",
+-		B_URGENT_DISPLAY_PRIORITY, this);
++		B_REAL_TIME_PRIORITY, this);
+ 	if (fIsoThread < 0)
+ 		return fIsoThread;
+ 	resume_thread(fIsoThread);
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.h b/src/add-ons/kernel/busses/usb/dwc2.h
+index d99226babd..81bf223d72 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.h
++++ b/src/add-ons/kernel/busses/usb/dwc2.h
+@@ -43,6 +43,7 @@ static const uint32 kIsoMaxPieces = 4;
+ struct dwc2_iso_transfer : DoublyLinkedListLinkImpl<dwc2_iso_transfer> {
+ 	Transfer*		transfer;
+ 	struct dwc2_iso_stream* stream;
++	bigtime_t		done;			// when its last packet was
+ 	uint32			slot;
+ 	uint32			packetCount;
+ 	uint32			stride;
+@@ -71,6 +72,8 @@ struct dwc2_iso_statistics {
+ 	uint64		empty;				// IN: zero-length packets
+ 	uint32		completeSplits[8];	// IN: data at complete-split n
+ 	bigtime_t	worstTimer;			// the latest the timer fired
++	uint64		underruns;			// the queue ran empty while running
++	bigtime_t	worstFinish;		// transfer done to handed back
+ };
+ 
+ 
+diff --git a/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp b/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
+index af6d8cc4ea..577421b5ad 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
+@@ -147,15 +147,24 @@ DWC2::_SubmitIsochronous(Transfer* transfer)
+ 		return B_NOT_SUPPORTED;
+ 	}
+ 
+-	// each packet at a 32-bit aligned place for the controller's DMA; IN
+-	// packets get room for the alignment of their pieces
++	// each packet at a 32-bit aligned place for the controller's DMA: OUT
++	// packets as large as the largest, IN packets as large as the endpoint
++	// allows, with room for the alignment of their pieces
+ 	uint32 maxPacket = pipe->MaxPacketSize();
+-	uint32 stride = maxPacket;
++	uint32 count = isochronousData->packet_count;
++	if (count == 0 || count > kIsoMaxPackets)
++		return B_BAD_VALUE;
++	uint32 stride = 0;
+ 	if (pipe->Direction() == Pipe::In)
+-		stride += 3 * (kIsoMaxPieces - 1);
++		stride = maxPacket + 3 * (kIsoMaxPieces - 1);
++	else {
++		for (uint32 i = 0; i < count; i++) {
++			stride = max_c(stride,
++				(uint32)isochronousData->packet_descriptors[i].request_length);
++		}
++	}
+ 	stride = (stride + 3) & ~(uint32)3;
+-	uint32 count = isochronousData->packet_count;
+-	if (count == 0 || count > kIsoMaxPackets || count * stride > kIsoSlotSize)
++	if (count * stride > kIsoSlotSize)
+ 		return B_BAD_VALUE;
+ 
+ 	dwc2_iso_transfer* entry = new(std::nothrow) dwc2_iso_transfer;
+@@ -310,12 +319,13 @@ DWC2::_CancelIsochronous(Pipe* pipe, bool force)
+ 		}
+ 		INFO("isochronous %s, device %d endpoint %d (hub %d port %d): %"
+ 			B_PRIu64 " packets, %" B_PRIu64 " bytes, %" B_PRIu64 " late, %"
+-			B_PRIu64 " errors (last %#" B_PRIx32 "), timer up to %"
+-			B_PRIdBIGTIME " us late; %s\n", in ? "IN" : "OUT",
++			B_PRIu64 " errors (last %#" B_PRIx32 "), %" B_PRIu64 " underruns,"
++			" timer up to %" B_PRIdBIGTIME " us late, transfers handed back"
++			" up to %" B_PRIdBIGTIME " us after; %s\n", in ? "IN" : "OUT",
+ 			pipe->DeviceAddress(), pipe->EndpointAddress() & 0xf,
+ 			pipe->HubAddress(), pipe->HubPort(), stats.packets, stats.bytes,
+-			stats.late, stats.errors, stats.lastError, stats.worstTimer,
+-			detail);
++			stats.late, stats.errors, stats.lastError, stats.underruns,
++			stats.worstTimer, stats.worstFinish, detail);
+ 	}
+ 
+ 	dwc2_iso_transfer* entry;
+@@ -519,9 +529,12 @@ DWC2::_IsoPacketDone(dwc2_iso_stream* stream, status_t status,
+ 	stream->part = 0;
+ 	if (++stream->packet == entry->packetCount) {
+ 		stream->queue.Remove(entry);
++		entry->done = system_time();
+ 		fIsoDone.Add(entry);
+ 		stream->packet = 0;
+ 		release_sem_etc(fIsoSemaphore, 1, B_DO_NOT_RESCHEDULE);
++		if (stream->queue.IsEmpty())
++			stream->stats.underruns++;
+ 	}
+ 
+ 	if (!stream->queue.IsEmpty() && !stream->timerPending)
+@@ -647,6 +660,12 @@ DWC2::_IsoFinish(dwc2_iso_transfer* entry, bool callback)
+ 	// free the slot first: the callback usually submits the next transfer
+ 	InterruptsSpinLocker locker(fIsoLock);
+ 	stream->freeSlots |= 1 << entry->slot;
++	if (callback) {
++		// how late the class driver hears of it: its time stamps
++		bigtime_t finish = system_time() - entry->done;
++		if (finish > stream->stats.worstFinish)
++			stream->stats.worstFinish = finish;
++	}
+ 	locker.Unlock();
+ 
+ 	if (callback)

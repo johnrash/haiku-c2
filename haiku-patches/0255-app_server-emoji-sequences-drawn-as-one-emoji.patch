@@ -1,0 +1,771 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Mon, 2 Nov 2026 02:08:39 -0500
+Subject: [PATCH 255/342] app_server: emoji sequences drawn as one emoji
+
+Flags (two regional indicators), ZWJ sequences (a family, a
+profession), skin tones, keycaps and tag sequences (England's flag)
+were drawn a character at a time: two letters in boxes, three people,
+a hand and a colour swatch. The colour emoji font has a ligature for
+each in its GSUB table (the 'ccmp' feature, 3888 of them in Noto Color
+Emoji); the app_server has no shaper.
+
+EmojiSequences reads the colour font's cmap and GSUB once, from the
+font file, and applies the ligature lookups of 'ccmp' as a shaper
+would (each lookup over all the glyphs in turn, variation selectors
+left out: the font has no glyph for them). The glyph layout looks for a
+sequence only after a character that something joins (U+200D and what
+follows it, a skin tone, U+20E3, tags, a second regional indicator).
+A sequence that becomes one ligature is drawn as that glyph of the
+colour font, cached by its index (kGlyphCodeGlyphIndex); the sequence's
+other characters get no width of their own. Without a colour font, or
+without a ligature, the characters are drawn one at a time as before.
+Shaping for other scripts would still need HarfBuzz.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/servers/app/Jamfile                  |   1 +
+ src/servers/app/font/EmojiSequences.cpp  | 474 +++++++++++++++++++++++
+ src/servers/app/font/EmojiSequences.h    |  73 ++++
+ src/servers/app/font/FontCacheEntry.cpp  |  19 +
+ src/servers/app/font/FontCacheEntry.h    |   6 +-
+ src/servers/app/font/GlyphLayoutEngine.h |  69 +++-
+ 6 files changed, 638 insertions(+), 4 deletions(-)
+ create mode 100644 src/servers/app/font/EmojiSequences.cpp
+ create mode 100644 src/servers/app/font/EmojiSequences.h
+
+diff --git a/src/servers/app/Jamfile b/src/servers/app/Jamfile
+index 9ecb85e7dc..16696e01b4 100644
+--- a/src/servers/app/Jamfile
++++ b/src/servers/app/Jamfile
+@@ -26,6 +26,7 @@ local decorator_src =
+ 
+ UseHeaders [ FDirName $(HAIKU_TOP) src servers app font ] ;
+ local font_src =
++	EmojiSequences.cpp
+ 	FontCache.cpp
+ 	FontCacheEntry.cpp
+ 	FontEngine.cpp
+diff --git a/src/servers/app/font/EmojiSequences.cpp b/src/servers/app/font/EmojiSequences.cpp
+new file mode 100644
+index 0000000000..328eebafd4
+--- /dev/null
++++ b/src/servers/app/font/EmojiSequences.cpp
+@@ -0,0 +1,474 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "EmojiSequences.h"
++
++#include <fcntl.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <new>
++
++#include <Autolock.h>
++#include <String.h>
++#include <utf8_functions.h>
++
++#include "FontStyle.h"
++#include "GlobalFontManager.h"
++
++
++static const char* kFamily = "Noto Color Emoji";
++static const uint32 kMaxGsubSize = 4 * 1024 * 1024;
++static const uint32 kMaxCmapSize = 4 * 1024 * 1024;
++
++static EmojiSequences* sDefault = NULL;
++static BLocker sDefaultLock("emoji sequences");
++
++
++static inline bool
++is_variation_selector(uint32 code)
++{
++	return code == 0xfe0f || code == 0xfe0e;
++}
++
++
++static inline bool
++is_regional_indicator(uint32 code)
++{
++	return code >= 0x1f1e6 && code <= 0x1f1ff;
++}
++
++
++static inline uint16
++read16(const uint8* data)
++{
++	return (data[0] << 8) | data[1];
++}
++
++
++static inline uint32
++read32(const uint8* data)
++{
++	return ((uint32)data[0] << 24) | (data[1] << 16) | (data[2] << 8)
++		| data[3];
++}
++
++
++/*static*/ EmojiSequences*
++EmojiSequences::Default()
++{
++	BAutolock locker(sDefaultLock);
++	if (sDefault == NULL)
++		sDefault = new(std::nothrow) EmojiSequences;
++	return sDefault;
++}
++
++
++EmojiSequences::EmojiSequences()
++	:
++	fLock("emoji sequences tables"),
++	fLoaded(0),
++	fUsable(false),
++	fGroups(NULL),
++	fGroupCount(0),
++	fGsub(NULL),
++	fGsubSize(0),
++	fSubtables(NULL),
++	fSubtableLookup(NULL),
++	fSubtableCount(0)
++{
++}
++
++
++/*static*/ int32
++EmojiSequences::Collect(uint32 first, const char* next, const char* end,
++	uint32* codes)
++{
++	int32 count = 0;
++	codes[count++] = first;
++	bool joined = false;
++	const char* position = next;
++	while (position < end && count < kMaxLength) {
++		const char* after = position;
++		uint32 code = UTF8ToCharCode(&after);
++		if (code == 0)
++			break;
++		if (is_variation_selector(code)) {
++			codes[count++] = code;
++			position = after;
++			continue;
++		}
++		// skin tones, the keycap, tags
++		if ((code >= 0x1f3fb && code <= 0x1f3ff) || code == 0x20e3
++			|| (code >= 0xe0020 && code <= 0xe007f)) {
++			codes[count++] = code;
++			position = after;
++			joined = true;
++			continue;
++		}
++		// a flag: two regional indicators
++		if (count == 1 && is_regional_indicator(first)
++			&& is_regional_indicator(code)) {
++			codes[count++] = code;
++			joined = true;
++			break;
++		}
++		// the zero width joiner, and what it joins
++		if (code == 0x200d && count + 1 < kMaxLength && after < end) {
++			const char* joinedEnd = after;
++			uint32 nextCode = UTF8ToCharCode(&joinedEnd);
++			if (nextCode > 0x7f && nextCode != 0x200d) {
++				codes[count++] = code;
++				codes[count++] = nextCode;
++				position = joinedEnd;
++				joined = true;
++				continue;
++			}
++		}
++		break;
++	}
++	return joined ? count : 0;
++}
++
++
++bool
++EmojiSequences::Match(const uint32* codes, int32 count, uint32* _glyph,
++	int32* _used)
++{
++	if (count < 2 || !_Load())
++		return false;
++
++	// the glyphs, without variation selectors (each glyph's end in codes
++	// takes the selectors after it); the sequence ends at a character the
++	// font doesn't have
++	uint32 glyphs[kMaxLength];
++	int32 ends[kMaxLength];
++	int32 glyphCount = 0;
++	for (int32 i = 0; i < count && i < kMaxLength; i++) {
++		if (is_variation_selector(codes[i])) {
++			if (glyphCount > 0)
++				ends[glyphCount - 1] = i + 1;
++			continue;
++		}
++		uint32 glyph = _GlyphFor(codes[i]);
++		if (glyph == 0)
++			break;
++		glyphs[glyphCount] = glyph;
++		ends[glyphCount] = i + 1;
++		glyphCount++;
++	}
++	if (glyphCount < 2)
++		return false;
++
++	// each lookup over all the glyphs before the next, as OpenType wants;
++	// at a position, its subtables in turn until one applies
++	for (uint32 first = 0; first < fSubtableCount;) {
++		uint32 last = first;
++		while (last + 1 < fSubtableCount
++			&& fSubtableLookup[last + 1] == fSubtableLookup[first]) {
++			last++;
++		}
++		for (int32 position = 0; position < glyphCount; position++) {
++			for (uint32 i = first; i <= last; i++) {
++				if (_ApplyLigature(fSubtables[i], glyphs, ends, glyphCount,
++						position)) {
++					break;
++				}
++			}
++		}
++		first = last + 1;
++	}
++
++	// a ligature at the start: two characters or more up to its end
++	int32 characters = 0;
++	for (int32 i = 0; i < ends[0]; i++) {
++		if (!is_variation_selector(codes[i]))
++			characters++;
++	}
++	if (characters < 2)
++		return false;
++	*_glyph = glyphs[0];
++	*_used = ends[0];
++	return true;
++}
++
++
++bool
++EmojiSequences::_Load()
++{
++	if (atomic_get(&fLoaded) != 0)
++		return fUsable;
++
++	BAutolock locker(fLock);
++	if (fLoaded != 0)
++		return fUsable;
++
++	BString path;
++	if (gFontManager != NULL && gFontManager->Lock()) {
++		FontStyle* style = gFontManager->GetStyle(kFamily, "Regular");
++		if (style == NULL)
++			style = gFontManager->GetStyleByIndex(kFamily, 0);
++		if (style != NULL)
++			path = style->Path();
++		gFontManager->Unlock();
++	}
++	if (!path.IsEmpty()) {
++		int fd = open(path.String(), O_RDONLY | O_CLOEXEC);
++		if (fd >= 0) {
++			fUsable = _LoadTables(fd);
++			close(fd);
++		}
++	}
++	atomic_set(&fLoaded, 1);
++	return fUsable;
++}
++
++
++/*!	The font's cmap (its format 12 subtable) and GSUB, and the ligature
++	subtables of the 'ccmp' feature, in lookup order.
++*/
++bool
++EmojiSequences::_LoadTables(int fd)
++{
++	uint8 header[12];
++	if (pread(fd, header, sizeof(header), 0) != (ssize_t)sizeof(header))
++		return false;
++	uint32 tableCount = read16(header + 4);
++	if (tableCount == 0 || tableCount > 64)
++		return false;
++	uint8 records[64 * 16];
++	if (pread(fd, records, tableCount * 16, 12) != (ssize_t)(tableCount * 16))
++		return false;
++	uint32 cmapOffset = 0, cmapSize = 0, gsubOffset = 0, gsubSize = 0;
++	for (uint32 i = 0; i < tableCount; i++) {
++		const uint8* record = records + i * 16;
++		if (memcmp(record, "cmap", 4) == 0) {
++			cmapOffset = read32(record + 8);
++			cmapSize = read32(record + 12);
++		} else if (memcmp(record, "GSUB", 4) == 0) {
++			gsubOffset = read32(record + 8);
++			gsubSize = read32(record + 12);
++		}
++	}
++	if (cmapSize < 4 || cmapSize > kMaxCmapSize || gsubSize < 10
++		|| gsubSize > kMaxGsubSize) {
++		return false;
++	}
++
++	// cmap: the format 12 subtable (all of Unicode)
++	uint8* cmap = (uint8*)malloc(cmapSize);
++	if (cmap == NULL)
++		return false;
++	if (pread(fd, cmap, cmapSize, cmapOffset) != (ssize_t)cmapSize) {
++		free(cmap);
++		return false;
++	}
++	uint32 subtableCount = read16(cmap + 2);
++	for (uint32 i = 0; i < subtableCount && 4 + i * 8 + 8 <= cmapSize; i++) {
++		uint32 offset = read32(cmap + 4 + i * 8 + 4);
++		if (offset + 16 > cmapSize || read16(cmap + offset) != 12)
++			continue;
++		uint32 groupCount = read32(cmap + offset + 12);
++		if (groupCount == 0 || offset + 16 + groupCount * 12 > cmapSize)
++			continue;
++		fGroups = (uint32*)malloc(groupCount * 3 * sizeof(uint32));
++		if (fGroups == NULL)
++			break;
++		for (uint32 g = 0; g < groupCount * 3; g++)
++			fGroups[g] = read32(cmap + offset + 16 + g * 4);
++		fGroupCount = groupCount;
++		break;
++	}
++	free(cmap);
++	if (fGroupCount == 0)
++		return false;
++
++	fGsub = (uint8*)malloc(gsubSize);
++	if (fGsub == NULL)
++		return false;
++	if (pread(fd, fGsub, gsubSize, gsubOffset) != (ssize_t)gsubSize)
++		return false;
++	fGsubSize = gsubSize;
++
++	// the lookups of 'ccmp', in the order of the lookup list
++	uint32 featureList = _U16(6);
++	uint32 lookupList = _U16(8);
++	uint32 lookupCount = _U16(lookupList);
++	if (featureList == 0 || lookupList == 0 || lookupCount == 0)
++		return false;
++	bool* used = (bool*)calloc(lookupCount, sizeof(bool));
++	if (used == NULL)
++		return false;
++	uint32 featureCount = _U16(featureList);
++	for (uint32 i = 0; i < featureCount; i++) {
++		uint32 record = featureList + 2 + i * 6;
++		if (record + 6 > fGsubSize
++			|| memcmp(fGsub + record, "ccmp", 4) != 0) {
++			continue;
++		}
++		uint32 feature = featureList + _U16(record + 4);
++		uint32 indexCount = _U16(feature + 2);
++		for (uint32 k = 0; k < indexCount; k++) {
++			uint32 index = _U16(feature + 4 + k * 2);
++			if (index < lookupCount)
++				used[index] = true;
++		}
++	}
++
++	// their ligature subtables (also through extension subtables)
++	uint32 capacity = 0;
++	for (uint32 index = 0; index < lookupCount; index++) {
++		if (!used[index])
++			continue;
++		uint32 lookup = lookupList + _U16(lookupList + 2 + index * 2);
++		uint32 type = _U16(lookup);
++		uint32 count = _U16(lookup + 4);
++		for (uint32 k = 0; k < count; k++) {
++			uint32 subtable = lookup + _U16(lookup + 6 + k * 2);
++			uint32 subtableType = type;
++			if (type == 7) {
++				subtableType = _U16(subtable + 2);
++				subtable += _U32(subtable + 4);
++			}
++			if (subtableType != 4 || _U16(subtable) != 1)
++				continue;
++			if (fSubtableCount == capacity) {
++				capacity = capacity > 0 ? capacity * 2 : 16;
++				uint32* subtables = (uint32*)realloc(fSubtables,
++					capacity * sizeof(uint32));
++				uint32* lookups = (uint32*)realloc(fSubtableLookup,
++					capacity * sizeof(uint32));
++				if (subtables != NULL)
++					fSubtables = subtables;
++				if (lookups != NULL)
++					fSubtableLookup = lookups;
++				if (subtables == NULL || lookups == NULL) {
++					free(used);
++					return false;
++				}
++			}
++			fSubtables[fSubtableCount] = subtable;
++			fSubtableLookup[fSubtableCount] = index;
++			fSubtableCount++;
++		}
++	}
++	free(used);
++	return fSubtableCount > 0;
++}
++
++
++uint32
++EmojiSequences::_GlyphFor(uint32 code) const
++{
++	int32 low = 0;
++	int32 high = (int32)fGroupCount - 1;
++	while (low <= high) {
++		int32 middle = (low + high) / 2;
++		const uint32* group = fGroups + middle * 3;
++		if (code < group[0])
++			high = middle - 1;
++		else if (code > group[1])
++			low = middle + 1;
++		else
++			return group[2] + code - group[0];
++	}
++	return 0;
++}
++
++
++/*!	The index of \a glyph in the coverage table at \a offset, -1 if it
++	isn't in it.
++*/
++int32
++EmojiSequences::_Coverage(uint32 offset, uint32 glyph) const
++{
++	uint32 format = _U16(offset);
++	int32 count = _U16(offset + 2);
++	int32 low = 0;
++	int32 high = count - 1;
++	while (low <= high) {
++		int32 middle = (low + high) / 2;
++		if (format == 1) {
++			uint32 entry = _U16(offset + 4 + middle * 2);
++			if (glyph < entry)
++				high = middle - 1;
++			else if (glyph > entry)
++				low = middle + 1;
++			else
++				return middle;
++		} else if (format == 2) {
++			uint32 range = offset + 4 + middle * 6;
++			uint32 start = _U16(range);
++			uint32 end = _U16(range + 2);
++			if (glyph < start)
++				high = middle - 1;
++			else if (glyph > end)
++				low = middle + 1;
++			else
++				return _U16(range + 4) + glyph - start;
++		} else
++			return -1;
++	}
++	return -1;
++}
++
++
++/*!	The first ligature of \a subtable (format 1) that the glyphs at
++	\a position begin with, if one does: it replaces them, its end is the
++	last one's.
++*/
++bool
++EmojiSequences::_ApplyLigature(uint32 subtable, uint32* glyphs, int32* ends,
++	int32& count, int32 position) const
++{
++	int32 index = _Coverage(subtable + _U16(subtable + 2), glyphs[position]);
++	if (index < 0 || index >= _U16(subtable + 4))
++		return false;
++	uint32 set = subtable + _U16(subtable + 6 + index * 2);
++	uint32 ligatureCount = _U16(set);
++	for (uint32 i = 0; i < ligatureCount; i++) {
++		uint32 ligature = set + _U16(set + 2 + i * 2);
++		int32 componentCount = _U16(ligature + 2);
++		if (componentCount < 2 || position + componentCount > count)
++			continue;
++		bool matches = true;
++		for (int32 c = 1; c < componentCount && matches; c++) {
++			if (_U16(ligature + 4 + (c - 1) * 2) != glyphs[position + c])
++				matches = false;
++		}
++		if (!matches)
++			continue;
++		glyphs[position] = _U16(ligature);
++		ends[position] = ends[position + componentCount - 1];
++		int32 rest = count - position - componentCount;
++		memmove(glyphs + position + 1, glyphs + position + componentCount,
++			rest * sizeof(uint32));
++		memmove(ends + position + 1, ends + position + componentCount,
++			rest * sizeof(int32));
++		count -= componentCount - 1;
++		return true;
++	}
++	return false;
++}
++
++
++uint16
++EmojiSequences::_U16(uint32 offset) const
++{
++	if (offset + 2 > fGsubSize)
++		return 0;
++	return read16(fGsub + offset);
++}
++
++
++uint32
++EmojiSequences::_U32(uint32 offset) const
++{
++	if (offset + 4 > fGsubSize)
++		return 0;
++	return read32(fGsub + offset);
++}
+diff --git a/src/servers/app/font/EmojiSequences.h b/src/servers/app/font/EmojiSequences.h
+new file mode 100644
+index 0000000000..9e4da2a33a
+--- /dev/null
++++ b/src/servers/app/font/EmojiSequences.h
+@@ -0,0 +1,73 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef EMOJI_SEQUENCES_H
++#define EMOJI_SEQUENCES_H
++
++
++#include <Locker.h>
++#include <SupportDefs.h>
++
++
++/*!	Emoji sequences drawn as one glyph: flags (two regional indicators), ZWJ
++	sequences (a family, a profession), skin tones, keycaps, tag sequences
++	(England's flag). The app_server lays text out a character at a time;
++	for these the colour emoji font has ligatures in its GSUB table (the
++	'ccmp' feature), which are applied here as a shaper would, from the
++	font file's cmap and GSUB, read once. Variation selectors are left out
++	of the matching, as the font has no glyph for them.
++*/
++class EmojiSequences {
++public:
++	static	const int32			kMaxLength = 16;
++		// code points of a sequence, variation selectors included
++
++	static	EmojiSequences*		Default();
++
++	/*!	The sequence that may start with \a first: what follows it at
++		\a next (up to \a end) and joins it. Returns its length (code points
++		in \a codes, \a first included), 0 if nothing joins it.
++	*/
++	static	int32				Collect(uint32 first, const char* next,
++									const char* end, uint32* codes);
++
++	/*!	The colour font's glyph the longest sequence at the start of
++		\a codes becomes, and how many code points it takes (2 or more,
++		trailing variation selectors included); false if none does.
++	*/
++			bool				Match(const uint32* codes, int32 count,
++									uint32* _glyph, int32* _used);
++
++private:
++								EmojiSequences();
++
++			bool				_Load();
++			bool				_LoadTables(int fd);
++			uint32				_GlyphFor(uint32 code) const;
++			int32				_Coverage(uint32 offset, uint32 glyph) const;
++			bool				_ApplyLigature(uint32 subtable,
++									uint32* glyphs, int32* ends,
++									int32& count, int32 position) const;
++			uint16				_U16(uint32 offset) const;
++			uint32				_U32(uint32 offset) const;
++
++			BLocker				fLock;
++			int32				fLoaded;	// atomic: the tables were read
++			bool				fUsable;
++			uint32*				fGroups;
++				// cmap format 12: start, end, first glyph
++			uint32				fGroupCount;
++			uint8*				fGsub;
++			uint32				fGsubSize;
++			uint32*				fSubtables;
++				// the ligature subtables of 'ccmp', in lookup order
++				// (offsets in fGsub)
++			uint32*				fSubtableLookup;
++				// each one's lookup (the subtables of a lookup are tried
++				// in turn at a position)
++			uint32				fSubtableCount;
++};
++
++
++#endif	// EMOJI_SEQUENCES_H
+diff --git a/src/servers/app/font/FontCacheEntry.cpp b/src/servers/app/font/FontCacheEntry.cpp
+index 3550d45fd7..3a1704ddba 100644
+--- a/src/servers/app/font/FontCacheEntry.cpp
++++ b/src/servers/app/font/FontCacheEntry.cpp
+@@ -312,6 +312,25 @@ FontCacheEntry::CreateGlyph(uint32 glyphCode, FontCacheEntry* fallbackEntry,
+ 	if (glyph != NULL)
+ 		return glyph;
+ 
++	if ((glyphCode & kGlyphCodeGlyphIndex) != 0) {
++		// an emoji sequence's ligature: a glyph of the colour font, the
++		// fallback's or our own, by its index
++		FontEngine* engine = fallbackEntry != NULL
++			? &fallbackEntry->fEngine : &fEngine;
++		if (!engine->IsColorFont()
++			|| !engine->PrepareGlyph(glyphCode & kGlyphCodeIndex)) {
++			return NULL;
++		}
++		glyph = fGlyphCache->CacheGlyph(glyphCode, engine->DataSize(),
++			engine->DataType(), engine->Bounds(), engine->AdvanceX(),
++			engine->AdvanceY(), engine->PreciseAdvanceX(),
++			engine->PreciseAdvanceY(), engine->InsetLeft(),
++			engine->InsetRight());
++		if (glyph != NULL)
++			engine->WriteGlyphTo(glyph->data);
++		return glyph;
++	}
++
+ 	uint32 charCode = glyphCode & kGlyphCodeCharacter;
+ 	FontEngine* engine = &fEngine;
+ 	uint32 glyphIndex = 0;
+diff --git a/src/servers/app/font/FontCacheEntry.h b/src/servers/app/font/FontCacheEntry.h
+index 7c60b422b4..899841e1c6 100644
+--- a/src/servers/app/font/FontCacheEntry.h
++++ b/src/servers/app/font/FontCacheEntry.h
+@@ -88,7 +88,11 @@ struct GlyphCache {
+ enum {
+ 	kGlyphCodeCharacter	= 0x001fffff,
+ 	kGlyphCodeEmoji		= 0x00200000,	// colour (U+FE0F)
+-	kGlyphCodeText		= 0x00400000	// monochrome (U+FE0E)
++	kGlyphCodeText		= 0x00400000,	// monochrome (U+FE0E)
++	kGlyphCodeGlyphIndex = 0x00800000,
++		// an emoji sequence drawn as one glyph (EmojiSequences): the colour
++		// font's glyph, its index in kGlyphCodeIndex
++	kGlyphCodeIndex		= 0x0000ffff
+ };
+ 
+ 
+diff --git a/src/servers/app/font/GlyphLayoutEngine.h b/src/servers/app/font/GlyphLayoutEngine.h
+index 1c1ebca129..2dbfb06e48 100644
+--- a/src/servers/app/font/GlyphLayoutEngine.h
++++ b/src/servers/app/font/GlyphLayoutEngine.h
+@@ -11,6 +11,7 @@
+ 
+ #include "utf8_functions.h"
+ 
++#include "EmojiSequences.h"
+ #include "FontCache.h"
+ #include "FontCacheEntry.h"
+ #include "GlobalFontManager.h"
+@@ -219,7 +220,7 @@ private:
+ 									FontCacheReference& cacheReference,
+ 									BObjectList<FontCacheReference, true>& fallbacks,
+ 									const ServerFont& font, bool needsVector,
+-									uint32 glyphCode);
++									uint32 glyphCode, uint32 charCode);
+ 
+ 								GlyphLayoutEngine();
+ 	virtual						~GlyphLayoutEngine();
+@@ -376,14 +377,44 @@ GlyphLayoutEngine::LayoutGlyphs(GlyphConsumer& consumer,
+ 				glyphCode |= kGlyphCodeText;
+ 		}
+ 
++		// An emoji sequence drawn as one glyph (a flag, a ZWJ sequence, a
++		// skin tone, a keycap): the colour font's ligature.
++		uint32 sequence[EmojiSequences::kMaxLength];
++		int32 sequenceUsed = 0;
++		if (utf8String - start < length) {
++			int32 sequenceLength = EmojiSequences::Collect(charCode,
++				utf8String, start + length, sequence);
++			uint32 sequenceGlyph;
++			EmojiSequences* sequences = EmojiSequences::Default();
++			if (sequenceLength >= 2 && sequences != NULL
++				&& sequences->Match(sequence, sequenceLength, &sequenceGlyph,
++					&sequenceUsed)) {
++				glyphCode = kGlyphCodeGlyphIndex | sequenceGlyph;
++			} else
++				sequenceUsed = 0;
++		}
++
+ 		const GlyphCache* glyph = entry->CachedGlyph(glyphCode);
+ 		if (glyph == NULL) {
+ 			glyph = _CreateGlyph(*pCacheReference, fallbacksList, font,
+-				consumer.NeedsVector(), glyphCode);
++				consumer.NeedsVector(), glyphCode, charCode);
+ 
+ 			// Something may have gone wrong while reacquiring the entry lock
+ 			if (pCacheReference->Entry() == NULL)
+ 				return false;
++
++			if (glyph == NULL && sequenceUsed > 0) {
++				// no colour font after all: one character at a time
++				sequenceUsed = 0;
++				glyphCode = charCode;
++				glyph = entry->CachedGlyph(glyphCode);
++				if (glyph == NULL) {
++					glyph = _CreateGlyph(*pCacheReference, fallbacksList,
++						font, consumer.NeedsVector(), glyphCode, charCode);
++					if (pCacheReference->Entry() == NULL)
++						return false;
++				}
++			}
+ 		}
+ 
+ 		if (glyph == NULL) {
+@@ -414,6 +445,15 @@ GlyphLayoutEngine::LayoutGlyphs(GlyphConsumer& consumer,
+ 			}
+ 		}
+ 
++		// the rest of a sequence: drawn by its glyph, without a width of
++		// its own
++		for (int32 i = 1; i < sequenceUsed && maxChars > 0; i++) {
++			charCode = UTF8ToCharCode(&utf8String);
++			maxChars--;
++			consumer.ConsumeEmptyGlyph(index++, charCode, x + advanceX,
++				y + advanceY);
++		}
++
+ 		lastCharCode = charCode;
+ 		if (utf8String - start + 1 > length)
+ 			break;
+@@ -430,9 +470,32 @@ GlyphLayoutEngine::LayoutGlyphs(GlyphConsumer& consumer,
+ inline const GlyphCache*
+ GlyphLayoutEngine::_CreateGlyph(FontCacheReference& cacheReference,
+ 	BObjectList<FontCacheReference, true>& fallbacks,
+-	const ServerFont& font, bool forceVector, uint32 glyphCode)
++	const ServerFont& font, bool forceVector, uint32 glyphCode,
++	uint32 sequenceStart)
+ {
+ 	FontCacheEntry* entry = cacheReference.Entry();
++
++	if ((glyphCode & kGlyphCodeGlyphIndex) != 0) {
++		// an emoji sequence's ligature: a glyph of the colour font (ours,
++		// or the fallback that has the sequence's first character)
++		if (entry->IsColorFont()) {
++			if (cacheReference.WriteLock())
++				return entry->CreateGlyph(glyphCode);
++			return NULL;
++		}
++		if (fallbacks.IsEmpty())
++			PopulateFallbacks(fallbacks, font, forceVector);
++		FontCacheReference* fallbackReference = GetFallbackReference(
++			fallbacks, sequenceStart, true, false);
++		if (fallbackReference == NULL
++			|| !fallbackReference->Entry()->IsColorFont()
++			|| !cacheReference.SetFallback(fallbackReference)) {
++			return NULL;
++		}
++		return entry->CreateGlyph(glyphCode, fallbackReference->Entry(),
++			true);
++	}
++
+ 	uint32 charCode = glyphCode & kGlyphCodeCharacter;
+ 	bool text = (glyphCode & kGlyphCodeText) != 0;
+ 	bool color = (glyphCode & kGlyphCodeEmoji) != 0

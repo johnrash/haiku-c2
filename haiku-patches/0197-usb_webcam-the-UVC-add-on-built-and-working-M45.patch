@@ -1,0 +1,609 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 01:48:24 -0500
+Subject: [PATCH 197/342] usb_webcam: the UVC add-on, built and working (M45)
+
+The UVC code had been left out of the build since 2010. Built again,
+with what kept it from working on the C920:
+- the frame index requested is the descriptor's own (1-based) one, not
+  its place in the list (320x240 asked for 320x180);
+- commit sends the camera's probe answer, and a short probe answer
+  fails;
+- the alternate setting is chosen by bytes per microframe (packet size
+  times high bandwidth transactions), not by the raw wMaxPacketSize;
+- the endpoint searches used the wrong loop variable;
+- YUY2 is converted to B_RGB32 (BT.601), where a Bayer demosaic from the
+  Sonix code was;
+- the deframer resets its buffer for each frame, ends a frame at an FID
+  toggle or EOF, drops frames with ERR, of the wrong size, or partial
+  (the first), and keeps only the newest frame waiting;
+- its own data pump keeps four transfers of 32 microframes queued
+  (BUSBEndpoint::QueueIsochronous()), so the stream has no gaps;
+- StopTransfer() lets the pump finish before the alternate setting goes
+  back to 0;
+- the producer runs at 30 frames a second (5 left a 30 fps camera's
+  frames waiting).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../media/media-add-ons/usb_webcam/Jamfile    |   2 +-
+ .../media-add-ons/usb_webcam/Producer.cpp     |   5 +-
+ .../usb_webcam/addons/uvc/UVCCamDevice.cpp    | 211 +++++++++++-------
+ .../usb_webcam/addons/uvc/UVCCamDevice.h      |   7 +-
+ .../usb_webcam/addons/uvc/UVCDeframer.cpp     | 124 +++++++---
+ .../usb_webcam/addons/uvc/UVCDeframer.h       |  21 +-
+ 6 files changed, 249 insertions(+), 121 deletions(-)
+
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/Jamfile b/src/add-ons/media/media-add-ons/usb_webcam/Jamfile
+index 4be0934ed6..6cfc85bbf3 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/Jamfile
++++ b/src/add-ons/media/media-add-ons/usb_webcam/Jamfile
+@@ -28,7 +28,7 @@ addonSources =
+ 	QuickCamDevice.cpp
+ 	SonixCamDevice.cpp
+ 	NW80xCamDevice.cpp
+-#	UVCCamDevice.cpp UVCDeframer.cpp
++	UVCCamDevice.cpp UVCDeframer.cpp
+ ;
+ 
+ ## colorspace transforms sources
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp b/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
+index d6493c6476..606e2b84fa 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
+@@ -45,9 +45,10 @@
+ 
+ #include "Producer.h"
+ 
+-//#define FIELD_RATE 30.f
++#define FIELD_RATE 30.f
++	// a UVC camera's rate (5 left the frames of a 30 fps camera waiting)
+ //#define FIELD_RATE 29.97f
+-#define FIELD_RATE 5.f
++//#define FIELD_RATE 5.f
+ 
+ 
+ int32 VideoProducer::fInstances = 0;
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+index 13987ee472..56ac63e0e5 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+@@ -70,7 +70,10 @@ UVCCamDevice::UVCCamDevice(CamDeviceAddon& _addon, BUSBDevice* _device)
+ 	fHeaderDescriptor(NULL),
+ 	fInterruptIn(NULL),
+ 	fUncompressedFormatIndex(1),
+-	fUncompressedFrameIndex(1)
++	fUncompressedFrameIndex(1),
++	fMaxVideoFrameSize(0),
++	fMaxPayloadTransferSize(0),
++	fAlternatePayload(0)
+ {
+ 	fDeframer = new UVCDeframer(this);
+ 	SetDataInput(fDeframer);
+@@ -108,7 +111,7 @@ UVCCamDevice::UVCCamDevice(CamDeviceAddon& _addon, BUSBDevice* _device)
+ 						generic->generic.length);
+ 				}
+ 				for (uint32 k = 0; k < interface->CountEndpoints(); k++) {
+-					const BUSBEndpoint* e = interface->EndpointAt(i);
++					const BUSBEndpoint* e = interface->EndpointAt(k);
+ 					if (e && e->IsInterrupt() && e->IsInput()) {
+ 						fInterruptIn = e;
+ 						break;
+@@ -132,7 +135,7 @@ UVCCamDevice::UVCCamDevice(CamDeviceAddon& _addon, BUSBDevice* _device)
+ 				}
+ 
+ 				for (uint32 k = 0; k < interface->CountEndpoints(); k++) {
+-					const BUSBEndpoint* e = interface->EndpointAt(i);
++					const BUSBEndpoint* e = interface->EndpointAt(k);
+ 					if (e && e->IsIsochronous() && e->IsInput()) {
+ 						fIsoIn = e;
+ 						break;
+@@ -551,6 +554,10 @@ UVCCamDevice::StartTransfer()
+ {
+ 	if (_ProbeCommitFormat() != B_OK || _SelectBestAlternate() != B_OK)
+ 		return B_ERROR;
++	// YUY2: two bytes a pixel, whole frames only
++	BRect frame = VideoFrame();
++	((UVCDeframer*)fDeframer)->Start((size_t)(frame.IntegerWidth() + 1)
++		* (frame.IntegerHeight() + 1) * 2);
+ 	return CamDevice::StartTransfer();
+ }
+ 
+@@ -558,8 +565,11 @@ UVCCamDevice::StartTransfer()
+ status_t
+ UVCCamDevice::StopTransfer()
+ {
++	// the pump finishes the transfers it has queued first: then the
++	// alternate setting goes back to the one without bandwidth
++	status_t status = CamDevice::StopTransfer();
+ 	_SelectIdleAlternate();
+-	return CamDevice::StopTransfer();
++	return status;
+ }
+ 
+ 
+@@ -606,7 +616,9 @@ UVCCamDevice::AcceptVideoFrame(uint32& width, uint32& height)
+ 		const usb_video_frame_descriptor* descriptor
+ 			= (const usb_video_frame_descriptor*)fUncompressedFrames.ItemAt(i);
+ 		if ((*descriptor).width == width && (*descriptor).height == height) {
+-			fUncompressedFrameIndex = i;
++			// the descriptor's own (1-based) index, not its place in the
++			// list
++			fUncompressedFrameIndex = descriptor->frame_index;
+ 			SetVideoFrame(BRect(0, 0, width - 1, height - 1));
+ 			return B_OK;
+ 		}
+@@ -670,6 +682,11 @@ UVCCamDevice::_ProbeCommitFormat()
+ 	actualLength = fDevice->ControlTransfer(
+ 		USB_REQTYPE_CLASS | USB_REQTYPE_INTERFACE_IN, USB_VIDEO_RC_GET_CUR,
+ 		USB_VIDEO_VS_PROBE_CONTROL << 8, fStreamingIndex, length, &response);
++	if (actualLength != length) {
++		fprintf(stderr, "UVCCamDevice::_ProbeFormat() GET_CUR ProbeControl"
++			" failed %ld\n", actualLength);
++		return B_ERROR;
++	}
+ 
+ 	/*
+ 	actualLength = fDevice->ControlTransfer(
+@@ -682,9 +699,10 @@ UVCCamDevice::_ProbeCommitFormat()
+ 	}
+ 	*/
+ 
++	// the camera's answer, as UVC 1.1 4.3.1.1.1 wants
+ 	actualLength = fDevice->ControlTransfer(
+ 		USB_REQTYPE_CLASS | USB_REQTYPE_INTERFACE_OUT, USB_VIDEO_RC_SET_CUR,
+-		USB_VIDEO_VS_COMMIT_CONTROL << 8, fStreamingIndex, length, &request);
++		USB_VIDEO_VS_COMMIT_CONTROL << 8, fStreamingIndex, length, &response);
+ 	if (actualLength != length) {
+ 		fprintf(stderr, "UVCCamDevice::_ProbeFormat() SetCur CommitControl"
+ 			" failed\n");
+@@ -722,12 +740,15 @@ UVCCamDevice::_SelectBestAlternate()
+ 			const BUSBEndpoint* endpoint = alternate->EndpointAt(j);
+ 			if (!endpoint->IsIsochronous() || !endpoint->IsInput())
+ 				continue;
+-			if (fMaxPayloadTransferSize > endpoint->MaxPacketSize())
++			// wMaxPacketSize: the packet size, and at high speed the
++			// transactions per microframe in bits 11-12
++			uint16 field = endpoint->MaxPacketSize();
++			uint32 bandwidth = (field & 0x7ff) * (1 + ((field >> 11) & 3));
++			if (fMaxPayloadTransferSize > bandwidth)
+ 				continue;
+-			if (bestBandwidth != 0
+-				&& bestBandwidth < endpoint->MaxPacketSize())
++			if (bestBandwidth != 0 && bestBandwidth < bandwidth)
+ 				continue;
+-			bestBandwidth = endpoint->MaxPacketSize();
++			bestBandwidth = bandwidth;
+ 			endpointIndex = j;
+ 			alternateIndex = i;
+ 		}
+@@ -747,6 +768,7 @@ UVCCamDevice::_SelectBestAlternate()
+ 	}
+ 
+ 	fIsoIn = streaming->EndpointAt(endpointIndex);
++	fAlternatePayload = bestBandwidth;
+ 
+ 	return B_OK;
+ }
+@@ -1262,93 +1284,124 @@ UVCCamDevice::FillFrameBuffer(BBuffer* buffer, bigtime_t* stamp)
+ 	long int w = (long)(VideoFrame().right - VideoFrame().left + 1);
+ 	long int h = (long)(VideoFrame().bottom - VideoFrame().top + 1);
+ 
+-	if (buffer->SizeAvailable() >= (size_t)w * h * 4) {
++	if (buffer->SizeAvailable() >= (size_t)w * h * 4
++		&& f->BufferLength() >= (size_t)w * h * 2) {
+ 		// TODO: The Video Producer only outputs B_RGB32.  This is OK for most
+ 		// applications.  This could be leveraged if applications can
+ 		// consume B_YUV422.
+-		_DecodeColor((unsigned char*)buffer->Data(),
+-			(unsigned char*)f->Buffer(), w, h);
++		_ConvertYUY2((uint32*)buffer->Data(), (const uint8*)f->Buffer(), w,
++			h);
+ 	}
+ 	delete f;
+ 	return B_OK;
+ }
+ 
+ 
+-void
+-UVCCamDevice::_DecodeColor(unsigned char* dst, unsigned char* src,
+-	int32 width, int32 height)
++/*!	The payload transfers, several queued together so that the stream has
++	no gaps (BUSBEndpoint::QueueIsochronous()): a transfer of kPackets
++	microframes each, a packet per microframe, each going to the deframer
++	as one payload transfer.
++*/
++status_t
++UVCCamDevice::DataPumpThread()
+ {
+-	long int i;
+-	unsigned char* rawpt, * scanpt;
+-	long int size;
+-
+-	rawpt = src;
+-	scanpt = dst;
+-	size = width*height;
+-
+-	for ( i = 0; i < size; i++ ) {
+-	if ( (i/width) % 2 == 0 ) {
+-		if ( (i % 2) == 0 ) {
+-		/* B */
+-		if ( (i > width) && ((i % width) > 0) ) {
+-			*scanpt++ = (*(rawpt-width-1)+*(rawpt-width+1)
+-				+ *(rawpt+width-1)+*(rawpt+width+1))/4;	/* R */
+-			*scanpt++ = (*(rawpt-1)+*(rawpt+1)
+-				+ *(rawpt+width)+*(rawpt-width))/4;	/* G */
+-			*scanpt++ = *rawpt;					/* B */
+-		} else {
+-			/* first line or left column */
+-			*scanpt++ = *(rawpt+width+1);		/* R */
+-			*scanpt++ = (*(rawpt+1)+*(rawpt+width))/2;	/* G */
+-			*scanpt++ = *rawpt;				/* B */
+-		}
+-		} else {
+-		/* (B)G */
+-		if ( (i > width) && ((i % width) < (width-1)) ) {
+-			*scanpt++ = (*(rawpt+width)+*(rawpt-width))/2;	/* R */
+-			*scanpt++ = *rawpt;					/* G */
+-			*scanpt++ = (*(rawpt-1)+*(rawpt+1))/2;		/* B */
+-		} else {
+-			/* first line or right column */
+-			*scanpt++ = *(rawpt+width);	/* R */
+-			*scanpt++ = *rawpt;		/* G */
+-			*scanpt++ = *(rawpt-1);	/* B */
+-		}
+-		}
+-	} else {
+-		if ( (i % 2) == 0 ) {
+-		/* G(R) */
+-		if ( (i < (width*(height-1))) && ((i % width) > 0) ) {
+-			*scanpt++ = (*(rawpt-1)+*(rawpt+1))/2;		/* R */
+-			*scanpt++ = *rawpt;					/* G */
+-			*scanpt++ = (*(rawpt+width)+*(rawpt-width))/2;	/* B */
+-		} else {
+-			/* bottom line or left column */
+-			*scanpt++ = *(rawpt+1);		/* R */
+-			*scanpt++ = *rawpt;			/* G */
+-			*scanpt++ = *(rawpt-width);		/* B */
++	static const int kQueued = 4;
++	static const int kPackets = 32;
++	const BUSBEndpoint* endpoint = fIsoIn;
++	uint32 payload = fAlternatePayload;
++	if (endpoint == NULL || payload == 0)
++		return B_ERROR;
++
++	size_t length = (size_t)payload * kPackets;
++	uint8* buffers[kQueued];
++	usb_iso_packet_descriptor descriptors[kQueued][kPackets];
++	uint32 requests[kQueued];
++	bool queued[kQueued];
++	for (int q = 0; q < kQueued; q++) {
++		buffers[q] = (uint8*)malloc(length);
++		queued[q] = false;
++	}
++
++	int next = 0;
++	int failures = 0;
++	while (true) {
++		// keep all of them queued, while the transfer is on
++		for (int i = 0; i < kQueued && fTransferEnabled; i++) {
++			int q = (next + i) % kQueued;
++			if (queued[q] || buffers[q] == NULL)
++				continue;
++			for (int k = 0; k < kPackets; k++) {
++				descriptors[q][k].request_length = payload;
++				descriptors[q][k].actual_length = 0;
++				descriptors[q][k].status = B_OK;
++			}
++			queued[q] = endpoint->QueueIsochronous(buffers[q], length,
++				descriptors[q], kPackets, &requests[q]) == B_OK;
++			if (!queued[q])
++				break;
+ 		}
+-		} else {
+-		/* R */
+-		if ( i < (width*(height-1)) && ((i % width) < (width-1)) ) {
+-			*scanpt++ = *rawpt;					/* R */
+-			*scanpt++ = (*(rawpt-1)+*(rawpt+1)
+-				+ *(rawpt-width)+*(rawpt+width))/4;	/* G */
+-			*scanpt++ = (*(rawpt-width-1)+*(rawpt-width+1)
+-				+ *(rawpt+width-1)+*(rawpt+width+1))/4;	/* B */
+-		} else {
+-			/* bottom line or right column */
+-			*scanpt++ = *rawpt;				/* R */
+-			*scanpt++ = (*(rawpt-1)+*(rawpt-width))/2;	/* G */
+-			*scanpt++ = *(rawpt-width-1);		/* B */
++		if (!queued[next]) {
++			if (!fTransferEnabled)
++				break;
++			// nothing in flight: the device may have gone
++			if (++failures > 100)
++				break;
++			snooze(10000);
++			continue;
+ 		}
++
++		ssize_t result = endpoint->WaitIsochronous(requests[next]);
++		queued[next] = false;
++		if (result >= 0 && fDataInput != NULL) {
++			failures = 0;
++			// packet k at the sum of the request lengths before it
++			for (int k = 0; k < kPackets; k++) {
++				const usb_iso_packet_descriptor& packet = descriptors[next][k];
++				if (packet.status == B_OK && packet.actual_length > 0) {
++					fDataInput->Write(buffers[next] + (size_t)k * payload,
++						packet.actual_length);
++				}
++			}
+ 		}
++		next = (next + 1) % kQueued;
+ 	}
+-	rawpt++;
++
++	for (int q = 0; q < kQueued; q++) {
++		if (queued[q])
++			endpoint->WaitIsochronous(requests[q]);
++		free(buffers[q]);
+ 	}
++	return B_OK;
+ }
+ 
+ 
++/*!	YUY2 (bytes Y0 U Y1 V, two pixels) into B_RGB32, ITU-R BT.601 with the
++	studio range (Y 16-235), the matrix the C920's color matching descriptor
++	names (SMPTE 170M).
++*/
++void
++UVCCamDevice::_ConvertYUY2(uint32* destination, const uint8* source,
++	int32 width, int32 height)
++{
++	for (int32 i = 0; i < width * height / 2; i++) {
++		int32 u = source[1] - 128;
++		int32 v = source[3] - 128;
++		int32 red = 409 * v + 128;
++		int32 green = -100 * u - 208 * v + 128;
++		int32 blue = 516 * u + 128;
++		for (int32 k = 0; k < 2; k++) {
++			int32 y = 298 * (source[k * 2] - 16);
++			int32 r = (y + red) >> 8;
++			int32 g = (y + green) >> 8;
++			int32 b = (y + blue) >> 8;
++			r = r < 0 ? 0 : r > 255 ? 255 : r;
++			g = g < 0 ? 0 : g > 255 ? 255 : g;
++			b = b < 0 ? 0 : b > 255 ? 255 : b;
++			*destination++ = 0xff000000 | (r << 16) | (g << 8) | b;
++		}
++		source += 4;
++	}
++}
+ 
+ 
+ UVCCamDeviceAddon::UVCCamDeviceAddon(WebCamMediaAddOn* webcam)
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+index 9b60f38bfb..e950a8bc11 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+@@ -35,6 +35,7 @@ public:
+ 									const void *value, size_t size);
+ 	virtual status_t			FillFrameBuffer(BBuffer *buffer,
+ 									bigtime_t *stamp = NULL);
++	virtual status_t			DataPumpThread();
+ 
+ private:
+ 			void				_ParseVideoControl(
+@@ -46,8 +47,8 @@ private:
+ 			status_t			_ProbeCommitFormat();
+ 			status_t			_SelectBestAlternate();
+ 			status_t			_SelectIdleAlternate();
+-			void 				_DecodeColor(unsigned char *dst,
+-									unsigned char *src, int32 width,
++			void				_ConvertYUY2(uint32* destination,
++									const uint8* source, int32 width,
+ 									int32 height);
+ 
+ 			void				_AddProcessingParameter(BParameterGroup* group,
+@@ -77,6 +78,8 @@ private:
+ 			uint32				fMJPEGFrameIndex;
+ 			uint32				fMaxVideoFrameSize;
+ 			uint32				fMaxPayloadTransferSize;
++			uint32				fAlternatePayload;
++				// bytes per microframe of the chosen alternate setting
+ 
+ 			BList				fUncompressedFrames;
+ 			BList				fMJPEGFrames;
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.cpp b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.cpp
+index de84f3840c..5f8e586741 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.cpp
+@@ -19,8 +19,13 @@
+ UVCDeframer::UVCDeframer(CamDevice* device)
+ 	: CamDeframer(device),
+ 	fFrameCount(0),
+-	fID(0)
++	fDropped(0),
++	fID(-1),
++	fSynced(false),
++	fBad(false),
++	fFrameSize(0)
+ {
++	fInputBuffer.SetBlockSize(64 * 1024);
+ }
+ 
+ 
+@@ -29,51 +34,98 @@ UVCDeframer::~UVCDeframer()
+ }
+ 
+ 
++void
++UVCDeframer::Start(size_t frameSize)
++{
++	BAutolock locker(fLocker);
++	fFrameSize = frameSize;
++	fID = -1;
++	fSynced = false;
++	fBad = false;
++	fInputBuffer.SetSize(0);
++	fInputBuffer.Seek(0, SEEK_SET);
++	CamFrame* frame;
++	while ((frame = (CamFrame*)fFrames.RemoveItem((int32)0)) != NULL)
++		delete frame;
++	while (acquire_sem_etc(fFrameSem, 1, B_RELATIVE_TIMEOUT, 0) == B_OK)
++		;
++}
++
++
+ ssize_t
+ UVCDeframer::Write(const void* buffer, size_t size)
+ {
+-	const uint8* buf = (const uint8*)buffer;
+-	int payloadSize = size - buf[0]; // total length - header length
+-	
+-	// This packet is just a header
+-	if (size == buf[0])
+-		return 0;
+-	
+-	// Allocate frame
+-	if (!fCurrentFrame) {
+-		BAutolock l(fLocker);
+-		if (fFrames.CountItems() < MAXFRAMEBUF)
+-			fCurrentFrame = AllocFrame();
+-		else {
+-			printf("Dropped %ld bytes. Too many queued frames.)\n", size);
+-			return size;
+-		}
++	const uint8* data = (const uint8*)buffer;
++	if (size < 2 || data[0] < 2 || data[0] > size)
++		return size;
++			// not a payload header
++
++	uint8 info = data[1];
++	int32 id = info & 1;
++	if (fID >= 0 && id != fID) {
++		// a new frame: the one before ends
++		if (fSynced)
++			_EndFrame();
++		fSynced = true;
++		fInputBuffer.SetSize(0);
++		fInputBuffer.Seek(0, SEEK_SET);
++		fBad = false;
+ 	}
+-	
+-	// Write payload to buffer
+-	fInputBuffer.Write(&buf[buf[0]], payloadSize);
+-	
+-	// If end of frame add frame to list of frames
+-	if ((buf[1] & 2) || (buf[1] & 1) != fID) {
+-		fID = buf[1] & 1;
+-		fFrameCount++;
+-		buf = (uint8*)fInputBuffer.Buffer();
+-		fCurrentFrame->Write(buf, fInputBuffer.BufferLength());
+-		fFrames.AddItem(fCurrentFrame);
+-		release_sem(fFrameSem);
+-		fCurrentFrame = NULL;
++	fID = id;
++	if ((info & 0x40) != 0)
++		fBad = true;
++
++	size_t length = size - data[0];
++	if (length > 0 && fSynced) {
++		if (fFrameSize != 0
++			&& (size_t)fInputBuffer.BufferLength() + length > fFrameSize) {
++			fBad = true;
++		} else
++			fInputBuffer.Write(data + data[0], length);
+ 	}
+ 
++	if ((info & 2) != 0) {
++		// end of frame: the next payload (with the other FID) starts one
++		if (fSynced)
++			_EndFrame();
++		fSynced = true;
++		fInputBuffer.SetSize(0);
++		fInputBuffer.Seek(0, SEEK_SET);
++		fBad = false;
++		fID = -1;
++			// the toggle that follows starts nothing to end
++	}
+ 	return size;
+ }
+ 
+ 
++/*!	The frame collected so far, if whole, becomes the one waiting. */
+ void
+-UVCDeframer::_PrintBuffer(const void* buffer, size_t size)
++UVCDeframer::_EndFrame()
+ {
+-	uint8* b = (uint8*)buffer;
+-	for (size_t i = 0; i < size; i++)
+-		printf("0x%x\t", b[i]);
+-	printf("\n");
+-}
++	size_t length = fInputBuffer.BufferLength();
++	if (length == 0)
++		return;
++	if (fBad || (fFrameSize != 0 && length != fFrameSize)) {
++		fDropped++;
++		return;
++	}
+ 
++	CamFrame* frame = AllocFrame();
++	if (frame == NULL)
++		return;
++	frame->Write(fInputBuffer.Buffer(), length);
++	fFrameCount++;
++
++	BAutolock locker(fLocker);
++	bool waiting = false;
++	CamFrame* old;
++	while ((old = (CamFrame*)fFrames.RemoveItem((int32)0)) != NULL) {
++		delete old;
++		waiting = true;
++	}
++	fFrames.AddItem(frame);
++	if (!waiting)
++		release_sem(fFrameSem);
++			// one count for the one frame waiting
++}
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.h b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.h
+index f642bafdc7..c4707e7063 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.h
+@@ -11,6 +11,13 @@
+ #include <USB3.h>
+ 
+ 
++/*!	Frames from UVC payload transfers (one Write() each: a header, then
++	data): a frame ends where the header's frame ID (FID) toggles or at its
++	end-of-frame bit (EOF). Frames with the error bit (ERR) or, for an
++	uncompressed format, the wrong size are dropped, as is the first,
++	partial one. Only the newest frame waits to be taken: a consumer slower
++	than the camera gets the latest picture, not an old one.
++*/
+ class UVCDeframer : public CamDeframer {
+ public:
+ 								UVCDeframer(CamDevice *device);
+@@ -19,11 +26,23 @@ public:
+ 					// write from usb transfers
+ 	virtual ssize_t				Write(const void *buffer, size_t size);
+ 
++			void				Start(size_t frameSize);
++				// a new stream: frames of \a frameSize bytes, 0 any size
++
++			int32				Frames() const { return fFrameCount; }
++			int32				Dropped() const { return fDropped; }
++
+ private:
+-	void						_PrintBuffer(const void* buffer, size_t size);
++			void				_EndFrame();
+ 
+ 	int32						fFrameCount;
++	int32						fDropped;
+ 	int32						fID;
++		// the last payload's FID; -1: none yet
++	bool						fSynced;
++		// a frame began after the stream started
++	bool						fBad;
++	size_t						fFrameSize;
+ 	BMallocIO					fInputBuffer;
+ };
+ 

@@ -1,0 +1,14 @@
+# M1: write the gzipped Haiku image to the eMMC, then start the Haiku EFI
+# loader from its EFI system partition. The image is loaded at 0x20000000,
+# well clear of the secure monitor regions below 0x10200000.
+echo c2: FLASH BEGIN
+setenv imgaddr 0x20000000
+tftpboot ${imgaddr} haiku-mmc.image.gz
+gzwrite mmc 1 ${imgaddr} ${filesize}
+mmc dev 1
+mmc rescan
+mmc part
+echo c2: FLASH END
+load mmc 1:1 ${kernel_addr_r} EFI/BOOT/BOOTAA64.EFI
+echo c2: BOOTEFI
+bootefi ${kernel_addr_r} ${fdtcontroladdr}

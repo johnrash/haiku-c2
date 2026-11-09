@@ -1,0 +1,16 @@
+# systemd user service: serves repo/ (tools/c2-repo.py) over HTTP on port
+# 8090, on every interface: the C2s on the LAN and the one on the crossover
+# cable (10.42.0.1) both reach it. Install:
+#   ln -s /build/haiku-odroid-c2/tools/c2-repo.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now c2-repo
+# It runs while you are logged in; "loginctl enable-linger" keeps it running
+# without a login.
+[Unit]
+Description=Package repository for the ODROID-C2 port
+
+[Service]
+ExecStart=/usr/bin/python3 -m http.server 8090 --directory /build/haiku-odroid-c2/repo
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,3 @@
+#!/bin/sh
+# strip for arm64 binaries (see cc)
+exec "$HAIKU_TOOLS/aarch64-unknown-haiku-strip" "$@"

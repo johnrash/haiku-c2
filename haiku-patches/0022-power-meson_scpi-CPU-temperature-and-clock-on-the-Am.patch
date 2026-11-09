@@ -1,0 +1,868 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 09:19:19 -0400
+Subject: [PATCH 022/342] power: meson_scpi, CPU temperature and clock on the
+ Amlogic GXBB
+
+A device-manager driver for the firmware's legacy SCPI protocol on the
+Meson GXBB (S905): commands go to BL30 through the MHU mailbox in the
+HIU block, payloads through shared SRAM (polled, one command in flight,
+100 ms timeout; after a timeout it stops sending, since the same
+firmware serves PSCI).
+
+/dev/power/meson_scpi/0 reads as text: temperature (aml_thermal, whole
+degrees C), the CPU operating points and the current one. Writing
+"<MHz>", "max" or "auto" sets the clock, only when the driver settings
+contain "dvfs on" (the C2's device tree disables its SCPI clock node);
+it never goes above 1536 MHz, the boot clock. "auto" follows the busiest
+CPU (above 80 % the top point, below 30 % one point down, floor 1000
+MHz), and in every mode the temperature limits the clock from 80 C.
+
+Tested on the ODROID-C2: 42-49 C; operating points 100-1536 MHz; a
+fixed busy loop takes 14.6 s at 1536, 22.5 s at 1000 and 45.1 s at
+500 MHz; auto idles at 1000 and goes to 1536 under load; reboot still
+works; a 10-minute network/disk stress run was clean.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/jam/packages/Haiku                      |   1 +
+ src/add-ons/kernel/drivers/power/Jamfile      |   1 +
+ .../kernel/drivers/power/meson_scpi/Jamfile   |   9 +
+ .../drivers/power/meson_scpi/meson_scpi.cpp   | 791 ++++++++++++++++++
+ 4 files changed, 802 insertions(+)
+ create mode 100644 src/add-ons/kernel/drivers/power/meson_scpi/Jamfile
+ create mode 100644 src/add-ons/kernel/drivers/power/meson_scpi/meson_scpi.cpp
+
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index 75b72dfcc5..c2ce2f9b12 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -141,6 +141,7 @@ AddNewDriversToPackage graphics :
+ 	;
+ AddNewDriversToPackage power
+ 	: $(SYSTEM_ADD_ONS_DRIVERS_POWER) ;
++AddNewDriversToPackage power : meson_scpi@arm64 ;
+ AddNewDriversToPackage sensor
+ 	: $(SYSTEM_ADD_ONS_DRIVERS_SENSOR) ;
+ AddNewDriversToPackage network :
+diff --git a/src/add-ons/kernel/drivers/power/Jamfile b/src/add-ons/kernel/drivers/power/Jamfile
+index b929cd9759..38b73b0924 100644
+--- a/src/add-ons/kernel/drivers/power/Jamfile
++++ b/src/add-ons/kernel/drivers/power/Jamfile
+@@ -7,3 +7,4 @@ SubInclude HAIKU_TOP src add-ons kernel drivers power acpi_lid ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers power acpi_thermal ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers power amd_thermal ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers power pch_thermal ;
++SubInclude HAIKU_TOP src add-ons kernel drivers power meson_scpi ;
+diff --git a/src/add-ons/kernel/drivers/power/meson_scpi/Jamfile b/src/add-ons/kernel/drivers/power/meson_scpi/Jamfile
+new file mode 100644
+index 0000000000..ecf418ef02
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/power/meson_scpi/Jamfile
+@@ -0,0 +1,9 @@
++SubDir HAIKU_TOP src add-ons kernel drivers power meson_scpi ;
++
++UsePrivateKernelHeaders ;
++
++if $(TARGET_ARCH) = arm64 {
++	KernelAddon meson_scpi :
++		meson_scpi.cpp
++	;
++}
+diff --git a/src/add-ons/kernel/drivers/power/meson_scpi/meson_scpi.cpp b/src/add-ons/kernel/drivers/power/meson_scpi/meson_scpi.cpp
+new file mode 100644
+index 0000000000..001237a7b5
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/power/meson_scpi/meson_scpi.cpp
+@@ -0,0 +1,791 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++/*!	CPU temperature and clock on the Amlogic Meson GXBB (S905, ODROID-C2),
++	through the firmware's legacy SCPI protocol: commands go to BL30 through
++	the MHU mailbox in the HIU block, payloads through shared SRAM.
++
++	Published as /dev/power/meson_scpi/0:
++	- read: the temperature, the CPU operating points and the current one;
++	- write: "<MHz>" (the highest operating point not above it), "max", or
++	  "auto" (a governor following load and temperature).
++
++	Changing the clock is off unless the driver settings file
++	(~/config/settings/kernel/drivers/meson_scpi) contains "dvfs on": the
++	C2's device tree disables its SCPI clock node. The clock is never set
++	above 1536 MHz, the frequency the boot firmware runs at; the firmware's
++	table goes higher, and the C2 is not stable there.
++
++	Sources: the GXBB device tree for addresses, TF-A's plat/amlogic
++	(BSD-3-Clause) for the mailbox handshake and command word, ARM's SCPI
++	specification for the messages (docs/m6-scpi-design.md in the port's
++	project folder).
++*/
++
++
++#include <new>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <KernelExport.h>
++#include <device_manager.h>
++#include <driver_settings.h>
++#include <drivers/bus/FDT.h>
++
++#include <AutoDeleterDrivers.h>
++#include <cpu.h>
++#include <smp.h>
++#include <util/AutoLock.h>
++
++
++#define DRIVER_MODULE_NAME	"drivers/power/meson_scpi/driver_v1"
++#define DEVICE_MODULE_NAME	"drivers/power/meson_scpi/device_v1"
++
++#define INFO(x...)			dprintf("meson_scpi: " x)
++
++
++// The mailbox block is part of the HIU page (the rest are clock registers:
++// only 0x404-0x44f are touched). Six one-word mailboxes with SET/STAT/CLEAR
++// registers; link n replies through mailbox n and sends through mailbox
++// n + 3. Link 0 belongs to the secure firmware.
++static const phys_addr_t kMailboxPage = 0xc883c000;
++static const phys_addr_t kSramPage = 0xc8013000;
++
++struct link_info {
++	uint32	sendSet;
++	uint32	sendStatus;
++	uint32	replyStatus;
++	uint32	replyClear;
++	uint32	replyOffset;	// in the SRAM page
++	uint32	sendOffset;
++};
++
++static const link_info kLinks[2] = {
++	// low priority (device tree mbox 1, shmem 0xc8013000)
++	{ 0x434, 0x438, 0x414, 0x418, 0x000, 0x200 },
++	// high priority (device tree mbox 2, shmem 0xc8013400)
++	{ 0x440, 0x444, 0x420, 0x424, 0x400, 0x600 },
++};
++static const uint32 kLowPriority = 0;
++static const uint32 kHighPriority = 1;
++
++// legacy (pre-1.0) SCPI command numbers
++enum {
++	SCPI_CAPABILITIES			= 0x02,
++	SCPI_GET_DVFS_INFO			= 0x0d,
++	SCPI_SET_DVFS				= 0x0e,
++	SCPI_GET_DVFS				= 0x0f,
++	SCPI_SENSOR_CAPABILITIES	= 0x1a,
++	SCPI_SENSOR_INFO			= 0x1b,
++	SCPI_SENSOR_VALUE			= 0x1c,
++};
++
++static const uint32 kMaxOperatingPoints = 16;
++static const uint32 kMaxFrequency = 1536000000;		// the boot clock
++static const uint32 kAutoFloorFrequency = 1000000000;
++static const bigtime_t kCommandTimeout = 100000;
++static const bigtime_t kGovernorInterval = 200000;
++static const int32 kThermalStepDown = 80;			// device tree passive trip
++static const int32 kThermalFloor = 90;				// device tree hot trip
++static const int32 kThermalHysteresis = 2;
++static const int32 kCriticalTemperature = 110;		// device tree critical trip
++
++
++device_manager_info* gDeviceManager;
++
++
++class MesonScpi {
++public:
++								MesonScpi(device_node* node);
++								~MesonScpi();
++
++			status_t			Init();
++			device_node*		Node() const { return fNode; }
++
++			status_t			Read(off_t position, char* buffer,
++									size_t* _length);
++			status_t			Write(const char* buffer, size_t length);
++
++private:
++			uint32				_Mailbox(uint32 offset)
++									{ return fMailbox[offset / 4]; }
++			void				_SetMailbox(uint32 offset, uint32 value)
++									{ fMailbox[offset / 4] = value; }
++
++			status_t			_Command(uint32 link, uint32 command,
++									const uint8* payload, size_t payloadSize,
++									uint8* reply, size_t replySize);
++			void				_GiveUp(const char* reason);
++
++			status_t			_ReadTemperature(int32* celsius);
++			status_t			_SetIndex(int32 index);
++			int32				_IndexAtMost(uint32 hz) const;
++			size_t				_Describe(char* buffer, size_t size);
++
++	static	status_t			_GovernorThread(void* data);
++			void				_Governor();
++
++private:
++			device_node*		fNode;
++			area_id				fMailboxArea;
++			area_id				fSramArea;
++			volatile uint32*	fMailbox;
++			volatile uint32*	fSram;
++
++			mutex				fLock;		// one command in flight
++			bool				fGivenUp;
++
++			int32				fTemperatureSensor;
++			int32				fLastTemperature;
++
++			uint32				fOperatingPointCount;
++			uint32				fFrequency[kMaxOperatingPoints];
++			uint32				fMilliVolts[kMaxOperatingPoints];
++			int32				fMaxIndex;		// highest allowed
++			int32				fFloorIndex;	// lowest for "auto"
++			int32				fCurrentIndex;	// -1: unknown
++
++			bool				fClockControl;	// "dvfs on"
++			bool				fAuto;
++			int32				fRequestedIndex;
++			int32				fThermalLimit;
++			thread_id			fGovernorThread;
++			bool				fStopGovernor;
++};
++
++
++MesonScpi::MesonScpi(device_node* node)
++	:
++	fNode(node),
++	fMailboxArea(-1),
++	fSramArea(-1),
++	fMailbox(NULL),
++	fSram(NULL),
++	fGivenUp(false),
++	fTemperatureSensor(-1),
++	fLastTemperature(0),
++	fOperatingPointCount(0),
++	fMaxIndex(-1),
++	fFloorIndex(0),
++	fCurrentIndex(-1),
++	fClockControl(false),
++	fAuto(false),
++	fRequestedIndex(-1),
++	fThermalLimit(-1),
++	fGovernorThread(-1),
++	fStopGovernor(false)
++{
++	mutex_init(&fLock, "meson_scpi");
++}
++
++
++MesonScpi::~MesonScpi()
++{
++	fStopGovernor = true;
++	if (fGovernorThread >= 0) {
++		status_t result;
++		wait_for_thread(fGovernorThread, &result);
++	}
++	if (fMailboxArea >= 0)
++		delete_area(fMailboxArea);
++	if (fSramArea >= 0)
++		delete_area(fSramArea);
++	mutex_destroy(&fLock);
++}
++
++
++status_t
++MesonScpi::Init()
++{
++	void* address;
++	fMailboxArea = map_physical_memory("meson_scpi mailbox", kMailboxPage,
++		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++	if (fMailboxArea < 0)
++		return fMailboxArea;
++	fMailbox = (volatile uint32*)address;
++
++	fSramArea = map_physical_memory("meson_scpi shared memory", kSramPage,
++		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++	if (fSramArea < 0)
++		return fSramArea;
++	fSram = (volatile uint32*)address;
++
++	for (uint32 i = 0; i < 2; i++) {
++		uint32 stale = _Mailbox(kLinks[i].replyStatus);
++		if (stale != 0) {
++			INFO("link %" B_PRIu32 ": clearing a stale reply %#" B_PRIx32 "\n",
++				i + 1, stale);
++			_SetMailbox(kLinks[i].replyClear, stale);
++		}
++	}
++
++	uint8 capabilities[28];
++	if (_Command(kLowPriority, SCPI_CAPABILITIES, NULL, 0, capabilities,
++			sizeof(capabilities)) == B_OK) {
++		INFO("firmware protocol %#" B_PRIx32 ", platform %#" B_PRIx32 "\n",
++			*(uint32*)capabilities, *(uint32*)(capabilities + 8));
++	} else if (fGivenUp)
++		return B_ERROR;
++
++	// temperature: the first sensor of class 0
++	uint8 sensorCount[2];
++	if (_Command(kLowPriority, SCPI_SENSOR_CAPABILITIES, NULL, 0, sensorCount,
++			sizeof(sensorCount)) == B_OK) {
++		uint16 count = sensorCount[0] | (sensorCount[1] << 8);
++		for (uint16 id = 0; id < count && fTemperatureSensor < 0; id++) {
++			uint8 request[2] = { (uint8)id, (uint8)(id >> 8) };
++			uint8 info[24];
++			if (_Command(kLowPriority, SCPI_SENSOR_INFO, request,
++					sizeof(request), info, sizeof(info)) != B_OK) {
++				continue;
++			}
++			info[23] = '\0';
++			if (info[2] == 0) {
++				fTemperatureSensor = id;
++				INFO("sensor %u \"%s\" is the temperature\n", id,
++					(char*)info + 4);
++			}
++		}
++	}
++	int32 temperature;
++	if (_ReadTemperature(&temperature) == B_OK)
++		INFO("temperature %" B_PRId32 " C\n", temperature);
++
++	// CPU operating points (DVFS domain 0)
++	uint8 domain = 0;
++	uint8 dvfs[4 + 8 * kMaxOperatingPoints];
++	if (_Command(kLowPriority, SCPI_GET_DVFS_INFO, &domain, 1, dvfs,
++			sizeof(dvfs)) == B_OK) {
++		fOperatingPointCount = min_c(dvfs[1], kMaxOperatingPoints);
++		for (uint32 i = 0; i < fOperatingPointCount; i++) {
++			const uint8* entry = dvfs + 4 + 8 * i;
++			fFrequency[i] = entry[0] | (entry[1] << 8) | (entry[2] << 16)
++				| ((uint32)entry[3] << 24);
++			fMilliVolts[i] = entry[4] | (entry[5] << 8) | (entry[6] << 16)
++				| ((uint32)entry[7] << 24);
++			if (fFrequency[i] <= kMaxFrequency)
++				fMaxIndex = i;
++			if (fFrequency[i] <= kAutoFloorFrequency)
++				fFloorIndex = i;
++		}
++		char list[256];
++		size_t used = 0;
++		list[0] = '\0';
++		for (uint32 i = 0; i < fOperatingPointCount && used < sizeof(list); i++) {
++			used += snprintf(list + used, sizeof(list) - used, " %" B_PRIu32
++				"/%" B_PRIu32, fFrequency[i] / 1000000, fMilliVolts[i]);
++		}
++		INFO("operating points (MHz/mV):%s; latency %u us\n", list,
++			dvfs[2] | (dvfs[3] << 8));
++	}
++	uint8 index;
++	if (_Command(kHighPriority, SCPI_GET_DVFS, &domain, 1, &index, 1) == B_OK) {
++		INFO("firmware reports operating point %u\n", index);
++		// Reported at boot, but not trusted (some firmware reports a wrong
++		// one before the first change); shown as "unknown" until then.
++	}
++
++	void* settings = load_driver_settings("meson_scpi");
++	if (settings != NULL) {
++		fClockControl = get_driver_boolean_parameter(settings, "dvfs", false,
++			true);
++		unload_driver_settings(settings);
++	}
++	if (fClockControl && fMaxIndex >= 0 && !fGivenUp) {
++		fRequestedIndex = fMaxIndex;
++		fThermalLimit = fMaxIndex;
++		fGovernorThread = spawn_kernel_thread(_GovernorThread,
++			"meson_scpi governor", B_NORMAL_PRIORITY, this);
++		if (fGovernorThread >= 0)
++			resume_thread(fGovernorThread);
++	}
++	INFO("clock control %s\n", fClockControl ? "on" : "off");
++	return B_OK;
++}
++
++
++/*!	Sends one command and waits for the reply; legacy SCPI has no tokens, so
++	only one command can be in flight. The command word goes into the
++	mailbox (bits 6-0 command, 28-20 payload size), the payload into the
++	link's send half of the SRAM; the reply starts with a status word.
++	The SRAM is device memory: 32-bit accesses only.
++*/
++status_t
++MesonScpi::_Command(uint32 linkIndex, uint32 command, const uint8* payload,
++	size_t payloadSize, uint8* reply, size_t replySize)
++{
++	const link_info& link = kLinks[linkIndex];
++	MutexLocker locker(fLock);
++	if (fGivenUp)
++		return B_DEV_NOT_READY;
++
++	bigtime_t deadline = system_time() + kCommandTimeout;
++	while (_Mailbox(link.sendStatus) != 0) {
++		if (system_time() > deadline) {
++			_GiveUp("the firmware did not take the previous command");
++			return B_TIMED_OUT;
++		}
++		snooze(50);
++	}
++
++	for (size_t i = 0; i < payloadSize; i += 4) {
++		uint32 word = 0;
++		for (size_t j = 0; j < 4 && i + j < payloadSize; j++)
++			word |= (uint32)payload[i + j] << (8 * j);
++		fSram[(link.sendOffset + i) / 4] = word;
++	}
++	_SetMailbox(link.sendSet, (command & 0x7f) | ((uint32)payloadSize << 20));
++
++	deadline = system_time() + kCommandTimeout;
++	uint32 replyStatus;
++	while ((replyStatus = _Mailbox(link.replyStatus)) == 0) {
++		if (system_time() > deadline) {
++			_GiveUp("no reply");
++			return B_TIMED_OUT;
++		}
++		snooze(50);
++	}
++
++	uint32 status = fSram[link.replyOffset / 4];
++	for (size_t i = 0; i < replySize; i += 4) {
++		uint32 word = fSram[(link.replyOffset + 4 + i) / 4];
++		for (size_t j = 0; j < 4 && i + j < replySize; j++)
++			reply[i + j] = word >> (8 * j);
++	}
++	_SetMailbox(link.replyClear, replyStatus);
++
++	if (status != 0) {
++		INFO("command %#" B_PRIx32 ": firmware status %" B_PRIu32 "\n",
++			command, status);
++		return B_ERROR;
++	}
++	return B_OK;
++}
++
++
++/*!	The firmware also serves PSCI (CPU start, reset): rather than risk a
++	wedged mailbox, stop sending after the first timeout.
++*/
++void
++MesonScpi::_GiveUp(const char* reason)
++{
++	INFO("%s; no more firmware commands\n", reason);
++	fGivenUp = true;
++}
++
++
++status_t
++MesonScpi::_ReadTemperature(int32* _celsius)
++{
++	if (fTemperatureSensor < 0)
++		return B_NOT_SUPPORTED;
++	uint8 request[2] = { (uint8)fTemperatureSensor,
++		(uint8)(fTemperatureSensor >> 8) };
++	uint8 value[4];
++	status_t status = _Command(kLowPriority, SCPI_SENSOR_VALUE, request,
++		sizeof(request), value, sizeof(value));
++	if (status != B_OK)
++		return status;
++	// whole degrees on this firmware; ignore implausible readings
++	int32 celsius = (int32)(value[0] | (value[1] << 8) | (value[2] << 16)
++		| ((uint32)value[3] << 24));
++	if (celsius <= 0 || celsius >= 125)
++		return B_BAD_DATA;
++	fLastTemperature = celsius;
++	*_celsius = celsius;
++	return B_OK;
++}
++
++
++status_t
++MesonScpi::_SetIndex(int32 index)
++{
++	if (index < 0 || index > fMaxIndex)
++		return B_BAD_VALUE;
++	if (index == fCurrentIndex)
++		return B_OK;
++	uint8 request[2] = { 0, (uint8)index };
++	status_t status = _Command(kHighPriority, SCPI_SET_DVFS, request,
++		sizeof(request), NULL, 0);
++	if (status == B_OK)
++		fCurrentIndex = index;
++	return status;
++}
++
++
++int32
++MesonScpi::_IndexAtMost(uint32 hz) const
++{
++	int32 index = 0;
++	for (uint32 i = 0; i <= (uint32)fMaxIndex; i++) {
++		if (fFrequency[i] <= hz)
++			index = i;
++	}
++	return index;
++}
++
++
++/*static*/ status_t
++MesonScpi::_GovernorThread(void* data)
++{
++	((MesonScpi*)data)->_Governor();
++	return B_OK;
++}
++
++
++/*!	Runs while clock control is on. In "auto" mode the clock follows the
++	busiest CPU: above 80 % load the highest allowed point, below 30 % one
++	point lower, down to 1000 MHz. In every mode the temperature limits it:
++	from 80 C one point lower per second, from 90 C the 1000 MHz floor,
++	released 2 C below the limit.
++*/
++void
++MesonScpi::_Governor()
++{
++	int32 cpuCount = smp_get_num_cpus();
++	bigtime_t lastActive[SMP_MAX_CPUS];
++	for (int32 i = 0; i < cpuCount; i++)
++		lastActive[i] = cpu_get_active_time(i);
++	bigtime_t lastTime = system_time();
++	bigtime_t nextThermal = 0;
++	int32 hotReadings = 0;
++
++	while (!fStopGovernor && !fGivenUp) {
++		snooze(kGovernorInterval);
++		bigtime_t now = system_time();
++		bigtime_t elapsed = max_c(now - lastTime, 1);
++		bigtime_t busiest = 0;
++		for (int32 i = 0; i < cpuCount; i++) {
++			bigtime_t active = cpu_get_active_time(i);
++			busiest = max_c(busiest, active - lastActive[i]);
++			lastActive[i] = active;
++		}
++		lastTime = now;
++		int32 load = (int32)(busiest * 100 / elapsed);
++
++		if (now >= nextThermal) {
++			nextThermal = now + 1000000;
++			int32 celsius;
++			if (_ReadTemperature(&celsius) == B_OK) {
++				if (celsius >= kThermalFloor) {
++					// two readings in a row before acting on a spike
++					if (++hotReadings >= 2 && fThermalLimit != fFloorIndex) {
++						fThermalLimit = fFloorIndex;
++						INFO("%" B_PRId32 " C: clock limited to %" B_PRIu32
++							" MHz\n", celsius,
++							fFrequency[fThermalLimit] / 1000000);
++					}
++				} else if (celsius >= kThermalStepDown) {
++					if (++hotReadings >= 2 && fThermalLimit > fFloorIndex) {
++						fThermalLimit--;
++						INFO("%" B_PRId32 " C: clock limited to %" B_PRIu32
++							" MHz\n", celsius,
++							fFrequency[fThermalLimit] / 1000000);
++					}
++				} else {
++					hotReadings = 0;
++					if (celsius < kThermalStepDown - kThermalHysteresis
++						&& fThermalLimit != fMaxIndex) {
++						fThermalLimit = fMaxIndex;
++						INFO("%" B_PRId32 " C: clock limit lifted\n", celsius);
++					}
++				}
++				if (celsius >= kCriticalTemperature)
++					INFO("critical temperature %" B_PRId32 " C\n", celsius);
++			}
++		}
++
++		int32 target = fRequestedIndex;
++		if (fAuto) {
++			int32 current = fCurrentIndex >= 0 ? fCurrentIndex : fMaxIndex;
++			if (load > 80)
++				target = fMaxIndex;
++			else if (load < 30)
++				target = max_c(current - 1, fFloorIndex);
++			else
++				target = current;
++		}
++		target = min_c(target, fThermalLimit);
++		if (target >= 0 && target != fCurrentIndex)
++			_SetIndex(target);
++	}
++}
++
++
++size_t
++MesonScpi::_Describe(char* buffer, size_t size)
++{
++	size_t used = 0;
++#define ADD(x...) \
++	used += snprintf(buffer + used, used < size ? size - used : 0, x)
++
++	int32 celsius;
++	if (_ReadTemperature(&celsius) == B_OK)
++		ADD("Current Temperature: %" B_PRId32 ".0 C\n", celsius);
++	else
++		ADD("Current Temperature: unknown\n");
++	ADD("Critical Temperature: %" B_PRId32 ".0 C\n", kCriticalTemperature);
++	if (fCurrentIndex >= 0) {
++		ADD("CPU clock: %" B_PRIu32 " MHz\n",
++			fFrequency[fCurrentIndex] / 1000000);
++	} else
++		ADD("CPU clock: unknown (1536 MHz from the boot firmware)\n");
++	ADD("Operating points (MHz):");
++	for (uint32 i = 0; i < fOperatingPointCount; i++) {
++		ADD(" %" B_PRIu32 "%s", fFrequency[i] / 1000000,
++			(int32)i > fMaxIndex ? "(not allowed)"
++				: (int32)i == fCurrentIndex ? "*" : "");
++	}
++	ADD("\n");
++	if (!fClockControl) {
++		ADD("Clock control: off (\"dvfs on\" in "
++			"~/config/settings/kernel/drivers/meson_scpi turns it on)\n");
++	} else {
++		ADD("Clock control: %s, write \"<MHz>\", \"max\" or \"auto\"\n",
++			fAuto ? "auto" : "manual");
++		if (fThermalLimit >= 0 && fThermalLimit < fMaxIndex) {
++			ADD("Thermal limit: %" B_PRIu32 " MHz\n",
++				fFrequency[fThermalLimit] / 1000000);
++		}
++	}
++	if (fGivenUp)
++		ADD("Firmware: not answering, no more commands sent\n");
++#undef ADD
++	return min_c(used, size);
++}
++
++
++status_t
++MesonScpi::Read(off_t position, char* buffer, size_t* _length)
++{
++	char text[1024];
++	size_t length = _Describe(text, sizeof(text));
++	if (position >= (off_t)length) {
++		*_length = 0;
++		return B_OK;
++	}
++	size_t count = min_c(*_length, length - (size_t)position);
++	if (user_memcpy(buffer, text + position, count) != B_OK)
++		return B_BAD_ADDRESS;
++	*_length = count;
++	return B_OK;
++}
++
++
++status_t
++MesonScpi::Write(const char* buffer, size_t length)
++{
++	char text[32];
++	length = min_c(length, sizeof(text) - 1);
++	if (user_memcpy(text, buffer, length) != B_OK)
++		return B_BAD_ADDRESS;
++	text[length] = '\0';
++
++	if (!fClockControl || fGovernorThread < 0)
++		return B_NOT_ALLOWED;
++	if (strncmp(text, "auto", 4) == 0) {
++		fAuto = true;
++	} else if (strncmp(text, "max", 3) == 0) {
++		fAuto = false;
++		fRequestedIndex = fMaxIndex;
++	} else {
++		uint32 mhz = strtoul(text, NULL, 10);
++		if (mhz == 0)
++			return B_BAD_VALUE;
++		fAuto = false;
++		fRequestedIndex = _IndexAtMost(mhz * 1000000);
++	}
++	INFO("clock control: %s\n", fAuto ? "auto" : "manual");
++	return B_OK;
++}
++
++
++//	#pragma mark - driver module
++
++
++static float
++supports_device(device_node* parent)
++{
++	const char* bus;
++	if (gDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false)
++			!= B_OK || strcmp(bus, "fdt") != 0) {
++		return 0.0f;
++	}
++	const char* compatible;
++	if (gDeviceManager->get_attr_string(parent, "fdt/compatible", &compatible,
++			false) != B_OK
++		|| strcmp(compatible, "amlogic,meson-gxbb-scpi") != 0) {
++		return 0.0f;
++	}
++	return 0.8f;
++}
++
++
++static status_t
++register_device(device_node* parent)
++{
++	device_attr attrs[] = {
++		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE,
++			{ .string = "Amlogic Meson GXBB SCPI (temperature, CPU clock)" } },
++		{ NULL }
++	};
++	return gDeviceManager->register_node(parent, DRIVER_MODULE_NAME, attrs,
++		NULL, NULL);
++}
++
++
++static status_t
++init_driver(device_node* node, void** _cookie)
++{
++	MesonScpi* device = new(std::nothrow) MesonScpi(node);
++	if (device == NULL)
++		return B_NO_MEMORY;
++	status_t status = device->Init();
++	if (status != B_OK) {
++		delete device;
++		return status;
++	}
++	*_cookie = device;
++	return B_OK;
++}
++
++
++static void
++uninit_driver(void* cookie)
++{
++	delete (MesonScpi*)cookie;
++}
++
++
++static status_t
++register_child_devices(void* cookie)
++{
++	MesonScpi* device = (MesonScpi*)cookie;
++	return gDeviceManager->publish_device(device->Node(),
++		"power/meson_scpi/0", DEVICE_MODULE_NAME);
++}
++
++
++//	#pragma mark - device module
++
++
++static status_t
++device_init(void* driverCookie, void** _deviceCookie)
++{
++	*_deviceCookie = driverCookie;
++	return B_OK;
++}
++
++
++static void
++device_uninit(void* deviceCookie)
++{
++}
++
++
++static status_t
++device_open(void* deviceCookie, const char* path, int openMode,
++	void** _cookie)
++{
++	*_cookie = deviceCookie;
++	return B_OK;
++}
++
++
++static status_t
++device_close(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++device_free(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++device_read(void* cookie, off_t position, void* buffer, size_t* _length)
++{
++	return ((MesonScpi*)cookie)->Read(position, (char*)buffer, _length);
++}
++
++
++static status_t
++device_write(void* cookie, off_t position, const void* buffer,
++	size_t* _length)
++{
++	status_t status = ((MesonScpi*)cookie)->Write((const char*)buffer,
++		*_length);
++	if (status != B_OK)
++		*_length = 0;
++	return status;
++}
++
++
++static status_t
++device_control(void* cookie, uint32 op, void* buffer, size_t length)
++{
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++module_dependency module_dependencies[] = {
++	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&gDeviceManager },
++	{}
++};
++
++
++static struct device_module_info sMesonScpiDevice = {
++	{
++		DEVICE_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	device_init,
++	device_uninit,
++	NULL,	// remove
++
++	device_open,
++	device_close,
++	device_free,
++	device_read,
++	device_write,
++	NULL,	// io
++	device_control,
++
++	NULL,	// select
++	NULL,	// deselect
++};
++
++
++static struct driver_module_info sMesonScpiDriver = {
++	{
++		DRIVER_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	supports_device,
++	register_device,
++	init_driver,
++	uninit_driver,
++	register_child_devices,
++	NULL,	// rescan
++	NULL,	// removed
++};
++
++
++module_info* modules[] = {
++	(module_info*)&sMesonScpiDriver,
++	(module_info*)&sMesonScpiDevice,
++	NULL
++};

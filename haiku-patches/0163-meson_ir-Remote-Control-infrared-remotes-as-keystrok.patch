@@ -1,0 +1,4379 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 08:44:20 -0400
+Subject: [PATCH 163/342] meson_ir, Remote Control: infrared remotes as
+ keystrokes
+
+The ODROID-C2's infrared receiver (the S905's multi-format IR decoder
+at 0xc8100580) had no driver.
+
+- meson_ir (drivers/input) runs the receiver in raw mode: an interrupt
+  at every edge with the time since the one before, in 10 us ticks
+  (docs/m24-ir-facts.md). NEC (with extended addresses and NEC32), RC-5
+  and RC-5X, RC-6 mode 0, Sony 12/15/20 and JVC are decoded in software
+  (IRDecoder.cpp, also built on the build host by
+  tools/tests/irdecoder); a timer ends frames whose last space only the
+  next edge would measure. It publishes /dev/input/remote/meson_ir/0:
+  reads give decoded presses (ir_remote.h) to every open handle at its
+  own pace; ioctls give the raw pulses for learning, counters, and a
+  wait with a timeout.
+- The input_server add-on "Remote Control" looks each press up in the
+  enabled profiles and sends its keystroke through the current keymap,
+  as a keyboard would; media key codes work as the HID driver's. A held
+  button keeps its key down until the remote stops repeating, and can
+  repeat it. While the preferences learn, presses go to them.
+- The Remote Control preferences: profiles (new, duplicate, delete,
+  import, export), a table of buttons with their keystrokes (pressed
+  into a field, or picked by name), Learn, and templates for
+  MediaPlayer, a music player, desktop navigation and the system volume.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/jam/images/definitions/regular          |   1 +
+ build/jam/packages/Haiku                      |   2 +
+ headers/private/drivers/ir_remote.h           |  84 ++
+ src/add-ons/input_server/devices/Jamfile      |   1 +
+ .../devices/remote_control/Jamfile            |   8 +
+ .../remote_control/RemoteControlDevice.cpp    | 470 +++++++++
+ .../remote_control/RemoteControlDevice.h      |  57 +
+ .../devices/remote_control/RemoteProfile.cpp  | 295 ++++++
+ .../devices/remote_control/RemoteProfile.h    | 109 ++
+ src/add-ons/kernel/drivers/input/Jamfile      |   1 +
+ .../drivers/input/meson_ir/IRDecoder.cpp      | 686 ++++++++++++
+ .../kernel/drivers/input/meson_ir/IRDecoder.h | 174 +++
+ .../kernel/drivers/input/meson_ir/Jamfile     |  11 +
+ .../drivers/input/meson_ir/meson_ir.cpp       | 812 ++++++++++++++
+ src/preferences/Jamfile                       |   1 +
+ src/preferences/remotecontrol/Jamfile         |  19 +
+ src/preferences/remotecontrol/KeyNames.cpp    |  92 ++
+ src/preferences/remotecontrol/KeyNames.h      |  61 ++
+ .../remotecontrol/RemoteControl.cpp           |  33 +
+ .../remotecontrol/RemoteControl.rdef          |  24 +
+ .../remotecontrol/RemoteWindow.cpp            | 989 ++++++++++++++++++
+ src/preferences/remotecontrol/RemoteWindow.h  |  95 ++
+ src/preferences/remotecontrol/Templates.cpp   |  72 ++
+ src/preferences/remotecontrol/Templates.h     |  30 +
+ 24 files changed, 4127 insertions(+)
+ create mode 100644 headers/private/drivers/ir_remote.h
+ create mode 100644 src/add-ons/input_server/devices/remote_control/Jamfile
+ create mode 100644 src/add-ons/input_server/devices/remote_control/RemoteControlDevice.cpp
+ create mode 100644 src/add-ons/input_server/devices/remote_control/RemoteControlDevice.h
+ create mode 100644 src/add-ons/input_server/devices/remote_control/RemoteProfile.cpp
+ create mode 100644 src/add-ons/input_server/devices/remote_control/RemoteProfile.h
+ create mode 100644 src/add-ons/kernel/drivers/input/meson_ir/IRDecoder.cpp
+ create mode 100644 src/add-ons/kernel/drivers/input/meson_ir/IRDecoder.h
+ create mode 100644 src/add-ons/kernel/drivers/input/meson_ir/Jamfile
+ create mode 100644 src/add-ons/kernel/drivers/input/meson_ir/meson_ir.cpp
+ create mode 100644 src/preferences/remotecontrol/Jamfile
+ create mode 100644 src/preferences/remotecontrol/KeyNames.cpp
+ create mode 100644 src/preferences/remotecontrol/KeyNames.h
+ create mode 100644 src/preferences/remotecontrol/RemoteControl.cpp
+ create mode 100644 src/preferences/remotecontrol/RemoteControl.rdef
+ create mode 100644 src/preferences/remotecontrol/RemoteWindow.cpp
+ create mode 100644 src/preferences/remotecontrol/RemoteWindow.h
+ create mode 100644 src/preferences/remotecontrol/Templates.cpp
+ create mode 100644 src/preferences/remotecontrol/Templates.h
+
+diff --git a/build/jam/images/definitions/regular b/build/jam/images/definitions/regular
+index cda6c07839..7e36dc560c 100644
+--- a/build/jam/images/definitions/regular
++++ b/build/jam/images/definitions/regular
+@@ -84,6 +84,7 @@ SYSTEM_PREFERENCES += [ FFilterByBuildFeatures
+ 	E-mail
+ 	Media@fluidlite
+ 	Printers
++	RemoteControl@arm64
+ 	Repositories
+ 	ScreenSaver
+ 	Sounds
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index 841a81e112..ce1d6526af 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -161,6 +161,7 @@ AddNewDriversToPackage input :
+ 	hyperv_hid@x86,x86_64
+ 	hyperv_keyboard@x86,x86_64
+ 	i2c_elan
++	meson_ir@arm64
+ 	virtio_input
+ 	;
+ AddNewDriversToPackage display :
+@@ -439,6 +440,7 @@ AddSymlinkToPackage add-ons Tracker
+ AddFilesToPackage add-ons input_server devices :
+ 	<input>keyboard
+ 	<input>mouse
++	<input>remote_control@arm64
+ 	<input>tablet
+ 	<input>virtio
+ 	<input>wacom
+diff --git a/headers/private/drivers/ir_remote.h b/headers/private/drivers/ir_remote.h
+new file mode 100644
+index 0000000000..aea178ea27
+--- /dev/null
++++ b/headers/private/drivers/ir_remote.h
+@@ -0,0 +1,84 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef _IR_REMOTE_H
++#define _IR_REMOTE_H
++
++
++/*!	Infrared remote control receivers (the ODROID-C2's meson_ir): what a
++	read of /dev/input/remote/<driver>/<n> gives, and the ioctls.
++
++	A read returns whole ir_remote_event structures, one per decoded frame,
++	and blocks until there is at least one (or returns B_WOULD_BLOCK with
++	O_NONBLOCK). Pulse trains no decoder knows are only counted.
++*/
++
++
++#include <Drivers.h>
++
++
++#define IR_REMOTE_DEVICE_DIRECTORY	"/dev/input/remote"
++
++
++enum ir_remote_protocol {
++	IR_REMOTE_NEC		= 1,	// 8-bit address and its inverse
++	IR_REMOTE_NEC_EXTENDED,		// 16-bit address
++	IR_REMOTE_NEC32,			// command not followed by its inverse
++	IR_REMOTE_RC5,
++	IR_REMOTE_RC5X,				// 7-bit command (second start bit)
++	IR_REMOTE_RC6,				// mode 0
++	IR_REMOTE_SONY12,
++	IR_REMOTE_SONY15,
++	IR_REMOTE_SONY20,
++	IR_REMOTE_JVC
++};
++
++
++enum {
++	IR_REMOTE_REPEAT	= 0x01,	// the button is held: the same press
++	IR_REMOTE_TOGGLE	= 0x02	// RC-5/RC-6 toggle bit (changes per press)
++};
++
++
++struct ir_remote_event {
++	uint32		protocol;		// ir_remote_protocol
++	uint32		address;		// device/system code
++	uint32		command;		// the button
++	uint32		flags;
++	bigtime_t	when;			// system_time() at the frame's end
++};
++
++
++// a mark (carrier on) or a space, in microseconds
++struct ir_remote_pulse {
++	uint32		duration : 31;
++	uint32		mark : 1;
++};
++
++
++struct ir_remote_stats {
++	uint32		frames;			// decoded
++	uint32		repeats;		// of them
++	uint32		unknown;		// pulse trains no decoder took
++	uint32		edges;			// interrupts
++	uint32		overruns;		// events or pulses lost: nobody read them
++};
++
++
++enum {
++	// ir_remote_stats
++	IR_REMOTE_GET_STATS = B_DEVICE_OP_CODES_END + 0x4952,
++	// the newest raw pulses (ir_remote_pulse[], at most the length given;
++	// the size of what was copied is returned), oldest first, for learning
++	// unknown remotes; collected only while a raw reader asks for them
++	IR_REMOTE_READ_PULSES,
++	// flushes the pulse buffer and starts collecting pulses (bool)
++	IR_REMOTE_COLLECT_PULSES,
++	// waits until this handle has an event to read, at most the given
++	// time (bigtime_t, relative): B_OK, or B_TIMED_OUT
++	IR_REMOTE_WAIT_FOR_EVENT
++};
++
++
++#endif	// _IR_REMOTE_H
+diff --git a/src/add-ons/input_server/devices/Jamfile b/src/add-ons/input_server/devices/Jamfile
+index a5ba4da5ba..5a7b96e35e 100644
+--- a/src/add-ons/input_server/devices/Jamfile
++++ b/src/add-ons/input_server/devices/Jamfile
+@@ -3,6 +3,7 @@ SubDir HAIKU_TOP src add-ons input_server devices ;
+ SubInclude HAIKU_TOP src add-ons input_server devices easypen ;
+ SubInclude HAIKU_TOP src add-ons input_server devices keyboard ;
+ SubInclude HAIKU_TOP src add-ons input_server devices mouse ;
++SubInclude HAIKU_TOP src add-ons input_server devices remote_control ;
+ SubInclude HAIKU_TOP src add-ons input_server devices serial_mouse ;
+ SubInclude HAIKU_TOP src add-ons input_server devices tablet ;
+ SubInclude HAIKU_TOP src add-ons input_server devices virtio ;
+diff --git a/src/add-ons/input_server/devices/remote_control/Jamfile b/src/add-ons/input_server/devices/remote_control/Jamfile
+new file mode 100644
+index 0000000000..9bf1e5dd81
+--- /dev/null
++++ b/src/add-ons/input_server/devices/remote_control/Jamfile
+@@ -0,0 +1,8 @@
++SubDir HAIKU_TOP src add-ons input_server devices remote_control ;
++
++UsePrivateHeaders input drivers shared ;
++
++Addon <input>remote_control :
++	RemoteControlDevice.cpp
++	RemoteProfile.cpp
++	: be input_server shared [ TargetLibsupc++ ] ;
+diff --git a/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.cpp b/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.cpp
+new file mode 100644
+index 0000000000..46c1a81548
+--- /dev/null
++++ b/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.cpp
+@@ -0,0 +1,470 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * input_server device add-on "Remote Control": the buttons of infrared
++ * remotes (/dev/input/remote/...) as keystrokes. Each button press is
++ * looked up in the enabled profiles (RemoteProfile.h): the protocol and
++ * address say which remote, the command which button. Its keystroke goes
++ * out as from a keyboard, through the current keymap, so any application
++ * and the Shortcuts preferences get it; media key codes (0x0c00e9 volume
++ * up and so on) work as the keyboard's do.
++ *
++ * A remote repeats its frame while a button is held: the key stays down
++ * until no repeat came for kRelease, and repeats after kRepeatDelay for
++ * buttons that ask for it. While the Remote Control preferences learn a
++ * remote, presses go to them instead.
++ */
++
++
++#include "RemoteControlDevice.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <new>
++#include <stdio.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <Autolock.h>
++#include <Directory.h>
++#include <Entry.h>
++#include <Path.h>
++
++#include <AutoDeleter.h>
++
++
++using RemoteControl::Button;
++using RemoteControl::Profile;
++
++
++static const char* const kRemoteDirectory = IR_REMOTE_DEVICE_DIRECTORY;
++// the key goes up this long after the last frame of the press: longer than
++// the slowest repeat period (NEC 108 ms, RC-5 114 ms, JVC 50-60 ms)
++static const bigtime_t kRelease = 200000;
++// held buttons that repeat start repeating after this
++static const bigtime_t kRepeatDelay = 400000;
++
++
++class RemoteReceiver {
++public:
++								RemoteReceiver(RemoteControlDevice* device,
++									const char* path, const char* name);
++								~RemoteReceiver();
++
++			input_device_ref*	Ref() { return &fRef; }
++			status_t			Start();
++			void				Stop();
++
++private:
++	friend class RemoteControlDevice;
++
++	static	int32				_Thread(void* data);
++			void				_Run();
++
++			RemoteControlDevice* fDevice;
++			BString				fPath;
++			BString				fName;
++			input_device_ref	fRef;
++			int					fFD;
++			thread_id			fThread;
++			volatile bool		fQuit;
++
++			// the key held down (device lock)
++			bool				fHeld;
++			Button				fHeldButton;
++			bigtime_t			fPressed;
++			bigtime_t			fReleaseAt;
++			int32				fRepeats;
++};
++
++
++RemoteReceiver::RemoteReceiver(RemoteControlDevice* device, const char* path,
++	const char* name)
++	:
++	fDevice(device),
++	fPath(path),
++	fName(name),
++	fFD(-1),
++	fThread(-1),
++	fQuit(false),
++	fHeld(false),
++	fPressed(0),
++	fReleaseAt(0),
++	fRepeats(0)
++{
++	fRef.name = (char*)fName.String();
++	fRef.type = B_KEYBOARD_DEVICE;
++	fRef.cookie = this;
++}
++
++
++RemoteReceiver::~RemoteReceiver()
++{
++	Stop();
++}
++
++
++status_t
++RemoteReceiver::Start()
++{
++	if (fThread >= 0)
++		return B_OK;
++	fFD = open(fPath.String(), O_RDONLY | O_NONBLOCK);
++	if (fFD < 0)
++		return errno;
++	fQuit = false;
++	fThread = spawn_thread(&_Thread, "remote control", B_URGENT_DISPLAY_PRIORITY,
++		this);
++	if (fThread < 0) {
++		close(fFD);
++		fFD = -1;
++		return fThread;
++	}
++	resume_thread(fThread);
++	return B_OK;
++}
++
++
++void
++RemoteReceiver::Stop()
++{
++	if (fThread < 0)
++		return;
++	fQuit = true;
++	status_t result;
++	wait_for_thread(fThread, &result);
++	fThread = -1;
++	close(fFD);
++	fFD = -1;
++	BAutolock locker(fDevice->fLock);
++	fDevice->ReleaseKey(this);
++}
++
++
++/*static*/ int32
++RemoteReceiver::_Thread(void* data)
++{
++	((RemoteReceiver*)data)->_Run();
++	return 0;
++}
++
++
++void
++RemoteReceiver::_Run()
++{
++	while (!fQuit) {
++		// wake for a frame, for a held key's release, and now and then to
++		// see whether to quit
++		bigtime_t timeout = 250000;
++		{
++			BAutolock locker(fDevice->fLock);
++			if (fHeld) {
++				timeout = fReleaseAt - system_time();
++				if (timeout < 0)
++					timeout = 0;
++				if (timeout > 250000)
++					timeout = 250000;
++			}
++		}
++		if (ioctl(fFD, IR_REMOTE_WAIT_FOR_EVENT, &timeout, sizeof(timeout))
++				== 0) {
++			ir_remote_event events[8];
++			ssize_t size = read(fFD, events, sizeof(events));
++			for (ssize_t i = 0;
++					i < size / (ssize_t)sizeof(ir_remote_event); i++) {
++				fDevice->HandleEvent(this, events[i]);
++			}
++		} else if (errno != B_TIMED_OUT && errno != B_INTERRUPTED)
++			snooze(100000);
++
++		BAutolock locker(fDevice->fLock);
++		if (fHeld && system_time() >= fReleaseAt)
++			fDevice->ReleaseKey(this);
++	}
++}
++
++
++//	#pragma mark -
++
++
++RemoteControlDevice::RemoteControlDevice()
++	:
++	fLock("remote control"),
++	fReceivers(2),
++	fProfiles(10)
++{
++	fKeymap.SetToCurrent();
++}
++
++
++RemoteControlDevice::~RemoteControlDevice()
++{
++	fReceivers.MakeEmpty();
++}
++
++
++status_t
++RemoteControlDevice::InitCheck()
++{
++	// /dev/input/remote/<driver>/<n>
++	BDirectory remotes(kRemoteDirectory);
++	if (remotes.InitCheck() != B_OK)
++		return B_ERROR;
++
++	BEntry driverEntry;
++	while (remotes.GetNextEntry(&driverEntry) == B_OK) {
++		BDirectory driver(&driverEntry);
++		BEntry entry;
++		while (driver.InitCheck() == B_OK
++			&& driver.GetNextEntry(&entry) == B_OK) {
++			BPath path;
++			if (entry.GetPath(&path) != B_OK)
++				continue;
++			BString name(RemoteControl::kDeviceName);
++			if (fReceivers.CountItems() > 0)
++				name << " " << fReceivers.CountItems() + 1;
++			RemoteReceiver* receiver = new(std::nothrow) RemoteReceiver(this,
++				path.Path(), name.String());
++			if (receiver == NULL || !fReceivers.AddItem(receiver))
++				delete receiver;
++		}
++	}
++	if (fReceivers.IsEmpty())
++		return B_ERROR;
++
++	input_device_ref** refs = new(std::nothrow)
++		input_device_ref*[fReceivers.CountItems() + 1];
++	if (refs == NULL)
++		return B_NO_MEMORY;
++	ArrayDeleter<input_device_ref*> refsDeleter(refs);
++	for (int32 i = 0; i < fReceivers.CountItems(); i++)
++		refs[i] = fReceivers.ItemAt(i)->Ref();
++	refs[fReceivers.CountItems()] = NULL;
++
++	_LoadProfiles();
++	return RegisterDevices(refs);
++}
++
++
++status_t
++RemoteControlDevice::Start(const char* name, void* cookie)
++{
++	(void)name;
++	return ((RemoteReceiver*)cookie)->Start();
++}
++
++
++status_t
++RemoteControlDevice::Stop(const char* name, void* cookie)
++{
++	(void)name;
++	((RemoteReceiver*)cookie)->Stop();
++	return B_OK;
++}
++
++
++status_t
++RemoteControlDevice::Control(const char* name, void* cookie, uint32 command,
++	BMessage* message)
++{
++	(void)name;
++	(void)cookie;
++	switch (command) {
++		case B_KEY_MAP_CHANGED:
++		{
++			BAutolock locker(fLock);
++			fKeymap.SetToCurrent();
++			return B_OK;
++		}
++
++		case RemoteControl::kMsgReloadProfiles:
++			_LoadProfiles();
++			return B_OK;
++
++		case RemoteControl::kMsgStartLearning:
++		{
++			BMessenger learner;
++			if (message == NULL
++				|| message->FindMessenger("messenger", &learner) != B_OK)
++				return B_BAD_VALUE;
++			BAutolock locker(fLock);
++			fLearner = learner;
++			// no key stays down while learning
++			for (int32 i = 0; i < fReceivers.CountItems(); i++)
++				ReleaseKey(fReceivers.ItemAt(i));
++			return B_OK;
++		}
++
++		case RemoteControl::kMsgStopLearning:
++		{
++			BAutolock locker(fLock);
++			fLearner = BMessenger();
++			return B_OK;
++		}
++	}
++	return B_OK;
++}
++
++
++void
++RemoteControlDevice::HandleEvent(RemoteReceiver* receiver,
++	const ir_remote_event& event)
++{
++	BAutolock locker(fLock);
++
++	if (fLearner.IsValid()) {
++		BMessage message(RemoteControl::kMsgButtonEvent);
++		message.AddInt32("protocol", event.protocol);
++		message.AddInt32("address", event.address);
++		message.AddInt32("command", event.command);
++		message.AddInt32("flags", event.flags);
++		message.AddInt64("when", event.when);
++		if (fLearner.SendMessage(&message, (BHandler*)NULL, 100000)
++				== B_BAD_PORT_ID) {
++			// the preferences quit without saying so
++			fLearner = BMessenger();
++		} else
++			return;
++	}
++
++	const Button* button = NULL;
++	for (int32 i = 0; i < fProfiles.CountItems() && button == NULL; i++) {
++		const Profile* profile = fProfiles.ItemAt(i);
++		if (profile->Matches(event.protocol, event.address))
++			button = profile->FindButton(event.command);
++	}
++
++	bigtime_t now = system_time();
++	bool repeat = (event.flags & IR_REMOTE_REPEAT) != 0;
++	if (repeat && receiver->fHeld && button != NULL
++		&& button->command == receiver->fHeldButton.command
++		&& button->key == receiver->fHeldButton.key) {
++		// still held
++		receiver->fReleaseAt = now + kRelease;
++		if (button->repeat && now - receiver->fPressed >= kRepeatDelay)
++			RepeatKey(receiver);
++		return;
++	}
++
++	// a new press (a repeat without its first frame counts as one)
++	ReleaseKey(receiver);
++	if (button == NULL || button->key == 0)
++		return;
++	receiver->fHeld = true;
++	receiver->fHeldButton = *button;
++	receiver->fPressed = now;
++	receiver->fReleaseAt = now + kRelease;
++	receiver->fRepeats = 1;
++	if (button->modifiers != 0)
++		_ModifiersMessage(0, button->modifiers);
++	_KeyMessage(button->key, button->modifiers, true, 0);
++}
++
++
++/*!	The held key goes up, if there is one. Called with fLock held. */
++void
++RemoteControlDevice::ReleaseKey(RemoteReceiver* receiver)
++{
++	if (!receiver->fHeld)
++		return;
++	receiver->fHeld = false;
++	const Button& button = receiver->fHeldButton;
++	_KeyMessage(button.key, button.modifiers, false, 0);
++	if (button.modifiers != 0)
++		_ModifiersMessage(button.modifiers, 0);
++}
++
++
++/*!	The held key repeats. Called with fLock held. */
++void
++RemoteControlDevice::RepeatKey(RemoteReceiver* receiver)
++{
++	const Button& button = receiver->fHeldButton;
++	_KeyMessage(button.key, button.modifiers, true, ++receiver->fRepeats);
++}
++
++
++void
++RemoteControlDevice::_LoadProfiles()
++{
++	BObjectList<Profile, true> profiles(10);
++	Profile::LoadAll(profiles);
++	BAutolock locker(fLock);
++	fProfiles.MakeEmpty();
++	while (Profile* profile = profiles.RemoveItemAt(0))
++		fProfiles.AddItem(profile);
++}
++
++
++/*!	A key message as the keyboard add-on sends it. Called with fLock held. */
++void
++RemoteControlDevice::_KeyMessage(uint32 key, uint32 modifiers, bool down,
++	int32 repeat)
++{
++	char* string = NULL;
++	char* rawString = NULL;
++	int32 numBytes = 0;
++	int32 rawNumBytes = 0;
++	// the keymap knows the keyboard's keys; media keys have no characters
++	if (key < 128) {
++		fKeymap.GetChars(key, modifiers, 0, &string, &numBytes);
++		fKeymap.GetChars(key, 0, 0, &rawString, &rawNumBytes);
++	}
++	ArrayDeleter<char> stringDeleter(string);
++	ArrayDeleter<char> rawStringDeleter(rawString);
++
++	BMessage* message = new(std::nothrow) BMessage(numBytes > 0
++		? (down ? B_KEY_DOWN : B_KEY_UP)
++		: (down ? B_UNMAPPED_KEY_DOWN : B_UNMAPPED_KEY_UP));
++	if (message == NULL)
++		return;
++
++	uint8 states[16];
++	memset(states, 0, sizeof(states));
++	if (down && key < 128)
++		states[key >> 3] |= 1 << (7 - (key & 7));
++
++	message->AddInt64("when", system_time());
++	message->AddInt32("key", key);
++	message->AddInt32("modifiers", modifiers);
++	message->AddData("states", B_UINT8_TYPE, states, sizeof(states));
++	if (numBytes > 0) {
++		for (int32 i = 0; i < numBytes; i++)
++			message->AddInt8("byte", (int8)string[i]);
++		message->AddData("bytes", B_STRING_TYPE, string, numBytes + 1);
++		if (repeat > 0)
++			message->AddInt32("be:key_repeat", repeat);
++	}
++	if (rawNumBytes > 0)
++		message->AddInt32("raw_char", (uint32)((uint8)rawString[0] & 0x7f));
++	else if (numBytes > 0)
++		message->AddInt32("raw_char", (uint32)((uint8)string[0] & 0x7f));
++
++	if (EnqueueMessage(message) != B_OK)
++		delete message;
++}
++
++
++void
++RemoteControlDevice::_ModifiersMessage(uint32 oldModifiers, uint32 modifiers)
++{
++	BMessage* message = new(std::nothrow) BMessage(B_MODIFIERS_CHANGED);
++	if (message == NULL)
++		return;
++	uint8 states[16];
++	memset(states, 0, sizeof(states));
++	message->AddInt64("when", system_time());
++	message->AddInt32("be:old_modifiers", oldModifiers);
++	message->AddInt32("modifiers", modifiers);
++	message->AddData("states", B_UINT8_TYPE, states, sizeof(states));
++	if (EnqueueMessage(message) != B_OK)
++		delete message;
++}
++
++
++extern "C" BInputServerDevice*
++instantiate_input_device()
++{
++	return new(std::nothrow) RemoteControlDevice();
++}
+diff --git a/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.h b/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.h
+new file mode 100644
+index 0000000000..28f0319e5f
+--- /dev/null
++++ b/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.h
+@@ -0,0 +1,57 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef REMOTE_CONTROL_DEVICE_H
++#define REMOTE_CONTROL_DEVICE_H
++
++
++#include <InputServerDevice.h>
++#include <Keymap.h>
++#include <Locker.h>
++#include <Messenger.h>
++#include <ObjectList.h>
++
++#include <ir_remote.h>
++
++#include "RemoteProfile.h"
++
++
++class RemoteReceiver;
++
++
++class RemoteControlDevice : public BInputServerDevice {
++public:
++								RemoteControlDevice();
++	virtual						~RemoteControlDevice();
++
++	virtual	status_t			InitCheck();
++	virtual	status_t			Start(const char* name, void* cookie);
++	virtual	status_t			Stop(const char* name, void* cookie);
++	virtual	status_t			Control(const char* name, void* cookie,
++									uint32 command, BMessage* message);
++
++	// for the receivers' threads
++			void				HandleEvent(RemoteReceiver* receiver,
++									const ir_remote_event& event);
++			void				ReleaseKey(RemoteReceiver* receiver);
++			void				RepeatKey(RemoteReceiver* receiver);
++
++private:
++	friend class RemoteReceiver;
++
++			void				_LoadProfiles();
++			void				_KeyMessage(uint32 key, uint32 modifiers,
++									bool down, int32 repeat);
++			void				_ModifiersMessage(uint32 oldModifiers,
++									uint32 modifiers);
++
++			BLocker				fLock;
++			BObjectList<RemoteReceiver, true> fReceivers;
++			BObjectList<RemoteControl::Profile, true> fProfiles;
++			BKeymap				fKeymap;
++			BMessenger			fLearner;
++};
++
++
++#endif	// REMOTE_CONTROL_DEVICE_H
+diff --git a/src/add-ons/input_server/devices/remote_control/RemoteProfile.cpp b/src/add-ons/input_server/devices/remote_control/RemoteProfile.cpp
+new file mode 100644
+index 0000000000..54d70f9c5f
+--- /dev/null
++++ b/src/add-ons/input_server/devices/remote_control/RemoteProfile.cpp
+@@ -0,0 +1,295 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "RemoteProfile.h"
++
++#include <new>
++
++#include <Directory.h>
++#include <Entry.h>
++#include <File.h>
++#include <FindDirectory.h>
++#include <Message.h>
++#include <Path.h>
++
++#include <ir_remote.h>
++
++
++namespace RemoteControl {
++
++
++static const uint32 kProfileMessage = 'rcPF';
++static const char* const kDirectoryName = "Remote Control";
++
++
++static int
++CompareProfiles(const Profile* a, const Profile* b)
++{
++	return a->Name().ICompare(b->Name());
++}
++
++
++Profile::Profile()
++	:
++	fEnabled(true),
++	fProtocol(0),
++	fAddress(0),
++	fButtons(20)
++{
++}
++
++
++Profile::Profile(const Profile& other)
++	:
++	fButtons(20)
++{
++	*this = other;
++}
++
++
++Profile&
++Profile::operator=(const Profile& other)
++{
++	if (this == &other)
++		return *this;
++	fName = other.fName;
++	fEnabled = other.fEnabled;
++	fProtocol = other.fProtocol;
++	fAddress = other.fAddress;
++	fButtons.MakeEmpty();
++	for (int32 i = 0; i < other.CountButtons(); i++)
++		AddButton(*other.ButtonAt(i));
++	return *this;
++}
++
++
++status_t
++Profile::Archive(BMessage* archive) const
++{
++	archive->MakeEmpty();
++	archive->what = kProfileMessage;
++	archive->AddString("name", fName);
++	archive->AddBool("enabled", fEnabled);
++	archive->AddInt32("protocol", fProtocol);
++	archive->AddInt32("address", fAddress);
++	for (int32 i = 0; i < CountButtons(); i++) {
++		const Button* button = ButtonAt(i);
++		BMessage buttonArchive;
++		buttonArchive.AddString("label", button->label);
++		buttonArchive.AddInt32("command", button->command);
++		buttonArchive.AddInt32("key", button->key);
++		buttonArchive.AddInt32("modifiers", button->modifiers);
++		buttonArchive.AddBool("repeat", button->repeat);
++		status_t status = archive->AddMessage("button", &buttonArchive);
++		if (status != B_OK)
++			return status;
++	}
++	return B_OK;
++}
++
++
++status_t
++Profile::Unarchive(const BMessage& archive)
++{
++	if (archive.what != kProfileMessage)
++		return B_BAD_DATA;
++	fName = archive.GetString("name", "");
++	fEnabled = archive.GetBool("enabled", true);
++	fProtocol = (uint32)archive.GetInt32("protocol", 0);
++	fAddress = (uint32)archive.GetInt32("address", 0);
++	fButtons.MakeEmpty();
++	BMessage buttonArchive;
++	for (int32 i = 0; archive.FindMessage("button", i, &buttonArchive) == B_OK;
++			i++) {
++		Button button;
++		button.label = buttonArchive.GetString("label", "");
++		button.command = (uint32)buttonArchive.GetInt32("command", 0);
++		button.key = (uint32)buttonArchive.GetInt32("key", 0);
++		button.modifiers = (uint32)buttonArchive.GetInt32("modifiers", 0);
++		button.repeat = buttonArchive.GetBool("repeat", false);
++		AddButton(button);
++	}
++	return fName.IsEmpty() ? B_BAD_DATA : B_OK;
++}
++
++
++status_t
++Profile::Load(const char* path)
++{
++	BFile file(path, B_READ_ONLY);
++	status_t status = file.InitCheck();
++	if (status != B_OK)
++		return status;
++	BMessage archive;
++	status = archive.Unflatten(&file);
++	if (status != B_OK)
++		return status;
++	return Unarchive(archive);
++}
++
++
++status_t
++Profile::GetPath(BPath* path) const
++{
++	status_t status = GetDirectory(path, true);
++	if (status != B_OK)
++		return status;
++	// the name, without what a file name can't have
++	BString fileName(fName);
++	fileName.ReplaceAll('/', '-');
++	if (fileName.IsEmpty() || fileName == "." || fileName == "..")
++		fileName.Prepend("Remote ");
++	return path->Append(fileName);
++}
++
++
++status_t
++Profile::Save() const
++{
++	BPath path;
++	status_t status = GetPath(&path);
++	if (status != B_OK)
++		return status;
++	BMessage archive;
++	status = Archive(&archive);
++	if (status != B_OK)
++		return status;
++	BFile file(path.Path(), B_WRITE_ONLY | B_CREATE_FILE | B_ERASE_FILE);
++	status = file.InitCheck();
++	if (status != B_OK)
++		return status;
++	return archive.Flatten(&file);
++}
++
++
++status_t
++Profile::Remove() const
++{
++	BPath path;
++	status_t status = GetPath(&path);
++	if (status != B_OK)
++		return status;
++	BEntry entry(path.Path());
++	return entry.Remove();
++}
++
++
++bool
++Profile::Matches(uint32 protocol, uint32 address) const
++{
++	return fEnabled && Family(protocol) == Family(fProtocol)
++		&& address == fAddress;
++}
++
++
++Button*
++Profile::FindButton(uint32 command) const
++{
++	for (int32 i = 0; i < CountButtons(); i++) {
++		if (ButtonAt(i)->command == command)
++			return ButtonAt(i);
++	}
++	return NULL;
++}
++
++
++Button*
++Profile::AddButton(const Button& button)
++{
++	Button* copy = new(std::nothrow) Button(button);
++	if (copy == NULL || !fButtons.AddItem(copy)) {
++		delete copy;
++		return NULL;
++	}
++	return copy;
++}
++
++
++void
++Profile::RemoveButton(int32 index)
++{
++	delete fButtons.RemoveItemAt(index);
++}
++
++
++void
++Profile::MoveButton(int32 from, int32 to)
++{
++	fButtons.MoveItem(from, to);
++}
++
++
++/*static*/ status_t
++Profile::GetDirectory(BPath* path, bool create)
++{
++	status_t status = find_directory(B_USER_SETTINGS_DIRECTORY, path, create);
++	if (status != B_OK)
++		return status;
++	status = path->Append(kDirectoryName);
++	if (status != B_OK || !create)
++		return status;
++	status = create_directory(path->Path(), 0755);
++	return status == B_FILE_EXISTS ? B_OK : status;
++}
++
++
++/*static*/ status_t
++Profile::LoadAll(BObjectList<Profile, true>& profiles)
++{
++	profiles.MakeEmpty();
++	BPath path;
++	status_t status = GetDirectory(&path, false);
++	if (status != B_OK)
++		return status;
++	BDirectory directory(path.Path());
++	if (directory.InitCheck() != B_OK)
++		return B_OK;
++
++	BEntry entry;
++	while (directory.GetNextEntry(&entry, true) == B_OK) {
++		BPath entryPath;
++		if (entry.GetPath(&entryPath) != B_OK)
++			continue;
++		Profile* profile = new(std::nothrow) Profile;
++		if (profile == NULL)
++			return B_NO_MEMORY;
++		if (profile->Load(entryPath.Path()) != B_OK
++			|| !profiles.AddItem(profile)) {
++			delete profile;
++		}
++	}
++	profiles.SortItems(&CompareProfiles);
++	return B_OK;
++}
++
++
++/*static*/ uint32
++Profile::Family(uint32 protocol)
++{
++	return protocol == IR_REMOTE_RC5X ? (uint32)IR_REMOTE_RC5 : protocol;
++}
++
++
++/*static*/ const char*
++Profile::ProtocolName(uint32 protocol)
++{
++	switch (protocol) {
++		case IR_REMOTE_NEC: return "NEC";
++		case IR_REMOTE_NEC_EXTENDED: return "NEC (extended address)";
++		case IR_REMOTE_NEC32: return "NEC (32 bits)";
++		case IR_REMOTE_RC5: return "RC-5";
++		case IR_REMOTE_RC5X: return "RC-5X";
++		case IR_REMOTE_RC6: return "RC-6";
++		case IR_REMOTE_SONY12: return "Sony (12 bits)";
++		case IR_REMOTE_SONY15: return "Sony (15 bits)";
++		case IR_REMOTE_SONY20: return "Sony (20 bits)";
++		case IR_REMOTE_JVC: return "JVC";
++	}
++	return "unknown";
++}
++
++
++}	// namespace RemoteControl
+diff --git a/src/add-ons/input_server/devices/remote_control/RemoteProfile.h b/src/add-ons/input_server/devices/remote_control/RemoteProfile.h
+new file mode 100644
+index 0000000000..adc186454f
+--- /dev/null
++++ b/src/add-ons/input_server/devices/remote_control/RemoteProfile.h
+@@ -0,0 +1,109 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef REMOTE_PROFILE_H
++#define REMOTE_PROFILE_H
++
++
++/*!	A remote control's profile: which remote (protocol and address), and
++	the keystroke each of its buttons sends. One file per profile in
++	~/config/settings/Remote Control/, a flattened BMessage; shared by the
++	input_server add-on and the Remote Control preferences.
++*/
++
++
++#include <ObjectList.h>
++#include <String.h>
++
++
++class BMessage;
++class BPath;
++
++
++namespace RemoteControl {
++
++
++// BInputDevice::Control() codes of the input_server add-on (device
++// "Remote Control"), from the preferences
++enum {
++	kMsgReloadProfiles	= 'rcRL',	// the profile files changed
++	kMsgStartLearning	= 'rcL+',	// "messenger": gets kMsgButtonEvent
++	kMsgStopLearning	= 'rcL-',	// keys again
++	kMsgButtonEvent		= 'rcEV'	// "protocol", "address", "command",
++									// "flags" (int32), "when" (int64)
++};
++
++static const char* const kDeviceName = "Remote Control";
++
++
++struct Button {
++	BString		label;
++	uint32		command;
++	uint32		key;			// raw key code, 0 for none
++	uint32		modifiers;
++	bool		repeat;			// held: key repeats; else one press
++};
++
++
++class Profile {
++public:
++								Profile();
++								Profile(const Profile& other);
++
++			Profile&			operator=(const Profile& other);
++
++			status_t			Archive(BMessage* archive) const;
++			status_t			Unarchive(const BMessage& archive);
++
++			status_t			Load(const char* path);
++			status_t			Save() const;
++			status_t			Remove() const;
++	// the file this profile is saved in
++			status_t			GetPath(BPath* path) const;
++
++			const BString&		Name() const { return fName; }
++			void				SetName(const char* name) { fName = name; }
++			bool				IsEnabled() const { return fEnabled; }
++			void				SetEnabled(bool enabled)
++									{ fEnabled = enabled; }
++			uint32				Protocol() const { return fProtocol; }
++			uint32				Address() const { return fAddress; }
++			void				SetRemote(uint32 protocol, uint32 address)
++									{ fProtocol = protocol;
++									  fAddress = address; }
++			bool				HasRemote() const { return fProtocol != 0; }
++
++	// whether an event of this protocol and address is from this remote
++			bool				Matches(uint32 protocol,
++									uint32 address) const;
++
++			int32				CountButtons() const
++									{ return fButtons.CountItems(); }
++			Button*				ButtonAt(int32 index) const
++									{ return fButtons.ItemAt(index); }
++			Button*				FindButton(uint32 command) const;
++			Button*				AddButton(const Button& button);
++			void				RemoveButton(int32 index);
++			void				MoveButton(int32 from, int32 to);
++
++	static	status_t			GetDirectory(BPath* path, bool create);
++	// every profile in the settings directory, by name
++	static	status_t			LoadAll(BObjectList<Profile, true>& profiles);
++	// the protocol's family: RC-5 and RC-5X are one remote
++	static	uint32				Family(uint32 protocol);
++	static	const char*			ProtocolName(uint32 protocol);
++
++private:
++			BString				fName;
++			bool				fEnabled;
++			uint32				fProtocol;
++			uint32				fAddress;
++			BObjectList<Button, true> fButtons;
++};
++
++
++}	// namespace RemoteControl
++
++
++#endif	// REMOTE_PROFILE_H
+diff --git a/src/add-ons/kernel/drivers/input/Jamfile b/src/add-ons/kernel/drivers/input/Jamfile
+index bedf4e1b07..420c043e66 100644
+--- a/src/add-ons/kernel/drivers/input/Jamfile
++++ b/src/add-ons/kernel/drivers/input/Jamfile
+@@ -3,6 +3,7 @@ SubDir HAIKU_TOP src add-ons kernel drivers input ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers input hyperv ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers input i2c_elan ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers input i2c_hid ;
++SubInclude HAIKU_TOP src add-ons kernel drivers input meson_ir ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers input ps2_hid ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers input usb_hid ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers input virtio_input ;
+diff --git a/src/add-ons/kernel/drivers/input/meson_ir/IRDecoder.cpp b/src/add-ons/kernel/drivers/input/meson_ir/IRDecoder.cpp
+new file mode 100644
+index 0000000000..8adcfff829
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/input/meson_ir/IRDecoder.cpp
+@@ -0,0 +1,686 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * Protocol timings: the published descriptions of NEC, Philips RC-5 and
++ * RC-6, Sony SIRC and JVC (docs/m24-ir-facts.md). Receivers stretch marks
++ * and shorten spaces by up to about 100 us, so every range here is wide;
++ * the protocols' frame lengths and bit counts keep them apart.
++ */
++
++
++#include "IRDecoder.h"
++
++#include <string.h>
++
++
++namespace IRRemote {
++
++
++// a repeat (held button) comes within this time of the frame before
++static const uint32 kRepeatWindow = 200000;
++// NEC's repeat code carries no data: marked until the receiver fills it in
++static const uint32 kNECRepeatCode = 0x80000000;
++
++
++static inline bool
++InRange(uint32 value, uint32 low, uint32 high)
++{
++	return value >= low && value <= high;
++}
++
++
++/*!	How many \a unit long half bits \a duration is (Manchester codes): the
++	nearest whole number. The frame's structure tells wrong ones apart.
++*/
++static inline uint32
++Units(uint32 duration, uint32 unit)
++{
++	return (duration + unit / 2) / unit;
++}
++
++
++static inline uint32
++SaturatedAdd(uint32 a, uint32 b)
++{
++	return a + b < a ? ~0u : a + b;
++}
++
++
++//	#pragma mark - NEC
++// 9 ms mark, 4.5 ms space, 32 bits LSB first (address, its inverse or the
++// address' high byte, command, its inverse) of 560 us marks and 560 us (0)
++// or 1690 us (1) spaces, a 560 us stop mark. Held: 9 ms mark, 2.25 ms
++// space, 560 us mark, every 108 ms.
++
++
++void
++NECDecoder::Reset()
++{
++	fState = kIdle;
++	fBits = 0;
++	fCount = 0;
++}
++
++
++bool
++NECDecoder::Feed(bool mark, uint32 duration, ir_remote_event* event)
++{
++	switch (fState) {
++		case kIdle:
++			if (mark && InRange(duration, 6500, 11500))
++				fState = kHeaderSpace;
++			return false;
++
++		case kHeaderSpace:
++			if (!mark && InRange(duration, 3300, 5800)) {
++				fState = kBitMark;
++				fBits = 0;
++				fCount = 0;
++			} else if (!mark && InRange(duration, 1600, 3000))
++				fState = kRepeatMark;
++			else
++				Reset();
++			return false;
++
++		case kBitMark:
++			if (mark && InRange(duration, 200, 1000))
++				fState = kBitSpace;
++			else
++				Reset();
++			return false;
++
++		case kBitSpace:
++			// 560 us for a 0, 1690 us for a 1: split halfway
++			if (mark || !InRange(duration, 200, 2500)) {
++				Reset();
++				return false;
++			}
++			if (duration >= 1125)
++				fBits |= 1u << fCount;
++			fState = ++fCount == 32 ? kStopMark : kBitMark;
++			return false;
++
++		case kStopMark:
++		{
++			bool ok = mark && InRange(duration, 200, 1000);
++			if (ok) {
++				uint32 address = fBits & 0xff;
++				uint32 addressHigh = (fBits >> 8) & 0xff;
++				uint32 command = (fBits >> 16) & 0xff;
++				uint32 inverse = fBits >> 24;
++				event->flags = 0;
++				if ((command ^ inverse) != 0xff) {
++					event->protocol = IR_REMOTE_NEC32;
++					event->address = fBits & 0xffff;
++					event->command = fBits >> 16;
++				} else if ((address ^ addressHigh) == 0xff) {
++					event->protocol = IR_REMOTE_NEC;
++					event->address = address;
++					event->command = command;
++				} else {
++					event->protocol = IR_REMOTE_NEC_EXTENDED;
++					event->address = fBits & 0xffff;
++					event->command = command;
++				}
++			}
++			Reset();
++			return ok;
++		}
++
++		case kRepeatMark:
++		{
++			bool ok = mark && InRange(duration, 200, 1000);
++			if (ok) {
++				event->protocol = IR_REMOTE_NEC;
++				event->address = 0;
++				event->command = 0;
++				event->flags = IR_REMOTE_REPEAT | kNECRepeatCode;
++			}
++			Reset();
++			return ok;
++		}
++	}
++	return false;
++}
++
++
++//	#pragma mark - RC-5
++// Manchester code of 889 us half bits, a 1 being space then mark: 14 bits
++// MSB first, start bit (1), a second start bit (1, or 0 for the 7th
++// command bit of RC-5X), toggle, 5 address and 6 command bits. The first
++// half of the first bit is a space, unseen; the last half may be a space,
++// which only the gap after the frame ends.
++
++
++static const uint32 kRC5Unit = 889;
++static const uint32 kRC5Halves = 28;
++
++
++void
++RC5Decoder::Reset()
++{
++	fCount = 0;
++	fComplete = false;
++}
++
++
++bool
++RC5Decoder::_Add(bool mark, uint32 count)
++{
++	if (fCount + count > kRC5Halves)
++		return false;
++	while (count-- > 0)
++		fHalves[fCount++] = mark ? 1 : 0;
++	return true;
++}
++
++
++bool
++RC5Decoder::_Finish(ir_remote_event* event)
++{
++	uint32 bits = 0;
++	for (uint32 i = 0; i < kRC5Halves; i += 2) {
++		if (fHalves[i] == fHalves[i + 1])
++			return false;
++		bits = (bits << 1) | fHalves[i + 1];
++	}
++	if ((bits & (1u << 13)) == 0)
++		return false;
++
++	bool second = (bits & (1u << 12)) != 0;
++	event->protocol = second ? IR_REMOTE_RC5 : IR_REMOTE_RC5X;
++	event->address = (bits >> 6) & 0x1f;
++	event->command = (bits & 0x3f) | (second ? 0 : 0x40);
++	event->flags = (bits & (1u << 11)) != 0 ? IR_REMOTE_TOGGLE : 0;
++	return true;
++}
++
++
++bool
++RC5Decoder::Feed(bool mark, uint32 duration, ir_remote_event* event)
++{
++	// No header: a frame is only taken between gaps, or the bits of other
++	// protocols' frames could pass for one.
++	bool gap = !mark && duration > kRC5Unit * 9 / 2;
++	if (fCount == 0) {
++		// the start bit's mark half (with the next bit's, if it is a 0),
++		// right after silence
++		uint32 count = mark && fArmed ? Units(duration, kRC5Unit) : 0;
++		if (count == 1 || count == 2) {
++			_Add(false, 1);
++			_Add(true, count);
++		}
++		fArmed = gap;
++		return false;
++	}
++
++	if (gap) {
++		// the gap: it holds the last half bit if that is a space
++		if (fCount == kRC5Halves - 1)
++			_Add(false, 1);
++		bool ok = fCount == kRC5Halves && _Finish(event);
++		Reset();
++		fArmed = true;
++		return ok;
++	}
++	fArmed = false;
++
++	uint32 count = Units(duration, kRC5Unit);
++	if (fComplete || count < 1 || count > 2 || !_Add(mark, count)) {
++		Reset();
++		return false;
++	}
++	// a frame ending with a mark still waits for the gap
++	fComplete = fCount == kRC5Halves;
++	return false;
++}
++
++
++//	#pragma mark - RC-6 mode 0
++// A 2.666 ms leader mark and 889 us space, then Manchester code of 444 us
++// units, a 1 being mark then space: start bit (1), 3 mode bits (0), the
++// trailer bit of double length (the toggle), 8 address and 8 command bits,
++// MSB first.
++
++
++static const uint32 kRC6Unit = 444;
++static const uint32 kRC6Units = 44;
++
++
++void
++RC6Decoder::Reset()
++{
++	fState = kIdle;
++	fCount = 0;
++	fLeaderMark = 0;
++	fUnit = kRC6Unit;
++	fStretch = 0;
++}
++
++
++bool
++RC6Decoder::_Finish(ir_remote_event* event)
++{
++	const uint8* u = fUnits;
++	// start bit 1, mode 000
++	if (u[0] != 1 || u[1] != 0)
++		return false;
++	for (uint32 i = 2; i < 8; i += 2) {
++		if (u[i] != 0 || u[i + 1] != 1)
++			return false;
++	}
++	// trailer: 1 = mark mark space space
++	bool toggle;
++	if (u[8] == 1 && u[9] == 1 && u[10] == 0 && u[11] == 0)
++		toggle = true;
++	else if (u[8] == 0 && u[9] == 0 && u[10] == 1 && u[11] == 1)
++		toggle = false;
++	else
++		return false;
++
++	uint32 bits = 0;
++	for (uint32 i = 12; i < kRC6Units; i += 2) {
++		if (u[i] == u[i + 1])
++			return false;
++		bits = (bits << 1) | u[i];
++	}
++	event->protocol = IR_REMOTE_RC6;
++	event->address = bits >> 8;
++	event->command = bits & 0xff;
++	event->flags = toggle ? IR_REMOTE_TOGGLE : 0;
++	return true;
++}
++
++
++bool
++RC6Decoder::Feed(bool mark, uint32 duration, ir_remote_event* event)
++{
++	switch (fState) {
++		case kIdle:
++			if (mark && InRange(duration, 2000, 3600)) {
++				fLeaderMark = duration;
++				fState = kLeaderSpace;
++			}
++			return false;
++
++		case kLeaderSpace:
++		{
++			// The leader is 6 units of mark and 2 of space, whatever the
++			// receiver adds to marks and takes from spaces: it gives the
++			// remote's actual unit, and that stretch. 444 us units are short
++			// enough for both to matter.
++			if (mark || !InRange(duration, 400, 1600)) {
++				Reset();
++				return false;
++			}
++			fUnit = (fLeaderMark + duration) / 8;
++			fStretch = (int32)fLeaderMark - 6 * (int32)fUnit;
++			if (!InRange(fUnit, 370, 530) || fStretch > (int32)fUnit / 2
++				|| fStretch < -(int32)fUnit / 2) {
++				Reset();
++				return false;
++			}
++			fState = kBody;
++			fCount = 0;
++			return false;
++		}
++
++		case kBody:
++		case kComplete:
++		{
++			int32 corrected = (int32)duration + (mark ? -fStretch : fStretch);
++			if (corrected < 1)
++				corrected = 1;
++			if (!mark && corrected > (int32)fUnit * 7 / 2) {
++				// the gap, which holds a final space unit
++				if (fCount == kRC6Units - 1)
++					fUnits[fCount++] = 0;
++				bool ok = fCount == kRC6Units && _Finish(event);
++				Reset();
++				return ok;
++			}
++			uint32 count = Units(corrected, fUnit);
++			if (fState == kComplete || count < 1 || count > 3
++				|| fCount + count > kRC6Units) {
++				Reset();
++				return false;
++			}
++			while (count-- > 0)
++				fUnits[fCount++] = mark ? 1 : 0;
++			// a frame ending with a mark still waits for the gap
++			if (fCount == kRC6Units)
++				fState = kComplete;
++			return false;
++		}
++	}
++	return false;
++}
++
++
++//	#pragma mark - Sony SIRC
++// A 2.4 ms mark, then bits LSB first of a 600 us space and a 600 us (0) or
++// 1200 us (1) mark: 7 command bits, then 5 (12-bit frames), 8 (15-bit) or
++// 13 (20-bit) address bits. The gap after the last mark ends the frame;
++// a press sends it at least 3 times, every 45 ms.
++
++
++void
++SonyDecoder::Reset()
++{
++	fState = kIdle;
++	fBits = 0;
++	fCount = 0;
++	fHeaderMark = 0;
++	fOneMark = 900;
++}
++
++
++bool
++SonyDecoder::Feed(bool mark, uint32 duration, ir_remote_event* event)
++{
++	switch (fState) {
++		case kIdle:
++			if (mark && InRange(duration, 1800, 3200)) {
++				fHeaderMark = duration;
++				fState = kHeaderSpace;
++			}
++			return false;
++
++		case kHeaderSpace:
++		{
++			// The header is 4 units of mark and 1 of space: it gives the
++			// remote's unit and how much the receiver lengthens marks; a 1
++			// is a 2-unit mark, a 0 a 1-unit one.
++			if (mark || !InRange(duration, 250, 950)) {
++				Reset();
++				return false;
++			}
++			uint32 unit = (fHeaderMark + duration) / 5;
++			int32 stretch = (int32)fHeaderMark - 4 * (int32)unit;
++			if (!InRange(unit, 480, 720) || stretch > (int32)unit / 2
++				|| stretch < -(int32)unit / 2) {
++				Reset();
++				return false;
++			}
++			fOneMark = unit * 3 / 2 + stretch;
++			fState = kBitMark;
++			fBits = 0;
++			fCount = 0;
++			return false;
++		}
++
++		case kBitMark:
++			if (!mark || !InRange(duration, 300, 1800) || fCount == 20) {
++				Reset();
++				return false;
++			}
++			if (duration >= fOneMark)
++				fBits |= 1u << fCount;
++			fCount++;
++			fState = kBitSpace;
++			return false;
++
++		case kBitSpace:
++		{
++			if (!mark && InRange(duration, 250, 950)) {
++				fState = kBitMark;
++				return false;
++			}
++			bool ok = !mark && duration >= 3000
++				&& (fCount == 12 || fCount == 15 || fCount == 20);
++			if (ok) {
++				event->command = fBits & 0x7f;
++				event->flags = 0;
++				if (fCount == 12) {
++					event->protocol = IR_REMOTE_SONY12;
++					event->address = (fBits >> 7) & 0x1f;
++				} else if (fCount == 15) {
++					event->protocol = IR_REMOTE_SONY15;
++					event->address = (fBits >> 7) & 0xff;
++				} else {
++					// 5-bit device and 8 extended bits
++					event->protocol = IR_REMOTE_SONY20;
++					event->address = (fBits >> 7) & 0x1fff;
++				}
++			}
++			Reset();
++			return ok;
++		}
++	}
++	return false;
++}
++
++
++//	#pragma mark - JVC
++// An 8.4 ms mark and 4.2 ms space, 16 bits (8 address, 8 command) of
++// 526 us marks and 526 us (0) or 1574 us (1) spaces, a 526 us stop mark.
++// Held: the frame again without the header, every 50 to 60 ms. Bits are
++// taken LSB first, as most descriptions have it (one has MSB first).
++
++
++void
++JVCDecoder::Reset()
++{
++	fState = kIdle;
++	fRepeat = false;
++	fBits = 0;
++	fCount = 0;
++}
++
++
++void
++JVCDecoder::Elapse(uint32 duration)
++{
++	fSinceFrame = SaturatedAdd(fSinceFrame, duration);
++}
++
++
++bool
++JVCDecoder::Feed(bool mark, uint32 duration, ir_remote_event* event)
++{
++	uint32 sinceFrame = fSinceFrame;
++	Elapse(duration);
++
++	switch (fState) {
++		case kIdle:
++			if (mark && InRange(duration, 6500, 10500)) {
++				fState = kHeaderSpace;
++				fRepeat = false;
++			} else if (mark && InRange(duration, 200, 1000)
++				&& sinceFrame < 100000) {
++				// a repeat: this was the first bit's mark
++				fRepeat = true;
++				fBits = 0;
++				fCount = 0;
++				fState = kBitSpace;
++			}
++			return false;
++
++		case kHeaderSpace:
++			if (!mark && InRange(duration, 3000, 5400)) {
++				fState = kBitMark;
++				fBits = 0;
++				fCount = 0;
++			} else
++				Reset();
++			return false;
++
++		case kBitMark:
++			if (mark && InRange(duration, 200, 1000))
++				fState = fCount == 16 ? kEnd : kBitSpace;
++			else
++				Reset();
++			return false;
++
++		case kBitSpace:
++			// 526 us for a 0, 1574 us for a 1: split halfway
++			if (mark || !InRange(duration, 200, 2400)) {
++				Reset();
++				return false;
++			}
++			if (duration >= 1050)
++				fBits |= 1u << fCount;
++			fCount++;
++			fState = kBitMark;
++			return false;
++
++		case kEnd:
++		{
++			// the gap after the stop mark: not a longer frame's next bit
++			bool ok = !mark && duration >= 3000;
++			if (ok) {
++				event->protocol = IR_REMOTE_JVC;
++				event->address = fBits & 0xff;
++				event->command = fBits >> 8;
++				event->flags = fRepeat ? IR_REMOTE_REPEAT : 0;
++				fSinceFrame = 0;
++			}
++			Reset();
++			return ok;
++		}
++	}
++	return false;
++}
++
++
++//	#pragma mark - Receiver
++
++
++Receiver::Receiver()
++	:
++	fHaveLast(false),
++	fSinceLast(~0u),
++	fPulses(0),
++	fDecodedSinceGap(false),
++	fInGap(true),
++	fFrames(0),
++	fRepeats(0),
++	fUnknown(0)
++{
++	// RC-5, the one without a header, is asked last: when two finish a
++	// frame together, the other is right
++	fDecoders[0] = &fNEC;
++	fDecoders[1] = &fRC6;
++	fDecoders[2] = &fSony;
++	fDecoders[3] = &fJVC;
++	fDecoders[4] = &fRC5;
++	memset(&fLast, 0, sizeof(fLast));
++}
++
++
++void
++Receiver::Reset()
++{
++	for (uint32 i = 0; i < B_COUNT_OF(fDecoders); i++)
++		fDecoders[i]->Reset();
++	fHaveLast = false;
++	fSinceLast = ~0u;
++	fPulses = 0;
++	fDecodedSinceGap = false;
++	fInGap = true;
++}
++
++
++bool
++Receiver::Feed(bool mark, uint32 duration, ir_remote_event* event)
++{
++	fSinceLast = SaturatedAdd(fSinceLast, duration);
++
++	bool decoded = false;
++	if (mark || !fInGap)
++		decoded = _FeedAll(mark, duration, event);
++	else
++		fJVC.Elapse(duration);
++
++	if (mark) {
++		fInGap = false;
++		fPulses++;
++	}
++	bool result = decoded && _Decoded(event);
++
++	if (!mark && duration >= kGap && !fInGap) {
++		// the end of a pulse train
++		if (fPulses >= 4 && !fDecodedSinceGap)
++			fUnknown++;
++		fPulses = 0;
++		fDecodedSinceGap = false;
++		fInGap = true;
++	}
++	return result;
++}
++
++
++bool
++Receiver::Gap(ir_remote_event* event)
++{
++	if (fInGap)
++		return false;
++
++	// as if the space so far were one long space; the edge that ends it
++	// later only adds its time
++	bool result = _FeedAll(false, kGap, event) && _Decoded(event);
++	if (fPulses >= 4 && !fDecodedSinceGap)
++		fUnknown++;
++	fPulses = 0;
++	fDecodedSinceGap = false;
++	fInGap = true;
++	return result;
++}
++
++
++/*!	Every decoder sees every pulse (RC-5 has to see gaps to know where a
++	frame may start); the first in order that finishes a frame wins.
++*/
++bool
++Receiver::_FeedAll(bool mark, uint32 duration, ir_remote_event* event)
++{
++	bool decoded = false;
++	for (uint32 i = 0; i < B_COUNT_OF(fDecoders); i++) {
++		ir_remote_event candidate;
++		if (fDecoders[i]->Feed(mark, duration, &candidate) && !decoded) {
++			*event = candidate;
++			decoded = true;
++		}
++	}
++	return decoded;
++}
++
++
++bool
++Receiver::_Decoded(ir_remote_event* event)
++{
++	for (uint32 i = 0; i < B_COUNT_OF(fDecoders); i++)
++		fDecoders[i]->Reset();
++	fDecodedSinceGap = true;
++
++	bool recent = fHaveLast && fSinceLast < kRepeatWindow;
++	if ((event->flags & kNECRepeatCode) != 0) {
++		// NEC's repeat code: the last NEC frame again
++		if (!recent || (fLast.protocol != IR_REMOTE_NEC
++				&& fLast.protocol != IR_REMOTE_NEC_EXTENDED
++				&& fLast.protocol != IR_REMOTE_NEC32)) {
++			return false;
++		}
++		*event = fLast;
++		event->flags |= IR_REMOTE_REPEAT;
++	} else if (recent && event->protocol == fLast.protocol
++		&& event->address == fLast.address
++		&& event->command == fLast.command
++		&& (event->flags & IR_REMOTE_TOGGLE)
++			== (fLast.flags & IR_REMOTE_TOGGLE)) {
++		// the frame again while the button is held
++		event->flags |= IR_REMOTE_REPEAT;
++	}
++
++	fLast = *event;
++	fHaveLast = true;
++	fSinceLast = 0;
++	fFrames++;
++	if ((event->flags & IR_REMOTE_REPEAT) != 0)
++		fRepeats++;
++	return true;
++}
++
++
++}	// namespace IRRemote
+diff --git a/src/add-ons/kernel/drivers/input/meson_ir/IRDecoder.h b/src/add-ons/kernel/drivers/input/meson_ir/IRDecoder.h
+new file mode 100644
+index 0000000000..d804696468
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/input/meson_ir/IRDecoder.h
+@@ -0,0 +1,174 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef IR_DECODER_H
++#define IR_DECODER_H
++
++
++/*!	Infrared remote control protocols decoded from mark and space
++	durations, in software, as a receiver in raw mode delivers them. No
++	hardware here: the decoders also build and run on the build host
++	(tools/tests/irdecoder-test.cpp).
++
++	Each pulse goes to every decoder; the first one to finish a frame wins,
++	and all start over. Frames that end with a space (RC-5, RC-6, Sony,
++	JVC) are finished by the gap after them: when no edge comes, the caller
++	feeds one with Gap().
++*/
++
++
++#include <SupportDefs.h>
++
++#include <ir_remote.h>
++
++
++namespace IRRemote {
++
++
++// longer than any space inside a frame of these protocols (RC-6's leader
++// space is 0.9 ms, NEC's header space 4.5 ms): the end of a frame
++static const uint32 kGap = 6000;
++
++
++class Decoder {
++public:
++	virtual				~Decoder() {}
++	virtual	void		Reset() = 0;
++	// true and *event filled (protocol, address, command, flags) when the
++	// pulse finishes a frame
++	virtual	bool		Feed(bool mark, uint32 duration,
++							ir_remote_event* event) = 0;
++};
++
++
++class NECDecoder : public Decoder {
++public:
++						NECDecoder() { Reset(); }
++	virtual	void		Reset();
++	virtual	bool		Feed(bool mark, uint32 duration,
++							ir_remote_event* event);
++private:
++			enum { kIdle, kHeaderSpace, kBitMark, kBitSpace, kStopMark,
++				kRepeatMark };
++			int			fState;
++			uint32		fBits;
++			uint32		fCount;
++};
++
++
++class RC5Decoder : public Decoder {
++public:
++						RC5Decoder() : fArmed(true) { Reset(); }
++	virtual	void		Reset();
++	virtual	bool		Feed(bool mark, uint32 duration,
++							ir_remote_event* event);
++private:
++			bool		_Add(bool mark, uint32 count);
++			bool		_Finish(ir_remote_event* event);
++
++			uint8		fHalves[28];	// half bits: 1 = mark
++			uint32		fCount;
++			bool		fArmed;			// after silence: a frame may start
++			bool		fComplete;		// all halves, waiting for the gap
++};
++
++
++class RC6Decoder : public Decoder {
++public:
++						RC6Decoder() { Reset(); }
++	virtual	void		Reset();
++	virtual	bool		Feed(bool mark, uint32 duration,
++							ir_remote_event* event);
++private:
++			bool		_Finish(ir_remote_event* event);
++
++			enum { kIdle, kLeaderSpace, kBody, kComplete };
++			int			fState;
++			uint8		fUnits[44];		// units of 444 us: 1 = mark
++			uint32		fCount;
++			uint32		fLeaderMark;
++			uint32		fUnit;			// as measured on the leader
++			int32		fStretch;		// marks longer than sent (leader)
++};
++
++
++class SonyDecoder : public Decoder {
++public:
++						SonyDecoder() { Reset(); }
++	virtual	void		Reset();
++	virtual	bool		Feed(bool mark, uint32 duration,
++							ir_remote_event* event);
++private:
++			enum { kIdle, kHeaderSpace, kBitMark, kBitSpace };
++			int			fState;
++			uint32		fBits;
++			uint32		fCount;
++			uint32		fHeaderMark;
++			uint32		fOneMark;		// shorter bit marks are 0s
++};
++
++
++class JVCDecoder : public Decoder {
++public:
++						JVCDecoder() : fSinceFrame(~0u) { Reset(); }
++	virtual	void		Reset();
++	virtual	bool		Feed(bool mark, uint32 duration,
++							ir_remote_event* event);
++	// time since the last JVC frame ended (for headerless repeats)
++			void		Elapse(uint32 duration);
++private:
++			enum { kIdle, kHeaderSpace, kBitMark, kBitSpace, kEnd };
++			int			fState;
++			bool		fRepeat;		// a frame without the header
++			uint32		fBits;
++			uint32		fCount;
++			uint32		fSinceFrame;
++};
++
++
++class Receiver {
++public:
++								Receiver();
++
++			void				Reset();
++	// one mark or space as measured; true when a frame was decoded
++			bool				Feed(bool mark, uint32 duration,
++									ir_remote_event* event);
++	// no edge for a while: the space so far ends any frame
++			bool				Gap(ir_remote_event* event);
++
++			uint32				Frames() const { return fFrames; }
++			uint32				Repeats() const { return fRepeats; }
++			uint32				Unknown() const { return fUnknown; }
++
++private:
++			bool				_FeedAll(bool mark, uint32 duration,
++									ir_remote_event* event);
++			bool				_Decoded(ir_remote_event* event);
++
++			NECDecoder			fNEC;
++			RC5Decoder			fRC5;
++			RC6Decoder			fRC6;
++			SonyDecoder			fSony;
++			JVCDecoder			fJVC;
++			Decoder*			fDecoders[5];
++
++			// the last frame, for repeats; time is counted in pulses
++			ir_remote_event		fLast;
++			bool				fHaveLast;
++			uint32				fSinceLast;		// us
++			uint32				fPulses;		// since the last gap
++			bool				fDecodedSinceGap;
++			bool				fInGap;
++
++			uint32				fFrames;
++			uint32				fRepeats;
++			uint32				fUnknown;
++};
++
++
++}	// namespace IRRemote
++
++
++#endif	// IR_DECODER_H
+diff --git a/src/add-ons/kernel/drivers/input/meson_ir/Jamfile b/src/add-ons/kernel/drivers/input/meson_ir/Jamfile
+new file mode 100644
+index 0000000000..122d20b39a
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/input/meson_ir/Jamfile
+@@ -0,0 +1,11 @@
++SubDir HAIKU_TOP src add-ons kernel drivers input meson_ir ;
++
++UsePrivateKernelHeaders ;
++UsePrivateHeaders drivers ;
++
++if $(TARGET_ARCH) = arm64 {
++	KernelAddon meson_ir :
++		meson_ir.cpp
++		IRDecoder.cpp
++	;
++}
+diff --git a/src/add-ons/kernel/drivers/input/meson_ir/meson_ir.cpp b/src/add-ons/kernel/drivers/input/meson_ir/meson_ir.cpp
+new file mode 100644
+index 0000000000..651a4e43e8
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/input/meson_ir/meson_ir.cpp
+@@ -0,0 +1,812 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * The Amlogic S905's (GXBB) infrared remote control receiver, as
++ * /dev/input/remote/meson_ir/0: decoded button presses
++ * (headers/private/drivers/ir_remote.h) for the input_server add-on
++ * "Remote Control", and the raw pulses for learning unknown remotes.
++ *
++ * The receiver runs in its raw mode: an interrupt at every edge of the
++ * receiver module's output, with the time since the edge before. The
++ * protocols are decoded in software (IRDecoder.cpp): NEC, RC-5, RC-6,
++ * Sony and JVC. A frame that ends with a space only ends when the next
++ * edge would come, so a timer takes the gap after the last edge.
++ *
++ * The receiver runs while the device is open. Each open handle reads the
++ * events at its own pace from one ring; a reader that falls too far behind
++ * loses the oldest.
++ *
++ * Register facts: docs/m24-ir-facts.md.
++ */
++
++
++#include <new>
++#include <stdio.h>
++#include <string.h>
++
++#include <AutoDeleterDrivers.h>
++#include <KernelExport.h>
++#include <arch/int.h>
++#include <bus/FDT.h>
++#include <condition_variable.h>
++#include <device_manager.h>
++#include <kernel.h>
++#include <lock.h>
++#include <timer.h>
++#include <util/AutoLock.h>
++
++#include <ir_remote.h>
++
++#include "IRDecoder.h"
++
++
++#define DRIVER_MODULE_NAME	"drivers/input/meson_ir/driver_v1"
++#define DEVICE_MODULE_NAME	"drivers/input/meson_ir/device_v1"
++
++#define INFO(x...) dprintf("meson_ir: " x)
++
++
++static const uint32 kEventCount = 64;		// the ring every reader reads
++static const uint32 kPulseCount = 1024;		// raw pulses kept for learning
++// no edge for this long: the space so far ends any frame
++static const bigtime_t kGapTimeout = IRRemote::kGap;
++
++
++static device_manager_info* gDeviceManager;
++
++
++struct ReaderCookie;
++
++
++class MesonIr {
++public:
++								MesonIr(device_node* node);
++								~MesonIr();
++
++			status_t			Init(phys_addr_t registers, int32 vector);
++			device_node*		Node() const { return fNode; }
++
++			status_t			Open(ReaderCookie* cookie);
++			void				Close(ReaderCookie* cookie);
++			status_t			Read(ReaderCookie* cookie, void* buffer,
++									size_t* _length);
++			status_t			Wait(ReaderCookie* cookie, bigtime_t timeout);
++			status_t			Control(ReaderCookie* cookie, uint32 op,
++									void* buffer, size_t length);
++
++private:
++			status_t			_Start();
++			void				_Stop();
++
++			uint32				_Read(uint32 offset) const
++									{ return *(volatile uint32*)
++										(fRegisters + offset); }
++			void				_Write(uint32 offset, uint32 value)
++									{ *(volatile uint32*)
++										(fRegisters + offset) = value; }
++			void				_Modify(uint32 offset, uint32 clear,
++									uint32 set);
++			void				_RestartGapTimer();
++
++			void				_Pulse(bool mark, uint32 duration);
++			void				_Push(const ir_remote_event& event);
++
++	static	int32				_Interrupt(void* data);
++	static	int32				_GapTimer(timer* timer);
++
++			device_node*		fNode;
++			mutex				fLock;			// opens, closes
++			uint32				fOpenCount;
++
++			// hardware
++			area_id				fArea;
++			volatile uint8*		fRegisters;		// the AO page
++			uint32				fBlock;			// the receiver in it
++			int32				fVector;
++			bool				fRunning;
++			bool				fFirstEdge;
++
++			// all below: fSpinlock, interrupts off
++			spinlock			fSpinlock;
++			IRRemote::Receiver	fReceiver;
++			timer				fGapTimer;
++			bool				fGapTimerArmed;
++			bigtime_t			fLastEdge;
++
++			ir_remote_event		fEvents[kEventCount];
++			uint64				fEventSequence;	// of the next event
++			ConditionVariable	fEventCondition;
++
++			ir_remote_pulse		fPulses[kPulseCount];
++			uint32				fPulseFirst;
++			uint32				fPulseCount;
++			bool				fCollectPulses;
++
++			uint32				fEdges;
++			uint32				fOverruns;
++};
++
++
++struct ReaderCookie {
++	MesonIr*	device;
++	uint64		next;		// sequence of the next event to read
++	int			openMode;
++};
++
++
++//	#pragma mark - hardware
++
++/*!	Everything that touches the receiver's registers is in this section;
++	see docs/m24-ir-facts.md. The receiver is the "multi-format" decoder of
++	the always-on domain, at 0xc8100580 in the page mapped here.
++*/
++
++static const phys_addr_t kAoBusBase = 0xc8100000;
++static const uint64 kAoBusSize = 0x100000;
++
++// the always-on page (offsets from 0xc8100000)
++static const uint32 kPinMux = 0x14;			// AO_RTI_PIN_MUX_REG
++static const uint32 kGpioInput = 0x28;		// AO_GPIO_I
++static const uint32 kPullEnable = 0x2c;		// AO_RTI_PULL_UP_REG, bits 0-15
++static const uint32 kGenControl = 0x40;		// AO_RTI_GEN_CNTL_REG0
++static const uint32 kLegacyReg1 = 0x49c;	// the older NEC-only decoder
++
++static const uint32 kPinRemoteInput = 1u << 0;	// GPIOAO_7 to the receiver
++static const uint32 kPinRemoteOutput = 1u << 21;	// GPIOAO_7 as IR output
++static const uint32 kGpioAo7 = 1u << 7;
++static const uint32 kIrClock = 1u << 0;
++
++// the receiver's registers (offsets from it)
++enum {
++	REG0		= 0x10,		// time base
++	FRAME		= 0x14,
++	STATUS		= 0x18,
++	REG1		= 0x1c,		// width, enable, interrupt select, reset
++	REG2		= 0x20		// decode mode
++};
++
++static const uint32 kReg0BaseMask = 0xfff;
++static const uint32 kReg0Base10us = 9;		// ticks of (9 + 1) * 1 us
++static const uint32 kReg0Base20us = 19;		// the hardware decoders'
++static const uint32 kReg1Reset = 1u << 0;
++static const uint32 kReg1BothEdges = 1u << 2;	// interrupt select 01
++static const uint32 kReg1Enable = 1u << 15;
++static const uint32 kReg2ModeMask = 0xf;
++static const uint32 kReg2ModeRaw = 2;		// "general time measurement"
++static const uint32 kStatusLevel = 1u << 8;	// the input after the edge
++
++static const uint32 kTick = 10;				// us
++static const uint32 kWidthMask = 0x1fff;	// REG1 bits 28:16, ~82 ms
++// longer than the counter can say: the system time tells
++static const bigtime_t kLongInterval = 80000;
++
++
++void
++MesonIr::_Modify(uint32 offset, uint32 clear, uint32 set)
++{
++	_Write(offset, (_Read(offset) & ~clear) | set);
++}
++
++
++status_t
++MesonIr::_Start()
++{
++	// the clock gate is on from reset; the IR module reset (bit 16) stays
++	// as it is
++	if ((_Read(kGenControl) & kIrClock) == 0)
++		_Modify(kGenControl, 0, kIrClock);
++
++	// the pad: to the receiver, not the IR output; no pull (the receiver
++	// module drives it). Read-modify-write: the console is in these too.
++	{
++		InterruptsLocker locker;
++		_Modify(kPinMux, kPinRemoteOutput, kPinRemoteInput);
++		_Modify(kPullEnable, kGpioAo7, 0);
++	}
++
++	// a previous owner may have left it decoding: stop and reset it, then
++	// raw mode, 10 us ticks, an interrupt at every edge
++	_Write(fBlock + REG1, kReg1Reset);
++	_Write(fBlock + REG1, 0);
++	_Write(fBlock + REG2, kReg2ModeRaw);
++	_Write(fBlock + REG0, kReg0Base10us);
++	_Write(fBlock + REG1, kReg1BothEdges);
++	_Read(fBlock + STATUS);
++	_Read(fBlock + FRAME);
++
++	{
++		InterruptsSpinLocker locker(fSpinlock);
++		fReceiver.Reset();
++		fFirstEdge = true;
++		fLastEdge = system_time();
++		fRunning = true;
++	}
++	arch_int_configure_io_interrupt(fVector, B_EDGE_TRIGGERED,
++		B_RISING_EDGE_POLARITY);
++	status_t status = install_io_interrupt_handler(fVector, &_Interrupt,
++		this, 0);
++	if (status != B_OK) {
++		InterruptsSpinLocker locker(fSpinlock);
++		fRunning = false;
++		return status;
++	}
++	_Write(fBlock + REG1, kReg1BothEdges | kReg1Enable);
++	return B_OK;
++}
++
++
++void
++MesonIr::_Stop()
++{
++	if (fRegisters == NULL)
++		return;
++	{
++		InterruptsSpinLocker locker(fSpinlock);
++		if (!fRunning)
++			return;
++		fRunning = false;
++	}
++	_Write(fBlock + REG1, kReg1BothEdges);
++	remove_io_interrupt_handler(fVector, &_Interrupt, this);
++	cancel_timer(&fGapTimer);
++
++	// back to what the hardware NEC decoder uses, as Linux leaves it (in
++	// case firmware wakes the board from the remote)
++	_Modify(fBlock + REG2, kReg2ModeMask, 0);
++	_Modify(fBlock + REG0, kReg0BaseMask, kReg0Base20us);
++}
++
++
++/*!	An edge: the level after it says what the interval that just ended
++	was (the receiver module's output is low while it sees the carrier),
++	the width counter how long it was.
++*/
++/*static*/ int32
++MesonIr::_Interrupt(void* data)
++{
++	MesonIr* device = (MesonIr*)data;
++	bigtime_t now = system_time();
++	uint32 status = device->_Read(device->fBlock + STATUS);
++	uint32 reg1 = device->_Read(device->fBlock + REG1);
++
++	{
++		SpinLocker locker(device->fSpinlock);
++		if (!device->fRunning)
++			return B_HANDLED_INTERRUPT;
++		device->fEdges++;
++
++		bool mark = (status & kStatusLevel) != 0;
++		uint32 duration = ((reg1 >> 16) & kWidthMask) * kTick;
++		bigtime_t elapsed = now - device->fLastEdge;
++		device->fLastEdge = now;
++		if (device->fFirstEdge || elapsed >= kLongInterval) {
++			// longer than the counter goes: idle, a space
++			device->fFirstEdge = false;
++			duration = elapsed < 0x7fffffff ? (uint32)elapsed : 0x7fffffff;
++		} else if (duration == 0) {
++			// the counter sometimes reads 0 (Amlogic's driver says so)
++			duration = (uint32)elapsed;
++		}
++		device->_Pulse(mark, duration);
++	}
++
++	device->_RestartGapTimer();
++	return B_HANDLED_INTERRUPT;
++}
++
++
++/*!	kGapTimeout from now, unless another edge comes first. */
++void
++MesonIr::_RestartGapTimer()
++{
++	cancel_timer(&fGapTimer);
++	fGapTimer.user_data = this;
++	add_timer(&fGapTimer, &_GapTimer, kGapTimeout,
++		B_ONE_SHOT_RELATIVE_TIMER);
++}
++
++
++//	#pragma mark - decoding
++
++
++/*!	A mark or space as measured. Called with fSpinlock held. */
++void
++MesonIr::_Pulse(bool mark, uint32 duration)
++{
++	if (fCollectPulses) {
++		if (fPulseCount == kPulseCount) {
++			fPulseFirst = (fPulseFirst + 1) % kPulseCount;
++			fPulseCount--;
++		}
++		ir_remote_pulse& pulse
++			= fPulses[(fPulseFirst + fPulseCount) % kPulseCount];
++		pulse.duration = duration < 0x7fffffff ? duration : 0x7fffffff;
++		pulse.mark = mark ? 1 : 0;
++		fPulseCount++;
++	}
++
++	ir_remote_event event;
++	if (fReceiver.Feed(mark, duration, &event))
++		_Push(event);
++}
++
++
++/*!	A decoded frame for every reader. Called with fSpinlock held. */
++void
++MesonIr::_Push(const ir_remote_event& event)
++{
++	ir_remote_event& slot = fEvents[fEventSequence % kEventCount];
++	slot = event;
++	slot.when = system_time();
++	fEventSequence++;
++	fEventCondition.NotifyAll();
++}
++
++
++/*!	No edge for kGapTimeout: the space so far ends a frame. */
++/*static*/ int32
++MesonIr::_GapTimer(timer* timer)
++{
++	MesonIr* device = (MesonIr*)timer->user_data;
++	SpinLocker locker(device->fSpinlock);
++	device->fGapTimerArmed = false;
++	ir_remote_event event;
++	if (device->fReceiver.Gap(&event))
++		device->_Push(event);
++	return B_HANDLED_INTERRUPT;
++}
++
++
++//	#pragma mark - device
++
++
++MesonIr::MesonIr(device_node* node)
++	:
++	fNode(node),
++	fOpenCount(0),
++	fArea(-1),
++	fRegisters(NULL),
++	fBlock(0),
++	fVector(-1),
++	fRunning(false),
++	fFirstEdge(true),
++	fSpinlock(B_SPINLOCK_INITIALIZER),
++	fGapTimerArmed(false),
++	fLastEdge(0),
++	fEventSequence(0),
++	fPulseFirst(0),
++	fPulseCount(0),
++	fCollectPulses(false),
++	fEdges(0),
++	fOverruns(0)
++{
++	mutex_init(&fLock, "meson ir");
++	fEventCondition.Init(this, "meson ir event");
++	memset(&fGapTimer, 0, sizeof(fGapTimer));
++}
++
++
++MesonIr::~MesonIr()
++{
++	_Stop();
++	if (fArea >= 0)
++		delete_area(fArea);
++	mutex_destroy(&fLock);
++}
++
++
++status_t
++MesonIr::Init(phys_addr_t registers, int32 vector)
++{
++	phys_addr_t page = registers & ~(phys_addr_t)(B_PAGE_SIZE - 1);
++	fBlock = (uint32)(registers - page);
++	fVector = vector;
++	void* address;
++	fArea = map_physical_memory("meson ir", page, B_PAGE_SIZE,
++		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++		&address);
++	if (fArea < 0)
++		return fArea;
++	fRegisters = (volatile uint8*)address;
++
++	// what the receiver sees with no remote, and whether the older decoder
++	// runs too (it may share the interrupt)
++	INFO("receiver at %#" B_PRIxPHYSADDR ", interrupt %" B_PRId32 "; idle "
++		"level %s (pad %s), older decoder %s\n", registers, vector,
++		(_Read(fBlock + STATUS) & kStatusLevel) != 0 ? "high" : "low",
++		(_Read(kGpioInput) & kGpioAo7) != 0 ? "high" : "low",
++		(_Read(kLegacyReg1) & kReg1Enable) != 0 ? "enabled" : "off");
++	return B_OK;
++}
++
++
++status_t
++MesonIr::Open(ReaderCookie* cookie)
++{
++	MutexLocker locker(fLock);
++	if (fOpenCount == 0) {
++		status_t status = _Start();
++		if (status != B_OK)
++			return status;
++	}
++	fOpenCount++;
++
++	InterruptsSpinLocker spinLocker(fSpinlock);
++	cookie->next = fEventSequence;
++	return B_OK;
++}
++
++
++void
++MesonIr::Close(ReaderCookie* cookie)
++{
++	(void)cookie;
++	MutexLocker locker(fLock);
++	if (--fOpenCount == 0)
++		_Stop();
++}
++
++
++status_t
++MesonIr::Read(ReaderCookie* cookie, void* buffer, size_t* _length)
++{
++	size_t capacity = *_length / sizeof(ir_remote_event);
++	*_length = 0;
++	if (capacity == 0)
++		return B_BAD_VALUE;
++
++	ir_remote_event events[16];
++	if (capacity > B_COUNT_OF(events))
++		capacity = B_COUNT_OF(events);
++	size_t count = 0;
++
++	InterruptsSpinLocker locker(fSpinlock);
++	while (fEventSequence == cookie->next) {
++		if ((cookie->openMode & O_NONBLOCK) != 0)
++			return B_WOULD_BLOCK;
++		ConditionVariableEntry entry;
++		fEventCondition.Add(&entry);
++		locker.Unlock();
++		status_t status = entry.Wait(B_CAN_INTERRUPT);
++		locker.Lock();
++		if (status == B_INTERRUPTED)
++			return status;
++	}
++	if (fEventSequence - cookie->next > kEventCount) {
++		// fell behind: the oldest are gone
++		fOverruns++;
++		cookie->next = fEventSequence - kEventCount;
++	}
++	while (count < capacity && cookie->next < fEventSequence)
++		events[count++] = fEvents[cookie->next++ % kEventCount];
++	locker.Unlock();
++
++	size_t length = count * sizeof(ir_remote_event);
++	if (user_memcpy(buffer, events, length) != B_OK)
++		return B_BAD_ADDRESS;
++	*_length = length;
++	return B_OK;
++}
++
++
++/*!	Waits until \a cookie has an event to read, at most \a timeout. */
++status_t
++MesonIr::Wait(ReaderCookie* cookie, bigtime_t timeout)
++{
++	bigtime_t deadline = system_time() + timeout;
++	InterruptsSpinLocker locker(fSpinlock);
++	while (fEventSequence == cookie->next) {
++		if (system_time() >= deadline)
++			return B_TIMED_OUT;
++		ConditionVariableEntry entry;
++		fEventCondition.Add(&entry);
++		locker.Unlock();
++		status_t status = entry.Wait(B_CAN_INTERRUPT | B_ABSOLUTE_TIMEOUT,
++			deadline);
++		locker.Lock();
++		if (status == B_INTERRUPTED)
++			return status;
++	}
++	return B_OK;
++}
++
++
++status_t
++MesonIr::Control(ReaderCookie* cookie, uint32 op, void* buffer,
++	size_t length)
++{
++	switch (op) {
++		case IR_REMOTE_WAIT_FOR_EVENT:
++		{
++			bigtime_t timeout;
++			if (length < sizeof(timeout)
++				|| user_memcpy(&timeout, buffer, sizeof(timeout)) != B_OK)
++				return B_BAD_ADDRESS;
++			return Wait(cookie, timeout);
++		}
++
++		case IR_REMOTE_GET_STATS:
++		{
++			ir_remote_stats stats;
++			{
++				InterruptsSpinLocker locker(fSpinlock);
++				stats.frames = fReceiver.Frames();
++				stats.repeats = fReceiver.Repeats();
++				stats.unknown = fReceiver.Unknown();
++				stats.edges = fEdges;
++				stats.overruns = fOverruns;
++			}
++			if (length < sizeof(stats))
++				return B_BAD_VALUE;
++			return user_memcpy(buffer, &stats, sizeof(stats));
++		}
++
++		case IR_REMOTE_COLLECT_PULSES:
++		{
++			bool collect;
++			if (length < sizeof(collect)
++				|| user_memcpy(&collect, buffer, sizeof(collect)) != B_OK)
++				return B_BAD_ADDRESS;
++			InterruptsSpinLocker locker(fSpinlock);
++			fCollectPulses = collect;
++			fPulseFirst = 0;
++			fPulseCount = 0;
++			return B_OK;
++		}
++
++		case IR_REMOTE_READ_PULSES:
++		{
++			ir_remote_pulse pulses[256];
++			size_t count = length / sizeof(ir_remote_pulse);
++			if (count > B_COUNT_OF(pulses))
++				count = B_COUNT_OF(pulses);
++			{
++				InterruptsSpinLocker locker(fSpinlock);
++				if (count > fPulseCount)
++					count = fPulseCount;
++				for (size_t i = 0; i < count; i++)
++					pulses[i] = fPulses[(fPulseFirst + i) % kPulseCount];
++				fPulseFirst = (fPulseFirst + count) % kPulseCount;
++				fPulseCount -= count;
++			}
++			if (user_memcpy(buffer, pulses, count * sizeof(ir_remote_pulse))
++					!= B_OK)
++				return B_BAD_ADDRESS;
++			// the size copied, as ioctl's return value
++			return (status_t)(count * sizeof(ir_remote_pulse));
++		}
++	}
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++//	#pragma mark - driver module
++
++
++static float
++supports_device(device_node* parent)
++{
++	const char* bus;
++	const char* compatible;
++	if (gDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false)
++			!= B_OK || strcmp(bus, "fdt") != 0
++		|| gDeviceManager->get_attr_string(parent, "fdt/compatible",
++			&compatible, false) != B_OK
++		|| strcmp(compatible, "amlogic,meson-gxbb-ir") != 0) {
++		return 0.0f;
++	}
++	return 0.8f;
++}
++
++
++static status_t
++register_device(device_node* parent)
++{
++	device_attr attrs[] = {
++		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE,
++			{ .string = "Amlogic Meson GXBB infrared receiver" } },
++		{ NULL }
++	};
++	return gDeviceManager->register_node(parent, DRIVER_MODULE_NAME, attrs,
++		NULL, NULL);
++}
++
++
++static status_t
++init_driver(device_node* node, void** _cookie)
++{
++	DeviceNodePutter<&gDeviceManager> fdtNode(
++		gDeviceManager->get_parent_node(node));
++	fdt_device_module_info* fdtModule;
++	fdt_device* fdtDevice;
++	if (gDeviceManager->get_driver(fdtNode.Get(),
++			(driver_module_info**)&fdtModule, (void**)&fdtDevice) != B_OK) {
++		return B_ERROR;
++	}
++	int length;
++	const char* enabled = (const char*)fdtModule->get_prop(fdtDevice,
++		"status", &length);
++	if (enabled != NULL && strcmp(enabled, "okay") != 0
++		&& strcmp(enabled, "ok") != 0) {
++		return B_DEVICE_NOT_FOUND;
++	}
++	uint64 registers;
++	uint64 size;
++	uint64 vector = 0;
++	if (!fdtModule->get_reg(fdtDevice, 0, &registers, &size)
++		|| !fdtModule->get_interrupt(fdtDevice, 0, NULL, &vector)
++		|| vector == 0) {
++		return B_ERROR;
++	}
++	// The node sits in GXBB's AO bus, which maps its 1 MB of child
++	// addresses to 0xc8100000; the FDT bus gives the address untranslated.
++	if (registers < kAoBusSize)
++		registers += kAoBusBase;
++
++	MesonIr* device = new(std::nothrow) MesonIr(node);
++	if (device == NULL)
++		return B_NO_MEMORY;
++	status_t status = device->Init(registers, (int32)vector);
++	if (status != B_OK) {
++		delete device;
++		return status;
++	}
++	*_cookie = device;
++	return B_OK;
++}
++
++
++static void
++uninit_driver(void* cookie)
++{
++	delete (MesonIr*)cookie;
++}
++
++
++static status_t
++register_child_devices(void* cookie)
++{
++	MesonIr* device = (MesonIr*)cookie;
++	return gDeviceManager->publish_device(device->Node(),
++		"input/remote/meson_ir/0", DEVICE_MODULE_NAME);
++}
++
++
++//	#pragma mark - device module
++
++
++static status_t
++device_init(void* driverCookie, void** _deviceCookie)
++{
++	*_deviceCookie = driverCookie;
++	return B_OK;
++}
++
++
++static void
++device_uninit(void* deviceCookie)
++{
++	(void)deviceCookie;
++}
++
++
++static status_t
++device_open(void* deviceCookie, const char* path, int openMode,
++	void** _cookie)
++{
++	(void)path;
++	ReaderCookie* cookie = new(std::nothrow) ReaderCookie;
++	if (cookie == NULL)
++		return B_NO_MEMORY;
++	cookie->device = (MesonIr*)deviceCookie;
++	cookie->openMode = openMode;
++	status_t status = cookie->device->Open(cookie);
++	if (status != B_OK) {
++		delete cookie;
++		return status;
++	}
++	*_cookie = cookie;
++	return B_OK;
++}
++
++
++static status_t
++device_close(void* cookie)
++{
++	(void)cookie;
++	return B_OK;
++}
++
++
++static status_t
++device_free(void* _cookie)
++{
++	ReaderCookie* cookie = (ReaderCookie*)_cookie;
++	cookie->device->Close(cookie);
++	delete cookie;
++	return B_OK;
++}
++
++
++static status_t
++device_read(void* _cookie, off_t position, void* buffer, size_t* _length)
++{
++	(void)position;
++	ReaderCookie* cookie = (ReaderCookie*)_cookie;
++	return cookie->device->Read(cookie, buffer, _length);
++}
++
++
++static status_t
++device_write(void* cookie, off_t position, const void* buffer,
++	size_t* _length)
++{
++	(void)cookie;
++	(void)position;
++	(void)buffer;
++	*_length = 0;
++	return B_NOT_ALLOWED;
++}
++
++
++static status_t
++device_control(void* _cookie, uint32 op, void* buffer, size_t length)
++{
++	ReaderCookie* cookie = (ReaderCookie*)_cookie;
++	return cookie->device->Control(cookie, op, buffer, length);
++}
++
++
++module_dependency module_dependencies[] = {
++	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&gDeviceManager },
++	{}
++};
++
++
++static struct device_module_info sMesonIrDevice = {
++	{
++		DEVICE_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	device_init,
++	device_uninit,
++	NULL,	// remove
++
++	device_open,
++	device_close,
++	device_free,
++	device_read,
++	device_write,
++	NULL,	// io
++	device_control,
++
++	NULL,	// select
++	NULL,	// deselect
++};
++
++
++static struct driver_module_info sMesonIrDriver = {
++	{
++		DRIVER_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	supports_device,
++	register_device,
++	init_driver,
++	uninit_driver,
++	register_child_devices,
++	NULL,	// rescan
++	NULL,	// removed
++};
++
++
++module_info* modules[] = {
++	(module_info*)&sMesonIrDriver,
++	(module_info*)&sMesonIrDevice,
++	NULL
++};
+diff --git a/src/preferences/Jamfile b/src/preferences/Jamfile
+index b913663c89..768a931dd2 100644
+--- a/src/preferences/Jamfile
++++ b/src/preferences/Jamfile
+@@ -15,6 +15,7 @@ SubInclude HAIKU_TOP src preferences media ;
+ SubInclude HAIKU_TOP src preferences network ;
+ SubInclude HAIKU_TOP src preferences notifications ;
+ SubInclude HAIKU_TOP src preferences printers ;
++SubInclude HAIKU_TOP src preferences remotecontrol ;
+ SubInclude HAIKU_TOP src preferences repositories ;
+ SubInclude HAIKU_TOP src preferences screen ;
+ SubInclude HAIKU_TOP src preferences screensaver ;
+diff --git a/src/preferences/remotecontrol/Jamfile b/src/preferences/remotecontrol/Jamfile
+new file mode 100644
+index 0000000000..c3c4b134cc
+--- /dev/null
++++ b/src/preferences/remotecontrol/Jamfile
+@@ -0,0 +1,19 @@
++SubDir HAIKU_TOP src preferences remotecontrol ;
++
++UsePrivateHeaders drivers interface shared ;
++
++SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src add-ons input_server devices
++	remote_control ] ;
++SubDirHdrs [ FDirName $(HAIKU_TOP) src add-ons input_server devices
++	remote_control ] ;
++
++Application RemoteControl :
++	RemoteControl.cpp
++	RemoteWindow.cpp
++	KeyNames.cpp
++	Templates.cpp
++	RemoteProfile.cpp
++	: be tracker shared libcolumnlistview.a [ TargetLibstdc++ ]
++	: RemoteControl.rdef
++	;
++Depends RemoteControl : libcolumnlistview.a ;
+diff --git a/src/preferences/remotecontrol/KeyNames.cpp b/src/preferences/remotecontrol/KeyNames.cpp
+new file mode 100644
+index 0000000000..50027d7ae5
+--- /dev/null
++++ b/src/preferences/remotecontrol/KeyNames.cpp
+@@ -0,0 +1,92 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "KeyNames.h"
++
++#include <ctype.h>
++#include <stdio.h>
++
++#include <InterfaceDefs.h>
++
++#include <AutoDeleter.h>
++#include <Keymap.h>
++
++
++const NamedKey kNamedKeys[] = {
++	{ kKeySpace, "Space" },
++	{ kKeyEnter, "Enter" },
++	{ kKeyEscape, "Escape" },
++	{ kKeyTab, "Tab" },
++	{ kKeyBackspace, "Backspace" },
++	{ kKeyDelete, "Delete" },
++	{ kKeyInsert, "Insert" },
++	{ kKeyUp, "Up arrow" },
++	{ kKeyDown, "Down arrow" },
++	{ kKeyLeft, "Left arrow" },
++	{ kKeyRight, "Right arrow" },
++	{ kKeyPageUp, "Page up" },
++	{ kKeyPageDown, "Page down" },
++	{ kKeyHome, "Home" },
++	{ kKeyEnd, "End" },
++	{ kKeyMenu, "Menu" },
++	{ kKeyVolumeUp, "Volume up" },
++	{ kKeyVolumeDown, "Volume down" },
++	{ kKeyMute, "Mute" },
++	{ kKeyPlayPause, "Play/pause" },
++	{ kKeyNextTrack, "Next track" },
++	{ kKeyPreviousTrack, "Previous track" },
++	{ kKeyStop, "Stop" },
++};
++const int32 kNamedKeyCount = B_COUNT_OF(kNamedKeys);
++
++
++bool
++IsModifierKey(uint32 key)
++{
++	BKeymap keymap;
++	return keymap.SetToCurrent() == B_OK && keymap.IsModifierKey(key);
++}
++
++
++BString
++KeystrokeName(uint32 key, uint32 modifiers)
++{
++	if (key == 0)
++		return BString("None");
++
++	BString name;
++	if ((modifiers & B_COMMAND_KEY) != 0)
++		name << "Command+";
++	if ((modifiers & B_CONTROL_KEY) != 0)
++		name << "Control+";
++	if ((modifiers & B_OPTION_KEY) != 0)
++		name << "Option+";
++	if ((modifiers & B_SHIFT_KEY) != 0)
++		name << "Shift+";
++
++	for (int32 i = 0; i < kNamedKeyCount; i++) {
++		if (kNamedKeys[i].key == key)
++			return name << kNamedKeys[i].name;
++	}
++	if (key >= kKeyF1 && key < kKeyF1 + 12)
++		return name << "F" << key - kKeyF1 + 1;
++
++	// what the key types without modifiers
++	BKeymap keymap;
++	char* chars = NULL;
++	int32 count = 0;
++	if (key < 128 && keymap.SetToCurrent() == B_OK)
++		keymap.GetChars(key, 0, 0, &chars, &count);
++	ArrayDeleter<char> charsDeleter(chars);
++	if (count == 1 && isprint((uint8)chars[0]))
++		return name << (char)toupper((uint8)chars[0]);
++	if (count > 0)
++		return name << chars;
++
++	char code[24];
++	snprintf(code, sizeof(code), "Key 0x%" B_PRIx32, key);
++	return name << code;
++}
+diff --git a/src/preferences/remotecontrol/KeyNames.h b/src/preferences/remotecontrol/KeyNames.h
+new file mode 100644
+index 0000000000..d74624a04d
+--- /dev/null
++++ b/src/preferences/remotecontrol/KeyNames.h
+@@ -0,0 +1,61 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef KEY_NAMES_H
++#define KEY_NAMES_H
++
++
++#include <String.h>
++#include <SupportDefs.h>
++
++
++// Haiku's raw key codes (the keyboard layouts' numbering) and the media
++// keys as the HID keyboard driver reports them: usage page << 16 | usage
++enum {
++	kKeyEscape		= 0x01,
++	kKeyF1			= 0x02,
++	kKeyBackspace	= 0x1e,
++	kKeyInsert		= 0x1f,
++	kKeyHome		= 0x20,
++	kKeyPageUp		= 0x21,
++	kKeyTab			= 0x26,
++	kKeyDelete		= 0x34,
++	kKeyEnd			= 0x35,
++	kKeyPageDown	= 0x36,
++	kKeyEnter		= 0x47,
++	kKeyUp			= 0x57,
++	kKeySpace		= 0x5e,
++	kKeyLeft		= 0x61,
++	kKeyDown		= 0x62,
++	kKeyRight		= 0x63,
++	kKeyMenu		= 0x68,
++	kKeyM			= 0x52,
++	kKeyF			= 0x3f,
++	kKeyPeriod		= 0x54,
++
++	kKeyVolumeUp	= 0x0c00e9,
++	kKeyVolumeDown	= 0x0c00ea,
++	kKeyMute		= 0x0c00e2,
++	kKeyPlayPause	= 0x0c00cd,
++	kKeyNextTrack	= 0x0c00b5,
++	kKeyPreviousTrack = 0x0c00b6,
++	kKeyStop		= 0x0c00b7
++};
++
++
++struct NamedKey {
++	uint32		key;
++	const char*	name;
++};
++
++extern const NamedKey kNamedKeys[];
++extern const int32 kNamedKeyCount;
++
++
++// "Command+Shift+Right arrow", "Space", "Volume up", "None"
++BString KeystrokeName(uint32 key, uint32 modifiers);
++bool IsModifierKey(uint32 key);
++
++
++#endif	// KEY_NAMES_H
+diff --git a/src/preferences/remotecontrol/RemoteControl.cpp b/src/preferences/remotecontrol/RemoteControl.cpp
+new file mode 100644
+index 0000000000..e6c3acd37a
+--- /dev/null
++++ b/src/preferences/remotecontrol/RemoteControl.cpp
+@@ -0,0 +1,33 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include <Application.h>
++
++#include "RemoteWindow.h"
++
++
++class RemoteControlApp : public BApplication {
++public:
++	RemoteControlApp()
++		:
++		BApplication("application/x-vnd.Haiku-RemoteControl")
++	{
++	}
++
++	virtual void ReadyToRun()
++	{
++		(new RemoteWindow())->Show();
++	}
++};
++
++
++int
++main()
++{
++	RemoteControlApp app;
++	app.Run();
++	return 0;
++}
+diff --git a/src/preferences/remotecontrol/RemoteControl.rdef b/src/preferences/remotecontrol/RemoteControl.rdef
+new file mode 100644
+index 0000000000..47cd34d030
+--- /dev/null
++++ b/src/preferences/remotecontrol/RemoteControl.rdef
+@@ -0,0 +1,24 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++resource app_signature "application/x-vnd.Haiku-RemoteControl";
++
++resource app_flags B_SINGLE_LAUNCH;
++
++resource app_version {
++	major  = 1,
++	middle = 0,
++	minor  = 0,
++
++	variety = B_APPV_FINAL,
++	internal = 0,
++
++	short_info = "Remote Control",
++	long_info = "Remote Control ©2026 haiku-odroid-c2 port authors"
++};
++
++resource file_types message {
++	"types" = "application/x-vnd.Be-elfexecutable"
++};
+diff --git a/src/preferences/remotecontrol/RemoteWindow.cpp b/src/preferences/remotecontrol/RemoteWindow.cpp
+new file mode 100644
+index 0000000000..9549c9618d
+--- /dev/null
++++ b/src/preferences/remotecontrol/RemoteWindow.cpp
+@@ -0,0 +1,989 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * The Remote Control preferences: a profile per remote, each button's
++ * keystroke, and learning buttons from the remote itself. Every change is
++ * saved at once and the input_server add-on rereads the profiles.
++ *
++ * Learning: the add-on passes the presses here instead of typing them. The
++ * first press gives a new profile its remote (protocol and address); a
++ * button the profile doesn't have yet goes to the selected row if that
++ * one has no code yet (rows from a template), else to a new row.
++ */
++
++
++#include "RemoteWindow.h"
++
++#include <stdio.h>
++
++#include <Alert.h>
++#include <Application.h>
++#include <Button.h>
++#include <CheckBox.h>
++#include <ColumnListView.h>
++#include <ColumnTypes.h>
++#include <ControlLook.h>
++#include <Directory.h>
++#include <File.h>
++#include <FilePanel.h>
++#include <Input.h>
++#include <LayoutBuilder.h>
++#include <ListView.h>
++#include <MenuField.h>
++#include <MenuItem.h>
++#include <MessageFilter.h>
++#include <Path.h>
++#include <PopUpMenu.h>
++#include <ScrollView.h>
++#include <SeparatorView.h>
++#include <StringItem.h>
++#include <StringView.h>
++#include <TextControl.h>
++
++#include <ir_remote.h>
++
++#include "KeyNames.h"
++#include "Templates.h"
++
++
++using RemoteControl::Button;
++using RemoteControl::Profile;
++
++
++// a row from a template whose button wasn't learned yet
++static const uint32 kUnlearned = 0xffffffff;
++
++enum {
++	kMsgProfileSelected		= 'pSel',
++	kMsgNewProfile			= 'pNew',
++	kMsgDuplicateProfile	= 'pDup',
++	kMsgDeleteProfile		= 'pDel',
++	kMsgImport				= 'pImp',
++	kMsgExport				= 'pExp',
++	kMsgNameChanged			= 'pNam',
++	kMsgEnabled				= 'pEna',
++	kMsgForgetRemote		= 'pFgt',
++	kMsgButtonSelected		= 'bSel',
++	kMsgLabelChanged		= 'bLab',
++	kMsgRepeat				= 'bRep',
++	kMsgRemoveButton		= 'bRem',
++	kMsgMoveUp				= 'bUp ',
++	kMsgMoveDown			= 'bDn ',
++	kMsgNamedKey			= 'bKey',
++	kMsgLearn				= 'lrn ',
++	kMsgTemplate			= 'tmpl'
++};
++
++enum {
++	kLabelColumn,
++	kCodeColumn,
++	kKeystrokeColumn,
++	kRepeatColumn
++};
++
++
++static status_t
++control_add_on(uint32 code, BMessage* message)
++{
++	BInputDevice* device = find_input_device(RemoteControl::kDeviceName);
++	if (device == NULL)
++		return B_ENTRY_NOT_FOUND;
++	status_t status = device->Control(code, message);
++	delete device;
++	return status;
++}
++
++
++static bool
++receiver_present()
++{
++	BDirectory directory(IR_REMOTE_DEVICE_DIRECTORY);
++	return directory.InitCheck() == B_OK && directory.CountEntries() > 0;
++}
++
++
++//	#pragma mark - KeystrokeView
++
++
++/*!	Shows a keystroke; when focused, the next key pressed (with its
++	modifiers) becomes it. The window's filter hands it the keys, before
++	shortcuts and keyboard navigation take them.
++*/
++class KeystrokeView : public BView {
++public:
++	KeystrokeView()
++		:
++		BView("keystroke", B_WILL_DRAW | B_NAVIGABLE),
++		fKey(0),
++		fModifiers(0)
++	{
++		SetViewColor(B_TRANSPARENT_COLOR);
++	}
++
++	void SetKeystroke(uint32 key, uint32 modifiers)
++	{
++		fKey = key;
++		fModifiers = modifiers;
++		Invalidate();
++	}
++
++	virtual BSize MinSize()
++	{
++		font_height height;
++		GetFontHeight(&height);
++		return BSize(StringWidth("Command+Control+Shift+Right arrow") + 16,
++			ceilf(height.ascent + height.descent) + 10);
++	}
++
++	virtual BSize MaxSize()
++	{
++		return BSize(B_SIZE_UNLIMITED, MinSize().height);
++	}
++
++	virtual void MakeFocus(bool focus)
++	{
++		BView::MakeFocus(focus);
++		Invalidate();
++	}
++
++	virtual void MouseDown(BPoint where)
++	{
++		(void)where;
++		if (IsEnabled())
++			MakeFocus(true);
++	}
++
++	void SetEnabled(bool enabled)
++	{
++		fEnabled = enabled;
++		if (!enabled && IsFocus())
++			MakeFocus(false);
++		Invalidate();
++	}
++
++	bool IsEnabled() const { return fEnabled; }
++
++	virtual void Draw(BRect updateRect)
++	{
++		(void)updateRect;
++		BRect rect = Bounds();
++		rgb_color base = ui_color(B_PANEL_BACKGROUND_COLOR);
++		SetHighColor(base);
++		FillRect(rect);
++		uint32 flags = fEnabled ? 0 : BControlLook::B_DISABLED;
++		if (IsFocus())
++			flags |= BControlLook::B_FOCUSED;
++		be_control_look->DrawTextControlBorder(this, rect, rect, base, flags);
++		SetHighColor(ui_color(fEnabled ? B_DOCUMENT_TEXT_COLOR
++			: B_PANEL_TEXT_COLOR));
++		SetLowColor(ui_color(B_DOCUMENT_BACKGROUND_COLOR));
++		FillRect(rect, B_SOLID_LOW);
++		SetHighColor(ui_color(B_DOCUMENT_TEXT_COLOR));
++		if (!fEnabled)
++			SetHighColor(tint_color(HighColor(), B_LIGHTEN_1_TINT));
++		BString text = IsFocus() ? BString("Press the keys" B_UTF8_ELLIPSIS)
++			: KeystrokeName(fKey, fModifiers);
++		font_height height;
++		GetFontHeight(&height);
++		DrawString(text, BPoint(rect.left + 4,
++			rect.top + (rect.Height() + height.ascent - height.descent) / 2));
++	}
++
++private:
++	uint32	fKey;
++	uint32	fModifiers;
++	bool	fEnabled = true;
++};
++
++
++class KeystrokeFilter : public BMessageFilter {
++public:
++	KeystrokeFilter(RemoteWindow* window, KeystrokeView* view)
++		:
++		BMessageFilter(B_ANY_DELIVERY, B_ANY_SOURCE),
++		fWindow(window),
++		fView(view)
++	{
++	}
++
++	virtual filter_result Filter(BMessage* message, BHandler** target)
++	{
++		(void)target;
++		if ((message->what != B_KEY_DOWN
++				&& message->what != B_UNMAPPED_KEY_DOWN)
++			|| fWindow->CurrentFocus() != fView) {
++			return B_DISPATCH_MESSAGE;
++		}
++		uint32 key = (uint32)message->GetInt32("key", 0);
++		uint32 modifiers = (uint32)message->GetInt32("modifiers", 0);
++		if (key == 0 || IsModifierKey(key))
++			return B_SKIP_MESSAGE;
++		modifiers &= B_SHIFT_KEY | B_COMMAND_KEY | B_CONTROL_KEY | B_OPTION_KEY
++			| B_LEFT_SHIFT_KEY | B_RIGHT_SHIFT_KEY | B_LEFT_COMMAND_KEY
++			| B_RIGHT_COMMAND_KEY | B_LEFT_CONTROL_KEY | B_RIGHT_CONTROL_KEY
++			| B_LEFT_OPTION_KEY | B_RIGHT_OPTION_KEY;
++		fWindow->KeystrokeChanged(key, modifiers);
++		fView->MakeFocus(false);
++		return B_SKIP_MESSAGE;
++	}
++
++private:
++	RemoteWindow*	fWindow;
++	KeystrokeView*	fView;
++};
++
++
++//	#pragma mark - RemoteWindow
++
++
++RemoteWindow::RemoteWindow()
++	:
++	BWindow(BRect(100, 100, 900, 600), "Remote Control", B_TITLED_WINDOW,
++		B_ASYNCHRONOUS_CONTROLS | B_AUTO_UPDATE_SIZE_LIMITS),
++	fProfiles(10),
++	fLearning(false),
++	fOpenPanel(NULL),
++	fSavePanel(NULL)
++{
++	fProfileList = new BListView("profiles");
++	fProfileList->SetSelectionMessage(new BMessage(kMsgProfileSelected));
++	BScrollView* profileScroll = new BScrollView("profiles scroll",
++		fProfileList, 0, false, true);
++	fNewButton = new BButton("New", new BMessage(kMsgNewProfile));
++	fDuplicateButton = new BButton("Duplicate",
++		new BMessage(kMsgDuplicateProfile));
++	fDeleteButton = new BButton("Delete", new BMessage(kMsgDeleteProfile));
++	fImportButton = new BButton("Import" B_UTF8_ELLIPSIS,
++		new BMessage(kMsgImport));
++	fExportButton = new BButton("Export" B_UTF8_ELLIPSIS,
++		new BMessage(kMsgExport));
++
++	fNameControl = new BTextControl("Name:", "",
++		new BMessage(kMsgNameChanged));
++	fEnabledBox = new BCheckBox("Enabled", new BMessage(kMsgEnabled));
++	fRemoteView = new BStringView("remote", "");
++	fForgetRemoteButton = new BButton("Forget remote",
++		new BMessage(kMsgForgetRemote));
++
++	fButtonList = new BColumnListView("buttons", B_NAVIGABLE,
++		B_FANCY_BORDER, true);
++	fButtonList->SetSelectionMode(B_SINGLE_SELECTION_LIST);
++	fButtonList->SetSelectionMessage(new BMessage(kMsgButtonSelected));
++	float width = be_plain_font->StringWidth("Command+Shift+Right arrow");
++	fButtonList->AddColumn(new BStringColumn("Button", width, 40, 400,
++		B_TRUNCATE_END), kLabelColumn);
++	fButtonList->AddColumn(new BStringColumn("Code",
++		be_plain_font->StringWidth("0xffff  "), 30, 120, B_TRUNCATE_END),
++		kCodeColumn);
++	fButtonList->AddColumn(new BStringColumn("Keystroke", width, 40, 400,
++		B_TRUNCATE_END), kKeystrokeColumn);
++	fButtonList->AddColumn(new BStringColumn("When held",
++		be_plain_font->StringWidth("When held  "), 30, 200, B_TRUNCATE_END),
++		kRepeatColumn);
++
++	fLabelControl = new BTextControl("Button:", "",
++		new BMessage(kMsgLabelChanged));
++	fKeystrokeView = new KeystrokeView();
++	BPopUpMenu* keyMenu = new BPopUpMenu("Keys", true, false);
++	{
++		BMessage* none = new BMessage(kMsgNamedKey);
++		none->AddInt32("key", 0);
++		keyMenu->AddItem(new BMenuItem("None", none));
++		keyMenu->AddSeparatorItem();
++		for (int32 i = 0; i < kNamedKeyCount; i++) {
++			BMessage* message = new BMessage(kMsgNamedKey);
++			message->AddInt32("key", kNamedKeys[i].key);
++			keyMenu->AddItem(new BMenuItem(kNamedKeys[i].name, message));
++		}
++	}
++	keyMenu->SetRadioMode(false);
++	fKeyMenuField = new BMenuField("keys", NULL, keyMenu);
++	fRepeatBox = new BCheckBox("Repeats when held", new BMessage(kMsgRepeat));
++	fRemoveButton = new BButton("Remove", new BMessage(kMsgRemoveButton));
++	fUpButton = new BButton("Up", new BMessage(kMsgMoveUp));
++	fDownButton = new BButton("Down", new BMessage(kMsgMoveDown));
++
++	fLearnButton = new BButton("Learn", new BMessage(kMsgLearn));
++	fLearnButton->SetBehavior(BButton::B_TOGGLE_BEHAVIOR);
++	BPopUpMenu* templateMenu = new BPopUpMenu("Add buttons for",
++		true, false);
++	for (int32 i = 0; i < kTemplateCount; i++) {
++		BMessage* message = new BMessage(kMsgTemplate);
++		message->AddInt32("index", i);
++		templateMenu->AddItem(new BMenuItem(kTemplates[i].name, message));
++	}
++	templateMenu->SetRadioMode(false);
++	templateMenu->SetLabelFromMarked(false);
++	fTemplateField = new BMenuField("templates", NULL, templateMenu);
++
++	fStatusView = new BStringView("status", "");
++	fStatusView->SetExplicitMinSize(BSize(100, B_SIZE_UNSET));
++	fStatusView->SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, B_SIZE_UNSET));
++
++	BLayoutBuilder::Group<>(this, B_VERTICAL)
++		.SetInsets(B_USE_WINDOW_SPACING)
++		.AddGroup(B_HORIZONTAL)
++			.AddGroup(B_VERTICAL, B_USE_SMALL_SPACING, 0.3f)
++				.Add(new BStringView("remotes", "Remotes:"))
++				.Add(profileScroll)
++				.AddGrid(B_USE_SMALL_SPACING, B_USE_SMALL_SPACING)
++					.Add(fNewButton, 0, 0)
++					.Add(fDuplicateButton, 1, 0)
++					.Add(fDeleteButton, 0, 1)
++					.Add(fImportButton, 0, 2)
++					.Add(fExportButton, 1, 2)
++				.End()
++			.End()
++			.AddGroup(B_VERTICAL, B_USE_SMALL_SPACING, 1.0f)
++				.AddGroup(B_HORIZONTAL)
++					.Add(fNameControl)
++					.Add(fEnabledBox)
++				.End()
++				.AddGroup(B_HORIZONTAL)
++					.Add(fRemoteView)
++					.AddGlue()
++					.Add(fForgetRemoteButton)
++				.End()
++				.Add(fButtonList)
++				.AddGrid(B_USE_SMALL_SPACING, B_USE_SMALL_SPACING)
++					.AddTextControl(fLabelControl, 0, 0)
++					.Add(new BStringView("keystroke label", "Keystroke:"), 0, 1)
++					.AddGroup(B_HORIZONTAL, B_USE_SMALL_SPACING, 1, 1)
++						.Add(fKeystrokeView)
++						.Add(fKeyMenuField)
++					.End()
++					.Add(fRepeatBox, 1, 2)
++				.End()
++				.AddGroup(B_HORIZONTAL)
++					.Add(fLearnButton)
++					.Add(fTemplateField)
++					.AddGlue()
++					.Add(fUpButton)
++					.Add(fDownButton)
++					.Add(fRemoveButton)
++				.End()
++			.End()
++		.End()
++		.Add(new BSeparatorView(B_HORIZONTAL))
++		.Add(fStatusView);
++
++	AddCommonFilter(new KeystrokeFilter(this, fKeystrokeView));
++
++	Profile::LoadAll(fProfiles);
++	_UpdateProfileList(0);
++	_UpdateStatus();
++	CenterOnScreen();
++}
++
++
++RemoteWindow::~RemoteWindow()
++{
++	delete fOpenPanel;
++	delete fSavePanel;
++}
++
++
++bool
++RemoteWindow::QuitRequested()
++{
++	_SetLearning(false);
++	be_app->PostMessage(B_QUIT_REQUESTED);
++	return true;
++}
++
++
++void
++RemoteWindow::MessageReceived(BMessage* message)
++{
++	switch (message->what) {
++		case kMsgProfileSelected:
++			_UpdateProfile();
++			_Prompt();
++			break;
++
++		case kMsgNewProfile:
++			_NewProfile(NULL);
++			break;
++
++		case kMsgDuplicateProfile:
++			if (_CurrentProfile() != NULL)
++				_NewProfile(_CurrentProfile());
++			break;
++
++		case kMsgDeleteProfile:
++		{
++			Profile* profile = _CurrentProfile();
++			if (profile == NULL)
++				break;
++			BString text;
++			text << "Delete the profile \"" << profile->Name() << "\"?";
++			BAlert* alert = new BAlert("Delete", text, "Cancel", "Delete",
++				NULL, B_WIDTH_AS_USUAL, B_WARNING_ALERT);
++			alert->SetShortcut(0, B_ESCAPE);
++			if (alert->Go() != 1)
++				break;
++			profile->Remove();
++			int32 index = fProfiles.IndexOf(profile);
++			fProfiles.RemoveItem(profile);
++			control_add_on(RemoteControl::kMsgReloadProfiles, NULL);
++			_UpdateProfileList(index > 0 ? index - 1 : 0);
++			break;
++		}
++
++		case kMsgImport:
++			if (fOpenPanel == NULL) {
++				fOpenPanel = new BFilePanel(B_OPEN_PANEL,
++					new BMessenger(this), NULL, B_FILE_NODE, true);
++			}
++			fOpenPanel->Show();
++			break;
++
++		case B_REFS_RECEIVED:
++			_Import(message);
++			break;
++
++		case kMsgExport:
++		{
++			Profile* profile = _CurrentProfile();
++			if (profile == NULL)
++				break;
++			if (fSavePanel == NULL) {
++				fSavePanel = new BFilePanel(B_SAVE_PANEL,
++					new BMessenger(this), NULL, B_FILE_NODE, false);
++			}
++			fSavePanel->SetSaveText(profile->Name());
++			fSavePanel->Show();
++			break;
++		}
++
++		case B_SAVE_REQUESTED:
++			_Export(message);
++			break;
++
++		case kMsgNameChanged:
++		{
++			Profile* profile = _CurrentProfile();
++			if (profile == NULL || profile->Name() == fNameControl->Text())
++				break;
++			BString oldName = profile->Name();
++			BString name = fNameControl->Text();
++			name.Trim();
++			if (name.IsEmpty()) {
++				fNameControl->SetText(oldName);
++				break;
++			}
++			profile->SetName(_UniqueName(name));
++			_Changed(profile, oldName);
++			_UpdateProfileList(fProfiles.IndexOf(profile));
++			break;
++		}
++
++		case kMsgEnabled:
++		{
++			Profile* profile = _CurrentProfile();
++			if (profile == NULL)
++				break;
++			profile->SetEnabled(fEnabledBox->Value() == B_CONTROL_ON);
++			_Changed(profile);
++			_UpdateProfileList(fProfiles.IndexOf(profile));
++			break;
++		}
++
++		case kMsgForgetRemote:
++		{
++			Profile* profile = _CurrentProfile();
++			if (profile == NULL)
++				break;
++			// the buttons stay, to be learned again from another remote
++			profile->SetRemote(0, 0);
++			for (int32 i = 0; i < profile->CountButtons(); i++)
++				profile->ButtonAt(i)->command = kUnlearned;
++			_Changed(profile);
++			_UpdateProfile();
++			break;
++		}
++
++		case kMsgButtonSelected:
++			_UpdateEditor();
++			_Prompt();
++			break;
++
++		case kMsgLabelChanged:
++		{
++			Button* button = _CurrentButton();
++			if (button == NULL || button->label == fLabelControl->Text())
++				break;
++			button->label = fLabelControl->Text();
++			_Changed(_CurrentProfile());
++			_UpdateButtons(_CurrentButtonIndex());
++			break;
++		}
++
++		case kMsgRepeat:
++		{
++			Button* button = _CurrentButton();
++			if (button == NULL)
++				break;
++			button->repeat = fRepeatBox->Value() == B_CONTROL_ON;
++			_Changed(_CurrentProfile());
++			_UpdateButtons(_CurrentButtonIndex());
++			break;
++		}
++
++		case kMsgNamedKey:
++			KeystrokeChanged((uint32)message->GetInt32("key", 0), 0);
++			break;
++
++		case kMsgRemoveButton:
++		{
++			Profile* profile = _CurrentProfile();
++			int32 index = _CurrentButtonIndex();
++			if (profile == NULL || index < 0)
++				break;
++			profile->RemoveButton(index);
++			_Changed(profile);
++			_UpdateButtons(index < profile->CountButtons() ? index
++				: profile->CountButtons() - 1);
++			break;
++		}
++
++		case kMsgMoveUp:
++		case kMsgMoveDown:
++		{
++			Profile* profile = _CurrentProfile();
++			int32 index = _CurrentButtonIndex();
++			int32 to = index + (message->what == kMsgMoveUp ? -1 : 1);
++			if (profile == NULL || index < 0 || to < 0
++				|| to >= profile->CountButtons())
++				break;
++			profile->MoveButton(index, to);
++			_Changed(profile);
++			_UpdateButtons(to);
++			break;
++		}
++
++		case kMsgLearn:
++			_SetLearning(fLearnButton->Value() == B_CONTROL_ON);
++			break;
++
++		case kMsgTemplate:
++			_AddTemplate(message->GetInt32("index", 0));
++			break;
++
++		case RemoteControl::kMsgButtonEvent:
++			_ButtonEvent(message);
++			break;
++
++		default:
++			BWindow::MessageReceived(message);
++	}
++}
++
++
++void
++RemoteWindow::KeystrokeChanged(uint32 key, uint32 modifiers)
++{
++	Button* button = _CurrentButton();
++	if (button == NULL)
++		return;
++	button->key = key;
++	button->modifiers = modifiers;
++	_Changed(_CurrentProfile());
++	_UpdateButtons(_CurrentButtonIndex());
++}
++
++
++Profile*
++RemoteWindow::_CurrentProfile() const
++{
++	return fProfiles.ItemAt(fProfileList->CurrentSelection());
++}
++
++
++int32
++RemoteWindow::_CurrentButtonIndex() const
++{
++	BRow* row = fButtonList->CurrentSelection();
++	return row != NULL ? fButtonList->IndexOf(row) : -1;
++}
++
++
++Button*
++RemoteWindow::_CurrentButton() const
++{
++	Profile* profile = _CurrentProfile();
++	int32 index = _CurrentButtonIndex();
++	return profile != NULL && index >= 0 ? profile->ButtonAt(index) : NULL;
++}
++
++
++void
++RemoteWindow::_UpdateProfileList(int32 select)
++{
++	fProfileList->RemoveItems(0, fProfileList->CountItems());
++	for (int32 i = 0; i < fProfiles.CountItems(); i++) {
++		const Profile* profile = fProfiles.ItemAt(i);
++		BString text = profile->Name();
++		if (!profile->IsEnabled())
++			text << " (off)";
++		fProfileList->AddItem(new BStringItem(text));
++	}
++	if (select >= fProfiles.CountItems())
++		select = fProfiles.CountItems() - 1;
++	fProfileList->Select(select);
++	if (select < 0)
++		_UpdateProfile();
++}
++
++
++void
++RemoteWindow::_UpdateProfile()
++{
++	Profile* profile = _CurrentProfile();
++	bool enabled = profile != NULL;
++	fNameControl->SetText(enabled ? profile->Name().String() : "");
++	fNameControl->SetEnabled(enabled);
++	fEnabledBox->SetValue(enabled && profile->IsEnabled());
++	fEnabledBox->SetEnabled(enabled);
++	fDuplicateButton->SetEnabled(enabled);
++	fDeleteButton->SetEnabled(enabled);
++	fExportButton->SetEnabled(enabled);
++	fTemplateField->SetEnabled(enabled);
++	fForgetRemoteButton->SetEnabled(enabled && profile->HasRemote());
++
++	BString remote;
++	if (profile == NULL)
++		remote = "No profile: press New, then Learn.";
++	else if (!profile->HasRemote())
++		remote = "Remote: not learned yet (press Learn, then a button).";
++	else {
++		char address[16];
++		snprintf(address, sizeof(address), "0x%" B_PRIx32,
++			profile->Address());
++		remote << "Remote: " << Profile::ProtocolName(profile->Protocol())
++			<< ", address " << address;
++	}
++	fRemoteView->SetText(remote);
++	_UpdateButtons(0);
++}
++
++
++void
++RemoteWindow::_UpdateButtons(int32 select)
++{
++	fButtonList->Clear();
++	Profile* profile = _CurrentProfile();
++	for (int32 i = 0; profile != NULL && i < profile->CountButtons(); i++) {
++		const Button* button = profile->ButtonAt(i);
++		BRow* row = new BRow();
++		row->SetField(new BStringField(button->label), kLabelColumn);
++		char code[16] = "—";
++		if (button->command != kUnlearned) {
++			snprintf(code, sizeof(code), "0x%" B_PRIx32, button->command);
++		}
++		row->SetField(new BStringField(code), kCodeColumn);
++		row->SetField(new BStringField(KeystrokeName(button->key,
++			button->modifiers)), kKeystrokeColumn);
++		row->SetField(new BStringField(button->repeat ? "Repeats" : "Once"),
++			kRepeatColumn);
++		fButtonList->AddRow(row);
++	}
++	if (select >= 0 && select < fButtonList->CountRows()) {
++		BRow* row = fButtonList->RowAt(select);
++		fButtonList->AddToSelection(row);
++		fButtonList->SetFocusRow(row);
++		fButtonList->ScrollTo(row);
++	}
++	_UpdateEditor();
++}
++
++
++void
++RemoteWindow::_UpdateEditor()
++{
++	Button* button = _CurrentButton();
++	bool enabled = button != NULL;
++	fLabelControl->SetText(enabled ? button->label.String() : "");
++	fLabelControl->SetEnabled(enabled);
++	fKeystrokeView->SetKeystroke(enabled ? button->key : 0,
++		enabled ? button->modifiers : 0);
++	fKeystrokeView->SetEnabled(enabled);
++	fKeyMenuField->SetEnabled(enabled);
++	fRepeatBox->SetValue(enabled && button->repeat);
++	fRepeatBox->SetEnabled(enabled);
++	fRemoveButton->SetEnabled(enabled);
++	int32 index = _CurrentButtonIndex();
++	Profile* profile = _CurrentProfile();
++	fUpButton->SetEnabled(enabled && index > 0);
++	fDownButton->SetEnabled(enabled && profile != NULL
++		&& index < profile->CountButtons() - 1);
++}
++
++
++void
++RemoteWindow::_UpdateStatus()
++{
++	if (!receiver_present())
++		_SetStatus("No infrared receiver found.");
++	else if (find_input_device(RemoteControl::kDeviceName) == NULL) {
++		_SetStatus("The Remote Control input_server add-on isn't running "
++			"(restart the input_server).");
++	} else if (fLearning)
++		_Prompt();
++	else
++		_SetStatus("Ready. Press Learn to add buttons from your remote.");
++}
++
++
++void
++RemoteWindow::_SetStatus(const char* text)
++{
++	fStatusView->SetText(text);
++}
++
++
++/*!	While learning: what to press next. */
++void
++RemoteWindow::_Prompt()
++{
++	if (!fLearning)
++		return;
++	Profile* profile = _CurrentProfile();
++	Button* button = _CurrentButton();
++	if (profile == NULL)
++		_SetStatus("Learning: select or create a profile first.");
++	else if (button != NULL && button->command == kUnlearned) {
++		BString text;
++		text << "Learning: press the button for \"" << button->label << "\".";
++		_SetStatus(text);
++	} else
++		_SetStatus("Learning: press a button on the remote.");
++}
++
++
++void
++RemoteWindow::_Changed(const Profile* profile, const char* oldName)
++{
++	if (profile == NULL)
++		return;
++	if (oldName != NULL) {
++		Profile old(*profile);
++		old.SetName(oldName);
++		old.Remove();
++	}
++	status_t status = profile->Save();
++	if (status != B_OK) {
++		BString text;
++		text << "Couldn't save the profile: " << strerror(status);
++		_SetStatus(text);
++	}
++	control_add_on(RemoteControl::kMsgReloadProfiles, NULL);
++}
++
++
++void
++RemoteWindow::_NewProfile(const Profile* copy)
++{
++	Profile* profile = new Profile;
++	if (copy != NULL) {
++		*profile = *copy;
++		profile->SetName(_UniqueName(copy->Name()));
++	} else
++		profile->SetName(_UniqueName("New remote"));
++	fProfiles.AddItem(profile);
++	_Changed(profile);
++	_UpdateProfileList(fProfiles.CountItems() - 1);
++	fNameControl->MakeFocus(true);
++}
++
++
++BString
++RemoteWindow::_UniqueName(const char* name) const
++{
++	BString unique(name);
++	for (int32 number = 2; ; number++) {
++		bool taken = false;
++		for (int32 i = 0; i < fProfiles.CountItems() && !taken; i++)
++			taken = fProfiles.ItemAt(i)->Name().ICompare(unique) == 0;
++		if (!taken)
++			return unique;
++		unique = name;
++		unique << " " << number;
++	}
++}
++
++
++void
++RemoteWindow::_ButtonEvent(BMessage* message)
++{
++	uint32 protocol = (uint32)message->GetInt32("protocol", 0);
++	uint32 address = (uint32)message->GetInt32("address", 0);
++	uint32 command = (uint32)message->GetInt32("command", 0);
++	uint32 flags = (uint32)message->GetInt32("flags", 0);
++
++	char text[160];
++	snprintf(text, sizeof(text), "%s, address 0x%" B_PRIx32 ", button 0x%"
++		B_PRIx32 "%s", Profile::ProtocolName(protocol), address, command,
++		(flags & IR_REMOTE_REPEAT) != 0 ? " (held)" : "");
++	if ((flags & IR_REMOTE_REPEAT) != 0)
++		return;
++
++	Profile* profile = _CurrentProfile();
++	if (profile == NULL) {
++		BString status;
++		status << "Received " << text << ". Create a profile to learn it.";
++		_SetStatus(status);
++		return;
++	}
++	if (!profile->HasRemote()) {
++		profile->SetRemote(protocol, address);
++		_UpdateProfile();
++	} else if (!profile->Matches(protocol, address)
++		&& !(Profile::Family(protocol) == Profile::Family(profile->Protocol())
++			&& address == profile->Address())) {
++		BString status;
++		status << "Received " << text << ": another remote than this "
++			"profile's.";
++		_SetStatus(status);
++		return;
++	}
++
++	int32 index = -1;
++	for (int32 i = 0; i < profile->CountButtons(); i++) {
++		if (profile->ButtonAt(i)->command == command) {
++			index = i;
++			break;
++		}
++	}
++	if (index < 0) {
++		Button* selected = _CurrentButton();
++		if (selected != NULL && selected->command == kUnlearned) {
++			selected->command = command;
++			index = _CurrentButtonIndex();
++			// on to the next row still to learn
++			for (int32 i = index + 1; i < profile->CountButtons(); i++) {
++				if (profile->ButtonAt(i)->command == kUnlearned) {
++					index = i;
++					break;
++				}
++			}
++		} else {
++			Button button;
++			button.label << "Button " << profile->CountButtons() + 1;
++			button.command = command;
++			button.key = 0;
++			button.modifiers = 0;
++			button.repeat = false;
++			profile->AddButton(button);
++			index = profile->CountButtons() - 1;
++		}
++		_Changed(profile);
++	}
++	_UpdateButtons(index);
++
++	BString status;
++	status << "Received " << text << ".";
++	_SetStatus(status);
++	Button* next = _CurrentButton();
++	if (next != NULL && next->command == kUnlearned)
++		_Prompt();
++}
++
++
++void
++RemoteWindow::_SetLearning(bool learning)
++{
++	if (learning == fLearning)
++		return;
++	status_t status;
++	if (learning) {
++		BMessage message;
++		message.AddMessenger("messenger", BMessenger(this));
++		status = control_add_on(RemoteControl::kMsgStartLearning, &message);
++	} else
++		status = control_add_on(RemoteControl::kMsgStopLearning, NULL);
++	fLearning = learning && status == B_OK;
++	fLearnButton->SetValue(fLearning ? B_CONTROL_ON : B_CONTROL_OFF);
++	if (learning && status != B_OK)
++		_UpdateStatus();
++	else if (fLearning)
++		_Prompt();
++	else
++		_UpdateStatus();
++}
++
++
++void
++RemoteWindow::_AddTemplate(int32 index)
++{
++	Profile* profile = _CurrentProfile();
++	if (profile == NULL || index < 0 || index >= kTemplateCount)
++		return;
++	const Template& added = kTemplates[index];
++	int32 first = -1;
++	for (int32 i = 0; i < added.count; i++) {
++		Button button;
++		button.label = added.buttons[i].label;
++		button.command = kUnlearned;
++		button.key = added.buttons[i].key;
++		button.modifiers = added.buttons[i].modifiers;
++		button.repeat = added.buttons[i].repeat;
++		if (profile->AddButton(button) != NULL && first < 0)
++			first = profile->CountButtons() - 1;
++	}
++	_Changed(profile);
++	_UpdateButtons(first);
++	if (!fLearning)
++		_SetStatus("Now press Learn, then each button the list asks for.");
++	else
++		_Prompt();
++}
++
++
++void
++RemoteWindow::_Import(BMessage* message)
++{
++	entry_ref ref;
++	for (int32 i = 0; message->FindRef("refs", i, &ref) == B_OK; i++) {
++		BPath path(&ref);
++		Profile* profile = new Profile;
++		if (profile->Load(path.Path()) != B_OK) {
++			delete profile;
++			BString text;
++			text << "\"" << ref.name << "\" is no Remote Control profile.";
++			_SetStatus(text);
++			continue;
++		}
++		profile->SetName(_UniqueName(profile->Name()));
++		fProfiles.AddItem(profile);
++		_Changed(profile);
++		_UpdateProfileList(fProfiles.CountItems() - 1);
++	}
++}
++
++
++void
++RemoteWindow::_Export(BMessage* message)
++{
++	Profile* profile = _CurrentProfile();
++	entry_ref directoryRef;
++	const char* name;
++	if (profile == NULL || message->FindRef("directory", &directoryRef) != B_OK
++		|| message->FindString("name", &name) != B_OK)
++		return;
++	BPath path(&directoryRef);
++	path.Append(name);
++	BMessage archive;
++	profile->Archive(&archive);
++	BFile file(path.Path(), B_WRITE_ONLY | B_CREATE_FILE | B_ERASE_FILE);
++	status_t status = file.InitCheck();
++	if (status == B_OK)
++		status = archive.Flatten(&file);
++	BString text;
++	if (status == B_OK)
++		text << "Exported to " << path.Path() << ".";
++	else
++		text << "Couldn't export: " << strerror(status);
++	_SetStatus(text);
++}
+diff --git a/src/preferences/remotecontrol/RemoteWindow.h b/src/preferences/remotecontrol/RemoteWindow.h
+new file mode 100644
+index 0000000000..8cc3c4bcdf
+--- /dev/null
++++ b/src/preferences/remotecontrol/RemoteWindow.h
+@@ -0,0 +1,95 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef REMOTE_WINDOW_H
++#define REMOTE_WINDOW_H
++
++
++#include <ObjectList.h>
++#include <Window.h>
++
++#include "RemoteProfile.h"
++
++
++class BButton;
++class BCheckBox;
++class BColumnListView;
++class BFilePanel;
++class BListView;
++class BMenuField;
++class BRow;
++class BStringView;
++class BTextControl;
++class KeystrokeView;
++
++
++class RemoteWindow : public BWindow {
++public:
++								RemoteWindow();
++	virtual						~RemoteWindow();
++
++	virtual	bool				QuitRequested();
++	virtual	void				MessageReceived(BMessage* message);
++
++			void				KeystrokeChanged(uint32 key,
++									uint32 modifiers);
++
++private:
++			RemoteControl::Profile* _CurrentProfile() const;
++			RemoteControl::Button* _CurrentButton() const;
++			int32				_CurrentButtonIndex() const;
++
++			void				_UpdateProfileList(int32 select);
++			void				_UpdateProfile();
++			void				_UpdateButtons(int32 select);
++			void				_UpdateEditor();
++			void				_UpdateStatus();
++			void				_SetStatus(const char* text);
++			void				_Prompt();
++
++			void				_Changed(const RemoteControl::Profile* profile,
++									const char* oldName = NULL);
++			void				_NewProfile(const RemoteControl::Profile*
++									copy);
++			BString				_UniqueName(const char* name) const;
++			void				_ButtonEvent(BMessage* message);
++			void				_SetLearning(bool learning);
++			void				_AddTemplate(int32 index);
++			void				_Import(BMessage* message);
++			void				_Export(BMessage* message);
++
++			BObjectList<RemoteControl::Profile, true> fProfiles;
++
++			BListView*			fProfileList;
++			BButton*			fNewButton;
++			BButton*			fDuplicateButton;
++			BButton*			fDeleteButton;
++			BButton*			fImportButton;
++			BButton*			fExportButton;
++
++			BTextControl*		fNameControl;
++			BCheckBox*			fEnabledBox;
++			BStringView*		fRemoteView;
++			BButton*			fForgetRemoteButton;
++			BColumnListView*	fButtonList;
++
++			BTextControl*		fLabelControl;
++			KeystrokeView*		fKeystrokeView;
++			BMenuField*			fKeyMenuField;
++			BCheckBox*			fRepeatBox;
++			BButton*			fRemoveButton;
++			BButton*			fUpButton;
++			BButton*			fDownButton;
++
++			BButton*			fLearnButton;
++			BMenuField*			fTemplateField;
++			BStringView*		fStatusView;
++
++			bool				fLearning;
++			BFilePanel*			fOpenPanel;
++			BFilePanel*			fSavePanel;
++};
++
++
++#endif	// REMOTE_WINDOW_H
+diff --git a/src/preferences/remotecontrol/Templates.cpp b/src/preferences/remotecontrol/Templates.cpp
+new file mode 100644
+index 0000000000..d4f1480915
+--- /dev/null
++++ b/src/preferences/remotecontrol/Templates.cpp
+@@ -0,0 +1,72 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * The keystrokes come from the applications' own key handling: MediaPlayer
++ * (MainWin::_KeyDown), BeTunes (its Controls menu, and Space for play),
++ * and the media keys the Shortcuts preferences bind to setvolume.
++ */
++
++
++#include "Templates.h"
++
++#include <InterfaceDefs.h>
++
++#include "KeyNames.h"
++
++
++static const uint32 kCommand = B_COMMAND_KEY | B_LEFT_COMMAND_KEY;
++static const uint32 kShift = B_SHIFT_KEY | B_LEFT_SHIFT_KEY;
++
++
++static const TemplateButton kMediaPlayer[] = {
++	{ "Play/pause", kKeySpace, 0, false },
++	{ "Volume up", kKeyUp, 0, true },
++	{ "Volume down", kKeyDown, 0, true },
++	{ "Mute", kKeyM, 0, false },
++	{ "Forward 5 s", kKeyRight, 0, true },
++	{ "Back 5 s", kKeyLeft, 0, true },
++	{ "Forward 30 s", kKeyRight, kShift, true },
++	{ "Back 30 s", kKeyLeft, kShift, true },
++	{ "Next", kKeyPageUp, 0, false },
++	{ "Previous", kKeyPageDown, 0, false },
++	{ "Full screen", kKeyF, 0, false },
++	{ "Leave full screen", kKeyEscape, 0, false },
++};
++
++static const TemplateButton kBeTunes[] = {
++	{ "Play/pause", kKeySpace, 0, false },
++	{ "Stop", kKeyPeriod, kCommand, false },
++	{ "Next song", kKeyRight, kCommand, false },
++	{ "Previous song", kKeyLeft, kCommand, false },
++	{ "Volume up", kKeyUp, kCommand, true },
++	{ "Volume down", kKeyDown, kCommand, true },
++	{ "Mute", kKeyM, kCommand, false },
++};
++
++static const TemplateButton kDesktop[] = {
++	{ "Up", kKeyUp, 0, true },
++	{ "Down", kKeyDown, 0, true },
++	{ "Left", kKeyLeft, 0, true },
++	{ "Right", kKeyRight, 0, true },
++	{ "OK", kKeyEnter, 0, false },
++	{ "Back", kKeyEscape, 0, false },
++	{ "Next field", kKeyTab, 0, false },
++	{ "Page up", kKeyPageUp, 0, true },
++	{ "Page down", kKeyPageDown, 0, true },
++};
++
++static const TemplateButton kVolume[] = {
++	{ "Volume up (anywhere)", kKeyVolumeUp, 0, true },
++	{ "Volume down (anywhere)", kKeyVolumeDown, 0, true },
++	{ "Mute (anywhere)", kKeyMute, 0, false },
++};
++
++
++const Template kTemplates[] = {
++	{ "MediaPlayer", kMediaPlayer, B_COUNT_OF(kMediaPlayer) },
++	{ "BeTunes", kBeTunes, B_COUNT_OF(kBeTunes) },
++	{ "Desktop navigation", kDesktop, B_COUNT_OF(kDesktop) },
++	{ "System volume", kVolume, B_COUNT_OF(kVolume) },
++};
++const int32 kTemplateCount = B_COUNT_OF(kTemplates);
+diff --git a/src/preferences/remotecontrol/Templates.h b/src/preferences/remotecontrol/Templates.h
+new file mode 100644
+index 0000000000..85aedf1f1f
+--- /dev/null
++++ b/src/preferences/remotecontrol/Templates.h
+@@ -0,0 +1,30 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef TEMPLATES_H
++#define TEMPLATES_H
++
++
++#include <SupportDefs.h>
++
++
++struct TemplateButton {
++	const char*	label;
++	uint32		key;
++	uint32		modifiers;
++	bool		repeat;
++};
++
++struct Template {
++	const char*				name;
++	const TemplateButton*	buttons;
++	int32					count;
++};
++
++// buttons named for what they do in an application, with its keystrokes
++extern const Template kTemplates[];
++extern const int32 kTemplateCount;
++
++
++#endif	// TEMPLATES_H

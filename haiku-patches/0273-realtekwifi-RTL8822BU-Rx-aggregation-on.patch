@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Tue, 3 Nov 2026 17:13:31 -0500
+Subject: [PATCH 273/342] realtekwifi: RTL8822BU Rx aggregation on
+
+Every received frame took a USB transfer of its own. The setting rtw88 selects
+under load is now on all the time, and a transfer holds what it can bring.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_attach.c |  3 +++
+ .../realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_init.c   | 12 +++++-------
+ 2 files changed, 8 insertions(+), 7 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_attach.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_attach.c
+index aa5bf8d032..48699227f7 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_attach.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_attach.c
+@@ -241,6 +241,9 @@ r22bu_attach(struct rtwn_usb_softc *uc)
+ {
+ 	struct rtwn_softc *sc		= &uc->uc_sc;
+ 
++	/* Rx aggregation: 5 KiB and then a frame of up to 11454 bytes */
++	uc->uc_rx_buf_size = RTWN_USB_RXBUFSZ_MAX;
++
+ 	/* USB part. */
+ 	uc->uc_align_rx			= r22bu_align_rx;
+ 	uc->tx_agg_desc_num		= 1;	/* TODO: Tx aggregation */
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_init.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_init.c
+index 260dc532d2..9b31c7d710 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_init.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_init.c
+@@ -245,17 +245,15 @@ r22bu_set_rx_agg(struct rtwn_softc *sc, int enable)
+ }
+ 
+ /*
+- * sc_init_rx_agg: start with the low-traffic setting rtw88's watchdog
+- * selects (rtw_hci_dynamic_rx_agg(rtwdev, false)).
+- *
+- * TODO (later phase): switch to the aggregating setting (size 0x5,
+- * timeout 0x20) under load, like rtw_watch_dog_work() does when the
+- * unicast throughput is >= 1 Mbps.
++ * sc_init_rx_agg: the aggregating setting rtw88's watchdog selects when the
++ * unicast throughput is >= 1 Mbps (rtw_hci_dynamic_rx_agg(rtwdev, true)),
++ * all the time. A frame of its own costs a USB transfer, and that limited a
++ * download to 5.7 MB/s on the ODROID-C2's controller.
+  */
+ void
+ r22bu_init_rx_agg(struct rtwn_softc *sc)
+ {
+-	r22bu_set_rx_agg(sc, 0);
++	r22bu_set_rx_agg(sc, 1);
+ }
+ 
+ /* rtw_usb_phy_write() for SuperSpeed */

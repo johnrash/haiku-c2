@@ -1,0 +1,985 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 00:20:14 -0400
+Subject: [PATCH 007/342] mmc: add Amlogic Meson GX SD/eMMC host controller
+ driver
+
+mmc_bus_interface for the "amlogic,meson-gx-mmc" SD_EMMC controller of the
+S905 (ODROID-C2), attached through the device tree:
+
+- polled completion, one descriptor per command written into the CMD_*
+  registers (CMD_ARG starts it), DMA with explicit cache maintenance through
+  the physical map, multi-block transfers ended with CMD12
+- 400 kHz from the 24 MHz crystal for identification, 1 GHz/40 = 25 MHz
+  after; core phase 180 degrees as needed on the ODROID-C2
+- 136-bit responses shifted to drop the CRC byte, as the MMC stack expects
+- register address translated through the parent buses' "ranges"
+- skips device tree nodes with status "disabled" (sd_emmc_a's clock is
+  gated; touching it stalls the bus)
+- for now only non-removable slots (the eMMC) are used
+- DMA alignment of one sector: smaller values sent mmc_disk reads through a
+  bounce-buffer path that never completed
+
+Pin muxing, clock gates and card power are left as U-Boot set them up.
+Built and packaged (with a boot module link) for arm64 only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/jam/packages/Haiku                      |   2 +
+ src/add-ons/kernel/busses/mmc/Jamfile         |   6 +
+ .../kernel/busses/mmc/meson_gx_mmc.cpp        | 912 ++++++++++++++++++
+ 3 files changed, 920 insertions(+)
+ create mode 100644 src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
+
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index 9b838161c8..5e0ae56310 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -41,6 +41,7 @@ AddFilesToPackage add-ons kernel busses i2c :
+ 	;
+ AddFilesToPackage add-ons kernel busses mmc :
+ 	sdhci
++	meson_gx_mmc@arm64
+ 	;
+ AddFilesToPackage add-ons kernel busses pci :
+ 	<pci>designware@riscv64
+@@ -351,6 +352,7 @@ AddBootModuleSymlinksToPackage
+ 	silicon_image_3112
+ 	smbios@x86,x86_64
+ 	sdhci
++	meson_gx_mmc@arm64
+ 	ufshci
+ 	usb
+ 	usb_disk
+diff --git a/src/add-ons/kernel/busses/mmc/Jamfile b/src/add-ons/kernel/busses/mmc/Jamfile
+index 6190c2fa0d..047bf0f0f9 100644
+--- a/src/add-ons/kernel/busses/mmc/Jamfile
++++ b/src/add-ons/kernel/busses/mmc/Jamfile
+@@ -13,3 +13,9 @@ KernelAddon sdhci :
+ 	sdhci_acpi.cpp
+ 	sdhci_pci.cpp
+ ;
++
++if $(TARGET_ARCH) = arm64 {
++	KernelAddon meson_gx_mmc :
++		meson_gx_mmc.cpp
++	;
++}
+diff --git a/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp b/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
+new file mode 100644
+index 0000000000..e23d928066
+--- /dev/null
++++ b/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
+@@ -0,0 +1,912 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * Amlogic Meson GX "SD_EMMC" host controller (S905, ODROID-C2) for the MMC
++ * bus manager.
++ *
++ * The programming model follows the Amlogic S905 public datasheet (chapter
++ * 34) and NetBSD's mesongx_mmc.c (BSD-2-Clause), which carries the fixes
++ * needed for the ODROID-C2's eMMC.
++ *
++ * This first version is deliberately simple:
++ * - completion is polled, interrupts stay disabled;
++ * - every command is a single descriptor written straight into the CMD_*
++ *   registers (writing CMD_ARG starts it), data goes by DMA from one
++ *   contiguous buffer, multi-block transfers are ended with CMD12;
++ * - pin muxing, clock gates and card power are left as the firmware
++ *   (U-Boot) set them up;
++ * - removable cards (the SD slot) are read-only until writing has been
++ *   proven on the eMMC.
++ */
++
++
++#include <algorithm>
++#include <new>
++#include <stdio.h>
++#include <string.h>
++
++#include <ByteOrder.h>
++#include <KernelExport.h>
++#include <device_manager.h>
++#include <drivers/bus/FDT.h>
++
++#include <AutoDeleterDrivers.h>
++#include <arch/arm64/arch_kernel.h>
++#include <lock.h>
++#include <util/AutoLock.h>
++
++#include "IORequest.h"
++#include "mmc.h"
++
++
++#define MESON_GX_MMC_MODULE_NAME "busses/mmc/meson_gx_mmc/driver_v1"
++
++//#define TRACE_MESON_GX_MMC
++#ifdef TRACE_MESON_GX_MMC
++#	define TRACE(x...)	dprintf("meson_gx_mmc: " x)
++#else
++#	define TRACE(x...)
++#endif
++#define INFO(x...)		dprintf("meson_gx_mmc: " x)
++#define ERROR(x...)		dprintf("meson_gx_mmc: " x)
++
++
++// Registers (byte offsets)
++enum {
++	kClock			= 0x00,
++	kDelay			= 0x04,
++	kAdjust			= 0x08,
++	kStart			= 0x40,
++	kConfig			= 0x44,
++	kStatus			= 0x48,
++	kIrqEnable		= 0x4c,
++	kCommandConfig	= 0x50,
++	kCommandArg		= 0x54,
++	kCommandData	= 0x58,
++	kCommandResp	= 0x5c,
++	kCommandResp1	= 0x60,
++	kCommandResp2	= 0x64,
++	kCommandResp3	= 0x68,
++};
++
++// CLOCK
++#define CLOCK_DIV_MASK			0x3f
++#define CLOCK_SRC_XTAL			(0 << 6)	// clkin0, 24 MHz
++#define CLOCK_SRC_FCLK_DIV2		(1 << 6)	// clkin1, 1 GHz
++#define CLOCK_CORE_PHASE_180	(2 << 8)
++#define CLOCK_ALWAYS_ON			(1 << 24)	// bit 24 on GX (28 on AXG)
++
++// CONFIG
++#define CONFIG_BUS_WIDTH_MASK	0x3
++#define CONFIG_BUS_WIDTH_1		0
++#define CONFIG_BUS_WIDTH_4		1
++#define CONFIG_BUS_WIDTH_8		2
++#define CONFIG_BLOCK_LEN_SHIFT	4			// log2 of the block size
++#define CONFIG_RESP_TIMEOUT_SHIFT 8			// 2^n core clock cycles
++#define CONFIG_RC_CC_SHIFT		12			// 2^n cycles between commands
++#define CONFIG_STOP_CLOCK		(1 << 22)
++#define CONFIG_ERR_ABORT		(1 << 27)
++
++// STATUS (write 1 to clear bits 0-13)
++#define STATUS_RXD_ERR_MASK		0xff
++#define STATUS_TXD_ERR			(1 << 8)
++#define STATUS_DESC_ERR			(1 << 9)
++#define STATUS_RESP_ERR			(1 << 10)
++#define STATUS_RESP_TIMEOUT		(1 << 11)
++#define STATUS_DESC_TIMEOUT		(1 << 12)
++#define STATUS_END_OF_CHAIN		(1 << 13)
++#define STATUS_CLEAR_MASK		0x3fff
++#define STATUS_ERROR_MASK		0x7ff
++#define STATUS_DONE_MASK		(STATUS_END_OF_CHAIN | STATUS_DESC_TIMEOUT \
++	| STATUS_RESP_TIMEOUT | STATUS_ERROR_MASK)
++
++// CMD_CFG (descriptor word 0)
++#define COMMAND_LENGTH_MASK		0x1ff		// blocks (block mode) or bytes
++#define COMMAND_BLOCK_MODE		(1 << 9)
++#define COMMAND_R1B				(1 << 10)	// wait for DAT0 busy to end
++#define COMMAND_END_OF_CHAIN	(1 << 11)
++#define COMMAND_TIMEOUT_SHIFT	12			// 2^n ms
++#define COMMAND_NO_RESP			(1 << 16)
++#define COMMAND_DATA_IO			(1 << 18)
++#define COMMAND_DATA_WRITE		(1 << 19)
++#define COMMAND_RESP_NO_CRC		(1 << 20)
++#define COMMAND_RESP_128		(1 << 21)
++#define COMMAND_RESP_NUM		(1 << 22)	// response stays in CMD_RSP*
++#define COMMAND_INDEX_SHIFT		24
++#define COMMAND_OWNER			(1u << 31)
++
++static const uint32 kBlockSize = 512;
++static const uint32 kMaxBlocksPerCommand = COMMAND_LENGTH_MASK;
++static const uint32 kXtalRate = 24000000;
++static const uint32 kFclkDiv2Rate = 1000000000;
++
++// Amlogic HHI clock registers, logged at attach to check that the
++// firmware left the controllers' clock inputs as we expect.
++static const phys_addr_t kHhiBase = 0xc883c000;
++static const uint32 kHhiGclkMpeg0 = 0x50 * 4;
++static const uint32 kHhiNandClockControl = 0x97 * 4;
++static const uint32 kHhiSdEmmcClockControl = 0x99 * 4;
++
++
++static device_manager_info* gDeviceManager;
++
++
++enum response_type {
++	kNoResponse,
++	kR1,
++	kR1b,
++	kR2,
++	kR3,
++	kR6,
++	kR7,
++};
++
++
++static void
++dcache_maintain(phys_addr_t physical, size_t length, bool invalidate)
++{
++	// All RAM is mapped at KERNEL_PMAP_BASE as normal, write-back memory;
++	// the controller's DMA does not snoop the CPU caches.
++	uint64 ctr;
++	asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
++	const addr_t lineSize = 4 << ((ctr >> 16) & 0xf);
++
++	addr_t start = (KERNEL_PMAP_BASE + physical) & ~(lineSize - 1);
++	addr_t end = KERNEL_PMAP_BASE + physical + length;
++	for (addr_t address = start; address < end; address += lineSize) {
++		if (invalidate)
++			asm volatile("dc civac, %0" : : "r"(address) : "memory");
++		else
++			asm volatile("dc cvac, %0" : : "r"(address) : "memory");
++	}
++	asm volatile("dsb sy" : : : "memory");
++}
++
++
++class MesonMmc {
++public:
++								MesonMmc(area_id area, volatile uint32* registers,
++									phys_addr_t physicalBase, bool readOnly);
++								~MesonMmc();
++
++			void				Init();
++
++			status_t			SetClock(uint32 kilohertz);
++			void				SetBusWidth(int width);
++			void				SetCardType(card_type type);
++			void				SetScanSemaphore(sem_id semaphore);
++
++			status_t			ExecuteCommand(uint8 command, uint32 argument,
++									uint32* result);
++			status_t			DoIO(uint8 command, IOOperation* operation,
++									bool offsetAsSectors);
++
++private:
++			uint32				_Read(uint32 offset)
++									{ return fRegisters[offset / 4]; }
++			void				_Write(uint32 offset, uint32 value)
++									{ fRegisters[offset / 4] = value; }
++
++			bool				_IsMmc() const;
++			response_type		_ResponseType(uint8 command,
++									uint32 argument) const;
++			status_t			_Execute(uint8 command, uint32 argument,
++									uint32* result, phys_addr_t data,
++									uint32 blockCount, bool write);
++
++private:
++			area_id				fArea;
++			volatile uint32*	fRegisters;
++			phys_addr_t			fPhysicalBase;
++			bool				fReadOnly;
++			mutex				fLock;
++			card_type			fCardType;
++			bool				fAppCommand;
++			sem_id				fScanSemaphore;
++};
++
++
++MesonMmc::MesonMmc(area_id area, volatile uint32* registers,
++	phys_addr_t physicalBase, bool readOnly)
++	:
++	fArea(area),
++	fRegisters(registers),
++	fPhysicalBase(physicalBase),
++	fReadOnly(readOnly),
++	fCardType(CARD_TYPE_UNKNOWN),
++	fAppCommand(false),
++	fScanSemaphore(-1)
++{
++	mutex_init(&fLock, "meson_gx_mmc");
++}
++
++
++MesonMmc::~MesonMmc()
++{
++	mutex_destroy(&fLock);
++	delete_area(fArea);
++}
++
++
++void
++MesonMmc::Init()
++{
++	// Start from a known state instead of whatever the firmware left:
++	// no descriptor chain, no interrupts (we poll), 1-bit bus, 512-byte
++	// blocks, 16 cycles between commands, 256 cycle response timeout.
++	_Write(kStart, 0);
++	_Write(kIrqEnable, 0);
++	_Write(kStatus, STATUS_CLEAR_MASK);
++	_Write(kDelay, 0);
++	_Write(kAdjust, 0);
++	_Write(kConfig, CONFIG_ERR_ABORT | (4 << CONFIG_RC_CC_SHIFT)
++		| (8 << CONFIG_RESP_TIMEOUT_SHIFT) | (9 << CONFIG_BLOCK_LEN_SHIFT)
++		| CONFIG_BUS_WIDTH_1);
++
++	SetClock(400);
++}
++
++
++status_t
++MesonMmc::SetClock(uint32 kilohertz)
++{
++	uint32 rate = kilohertz * 1000;
++	if (rate == 0)
++		return B_BAD_VALUE;
++
++	// Slow clocks come from the 24 MHz crystal, fast ones from the 1 GHz
++	// fixed PLL output; never exceed the requested rate.
++	uint32 source;
++	uint32 parentRate;
++	if (rate < kFclkDiv2Rate / CLOCK_DIV_MASK) {
++		source = CLOCK_SRC_XTAL;
++		parentRate = kXtalRate;
++	} else {
++		source = CLOCK_SRC_FCLK_DIV2;
++		parentRate = kFclkDiv2Rate;
++	}
++	uint32 divider = (parentRate + rate - 1) / rate;
++	divider = std::max(std::min(divider, (uint32)CLOCK_DIV_MASK), (uint32)1);
++
++	MutexLocker locker(fLock);
++
++	// The clock may only change while it is stopped.
++	uint32 config = _Read(kConfig);
++	_Write(kConfig, config | CONFIG_STOP_CLOCK);
++	_Write(kClock, CLOCK_ALWAYS_ON | CLOCK_CORE_PHASE_180 | source | divider);
++	_Write(kConfig, config & ~CONFIG_STOP_CLOCK);
++
++	INFO("%#" B_PRIxPHYSADDR ": bus clock %" B_PRIu32 " kHz\n", fPhysicalBase,
++		parentRate / divider / 1000);
++	return B_OK;
++}
++
++
++void
++MesonMmc::SetBusWidth(int width)
++{
++	uint32 bits;
++	switch (width) {
++		case 8:
++			bits = CONFIG_BUS_WIDTH_8;
++			break;
++		case 4:
++			bits = CONFIG_BUS_WIDTH_4;
++			break;
++		default:
++			bits = CONFIG_BUS_WIDTH_1;
++			break;
++	}
++
++	MutexLocker locker(fLock);
++	_Write(kConfig, (_Read(kConfig) & ~CONFIG_BUS_WIDTH_MASK) | bits);
++	INFO("%#" B_PRIxPHYSADDR ": %d-bit bus\n", fPhysicalBase, width);
++}
++
++
++void
++MesonMmc::SetCardType(card_type type)
++{
++	fCardType = type;
++}
++
++
++void
++MesonMmc::SetScanSemaphore(sem_id semaphore)
++{
++	// Both slots are treated as populated: the eMMC is soldered in and the
++	// SD card holds the firmware we booted from. There is no card detect.
++	fScanSemaphore = semaphore;
++	release_sem(fScanSemaphore);
++}
++
++
++bool
++MesonMmc::_IsMmc() const
++{
++	return fCardType == CARD_TYPE_MMC
++		|| fCardType == CARD_TYPE_MMC_EXTENDED_CAPACITY;
++}
++
++
++response_type
++MesonMmc::_ResponseType(uint8 command, uint32 argument) const
++{
++	switch (command) {
++		case GO_IDLE_STATE:
++			return kNoResponse;
++		case MMC_SEND_OP_COND:
++		case SD_SEND_OP_COND:		// ACMD41
++			return kR3;
++		case ALL_SEND_CID:
++		case SEND_CSD:
++			return kR2;
++		case SD_SEND_RELATIVE_ADDR:	// MMC_SET_RELATIVE_ADDR
++			return _IsMmc() ? kR1 : kR6;
++		case MMC_SWITCH:			// ACMD6 SD_SET_BUS_WIDTH after CMD55
++			return fAppCommand || !_IsMmc() ? kR1 : kR1b;
++		case SELECT_DESELECT_CARD:
++			return argument == 0 ? kNoResponse : kR1b;
++		case SD_SEND_IF_COND:		// MMC_SEND_EXT_CSD
++			return _IsMmc() ? kR1 : kR7;
++		case SD_STOP_TRANSMISSION:
++		case SD_ERASE:
++			return kR1b;
++		default:
++			return kR1;
++	}
++}
++
++
++status_t
++MesonMmc::_Execute(uint8 command, uint32 argument, uint32* result,
++	phys_addr_t data, uint32 blockCount, bool write)
++{
++	response_type type = _ResponseType(command, argument);
++	fAppCommand = command == SD_APP_CMD;
++
++	uint32 config = COMMAND_OWNER | COMMAND_END_OF_CHAIN
++		| ((uint32)command << COMMAND_INDEX_SHIFT);
++	switch (type) {
++		case kNoResponse:
++			config |= COMMAND_NO_RESP;
++			break;
++		case kR2:
++			config |= COMMAND_RESP_128 | COMMAND_RESP_NUM;
++			break;
++		case kR3:
++			config |= COMMAND_RESP_NO_CRC | COMMAND_RESP_NUM;
++			break;
++		case kR1b:
++			config |= COMMAND_R1B | COMMAND_RESP_NUM;
++			break;
++		default:
++			config |= COMMAND_RESP_NUM;
++			break;
++	}
++
++	// hardware timeout 2^n ms, software timeout a bit longer
++	uint32 timeoutShift = 10;
++	if (blockCount > 0) {
++		config |= COMMAND_DATA_IO | COMMAND_BLOCK_MODE | blockCount;
++		if (write)
++			config |= COMMAND_DATA_WRITE;
++		timeoutShift = 12;
++	} else if (type == kR1b)
++		timeoutShift = 12;
++	config |= timeoutShift << COMMAND_TIMEOUT_SHIFT;
++	bigtime_t timeout = (1000LL << timeoutShift) + 1000000;
++
++	size_t dataLength = blockCount * kBlockSize;
++	if (blockCount > 0)
++		dcache_maintain(data, dataLength, !write);
++
++	_Write(kStart, 0);
++	_Write(kStatus, STATUS_CLEAR_MASK);
++	_Write(kCommandConfig, config);
++	_Write(kCommandData, (uint32)data);
++	_Write(kCommandResp, 0);
++	asm volatile("dsb sy" : : : "memory");
++	_Write(kCommandArg, argument);
++		// starts the command
++
++	bigtime_t started = system_time();
++	bigtime_t deadline = started + timeout;
++	uint32 status;
++	TRACE("CMD%u arg %#" B_PRIx32 " %s %" B_PRIu32 " blocks at %#"
++		B_PRIxPHYSADDR " cfg %#" B_PRIx32 "\n", command, argument,
++		write ? "write" : "read", blockCount, data, config);
++	for (int32 round = 0; ; round++) {
++		status = _Read(kStatus);
++		if ((status & STATUS_DONE_MASK) != 0)
++			break;
++		if (system_time() > deadline)
++			break;
++		if (round % 100000 == 99999) {
++			TRACE("CMD%u still running, status %#" B_PRIx32 "\n", command,
++				status);
++		}
++		if (round > 50)
++			snooze(10);
++		else
++			spin(1);
++	}
++
++	if ((status & STATUS_DONE_MASK) != 0
++		&& (status & STATUS_END_OF_CHAIN) == 0) {
++		// An error was flagged first; give the aborted descriptor a moment
++		// to finish before the next command is issued.
++		bigtime_t end = system_time() + 10000;
++		while ((_Read(kStatus) & STATUS_END_OF_CHAIN) == 0
++			&& system_time() < end) {
++			spin(10);
++		}
++	}
++	_Write(kStatus, STATUS_CLEAR_MASK);
++
++	TRACE("CMD%u done: status %#" B_PRIx32 " after %" B_PRIdBIGTIME
++		" us\n", command, status, system_time() - started);
++
++	if (blockCount > 0 && !write)
++		dcache_maintain(data, dataLength, true);
++
++	if ((status & STATUS_DONE_MASK) == 0) {
++		ERROR("CMD%u: no completion (status %#" B_PRIx32 ")\n", command,
++			_Read(kStatus));
++		return B_TIMED_OUT;
++	}
++	if ((status & (STATUS_RESP_TIMEOUT | STATUS_DESC_TIMEOUT)) != 0) {
++		// expected while probing (CMD8 on eMMC, CMD55 on MMC)
++		TRACE("CMD%u: timeout (status %#" B_PRIx32 ")\n", command, status);
++		return B_TIMED_OUT;
++	}
++	if ((status & STATUS_ERROR_MASK) != 0) {
++		ERROR("CMD%u arg %#" B_PRIx32 ": error, status %#" B_PRIx32 "\n",
++			command, argument, status);
++		return B_IO_ERROR;
++	}
++
++	if (result != NULL && type != kNoResponse) {
++		if (type == kR2) {
++			// The controller keeps the CRC7 and end bit in the low byte;
++			// the MMC stack expects the 120 remaining bits right-aligned.
++			uint32 response[4] = {
++				_Read(kCommandResp), _Read(kCommandResp1),
++				_Read(kCommandResp2), _Read(kCommandResp3)
++			};
++			result[0] = (response[0] >> 8) | (response[1] << 24);
++			result[1] = (response[1] >> 8) | (response[2] << 24);
++			result[2] = (response[2] >> 8) | (response[3] << 24);
++			result[3] = response[3] >> 8;
++		} else
++			*result = _Read(kCommandResp);
++	}
++
++	return B_OK;
++}
++
++
++status_t
++MesonMmc::ExecuteCommand(uint8 command, uint32 argument, uint32* result)
++{
++	MutexLocker locker(fLock);
++	return _Execute(command, argument, result, 0, 0, false);
++}
++
++
++status_t
++MesonMmc::DoIO(uint8 command, IOOperation* operation, bool offsetAsSectors)
++{
++	bool write = operation->IsWrite();
++	if (write && fReadOnly)
++		return B_READ_ONLY_DEVICE;
++
++	off_t offset = operation->Offset();
++	generic_size_t length = operation->Length();
++	if (offset % kBlockSize != 0 || length % kBlockSize != 0)
++		return B_BAD_VALUE;
++
++	MutexLocker locker(fLock);
++
++	TRACE("DoIO %s offset %" B_PRIdOFF " length %" B_PRIuGENADDR ", %" B_PRIu32
++		" vecs\n", write ? "write" : "read", offset, length,
++		operation->VecCount());
++
++	const generic_io_vec* vecs = operation->Vecs();
++	const generic_io_vec* vecsEnd = vecs + operation->VecCount();
++	generic_size_t vecOffset = 0;
++
++	while (length > 0) {
++		if (vecs >= vecsEnd)
++			return B_BAD_VALUE;
++
++		generic_size_t chunk = std::min(length, vecs->length - vecOffset);
++		if (chunk == 0) {
++			vecs++;
++			vecOffset = 0;
++			continue;
++		}
++		chunk = std::min(chunk,
++			(generic_size_t)kMaxBlocksPerCommand * kBlockSize);
++		chunk -= chunk % kBlockSize;
++		if (chunk == 0)
++			return B_BAD_VALUE;
++
++		phys_addr_t address = vecs->base + vecOffset;
++		if ((address & 7) != 0 || address + chunk > 0x100000000LL) {
++			ERROR("unusable DMA buffer %#" B_PRIxPHYSADDR "\n", address);
++			return B_BAD_VALUE;
++		}
++
++		uint32 argument = offsetAsSectors
++			? (uint32)(offset / kBlockSize) : (uint32)offset;
++		uint32 response;
++		status_t status = _Execute(command, argument, &response, address,
++			chunk / kBlockSize, write);
++
++		if (command == SD_READ_MULTIPLE_BLOCKS
++			|| command == SD_WRITE_MULTIPLE_BLOCKS) {
++			status_t stopStatus = _Execute(SD_STOP_TRANSMISSION, 0, &response,
++				0, 0, false);
++			if (status == B_OK)
++				status = stopStatus;
++		}
++		if (status != B_OK) {
++			ERROR("%s of %" B_PRIuGENADDR " bytes at %" B_PRIdOFF
++				" failed: %s\n", write ? "write" : "read", chunk, offset,
++				strerror(status));
++			return status;
++		}
++
++		offset += chunk;
++		length -= chunk;
++		vecOffset += chunk;
++	}
++
++	return B_OK;
++}
++
++
++//	#pragma mark - device tree helpers
++
++
++static const uint32*
++get_cells_prop(fdt_device_module_info* module, fdt_device* device,
++	const char* name, int* length)
++{
++	return (const uint32*)module->get_prop(device, name, length);
++}
++
++
++static uint32
++get_cell_count(fdt_device_module_info* module, fdt_device* device,
++	const char* name, uint32 defaultValue)
++{
++	int length;
++	const uint32* prop = get_cells_prop(module, device, name, &length);
++	if (prop == NULL || length < 4)
++		return defaultValue;
++	return B_BENDIAN_TO_HOST_INT32(prop[0]);
++}
++
++
++static uint64
++read_cells(const uint32* cells, uint32 count)
++{
++	uint64 value = 0;
++	for (uint32 i = 0; i < count; i++)
++		value = (value << 32) | B_BENDIAN_TO_HOST_INT32(cells[i]);
++	return value;
++}
++
++
++/*!	The FDT bus returns "reg" as written in the node, relative to its parent
++	bus. Map it to a CPU physical address through the "ranges" of each
++	ancestor bus (on Meson GX the controllers sit in "apb@d0000000").
++*/
++static status_t
++translate_fdt_address(fdt_device_module_info* module, device_node* fdtNode,
++	uint64& address)
++{
++	device_node* busNode = gDeviceManager->get_parent_node(fdtNode);
++	while (busNode != NULL) {
++		DeviceNodePutter<&gDeviceManager> busPutter(busNode);
++
++		driver_module_info* busModule;
++		fdt_device* bus;
++		if (gDeviceManager->get_driver(busNode, &busModule, (void**)&bus)
++				!= B_OK || busModule != (driver_module_info*)module) {
++			return B_OK;
++		}
++
++		int length;
++		const uint32* ranges = get_cells_prop(module, bus, "ranges", &length);
++		if (ranges == NULL)
++			return B_OK;
++
++		device_node* parentNode = gDeviceManager->get_parent_node(busNode);
++		if (length > 0) {
++			uint32 childCells = get_cell_count(module, bus, "#address-cells", 2);
++			uint32 sizeCells = get_cell_count(module, bus, "#size-cells", 1);
++			uint32 parentCells = 2;
++			driver_module_info* parentModule;
++			fdt_device* parentBus;
++			if (parentNode != NULL
++				&& gDeviceManager->get_driver(parentNode, &parentModule,
++					(void**)&parentBus) == B_OK
++				&& parentModule == (driver_module_info*)module) {
++				parentCells = get_cell_count(module, parentBus,
++					"#address-cells", 2);
++			}
++
++			uint32 entryCells = childCells + parentCells + sizeCells;
++			uint32 entries = length / 4 / entryCells;
++			bool found = false;
++			for (uint32 i = 0; i < entries && !found; i++) {
++				const uint32* entry = ranges + i * entryCells;
++				uint64 child = read_cells(entry, childCells);
++				uint64 parent = read_cells(entry + childCells, parentCells);
++				uint64 size = read_cells(entry + childCells + parentCells,
++					sizeCells);
++				if (address >= child && address - child < size) {
++					address = address - child + parent;
++					found = true;
++				}
++			}
++			if (!found) {
++				if (parentNode != NULL)
++					gDeviceManager->put_node(parentNode);
++				return B_ENTRY_NOT_FOUND;
++			}
++		}
++
++		busNode = parentNode;
++	}
++	return B_OK;
++}
++
++
++/*!	The FDT bus also registers nodes with status "disabled" (sd_emmc_a on
++	the ODROID-C2, whose clock is gated: touching its registers stalls the
++	bus).
++*/
++static bool
++fdt_device_enabled(fdt_device_module_info* module, fdt_device* device)
++{
++	int length;
++	const char* status = (const char*)module->get_prop(device, "status",
++		&length);
++	return status == NULL || strcmp(status, "okay") == 0
++		|| strcmp(status, "ok") == 0;
++}
++
++
++static void
++log_firmware_clocks()
++{
++	void* hhi;
++	area_id area = map_physical_memory("meson hhi", kHhiBase, B_PAGE_SIZE,
++		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA, &hhi);
++	if (area < 0)
++		return;
++	volatile uint32* registers = (volatile uint32*)hhi;
++	INFO("HHI GCLK_MPEG0 %#" B_PRIx32 ", NAND_CLK_CNTL %#" B_PRIx32
++		", SD_EMMC_CLK_CNTL %#" B_PRIx32 "\n",
++		registers[kHhiGclkMpeg0 / 4], registers[kHhiNandClockControl / 4],
++		registers[kHhiSdEmmcClockControl / 4]);
++	delete_area(area);
++}
++
++
++//	#pragma mark - driver module
++
++
++static float
++supports_device(device_node* parent)
++{
++	const char* bus;
++	if (gDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false)
++			!= B_OK || strcmp(bus, "fdt") != 0) {
++		return 0.0f;
++	}
++
++	const char* compatible;
++	if (gDeviceManager->get_attr_string(parent, "fdt/compatible", &compatible,
++			false) != B_OK
++		|| strcmp(compatible, "amlogic,meson-gx-mmc") != 0) {
++		return 0.0f;
++	}
++
++	fdt_device_module_info* fdtModule = NULL;
++	fdt_device* fdtDevice = NULL;
++	if (gDeviceManager->get_driver(parent, (driver_module_info**)&fdtModule,
++			(void**)&fdtDevice) == B_OK
++		&& !fdt_device_enabled(fdtModule, fdtDevice)) {
++		return 0.0f;
++	}
++
++	// For now only the soldered-in eMMC: the SD slot holds the firmware
++	// and is left alone until the eMMC path works.
++	// TODO: enable removable slots (read-only first).
++	if (fdtModule != NULL
++		&& fdtModule->get_prop(fdtDevice, "non-removable", NULL) == NULL)
++		return 0.0f;
++
++	return 0.8f;
++}
++
++
++static status_t
++register_device(device_node* parent)
++{
++	device_attr attrs[] = {
++		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE,
++			{ .string = "Amlogic Meson GX SD/eMMC" } },
++		{ B_DEVICE_FIXED_CHILD, B_STRING_TYPE,
++			{ .string = MMC_BUS_MODULE_NAME } },
++		{ B_DEVICE_BUS, B_STRING_TYPE, { .string = "mmc" } },
++
++		// One descriptor per command: one contiguous segment of at most 511
++		// blocks below 4 GB. Whole-sector alignment (as sdhci uses) also keeps
++		// DMA buffers off cache lines shared with other data.
++		{ B_DMA_ALIGNMENT, B_UINT32_TYPE, { .ui32 = 511 } },
++		{ B_DMA_HIGH_ADDRESS, B_UINT64_TYPE, { .ui64 = 0x100000000LL } },
++		{ B_DMA_MAX_SEGMENT_COUNT, B_UINT32_TYPE, { .ui32 = 1 } },
++		{ B_DMA_MAX_SEGMENT_BLOCKS, B_UINT32_TYPE,
++			{ .ui32 = kMaxBlocksPerCommand } },
++		{ NULL }
++	};
++
++	return gDeviceManager->register_node(parent, MESON_GX_MMC_MODULE_NAME,
++		attrs, NULL, NULL);
++}
++
++
++static status_t
++init_driver(device_node* node, void** _cookie)
++{
++	DeviceNodePutter<&gDeviceManager> fdtNode(
++		gDeviceManager->get_parent_node(node));
++
++	fdt_device_module_info* fdtModule;
++	fdt_device* fdtDevice;
++	if (gDeviceManager->get_driver(fdtNode.Get(),
++			(driver_module_info**)&fdtModule, (void**)&fdtDevice) != B_OK) {
++		return B_ERROR;
++	}
++	if (!fdt_device_enabled(fdtModule, fdtDevice))
++		return B_DEVICE_NOT_FOUND;
++
++	// Removable slots stay read-only for now, see the top of this file;
++	// for the moment they are not used at all (see supports_device()).
++	bool removable = fdtModule->get_prop(fdtDevice, "non-removable", NULL)
++		== NULL;
++	if (removable)
++		return B_DEVICE_NOT_FOUND;
++
++	uint64 registers;
++	uint64 length;
++	if (!fdtModule->get_reg(fdtDevice, 0, &registers, &length))
++		return B_ERROR;
++	status_t status = translate_fdt_address(fdtModule, fdtNode.Get(),
++		registers);
++	if (status != B_OK) {
++		ERROR("cannot translate register address %#" B_PRIx64 "\n",
++			registers);
++		return status;
++	}
++
++	void* mapped;
++	area_id area = map_physical_memory("meson_gx_mmc registers", registers,
++		length, B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++		&mapped);
++	if (area < 0)
++		return area;
++
++	MesonMmc* controller = new(std::nothrow) MesonMmc(area,
++		(volatile uint32*)mapped, registers, removable);
++	if (controller == NULL) {
++		delete_area(area);
++		return B_NO_MEMORY;
++	}
++
++	INFO("controller at %#" B_PRIx64 ", %s\n", registers,
++		removable ? "removable card (read-only)" : "eMMC");
++	log_firmware_clocks();
++	controller->Init();
++
++	*_cookie = controller;
++	return B_OK;
++}
++
++
++static void
++uninit_driver(void* cookie)
++{
++	delete (MesonMmc*)cookie;
++}
++
++
++static status_t
++set_clock(void* controller, uint32_t kilohertz)
++{
++	return ((MesonMmc*)controller)->SetClock(kilohertz);
++}
++
++
++static status_t
++execute_command(void* controller, uint8_t command, uint32_t argument,
++	uint32_t* result)
++{
++	return ((MesonMmc*)controller)->ExecuteCommand(command, argument, result);
++}
++
++
++static status_t
++do_io(void* controller, uint8_t command, IOOperation* operation,
++	bool offsetAsSectors)
++{
++	return ((MesonMmc*)controller)->DoIO(command, operation, offsetAsSectors);
++}
++
++
++static void
++set_scan_semaphore(void* controller, sem_id semaphore)
++{
++	((MesonMmc*)controller)->SetScanSemaphore(semaphore);
++}
++
++
++static void
++set_bus_width(void* controller, int width)
++{
++	((MesonMmc*)controller)->SetBusWidth(width);
++}
++
++
++static void
++terminate_bus(void* controller)
++{
++}
++
++
++static void
++set_card_type(void* controller, card_type type)
++{
++	((MesonMmc*)controller)->SetCardType(type);
++}
++
++
++static mmc_bus_interface gMesonGxMmcModule = {
++	.info = {
++		.info = {
++			.name = MESON_GX_MMC_MODULE_NAME,
++		},
++
++		.supports_device = supports_device,
++		.register_device = register_device,
++		.init_driver = init_driver,
++		.uninit_driver = uninit_driver,
++	},
++
++	.set_clock = set_clock,
++	.execute_command = execute_command,
++	.do_io = do_io,
++	.set_scan_semaphore = set_scan_semaphore,
++	.set_bus_width = set_bus_width,
++	.terminate_bus = terminate_bus,
++	.set_card_type = set_card_type,
++};
++
++
++module_dependency module_dependencies[] = {
++	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&gDeviceManager },
++	{}
++};
++
++
++module_info* modules[] = {
++	(module_info*)&gMesonGxMmcModule,
++	NULL
++};

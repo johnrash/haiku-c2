@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 09:38:42 -0400
+Subject: [PATCH 168/342] Remote Control preferences: wider columns; the button
+ received stays shown
+
+The code and "When held" columns were too narrow for their contents.
+While learning, selecting the row of a button just received no longer
+replaces "Received ..." with the prompt; rows still to learn still ask.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/preferences/remotecontrol/RemoteWindow.cpp | 18 +++++++++++++-----
+ 1 file changed, 13 insertions(+), 5 deletions(-)
+
+diff --git a/src/preferences/remotecontrol/RemoteWindow.cpp b/src/preferences/remotecontrol/RemoteWindow.cpp
+index 50473c10e1..420e40e22d 100644
+--- a/src/preferences/remotecontrol/RemoteWindow.cpp
++++ b/src/preferences/remotecontrol/RemoteWindow.cpp
+@@ -277,14 +277,16 @@ RemoteWindow::RemoteWindow()
+ 	float width = be_plain_font->StringWidth("Command+Shift+Right arrow");
+ 	fButtonList->AddColumn(new BStringColumn("Button", width, 40, 400,
+ 		B_TRUNCATE_END), kLabelColumn);
++	// the columns' own margins are about a letter "M" wide on each side
++	float margin = be_plain_font->StringWidth("MM");
+ 	fButtonList->AddColumn(new BStringColumn("Code",
+-		be_plain_font->StringWidth("0xffff  "), 30, 120, B_TRUNCATE_END),
+-		kCodeColumn);
++		be_plain_font->StringWidth("0xffff") + margin, 30, 120,
++		B_TRUNCATE_END), kCodeColumn);
+ 	fButtonList->AddColumn(new BStringColumn("Keystroke", width, 40, 400,
+ 		B_TRUNCATE_END), kKeystrokeColumn);
+ 	fButtonList->AddColumn(new BStringColumn("When held",
+-		be_plain_font->StringWidth("When held  "), 30, 200, B_TRUNCATE_END),
+-		kRepeatColumn);
++		be_plain_font->StringWidth("When held") + margin, 30, 200,
++		B_TRUNCATE_END), kRepeatColumn);
+ 
+ 	fLabelControl = new BTextControl("Button:", "",
+ 		new BMessage(kMsgLabelChanged));
+@@ -509,9 +511,15 @@ RemoteWindow::MessageReceived(BMessage* message)
+ 		}
+ 
+ 		case kMsgButtonSelected:
++		{
+ 			_UpdateEditor();
+-			_Prompt();
++			// a row still to learn says so; else the status stays (what was
++			// just received)
++			Button* button = _CurrentButton();
++			if (button != NULL && button->command == kUnlearned)
++				_Prompt();
+ 			break;
++		}
+ 
+ 		case kMsgLabelChanged:
+ 		{

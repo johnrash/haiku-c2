@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 17:28:56 -0400
+Subject: [PATCH 062/342] meson_hdmi: switch overlay buffers in the vertical
+ blank
+
+The video layer takes a new canvas at once, not at the start of the next
+frame as assumed: MediaPlayer's frames showed in two pieces, with a tear
+line where the switch caught the scan-out. At 30 fps it stood still, at
+29.47 fps it rolled down the picture, and decoding load moved it.
+ConfigureOverlay() now waits for the encoder's vertical blank before it
+programs a new buffer: from the line after the active area to 16 lines
+before the next one (the video layer reads ahead), sleeping through most
+of the active area and polling the line counter in ENCP_INFO_READ
+(0x271d, line in bits 28-16) from shortly before its end.
+
+Done there, the next frame is all new, and the buffer shown until then
+is free when the call returns (MediaPlayer gives it back to the decoder
+right away).
+
+Measured with the HDMI capture at 60 Hz (a frame shown in two pieces in
+consecutive captures counts as a tear): 1080x1920 H.264 at 30 fps, 206
+tears in 7 s before, 0 in 10 s after; 1280x720 at 29.47 fps, 249 in
+15 s before, 0 after.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../graphics/meson_hdmi/meson_hdmi.cpp        | 56 ++++++++++++++++++-
+ 1 file changed, 54 insertions(+), 2 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+index efd8147fd5..fbaad0ad5a 100644
+--- a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
++++ b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+@@ -109,6 +109,7 @@ enum {
+ 	VD1_IF0_RANGE_MAP_CR		= 0x1a6c,
+ 	VD1_IF0_GEN_REG2			= 0x1a6d,
+ 	VENC_DVI_SETTING			= 0x1b62,
++	ENCP_INFO_READ				= 0x271d,	// [28:16] line, [12:0] pixel
+ 	ENCP_VIDEO_EN				= 0x1b80,
+ 	ENCP_VIDEO_MODE				= 0x1b8d,
+ 	ENCP_VIDEO_MODE_ADV			= 0x1b8e,
+@@ -422,6 +423,7 @@ public:
+ 									{ _SetVpu(word, value); }
+ 
+ private:
++			void				_WaitForVerticalBlank();
+ 			uint32				_Vpu(uint32 word)
+ 									{ return fVpu[word]; }
+ 			void				_SetVpu(uint32 word, uint32 value)
+@@ -1162,18 +1164,68 @@ MesonHdmi::ConfigureOverlay(const meson_hdmi_overlay_config& config)
+ 		return B_BAD_VALUE;
+ 	}
+ 
+-	if (info->physical != fOverlayPhysical) {
++	bool newFrame = info->physical != fOverlayPhysical;
++	if (newFrame) {
+ 		// a new frame: the other canvas, so that the shown one stays intact
+-		// until the video layer switches over
+ 		fOverlayCanvas ^= 1;
+ 		fOverlayPhysical = info->physical;
+ 	}
+ 	fOverlay = config;
++
++	// The video layer takes a new canvas at once, not at the next frame:
++	// switched while it scans the buffer out, the picture tears where it
++	// is, a line that wanders with the frame rate. In the vertical blank,
++	// the next frame is all new, and the client may reuse the buffer shown
++	// until now as soon as this returns (MediaPlayer gives it back to the
++	// decoder).
++	if (newFrame)
++		_WaitForVerticalBlank();
+ 	_ApplyOverlay();
+ 	return B_OK;
+ }
+ 
+ 
++/*!	Waits for the video encoder's vertical blank: from the line after the
++	active area to a few lines before the next one begins (the video layer
++	reads ahead). Sleeps through most of the active area and polls the line
++	counter from shortly before its end.
++*/
++void
++MesonHdmi::_WaitForVerticalBlank()
++{
++	const display_timing& timing = fShared->current_mode.timing;
++	uint32 activeBegin = _Vpu(ENCP_VIDEO_VAVON_BLINE);
++	uint32 activeEnd = _Vpu(ENCP_VIDEO_VAVON_ELINE);
++	if (timing.pixel_clock == 0 || timing.h_total == 0
++		|| timing.v_total == 0 || activeEnd <= activeBegin) {
++		return;
++	}
++	// what the video layer reads ahead of the active area
++	uint32 blankEnd = activeBegin > 16 ? activeBegin - 16 : 0;
++
++	// a line in nanoseconds (1080p60: 14.8 us)
++	bigtime_t lineTime = (bigtime_t)timing.h_total * 1000000
++		/ timing.pixel_clock;
++	bigtime_t deadline = system_time()
++		+ 2 * (timing.v_total * lineTime / 1000);
++	bool slept = false;
++	while (true) {
++		uint32 line = (_Vpu(ENCP_INFO_READ) >> 16) & 0x1fff;
++		if (line > activeEnd || line < blankEnd)
++			return;
++		bigtime_t now = system_time();
++		if (now >= deadline)
++			return;
++		bigtime_t toBlank = (activeEnd + 1 - line) * lineTime / 1000;
++		if (!slept && toBlank > 300) {
++			// sleep until shortly before the active area ends
++			snooze(toBlank - 200);
++			slept = true;
++		}
++	}
++}
++
++
+ /*!	Programs the video layer (VD1) for fOverlay: the read interface takes
+ 	the visible part of the buffer through a canvas, the formatter expands
+ 	4:2:2 to 4:4:4, the VPP scaler scales it to the visible part of the

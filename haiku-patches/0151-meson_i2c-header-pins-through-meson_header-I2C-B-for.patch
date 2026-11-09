@@ -1,0 +1,561 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 01:45:41 -0400
+Subject: [PATCH 151/342] meson_i2c: header pins through meson_header; I2C B
+ for programs
+
+I2C A's pins (the RTC shield's) are claimed in meson_header. I2C B, on
+header pins 27 and 28, is the programs' bus: its device tree node is
+disabled, and it was left unattached. It now attaches, gets no scan at
+boot, and publishes /dev/bus/i2c/header: the first open file claims and
+muxes its pins (B_BUSY while a program has one as GPIO), the last one
+closed gives them back as GPIO. An ioctl runs one transfer: the bytes
+written, a repeated start and the bytes read, or only the address, to
+see whether a device answers. Until a program has the bus open, the bus
+manager's bus_raw device can't use it either.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/drivers/meson_i2c.h           |  43 +++
+ src/add-ons/kernel/busses/i2c/meson/Jamfile   |   2 +-
+ .../kernel/busses/i2c/meson/meson_i2c.cpp     | 321 ++++++++++++++++--
+ 3 files changed, 329 insertions(+), 37 deletions(-)
+ create mode 100644 headers/private/drivers/meson_i2c.h
+
+diff --git a/headers/private/drivers/meson_i2c.h b/headers/private/drivers/meson_i2c.h
+new file mode 100644
+index 0000000000..673cac36b2
+--- /dev/null
++++ b/headers/private/drivers/meson_i2c.h
+@@ -0,0 +1,43 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef _MESON_I2C_H
++#define _MESON_I2C_H
++
++
++#include <Drivers.h>
++
++
++/*!	The ODROID-C2 header's I2C bus for programs (meson_i2c): I2C B on pins
++	27 (SDA) and 28 (SCL), 3.3 V, with 1 kOhm pull-ups on the board, at
++	100 kHz. The first open file takes the two pins from GPIO (B_BUSY while
++	a program has one), the last one closed gives them back. Until then
++	the bus manager's bus_raw device can't use the bus either. libdevice's
++	BI2CDevice is the interface programs use.
++*/
++
++
++#define MESON_I2C_HEADER_DEVICE	"/dev/bus/i2c/header"
++
++enum {
++	MESON_I2C_TRANSFER = B_DEVICE_OP_CODES_END + 0x4932,
++		// meson_i2c_transfer: a start, the address, the bytes to write,
++		// then (both given) a repeated start and the bytes to read, a stop.
++		// Neither: only the address, to see whether a device answers.
++		// B_DEV_NOT_READY: no acknowledge; B_TIMED_OUT
++};
++
++#define MESON_I2C_MAX_TRANSFER	4096
++
++
++struct meson_i2c_transfer {
++	uint32		address;		// 7 bits: 0x08 to 0x77
++	const void*	write;
++	size_t		writeLength;
++	void*		read;
++	size_t		readLength;
++};
++
++
++#endif	// _MESON_I2C_H
+diff --git a/src/add-ons/kernel/busses/i2c/meson/Jamfile b/src/add-ons/kernel/busses/i2c/meson/Jamfile
+index d3d8489d44..b9bbba8d47 100644
+--- a/src/add-ons/kernel/busses/i2c/meson/Jamfile
++++ b/src/add-ons/kernel/busses/i2c/meson/Jamfile
+@@ -1,6 +1,6 @@
+ SubDir HAIKU_TOP src add-ons kernel busses i2c meson ;
+ 
+-UsePrivateHeaders i2c ;
++UsePrivateHeaders drivers i2c ;
+ UsePrivateKernelHeaders ;
+ 
+ if $(TARGET_ARCH) = arm64 {
+diff --git a/src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp b/src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp
+index 593d2257b8..73e165e41c 100644
+--- a/src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp
++++ b/src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp
+@@ -14,13 +14,20 @@
+  * Neither U-Boot nor Haiku has a pin controller driver for these pins, so
+  * the driver muxes them itself for the two controllers on the ODROID-C2's
+  * 40-pin header: I2C A on pins 3 (SDA, GPIODV_24) and 5 (SCK, GPIODV_25),
+- * I2C B on pins 27 and 28 (GPIODV_26, GPIODV_27). It also opens the
++ * I2C B on pins 27 and 28 (GPIODV_26, GPIODV_27), through the meson_header
++ * module, which keeps who has the header's pins. It also opens the
+  * controllers' clock gate and sets 100 kHz from clk81.
+  *
+  * Devices: the C2's device tree describes none (its I2C nodes have no
+  * children), and add-on boards are found by probing their addresses:
+  * scan_bus() looks for the real-time clock of Hardkernel's RTC shield, an
+  * NXP PCF8563 at address 0x51, and registers it with its compatible string.
++ *
++ * I2C A (pins 3 and 5, the RTC shield's) is the system's. I2C B is for
++ * programs (headers/private/drivers/meson_i2c.h): its device tree node is
++ * disabled, and it gets no scan; it publishes /dev/bus/i2c/header, and has
++ * its pins only while that is open. Its transfers through the bus manager
++ * (bus_raw) need it open too.
+  */
+ 
+ 
+@@ -39,8 +46,12 @@
+ #include <lock.h>
+ #include <util/AutoLock.h>
+ 
++#include <meson_header.h>
++#include <meson_i2c.h>
++
+ 
+ #define DRIVER_MODULE_NAME	"busses/i2c/meson_i2c/driver_v1"
++#define DEVICE_MODULE_NAME	"busses/i2c/meson_i2c/device_v1"
+ 
+ //#define TRACE_MESON_I2C
+ #ifdef TRACE_MESON_I2C
+@@ -102,28 +113,23 @@ static const uint32 kXtalRate = 24000000;
+ static const uint32 kFixedPllRate = 2000000000;
+ static const uint32 kDefaultClk81Rate = 166666667;
+ 
+-// pin muxing (periphs pin controller)
+-static const phys_addr_t kPinMuxBase = 0xc88344b0;
+-	// PERIPHS_PIN_MUX_0
+ static const phys_addr_t kI2cABase = 0xc1108500;
+ static const phys_addr_t kI2cBBase = 0xc11087c0;
+ static const phys_addr_t kI2cCBase = 0xc11087e0;
+ 	// A, B and C share the clock gate; the AO controller has its own
++static const char* kI2cBNodeName = "i2c@87c0";
++	// programs' bus, disabled in the device tree
+ 
+-struct PinMux {
++// the controllers on the header: their pins and function
++struct HeaderPins {
+ 	phys_addr_t	controller;
+-	const char*	name;
+-	uint32		set7;
+-		// PERIPHS_PIN_MUX_7: the I2C function
+-	uint32		clear2;
+-		// PERIPHS_PIN_MUX_2: UART B, which shares the pins
++	const char*	function;
++	const char*	pins[2];
+ };
+ 
+-static const PinMux kPinMuxes[] = {
+-	{ kI2cABase, "I2C A (header pins 3, 5)", (1 << 27) | (1 << 26),
+-		(1 << 29) | (1 << 28) },
+-	{ kI2cBBase, "I2C B (header pins 27, 28)", (1 << 25) | (1 << 24),
+-		(1 << 27) | (1 << 26) },
++static const HeaderPins kHeaderPins[] = {
++	{ kI2cABase, "I2C A", { "3", "5" } },
++	{ kI2cBBase, "I2C B", { "27", "28" } },
+ };
+ 
+ // add-on boards
+@@ -132,6 +138,7 @@ static const i2c_addr kPcf8563Address = 0x51;
+ 
+ static device_manager_info* gDeviceManager;
+ static i2c_for_controller_interface* gI2c;
++static meson_header_module_info* gHeader;
+ 
+ 
+ class MesonI2c {
+@@ -149,6 +156,13 @@ public:
+ 			status_t			AcquireBus();
+ 			void				ReleaseBus();
+ 
++			device_node*		Node() const { return fNode; }
++			bool				ForPrograms() const
++									{ return fBase == kI2cBBase; }
++			status_t			Open();
++			void				Free();
++			status_t			Transfer(void* buffer);
++
+ private:
+ 			uint32				_Read(uint32 offset)
+ 									{ return fRegisters[offset / 4]; }
+@@ -156,6 +170,7 @@ private:
+ 									{ fRegisters[offset / 4] = value; }
+ 
+ 			void				_SetupPinsAndClock(phys_addr_t base);
++			status_t			_SelectPins(bool select);
+ 			status_t			_Run();
+ 			status_t			_Message(i2c_addr address, bool read,
+ 									uint8* buffer, size_t length, bool stop);
+@@ -165,7 +180,10 @@ private:
+ 
+ 			device_node*		fNode;
+ 			i2c_bus				fBus;
++			phys_addr_t			fBase;
+ 			recursive_lock		fLock;
++			int32				fOpenCount;
++				// programs' files (I2C B): the pins are ours while open
+ 			area_id				fRegistersArea;
+ 			volatile uint32*	fRegisters;
+ 			uint32				fTokens[2];
+@@ -177,6 +195,8 @@ MesonI2c::MesonI2c(device_node* node)
+ 	:
+ 	fNode(node),
+ 	fBus(NULL),
++	fBase(0),
++	fOpenCount(0),
+ 	fRegistersArea(-1),
+ 	fRegisters(NULL),
+ 	fTokenCount(0)
+@@ -325,6 +345,8 @@ MesonI2c::Init()
+ 		return B_ERROR;
+ 	}
+ 
++	fBase = base;
++
+ 	// the registers sit inside a page shared with other controllers
+ 	phys_addr_t pageBase = ROUNDDOWN(base, B_PAGE_SIZE);
+ 	void* page;
+@@ -383,24 +405,19 @@ MesonI2c::_SetupPinsAndClock(phys_addr_t base)
+ 		delete_area(area);
+ 	}
+ 
+-	for (size_t i = 0; i < B_COUNT_OF(kPinMuxes); i++) {
+-		const PinMux& mux = kPinMuxes[i];
+-		if (mux.controller != base)
+-			continue;
+-
+-		phys_addr_t pageBase = ROUNDDOWN(kPinMuxBase, B_PAGE_SIZE);
+-		void* page;
+-		area = map_physical_memory("meson i2c pinmux", pageBase,
+-			B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
+-			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &page);
+-		if (area < 0)
+-			break;
+-		volatile uint32* pinMux = (volatile uint32*)((addr_t)page
+-			+ (kPinMuxBase - pageBase));
+-		pinMux[2] &= ~mux.clear2;
+-		pinMux[7] |= mux.set7;
+-		delete_area(area);
+-		INFO("%s: pins muxed\n", mux.name);
++	// the pins: ours for good, the I2C function selected (UART B, which
++	// shares them, off); programs' bus: while it's open
++	if (ForPrograms()) {
++		INFO("I2C B: header pins 27 and 28 for programs, at %s\n",
++			MESON_I2C_HEADER_DEVICE);
++	} else if (_SelectPins(true) == B_OK) {
++		for (size_t i = 0; i < B_COUNT_OF(kHeaderPins); i++) {
++			if (kHeaderPins[i].controller == base) {
++				INFO("%s: header pins %s and %s muxed\n",
++					kHeaderPins[i].function, kHeaderPins[i].pins[0],
++					kHeaderPins[i].pins[1]);
++			}
++		}
+ 	}
+ 
+ 	uint32 divider = (clk81 + kBusSpeed * kDividerFactor - 1)
+@@ -424,6 +441,47 @@ MesonI2c::_SetupPinsAndClock(phys_addr_t base)
+ }
+ 
+ 
++/*!	Claims the controller's header pins and selects its function on them
++	(\a select), or gives them back as GPIO. All or none.
++*/
++status_t
++MesonI2c::_SelectPins(bool select)
++{
++	const HeaderPins* header = NULL;
++	for (size_t i = 0; i < B_COUNT_OF(kHeaderPins); i++) {
++		if (kHeaderPins[i].controller == fBase)
++			header = &kHeaderPins[i];
++	}
++	if (header == NULL)
++		return B_OK;
++	int32 indexes[2];
++	for (size_t j = 0; j < B_COUNT_OF(header->pins); j++) {
++		indexes[j] = gHeader->find_pin(header->pins[j]);
++		if (indexes[j] < 0)
++			return B_ERROR;
++	}
++	if (!select) {
++		for (size_t j = 0; j < B_COUNT_OF(indexes); j++) {
++			gHeader->select(indexes[j], NULL);
++			gHeader->release(indexes[j], this);
++		}
++		return B_OK;
++	}
++	for (size_t j = 0; j < B_COUNT_OF(indexes); j++) {
++		if (gHeader->claim(indexes[j], this, header->function) != B_OK) {
++			INFO("%s: header pin %s is not available\n", header->function,
++				header->pins[j]);
++			for (size_t k = 0; k < j; k++)
++				gHeader->release(indexes[k], this);
++			return B_BUSY;
++		}
++	}
++	for (size_t j = 0; j < B_COUNT_OF(indexes); j++)
++		gHeader->select(indexes[j], header->function);
++	return B_OK;
++}
++
++
+ void
+ MesonI2c::_AddToken(uint32 token)
+ {
+@@ -537,6 +595,8 @@ MesonI2c::ExecCommand(i2c_op op, i2c_addr address, const uint8* command,
+ 		return B_NOT_SUPPORTED;
+ 
+ 	RecursiveLocker locker(fLock);
++	if (ForPrograms() && fOpenCount == 0)
++		return B_NOT_ALLOWED;
+ 
+ 	bool stop = IS_STOP_OP(op);
+ 	if (IS_WRITE_OP(op)) {
+@@ -598,6 +658,9 @@ MesonI2c::_LooksLikePcf8563(const uint8* registers)
+ status_t
+ MesonI2c::ScanBus()
+ {
++	if (ForPrograms())
++		return B_OK;
++
+ 	// in case the stop after setup didn't take the first transfer's failure
+ 	uint8 reg = 0;
+ 	uint8 registers[9];
+@@ -640,6 +703,79 @@ MesonI2c::ReleaseBus()
+ }
+ 
+ 
++/*!	A program opens the bus: the first one takes the pins. */
++status_t
++MesonI2c::Open()
++{
++	RecursiveLocker locker(fLock);
++	if (fOpenCount == 0) {
++		status_t status = _SelectPins(true);
++		if (status != B_OK)
++			return status;
++		// the first token list after the pins are muxed doesn't finish
++		_Stop();
++	}
++	fOpenCount++;
++	return B_OK;
++}
++
++
++/*!	A program's file is done: the last one gives the pins back. */
++void
++MesonI2c::Free()
++{
++	RecursiveLocker locker(fLock);
++	if (--fOpenCount == 0)
++		_SelectPins(false);
++}
++
++
++status_t
++MesonI2c::Transfer(void* userBuffer)
++{
++	meson_i2c_transfer transfer;
++	if (user_memcpy(&transfer, userBuffer, sizeof(transfer)) != B_OK)
++		return B_BAD_ADDRESS;
++	if (transfer.address < 0x08 || transfer.address > 0x77
++		|| transfer.writeLength > MESON_I2C_MAX_TRANSFER
++		|| transfer.readLength > MESON_I2C_MAX_TRANSFER
++		|| (transfer.writeLength > 0 && transfer.write == NULL)
++		|| (transfer.readLength > 0 && transfer.read == NULL)) {
++		return B_BAD_VALUE;
++	}
++	uint8* buffer = NULL;
++	size_t length = transfer.writeLength + transfer.readLength;
++	if (length > 0) {
++		buffer = (uint8*)malloc(length);
++		if (buffer == NULL)
++			return B_NO_MEMORY;
++	}
++	MemoryDeleter deleter(buffer);
++	uint8* written = buffer;
++	uint8* read = buffer + transfer.writeLength;
++	if (transfer.writeLength > 0 && user_memcpy(written, transfer.write,
++			transfer.writeLength) != B_OK) {
++		return B_BAD_ADDRESS;
++	}
++
++	status_t status;
++	if (transfer.readLength > 0) {
++		status = ExecCommand(I2C_OP_READ_STOP, transfer.address, written,
++			transfer.writeLength, read, transfer.readLength);
++	} else {
++		status = ExecCommand(I2C_OP_WRITE_STOP, transfer.address, written,
++			transfer.writeLength, NULL, 0);
++	}
++	if (status != B_OK)
++		return status;
++	if (transfer.readLength > 0
++		&& user_memcpy(transfer.read, read, transfer.readLength) != B_OK) {
++		return B_BAD_ADDRESS;
++	}
++	return B_OK;
++}
++
++
+ //	#pragma mark - driver module
+ 
+ 
+@@ -677,8 +813,13 @@ supports_device(device_node* parent)
+ 	fdt_device_module_info* fdtModule;
+ 	fdt_device* fdtDevice;
+ 	if (gDeviceManager->get_driver(parent, (driver_module_info**)&fdtModule,
+-			(void**)&fdtDevice) != B_OK
+-		|| !fdt_device_enabled(fdtModule, fdtDevice)) {
++			(void**)&fdtDevice) != B_OK) {
++		return 0.0f;
++	}
++	// I2C B, the programs' bus, though the device tree has it disabled
++	const char* name = fdtModule->get_name(fdtDevice);
++	if (!fdt_device_enabled(fdtModule, fdtDevice)
++		&& (name == NULL || strcmp(name, kI2cBNodeName) != 0)) {
+ 		return 0.0f;
+ 	}
+ 	return 0.8f;
+@@ -723,6 +864,17 @@ uninit_driver(void* cookie)
+ }
+ 
+ 
++static status_t
++register_child_devices(void* cookie)
++{
++	MesonI2c* controller = (MesonI2c*)cookie;
++	if (!controller->ForPrograms())
++		return B_OK;
++	return gDeviceManager->publish_device(controller->Node(), "bus/i2c/header",
++		DEVICE_MODULE_NAME);
++}
++
++
+ static void
+ set_i2c_bus(i2c_bus_cookie cookie, i2c_bus bus)
+ {
+@@ -763,6 +915,7 @@ release_bus(i2c_bus_cookie cookie)
+ module_dependency module_dependencies[] = {
+ 	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&gDeviceManager },
+ 	{ I2C_FOR_CONTROLLER_MODULE_NAME, (module_info**)&gI2c },
++	{ MESON_HEADER_MODULE_NAME, (module_info**)&gHeader },
+ 	{}
+ };
+ 
+@@ -779,7 +932,7 @@ static i2c_sim_interface sMesonI2cDriver = {
+ 		register_device,
+ 		init_driver,
+ 		uninit_driver,
+-		NULL,	// register child devices
++		register_child_devices,
+ 		NULL,	// rescan
+ 		NULL,	// removed
+ 	},
+@@ -794,7 +947,103 @@ static i2c_sim_interface sMesonI2cDriver = {
+ };
+ 
+ 
++//	#pragma mark - device module (I2C B)
++
++
++static status_t
++device_init(void* driverCookie, void** _deviceCookie)
++{
++	*_deviceCookie = driverCookie;
++	return B_OK;
++}
++
++
++static void
++device_uninit(void* deviceCookie)
++{
++}
++
++
++static status_t
++device_open(void* deviceCookie, const char* path, int openMode,
++	void** _cookie)
++{
++	MesonI2c* controller = (MesonI2c*)deviceCookie;
++	status_t status = controller->Open();
++	if (status != B_OK)
++		return status;
++	*_cookie = controller;
++	return B_OK;
++}
++
++
++static status_t
++device_close(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++device_free(void* cookie)
++{
++	((MesonI2c*)cookie)->Free();
++	return B_OK;
++}
++
++
++static status_t
++device_read(void* cookie, off_t position, void* buffer, size_t* _length)
++{
++	*_length = 0;
++	return B_NOT_SUPPORTED;
++}
++
++
++static status_t
++device_write(void* cookie, off_t position, const void* buffer,
++	size_t* _length)
++{
++	*_length = 0;
++	return B_NOT_SUPPORTED;
++}
++
++
++static status_t
++device_control(void* cookie, uint32 op, void* buffer, size_t length)
++{
++	if (op == MESON_I2C_TRANSFER)
++		return ((MesonI2c*)cookie)->Transfer(buffer);
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++static struct device_module_info sMesonI2cDevice = {
++	{
++		DEVICE_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	device_init,
++	device_uninit,
++	NULL,	// remove
++
++	device_open,
++	device_close,
++	device_free,
++	device_read,
++	device_write,
++	NULL,	// io
++	device_control,
++
++	NULL,	// select
++	NULL,	// deselect
++};
++
++
+ module_info* modules[] = {
+ 	(module_info*)&sMesonI2cDriver,
++	(module_info*)&sMesonI2cDevice,
+ 	NULL
+ };

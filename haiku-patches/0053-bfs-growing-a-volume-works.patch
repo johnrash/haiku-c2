@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 08:26:09 -0400
+Subject: [PATCH 053/342] bfs: growing a volume works
+
+Growing a BFS volume (BFS_IOCTL_RESIZE, bfs_shell resizefs) failed in two
+places:
+* ResizeVisitor kept the allocator restricted to the range moved data
+  had to go to, so MoveLog() could not get blocks for the larger log:
+  "Failed to move the log area". The restriction is lifted once all data
+  is out of the way.
+* BlockAllocator::Reinitialize() called Initialize(true, true), which
+  hands the allocator lock to _Initialize() to release it, without
+  holding that lock: the unlock of a lock not held crashed. It now takes
+  the lock first; Initialize() also releases it when it fails early.
+
+Tested with bfs_shell on 300 MiB system volumes grown to 988 MiB and to
+4060 MiB (checkfs clean before and after), and on the board: a grown
+988 MiB system volume booting, a 540 MB file written and read back after a
+power cycle.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/file_systems/bfs/BlockAllocator.cpp | 9 ++++++++-
+ src/add-ons/kernel/file_systems/bfs/ResizeVisitor.cpp  | 5 +++++
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/file_systems/bfs/BlockAllocator.cpp b/src/add-ons/kernel/file_systems/bfs/BlockAllocator.cpp
+index c9a28a1cda..39a5a61870 100644
+--- a/src/add-ons/kernel/file_systems/bfs/BlockAllocator.cpp
++++ b/src/add-ons/kernel/file_systems/bfs/BlockAllocator.cpp
+@@ -653,8 +653,11 @@ BlockAllocator::Initialize(bool full, bool alreadyLocked)
+ 	fNumBitmapBlocks = fVolume->NumBitmapBlocks();
+ 
+ 	fGroups = new(std::nothrow) AllocationGroup[fNumGroups];
+-	if (fGroups == NULL)
++	if (fGroups == NULL) {
++		if (alreadyLocked)
++			recursive_lock_unlock(&fLock);
+ 		return B_NO_MEMORY;
++	}
+ 
+ 	if (!full)
+ 		return B_OK;
+@@ -751,7 +754,11 @@ BlockAllocator::Reinitialize()
+ 		// starts a transaction before we get the allocator lock, as that
+ 		// would cause a deadlock
+ 
++	// Initialize() hands the lock over to _Initialize(), which releases it:
++	// it has to be ours first (no one else may use the groups meanwhile).
++	recursive_lock_lock(&fLock);
+ 	delete[] fGroups;
++	fGroups = NULL;
+ 	return Initialize(true, true);
+ }
+ 
+diff --git a/src/add-ons/kernel/file_systems/bfs/ResizeVisitor.cpp b/src/add-ons/kernel/file_systems/bfs/ResizeVisitor.cpp
+index 353b7e50b6..25255f8114 100644
+--- a/src/add-ons/kernel/file_systems/bfs/ResizeVisitor.cpp
++++ b/src/add-ons/kernel/file_systems/bfs/ResizeVisitor.cpp
+@@ -79,6 +79,11 @@ ResizeVisitor::Resize(off_t size, bool dryRun, disk_job_id job)
+ 	if (fDryRun)
+ 		return B_OK;
+ 
++	// The data is out of the way: the log may now take blocks outside the
++	// range moved data had to go to (growing, it extends into the area the
++	// larger block bitmap freed up).
++	GetVolume()->Allocator().SetAllowedRange(0, 0);
++
+ 	// move log and change file system size in the superblock
+ 	if (fShrinking) {
+ 		status = _ResizeVolume();

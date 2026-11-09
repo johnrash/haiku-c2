@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 11:01:18 -0400
+Subject: [PATCH 025/342] arm64: deliver SIGILL for undefined instructions from
+ userland
+
+do_sync_handler() mapped only alignment faults, aborts and system calls;
+for any other exception class, an undefined instruction (EC 0) above
+all, signalNumber, signalCode and exceptionType were uninitialized, so a
+program's SIGILL handler never ran and the debugger got a garbage event.
+Programs probe for optional CPU features exactly this way: OpenSSL's
+ARMv8 crypto probes stopped every program using OpenSSL on the
+ODROID-C2, whose Cortex-A53s have no crypto extensions.
+
+Undefined instructions now raise SIGILL (ILL_ILLOPC), BRK raises SIGTRAP
+(TRAP_BRKPT), and any other unexpected exception class SIGILL
+(ILL_ILLTRP).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/kernel/arch/arm64/arch_int.cpp | 29 ++++++++++++++++++++---
+ 1 file changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/src/system/kernel/arch/arm64/arch_int.cpp b/src/system/kernel/arch/arm64/arch_int.cpp
+index 6cde153200..5b4d0b24a3 100644
+--- a/src/system/kernel/arch/arm64/arch_int.cpp
++++ b/src/system/kernel/arch/arm64/arch_int.cpp
+@@ -259,9 +259,9 @@ do_sync_handler(iframe * frame)
+ #endif
+ 
+ 	InterruptScope scope(frame);
+-	debug_exception_type exceptionType;
+-	uint32 signalNumber;
+-	int32 signalCode;
++	debug_exception_type exceptionType = B_INVALID_OPCODE_EXCEPTION;
++	uint32 signalNumber = SIGILL;
++	int32 signalCode = ILL_ILLTRP;
+ 	uint64 signalAddress = 0;
+ 
+ 	bool isUser = (frame->spsr & PSR_M_MASK) == PSR_M_EL0t;
+@@ -273,6 +273,21 @@ do_sync_handler(iframe * frame)
+ 			signalCode = BUS_ADRALN;
+ 			signalAddress = frame->elr;
+ 			break;
++		case EXCP_UNKNOWN:
++			// An undefined instruction. Programs probe for optional CPU
++			// features this way (OpenSSL's ARMv8 crypto probes) and expect
++			// SIGILL.
++			exceptionType = B_INVALID_OPCODE_EXCEPTION;
++			signalNumber = SIGILL;
++			signalCode = ILL_ILLOPC;
++			signalAddress = frame->elr;
++			break;
++		case EXCP_BRK:
++			exceptionType = B_INVALID_OPCODE_EXCEPTION;
++			signalNumber = SIGTRAP;
++			signalCode = TRAP_BRKPT;
++			signalAddress = frame->elr;
++			break;
+ 		case EXCP_INSN_ABORT_L:
+ 		case EXCP_INSN_ABORT:
+ 			isExec = true;
+@@ -386,6 +401,14 @@ do_sync_handler(iframe * frame)
+ 			syscall_dispatcher(syscall, (void*)args, &frame->x[0]);
+ 			return;
+ 		}
++
++		default:
++			// any other exception class: no garbage signal for userland
++			exceptionType = B_INVALID_OPCODE_EXCEPTION;
++			signalNumber = SIGILL;
++			signalCode = ILL_ILLTRP;
++			signalAddress = frame->elr;
++			break;
+ 	}
+ 
+ 	if (isUser) {

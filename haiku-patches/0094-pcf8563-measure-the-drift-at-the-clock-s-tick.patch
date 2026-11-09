@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 12:18:23 -0400
+Subject: [PATCH 094/342] pcf8563: measure the drift at the clock's tick
+
+The drift logged when the time is set compared the new time with the
+time last asked for, which measures the system clock against the time
+source, not the clock chip. Read the chip at its tick before writing
+it, and log how far that was from the new time.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/drivers/rtc/pcf8563/pcf8563.cpp    | 37 +++++++++++--------
+ 1 file changed, 22 insertions(+), 15 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/rtc/pcf8563/pcf8563.cpp b/src/add-ons/kernel/drivers/rtc/pcf8563/pcf8563.cpp
+index 039c1f0804..796a7a3a71 100644
+--- a/src/add-ons/kernel/drivers/rtc/pcf8563/pcf8563.cpp
++++ b/src/add-ons/kernel/drivers/rtc/pcf8563/pcf8563.cpp
+@@ -16,8 +16,9 @@
+  * - Writing: it stops the clock's divider (STOP), writes the second about
+  *   to come and releases the divider so the next tick, which comes 63/128 s
+  *   (0.492 s) after the release, falls on the second. Then it polls for
+- *   that tick and logs how far off it came, and how far off the clock was
+- *   from the new time before (its drift since it was last set or read).
++ *   that tick and logs how far off it came. Before writing, it reads the
++ *   clock at its tick too, and logs how far it was from the new time: its
++ *   drift since it was last set or read, against the new time's source.
+  * A clock whose VL flag is set (its supply dropped too low: battery empty,
+  * or never set) is not used until the time is set.
+  *
+@@ -130,9 +131,8 @@ private:
+ 			Measurement			fLastSet;
+ 
+ 			bool				fClockOffsetKnown;
+-			bigtime_t			fClockOffset;
+-				// the clock shows system_time() + fClockOffset, since:
+ 			bigtime_t			fClockOffsetSince;
++				// when the clock was last read at its tick or set
+ 			bigtime_t			fLastDrift;
+ 			bigtime_t			fLastDriftOver;
+ };
+@@ -152,7 +152,6 @@ Pcf8563::Pcf8563(device_node* node)
+ 	fQuit(false),
+ 	fValidAtBoot(false),
+ 	fClockOffsetKnown(false),
+-	fClockOffset(0),
+ 	fClockOffsetSince(0),
+ 	fLastDrift(0),
+ 	fLastDriftOver(0)
+@@ -371,7 +370,6 @@ Pcf8563::_ReadAtTick()
+ 
+ 	MutexLocker locker(fStatusLock);
+ 	fClockOffsetKnown = true;
+-	fClockOffset = seconds * 1000000 - tick;
+ 	fClockOffsetSince = system_time();
+ 	fBootRead.done = true;
+ 	fBootRead.seconds = seconds;
+@@ -390,6 +388,23 @@ Pcf8563::_ReadAtTick()
+ status_t
+ Pcf8563::_WriteTime(bigtime_t offset)
+ {
++	// how far the clock is from the new time, at its tick
++	bool driftKnown = false;
++	bigtime_t drift = 0;
++	uint8 registers[kTimeRegisters];
++	{
++		MutexLocker locker(fStatusLock);
++		driftKnown = fClockOffsetKnown;
++	}
++	bigtime_t tick;
++	int64 tickSeconds;
++	if (driftKnown) {
++		driftKnown = _WaitForTick(registers, &tick) == B_OK
++			&& _SecondsFromRegisters(registers, &tickSeconds);
++		if (driftKnown)
++			drift = tickSeconds * 1000000 - tick - offset;
++	}
++
+ 	// set to the second whose last part is at least kSetMargin away, the
+ 	// divider released (1 - kFirstTickAfterStop) into it
+ 	bigtime_t clockNow = system_time() + offset;
+@@ -399,7 +414,6 @@ Pcf8563::_WriteTime(bigtime_t offset)
+ 		- offset - kReleaseWriteTime;
+ 
+ 	uint8 stop = kControl1Stop;
+-	uint8 registers[kTimeRegisters];
+ 	_RegistersFromSeconds(seconds, registers);
+ 	status_t status = _WriteRegisters(kControl1, &stop, 1);
+ 	if (status == B_OK)
+@@ -417,9 +431,7 @@ Pcf8563::_WriteTime(bigtime_t offset)
+ 		return status;
+ 
+ 	// when it ticked to seconds + 1, against when it should have
+-	bigtime_t tick;
+ 	status = _WaitForTick(registers, &tick);
+-	int64 tickSeconds;
+ 	if (status != B_OK || !_SecondsFromRegisters(registers, &tickSeconds)) {
+ 		INFO("the clock didn't tick after it was set: %s\n",
+ 			status != B_OK ? strerror(status) : "no valid time");
+@@ -427,16 +439,12 @@ Pcf8563::_WriteTime(bigtime_t offset)
+ 	}
+ 	bigtime_t error = tick + offset - (seconds + 1) * 1000000;
+ 
+-	// how far off the clock was from the new time, since it was last read
+-	// or set
+ 	MutexLocker locker(fStatusLock);
+-	bool driftKnown = fClockOffsetKnown;
+ 	if (driftKnown) {
+-		fLastDrift = fClockOffset - offset;
++		fLastDrift = drift;
+ 		fLastDriftOver = system_time() - fClockOffsetSince;
+ 	}
+ 	fClockOffsetKnown = true;
+-	fClockOffset = offset;
+ 	fClockOffsetSince = system_time();
+ 	fLastSet.done = true;
+ 	fLastSet.seconds = tickSeconds;
+@@ -450,7 +458,6 @@ Pcf8563::_WriteTime(bigtime_t offset)
+ 		(error < 0 ? -error : error) % 1000, error < 0 ? "before" : "after",
+ 		released - release, tick - released);
+ 	if (driftKnown) {
+-		bigtime_t drift = fLastDrift;
+ 		INFO("before, the clock was %" B_PRId64 ".%03" B_PRId64 " ms %s the "
+ 			"new time (%" B_PRId64 " s after it was last read or set)\n",
+ 			(drift < 0 ? -drift : drift) / 1000,

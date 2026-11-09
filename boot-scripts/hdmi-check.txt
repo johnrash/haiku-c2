@@ -1,0 +1,5 @@
+# Show which U-Boot is running and whether its HDMI output came up.
+echo c2: HDMI CHECK
+version
+dm tree
+echo c2: HDMI CHECK END

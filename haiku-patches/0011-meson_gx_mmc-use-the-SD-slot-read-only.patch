@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 01:07:53 -0400
+Subject: [PATCH 011/342] meson_gx_mmc: use the SD slot read-only
+
+Removable slots (the ODROID-C2's microSD, which holds the firmware) are
+now attached again, read-only: data writes and all commands that can
+change the card (write, erase, write protect, PROGRAM_CSD, LOCK_UNLOCK,
+GEN_CMD) are refused. The controller publishes "mmc/read_only" and
+mmc_disk reports such disks as read-only.
+
+Verified on the board: the first 4 MiB of the microSD (partition table
+and U-Boot) read back with the same sha256 as the image they were written
+from; raw read 11.8 MB/s (SDHC, 4-bit, 25 MHz).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/drivers/mmc.h                 |  2 +
+ .../kernel/busses/mmc/meson_gx_mmc.cpp        | 48 ++++++++++++++-----
+ .../kernel/drivers/disk/mmc/mmc_disk.cpp      |  8 +++-
+ 3 files changed, 43 insertions(+), 15 deletions(-)
+
+diff --git a/headers/private/drivers/mmc.h b/headers/private/drivers/mmc.h
+index da6c9af124..5c5e2b845a 100644
+--- a/headers/private/drivers/mmc.h
++++ b/headers/private/drivers/mmc.h
+@@ -144,6 +144,8 @@ const char* const kMmcRcaAttribute = "mmc/rca";
+ const char* const kMmcTypeAttribute = "mmc/type";
+ // Published by host controllers that can drive more than 4 data lines
+ const char* const kMmcMaxBusWidthAttribute = "mmc/max_bus_width";
++// Published (uint8 1) by host controllers that must not write their cards
++const char* const kMmcReadOnlyAttribute = "mmc/read_only";
+ 
+ 
+ #endif /* _MMC_H */
+diff --git a/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp b/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
+index 6b02020ff9..7b5313501b 100644
+--- a/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
++++ b/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
+@@ -17,8 +17,9 @@
+  *   contiguous buffer, multi-block transfers are ended with CMD12;
+  * - pin muxing, clock gates and card power are left as the firmware
+  *   (U-Boot) set them up;
+- * - removable cards (the SD slot) are read-only until writing has been
+- *   proven on the eMMC.
++ * - removable cards (the SD slot, which holds the firmware on the
++ *   ODROID-C2) are read-only: data writes and every command that can
++ *   change the card are refused.
+  */
+ 
+ 
+@@ -587,9 +588,35 @@ MesonMmc::_Execute(uint8 command, uint32 argument, uint32* result,
+ }
+ 
+ 
++static bool
++modifies_card(uint8 command)
++{
++	switch (command) {
++		case SD_WRITE_SINGLE_BLOCK:
++		case SD_WRITE_MULTIPLE_BLOCKS:
++		case 27:	// PROGRAM_CSD
++		case 28:	// SET_WRITE_PROT
++		case 29:	// CLR_WRITE_PROT
++		case SD_ERASE_WR_BLK_START:
++		case SD_ERASE_WR_BLK_END:
++		case SD_ERASE:
++		case 42:	// LOCK_UNLOCK
++		case 56:	// GEN_CMD
++			return true;
++		default:
++			return false;
++	}
++}
++
++
+ status_t
+ MesonMmc::ExecuteCommand(uint8 command, uint32 argument, uint32* result)
+ {
++	if (fReadOnly && !fAppCommand && modifies_card(command)) {
++		ERROR("CMD%u refused: read-only card\n", command);
++		return B_READ_ONLY_DEVICE;
++	}
++
+ 	MutexLocker locker(fLock);
+ 	return _Execute(command, argument, result, 0, 0, false);
+ }
+@@ -845,12 +872,6 @@ supports_device(device_node* parent)
+ 		return 0.0f;
+ 	}
+ 
+-	// For now only the soldered-in eMMC: the SD slot holds the firmware
+-	// and is left alone until the eMMC path works.
+-	// TODO: enable removable slots (read-only first).
+-	if (fdtModule != NULL
+-		&& fdtModule->get_prop(fdtDevice, "non-removable", NULL) == NULL)
+-		return 0.0f;
+ 
+ 	return 0.8f;
+ }
+@@ -859,13 +880,16 @@ supports_device(device_node* parent)
+ static status_t
+ register_device(device_node* parent)
+ {
+-	// data lines wired to the slot (eMMC: 8)
++	// data lines wired to the slot (eMMC: 8); removable slots read-only
+ 	uint8 busWidth = 4;
++	uint8 readOnly = 1;
+ 	fdt_device_module_info* fdtModule;
+ 	fdt_device* fdtDevice;
+ 	if (gDeviceManager->get_driver(parent, (driver_module_info**)&fdtModule,
+ 			(void**)&fdtDevice) == B_OK) {
+ 		busWidth = get_cell_count(fdtModule, fdtDevice, "bus-width", 4);
++		readOnly = fdtModule->get_prop(fdtDevice, "non-removable", NULL)
++			== NULL;
+ 	}
+ 
+ 	device_attr attrs[] = {
+@@ -875,6 +899,7 @@ register_device(device_node* parent)
+ 			{ .string = MMC_BUS_MODULE_NAME } },
+ 		{ B_DEVICE_BUS, B_STRING_TYPE, { .string = "mmc" } },
+ 		{ kMmcMaxBusWidthAttribute, B_UINT8_TYPE, { .ui8 = busWidth } },
++		{ kMmcReadOnlyAttribute, B_UINT8_TYPE, { .ui8 = readOnly } },
+ 
+ 		// One descriptor per command: one contiguous segment of at most 511
+ 		// blocks below 4 GB. Whole-sector alignment (as sdhci uses) also keeps
+@@ -907,12 +932,9 @@ init_driver(device_node* node, void** _cookie)
+ 	if (!fdt_device_enabled(fdtModule, fdtDevice))
+ 		return B_DEVICE_NOT_FOUND;
+ 
+-	// Removable slots stay read-only for now, see the top of this file;
+-	// for the moment they are not used at all (see supports_device()).
++	// Removable slots are read-only, see the top of this file.
+ 	bool removable = fdtModule->get_prop(fdtDevice, "non-removable", NULL)
+ 		== NULL;
+-	if (removable)
+-		return B_DEVICE_NOT_FOUND;
+ 
+ 	uint64 registers;
+ 	uint64 length;
+diff --git a/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp b/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
+index f41be310f5..e594230b30 100644
+--- a/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
++++ b/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
+@@ -28,7 +28,7 @@
+ #include <AutoDeleter.h>
+ 
+ 
+-#define TRACE_MMC_DISK
++//#define TRACE_MMC_DISK
+ #ifdef TRACE_MMC_DISK
+ #	define TRACE(x...) dprintf("\33[33mmmc_disk:\33[0m " x)
+ #else
+@@ -208,7 +208,11 @@ mmc_block_get_geometry(mmc_disk_driver_info* info, device_geometry* geometry)
+ 	}
+ 
+ 	geometry->removable = !isMMC;
+-	geometry->read_only = false; // TODO check write protect switch?
++	// TODO check the write protect switch
++	uint8 readOnly = 0;
++	sDeviceManager->get_attr_uint8(info->node, kMmcReadOnlyAttribute,
++		&readOnly, true);
++	geometry->read_only = readOnly != 0;
+ 	geometry->write_once = false;
+ 
+ 	// This function will be called before all data transfers, so we use this

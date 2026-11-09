@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 8 Nov 2026 17:33:24 -0500
+Subject: [PATCH 341/342] Terminal: a setting to turn antialiased text off
+
+"Antialiased text" in the Settings window, beside "Allow bold text",
+on by default and saved with the other settings ("Antialiased text" in
+~/config/settings/Terminal/Default). Off, TermView gives its fonts
+B_DISABLE_ANTIALIASING; open windows change at once.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apps/terminal/AppearPrefView.cpp | 16 ++++++++++++++++
+ src/apps/terminal/AppearPrefView.h   |  2 ++
+ src/apps/terminal/PrefHandler.cpp    |  1 +
+ src/apps/terminal/TermConst.h        |  1 +
+ src/apps/terminal/TermView.cpp       |  9 +++++++++
+ src/apps/terminal/TermWindow.cpp     |  1 +
+ 6 files changed, 30 insertions(+)
+
+diff --git a/src/apps/terminal/AppearPrefView.cpp b/src/apps/terminal/AppearPrefView.cpp
+index b7a99cf9c7..e510f6543f 100644
+--- a/src/apps/terminal/AppearPrefView.cpp
++++ b/src/apps/terminal/AppearPrefView.cpp
+@@ -52,6 +52,10 @@ AppearancePrefView::AppearancePrefView(const char* name,
+ 		B_TRANSLATE("Allow bold text"),
+ 			new BMessage(MSG_ALLOW_BOLD_CHANGED));
+ 
++	fTextAntialiasing = new BCheckBox(
++		B_TRANSLATE("Antialiased text"),
++			new BMessage(MSG_TEXT_ANTIALIASING_CHANGED));
++
+ 	fUseOptionAsMetaKey = new BCheckBox(
+ 		B_TRANSLATE("Use left Option as Meta key"),
+ 			new BMessage(MSG_USE_OPTION_AS_META_CHANGED));
+@@ -115,6 +119,7 @@ AppearancePrefView::AppearancePrefView(const char* name,
+ 		.AddGlue()
+ 		.Add(fBlinkCursor)
+ 		.Add(fAllowBold)
++		.Add(fTextAntialiasing)
+ 		.Add(fUseOptionAsMetaKey)
+ 		.Add(fWarnOnExit);
+ 
+@@ -138,6 +143,7 @@ AppearancePrefView::Revert()
+ 
+ 	fBlinkCursor->SetValue(pref->getBool(PREF_BLINK_CURSOR));
+ 	fAllowBold->SetValue(pref->getBool(PREF_ALLOW_BOLD));
++	fTextAntialiasing->SetValue(pref->getBool(PREF_TEXT_ANTIALIASING));
+ 	fUseOptionAsMetaKey->SetValue(pref->getBool(PREF_USE_OPTION_AS_META));
+ 	fWarnOnExit->SetValue(pref->getBool(PREF_WARN_ON_EXIT));
+ 
+@@ -159,6 +165,7 @@ AppearancePrefView::AttachedToWindow()
+ 	fWindowTitle->SetTarget(this);
+ 	fBlinkCursor->SetTarget(this);
+ 	fAllowBold->SetTarget(this);
++	fTextAntialiasing->SetTarget(this);
+ 	fUseOptionAsMetaKey->SetTarget(this);
+ 	fWarnOnExit->SetTarget(this);
+ 
+@@ -250,6 +257,15 @@ AppearancePrefView::MessageReceived(BMessage* msg)
+ 			}
+ 			break;
+ 
++		case MSG_TEXT_ANTIALIASING_CHANGED:
++			if (PrefHandler::Default()->getBool(PREF_TEXT_ANTIALIASING)
++				!= fTextAntialiasing->Value()) {
++					PrefHandler::Default()->setBool(PREF_TEXT_ANTIALIASING,
++						fTextAntialiasing->Value());
++					modified = true;
++			}
++			break;
++
+ 		case MSG_USE_OPTION_AS_META_CHANGED:
+ 			if (PrefHandler::Default()->getBool(PREF_USE_OPTION_AS_META)
+ 				!= fUseOptionAsMetaKey->Value()) {
+diff --git a/src/apps/terminal/AppearPrefView.h b/src/apps/terminal/AppearPrefView.h
+index 14d5071f38..a2cc76e52c 100644
+--- a/src/apps/terminal/AppearPrefView.h
++++ b/src/apps/terminal/AppearPrefView.h
+@@ -24,6 +24,7 @@ static const uint32 MSG_TAB_TITLE_SETTING_CHANGED		= 'mtts';
+ static const uint32 MSG_WINDOW_TITLE_SETTING_CHANGED	= 'mwts';
+ static const uint32 MSG_BLINK_CURSOR_CHANGED			= 'mbcc';
+ static const uint32 MSG_ALLOW_BOLD_CHANGED				= 'mabc';
++static const uint32 MSG_TEXT_ANTIALIASING_CHANGED		= 'mtac';
+ static const uint32 MSG_USE_OPTION_AS_META_CHANGED		= 'momc';
+ static const uint32 MSG_WARN_ON_EXIT_CHANGED			= 'mwec';
+ static const uint32 MSG_COLS_CHANGED					= 'mccl';
+@@ -69,6 +70,7 @@ private:
+ 
+ 			BCheckBox*			fBlinkCursor;
+ 			BCheckBox*			fAllowBold;
++			BCheckBox*			fTextAntialiasing;
+ 			BCheckBox*			fUseOptionAsMetaKey;
+ 			BCheckBox*			fWarnOnExit;
+ 			BMenuField*			fFontField;
+diff --git a/src/apps/terminal/PrefHandler.cpp b/src/apps/terminal/PrefHandler.cpp
+index 334da1ce92..0e7cef5247 100644
+--- a/src/apps/terminal/PrefHandler.cpp
++++ b/src/apps/terminal/PrefHandler.cpp
+@@ -90,6 +90,7 @@ static const pref_defaults kTermDefaults[] = {
+ 	{ PREF_TAB_TITLE,			"%1d: %p%e" },
+ 	{ PREF_WINDOW_TITLE,		"%T% i: %t" },
+ 	{ PREF_BLINK_CURSOR,		PREF_TRUE },
++	{ PREF_TEXT_ANTIALIASING,	PREF_TRUE },
+ 	{ PREF_USE_OPTION_AS_META,	PREF_FALSE },
+ 	{ PREF_WARN_ON_EXIT,		PREF_TRUE },
+ 	{ PREF_CURSOR_STYLE,		PREF_BLOCK_CURSOR },
+diff --git a/src/apps/terminal/TermConst.h b/src/apps/terminal/TermConst.h
+index e65723b8bc..8dbec541e0 100644
+--- a/src/apps/terminal/TermConst.h
++++ b/src/apps/terminal/TermConst.h
+@@ -142,6 +142,7 @@ static const char* const PREF_TEXT_ENCODING = "Text encoding";
+ 
+ static const char* const PREF_BLINK_CURSOR = "Blinking cursor";
+ static const char* const PREF_ALLOW_BOLD = "Allow bold text";
++static const char* const PREF_TEXT_ANTIALIASING = "Antialiased text";
+ static const char* const PREF_USE_OPTION_AS_META =
+ 	"Use left Option as Meta key";
+ static const char* const PREF_WARN_ON_EXIT = "Warn on exit";
+diff --git a/src/apps/terminal/TermView.cpp b/src/apps/terminal/TermView.cpp
+index e09e7cae15..7a440bae66 100644
+--- a/src/apps/terminal/TermView.cpp
++++ b/src/apps/terminal/TermView.cpp
+@@ -784,6 +784,15 @@ TermView::SetTermFont(const BFont *font)
+ 
+ 	fHalfFont.SetSpacing(B_FIXED_SPACING);
+ 
++	// antialiased text, unless the settings turn it off
++	bool antialiased = PrefHandler::Default() == NULL
++		|| PrefHandler::Default()->getBool(PREF_TEXT_ANTIALIASING);
++	uint32 flags = fHalfFont.Flags() & ~B_DISABLE_ANTIALIASING;
++	if (!antialiased)
++		flags |= B_DISABLE_ANTIALIASING;
++	fHalfFont.SetFlags(flags);
++	fBoldFont.SetFlags(flags);
++
+ 	// calculate half font's max width
+ 	// Not Bounding, check only A-Z (For case of fHalfFont is KanjiFont.)
+ 	for (int c = 0x20; c <= 0x7e; c++) {
+diff --git a/src/apps/terminal/TermWindow.cpp b/src/apps/terminal/TermWindow.cpp
+index ccbd76854e..39c7180988 100644
+--- a/src/apps/terminal/TermWindow.cpp
++++ b/src/apps/terminal/TermWindow.cpp
+@@ -912,6 +912,7 @@ TermWindow::MessageReceived(BMessage *message)
+ 		case MSG_HALF_FONT_CHANGED:
+ 		case MSG_FULL_FONT_CHANGED:
+ 		case MSG_ALLOW_BOLD_CHANGED:
++		case MSG_TEXT_ANTIALIASING_CHANGED:
+ 		{
+ 			BFont font;
+ 			_GetPreferredFont(font);

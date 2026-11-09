@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 4 Nov 2026 11:58:13 -0500
+Subject: [PATCH 288/342] realtekwifi: STBC and LDPC in the Tx descriptor are
+ on or off
+
+For a VHT peer the RTL8822B code wrote STBC 2 and LDPC 0, from flags that rtw88
+keeps in bool fields and so sends as 1 and 1. STBC 2 asks for more streams than
+two chains have. The baseband hung in the middle of a transmission every few GB
+on 5 GHz, with RF path A in Tx, path B in standby and all the BB counters frozen,
+until the watchdog restarted the chip. 2.4 GHz peers got a valid 1.
+
+Now no stall and no beacon miss in 51 GB on two 5 GHz radios, full load up and
+down against a laptop.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_tx.c   | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_tx.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_tx.c
+index 4c7896c5b1..bffdb365ff 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_tx.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_tx.c
+@@ -322,15 +322,19 @@ r22b_fill_tx_desc(struct rtwn_softc *sc, struct ieee80211_node *ni,
+ 				 * The firmware picks rate and short GI; the
+ 				 * descriptor carries the initial rate, the
+ 				 * bandwidth, STBC and LDPC of the station.
+-				 * As in rtw88, the 1-bit LDPC field only
+-				 * takes HT_LDPC_EN (le32_encode_bits()).
++				 * Both are on or off here, whichever of the
++				 * HT and VHT flags is set (bool in rtw88's
++				 * rtw_tx_pkt_info).  An STBC of 2 asks for
++				 * more streams than this chip has; with it,
++				 * the baseband hung in transmit on 5 GHz.
+ 				 */
+ 				ridx = si->init_rate;
+ 				txd->txdw5 |= htole32(SM(R22B_TXDW5_DATA_BW,
+ 				    si->bw_mode));
+-				txd->txdw5 |= htole32(SM(R22B_TXDW5_DATA_STBC,
+-				    si->stbc_en & 0x3));
+-				if (si->ldpc_en & 0x1)
++				if (si->stbc_en != 0)
++					txd->txdw5 |= htole32(SM(
++					    R22B_TXDW5_DATA_STBC, 1));
++				if (si->ldpc_en != 0)
+ 					txd->txdw5 |= htole32(
+ 					    R22B_TXDW5_DATA_LDPC);
+ 			} else {

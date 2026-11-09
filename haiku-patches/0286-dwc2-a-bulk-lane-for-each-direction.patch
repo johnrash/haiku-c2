@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 4 Nov 2026 08:58:42 -0500
+Subject: [PATCH 286/342] dwc2: a bulk lane for each direction
+
+Bulk IN and OUT ran one at a time on one channel, and a waiting IN was halted
+whenever an OUT was queued. Linux on the same board, dongle and access point keeps
+Rx transfers open and never halts them, and neither stalls nor loses speed: 35
+MB/s up against 12 here. A bulk IN now only gives way to other bulk INs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/busses/usb/dwc2.cpp | 26 ++++++++++++++++----------
+ src/add-ons/kernel/busses/usb/dwc2.h   |  7 ++++---
+ 2 files changed, 20 insertions(+), 13 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.cpp b/src/add-ons/kernel/busses/usb/dwc2.cpp
+index 0f6e2c51b3..70cef39680 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2.cpp
+@@ -18,10 +18,10 @@
+  * - runs transfers one at a time per lane, on a host channel and worker
+  *   thread each: control transfers stage by stage on one, interrupt IN on
+  *   another as one attempt that is retried every 10 ms while the device
+- *   NAKs, and bulk in one go on a third. A bulk IN can wait for ever (a
+- *   network device with nothing to receive): it has control transfers on a
+- *   lane of their own for that reason, and gives way to other bulk transfers
+- *   while nothing has come in;
++ *   NAKs, and bulk in one go, with one lane for each direction. A bulk IN can
++ *   wait for ever (a network device with nothing to receive): it has control
++ *   transfers and bulk OUT on lanes of their own for that reason, and gives
++ *   way to other bulk INs while nothing has come in;
+  * - reaches low/full speed devices behind a high speed hub (keyboards and
+  *   mice behind the ODROID-C2's GL852G hub) with split transactions, one
+  *   packet per start-split/complete-split pair; like FreeBSD, interrupt
+@@ -95,7 +95,8 @@ static const size_t kBounceSize = 64 * 1024;		// control and bulk lanes
+ static const size_t kInterruptBounceSize = 4096;
+ static const uint32 kControlLane = 0;
+ static const uint32 kInterruptLane = 1;
+-static const uint32 kBulkLane = 2;
++static const uint32 kBulkOutLane = 2;
++static const uint32 kBulkInLane = 3;
+ static const uint32 kDataOffset = 64;		// control data after the SETUP
+ static const bigtime_t kInterruptRetryDelay = 10000;
+ // how often a waiting bulk IN looks at the queue: with others in it, and without
+@@ -228,7 +229,7 @@ DWC2::DWC2(Stack* stack, device_node* node, phys_addr_t registers,
+ 	// isochronous streams
+ 	uint8* bounce;
+ 	fBounceArea = create_area("dwc2 bounce", (void**)&bounce,
+-		B_ANY_KERNEL_ADDRESS, 2 * kBounceSize + kInterruptBounceSize
++		B_ANY_KERNEL_ADDRESS, 3 * kBounceSize + kInterruptBounceSize
+ 			+ kIsoFirstHighSpeedStream * kIsoSlotCount * kIsoSlotSize
+ 			+ kIsoHighSpeedStreams * kIsoSlotCount * kIsoHighSpeedSlotSize,
+ 		B_32_BIT_CONTIGUOUS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
+@@ -489,7 +490,8 @@ DWC2::Start()
+ 	for (uint32 i = 0; i < kLaneCount; i++) {
+ 		fLanes[i].thread = spawn_kernel_thread(_WorkerThread,
+ 			i == kControlLane ? "dwc2 control"
+-				: i == kInterruptLane ? "dwc2 interrupt" : "dwc2 bulk",
++				: i == kInterruptLane ? "dwc2 interrupt"
++				: i == kBulkOutLane ? "dwc2 bulk out" : "dwc2 bulk in",
+ 			B_URGENT_DISPLAY_PRIORITY, &fLanes[i]);
+ 		if (fLanes[i].thread < 0)
+ 			return fLanes[i].thread;
+@@ -691,16 +693,20 @@ DWC2::SubmitTransfer(Transfer* transfer)
+ 	entry->canceled = false;
+ 	entry->silent = false;
+ 
++	// Bulk in and out each have a lane: with one, a transmit stopped the
++	// receive that was waiting for a frame, and a wireless adapter under load
++	// fell behind in both directions.
+ 	dwc2_lane* lane = &fLanes[(pipe->Type() & USB_OBJECT_INTERRUPT_PIPE) != 0
+ 		? kInterruptLane
+ 		: (pipe->Type() & USB_OBJECT_CONTROL_PIPE) != 0
+-			? kControlLane : kBulkLane];
++			? kControlLane
++			: pipe->Direction() == Pipe::In ? kBulkInLane : kBulkOutLane];
+ 	MutexLocker locker(fQueueLock);
+ 	lane->queue.Add(entry);
+ 	locker.Unlock();
+ 	release_sem_etc(lane->workSemaphore, 1, B_DO_NOT_RESCHEDULE);
+ 	// a bulk IN waiting on this lane gives way (_RunChannel())
+-	if (lane == &fLanes[kBulkLane])
++	if (lane == &fLanes[kBulkInLane])
+ 		lane->halted.NotifyAll();
+ 	return B_OK;
+ }
+@@ -889,7 +895,7 @@ DWC2::_Worker(dwc2_lane* lane)
+ 		if (retry) {
+ 			// a bulk IN that gave way goes on after what is queued
+ 			entry->due = system_time() + kInterruptRetryDelay;
+-			if (lane->channel == kBulkLane) {
++			if (lane->channel == kBulkOutLane || lane->channel == kBulkInLane) {
+ 				entry->due = 0;
+ 				if (_IsoSplitsRunning()) {
+ 					bigtime_t now = system_time();
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.h b/src/add-ons/kernel/busses/usb/dwc2.h
+index 1ebe586666..82f1270e84 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.h
++++ b/src/add-ons/kernel/busses/usb/dwc2.h
+@@ -28,8 +28,8 @@ struct dwc2_transfer : DoublyLinkedListLinkImpl<dwc2_transfer> {
+ typedef DoublyLinkedList<dwc2_transfer> dwc2_transfer_list;
+ 
+ 
+-static const uint32 kLaneCount = 3;		// channels 0, 1, 2
+-static const uint32 kIsoStreamCount = 8;	// channels 3 to 10
++static const uint32 kLaneCount = 4;		// channels 0 to 3
++static const uint32 kIsoStreamCount = 8;	// channels 4 to 11
+ static const uint32 kIsoFirstHighSpeedStream = 6;
+ 	// 6, 7: high speed devices (a webcam's video and its microphone at
+ 	// once); 0 to 5: full speed devices behind the hub (three audio adapters
+@@ -295,8 +295,9 @@ private:
+ 			DWC2RootHub*		fRootHub;
+ 			uint8				fPortResetChange;
+ 
+-			mutex				fQueueLock;		// both lanes' queues
++			mutex				fQueueLock;		// the lanes' queues
+ 			dwc2_lane			fLanes[kLaneCount];	// control, interrupt, bulk
++													// out, bulk in
+ 			bool				fStopWorker;
+ 			bool				fWarnedSplit;
+ 			int64				fStatBulkBytes;

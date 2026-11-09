@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Tue, 27 Oct 2026 23:07:17 -0400
+Subject: [PATCH 003/342] efi/arm64: drop to EL1 before programming the EL1 MMU
+ registers
+
+When entered at EL2 without VHE, arm64_common_cpu_startup() set up
+TCR/MAIR/TTBR0/TTBR1_EL1 and then called _arch_transition_EL2_EL1, which
+copies TTBR0, MAIR and VBAR from EL2 over them. Only the boot CPU has
+usable values there (left by the firmware); secondary CPUs started at EL2
+by PSCI have reset values, took a translation fault as soon as the MMU was
+enabled and spun at VBAR 0 + 0x200, while CPU 0 waited for them forever in
+the first boot rendezvous, before any kernel output.
+
+Drop to EL1 first and then do the same MMU setup as the EL1 path. Seen on
+the ODROID-C2 (U-Boot runs at EL2) and reproduced with QEMU virt,
+virtualization=on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../boot/platform/efi/arch/arm64/arch_start.cpp  | 16 +++++++++-------
+ 1 file changed, 9 insertions(+), 7 deletions(-)
+
+diff --git a/src/system/boot/platform/efi/arch/arm64/arch_start.cpp b/src/system/boot/platform/efi/arch/arm64/arch_start.cpp
+index f34e07ca15..c832b6a96c 100644
+--- a/src/system/boot/platform/efi/arch/arm64/arch_start.cpp
++++ b/src/system/boot/platform/efi/arch/arm64/arch_start.cpp
+@@ -64,14 +64,16 @@ arm64_common_cpu_startup()
+ 
+ 	// EL2 with E2H enabled behaves as a superset of EL1
+ 	//
+-	// EL2 without E2H enabled does not, so we need to drop to EL1
+-	if (el == 1 || e2h) {
+-		arm64_mmu_setup();
+-		WRITE_SPECIALREG(CNTKCTL_EL1, 0b11);
+-	} else {
+-		arm64_mmu_setup();
++	// EL2 without E2H enabled does not, so we need to drop to EL1. Do that
++	// before setting up the EL1 MMU registers: the transition copies TTBR0,
++	// MAIR and VBAR from EL2, which only hold usable values on the boot CPU
++	// (left by the firmware). Secondary CPUs started at EL2 by PSCI have reset
++	// values there and would fault as soon as the MMU is enabled.
++	if (el == 2 && !e2h)
+ 		_arch_transition_EL2_EL1();
+-	}
++
++	arm64_mmu_setup();
++	WRITE_SPECIALREG(CNTKCTL_EL1, 0b11);
+ 
+ 	WRITE_SPECIALREG(SCTLR_EL1, SCTLR_LSMAOE | SCTLR_nTLSMD
+ 		| SCTLR_UCI | SCTLR_SPAN | SCTLR_IESB | SCTLR_nTWE | SCTLR_nTWI

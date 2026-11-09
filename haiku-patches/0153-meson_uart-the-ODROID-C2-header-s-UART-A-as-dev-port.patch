@@ -1,0 +1,1082 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 01:45:41 -0400
+Subject: [PATCH 153/342] meson_uart: the ODROID-C2 header's UART A as
+ /dev/ports/header
+
+A serial port on header pins 8 (TX) and 10 (RX), 3.3 V, for BSerialPort
+("header") and termios programs. The device tree has the UART disabled
+and its pins are GPIO until the port is opened: opening claims them in
+meson_header (B_BUSY while a program has one) and selects UART A;
+closing lets the bytes written go out, then gives them back.
+
+Programs get the slave side of a tty pair, as with a pty, so termios
+works as on a terminal (VMIN and VTIME included); the driver is the
+master side, a thread passing received bytes in and one sending what
+comes out, into the 128-byte FIFO, woken when it is below half full.
+Two-wire: no RTS/CTS on the header. The baud clock is 8 MHz divided by
+a 23-bit divider: 500k to 4M exact, 9600 to 230400 within 0.8 %. A
+break inverts TX. Measured on the ODROID-C2 from pin 8: frames in 8N1,
+8E1 and 7O2, and speeds from 9600 to 4000000 within 0.02 % without gaps.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/jam/packages/Haiku                      |    1 +
+ src/add-ons/kernel/drivers/ports/Jamfile      |    1 +
+ .../kernel/drivers/ports/meson_uart/Jamfile   |   10 +
+ .../drivers/ports/meson_uart/meson_uart.cpp   | 1008 +++++++++++++++++
+ 4 files changed, 1020 insertions(+)
+ create mode 100644 src/add-ons/kernel/drivers/ports/meson_uart/Jamfile
+ create mode 100644 src/add-ons/kernel/drivers/ports/meson_uart/meson_uart.cpp
+
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index 02076ea96e..841a81e112 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -148,6 +148,7 @@ AddNewDriversToPackage power
+ AddNewDriversToPackage power : meson_scpi@arm64 ;
+ AddNewDriversToPackage rtc : pcf8563@arm64 ;
+ AddNewDriversToPackage misc : meson_gpio@arm64 meson_saradc@arm64 ;
++AddNewDriversToPackage ports : meson_uart@arm64 ;
+ AddNewDriversToPackage video : meson_vdec@arm64 ;
+ AddNewDriversToPackage sensor
+ 	: $(SYSTEM_ADD_ONS_DRIVERS_SENSOR) ;
+diff --git a/src/add-ons/kernel/drivers/ports/Jamfile b/src/add-ons/kernel/drivers/ports/Jamfile
+index ec6ae31ff3..6b83762a75 100644
+--- a/src/add-ons/kernel/drivers/ports/Jamfile
++++ b/src/add-ons/kernel/drivers/ports/Jamfile
+@@ -2,3 +2,4 @@ SubDir HAIKU_TOP src add-ons kernel drivers ports ;
+ 
+ SubInclude HAIKU_TOP src add-ons kernel drivers ports pc_serial ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers ports usb_serial ;
++SubInclude HAIKU_TOP src add-ons kernel drivers ports meson_uart ;
+diff --git a/src/add-ons/kernel/drivers/ports/meson_uart/Jamfile b/src/add-ons/kernel/drivers/ports/meson_uart/Jamfile
+new file mode 100644
+index 0000000000..57078fdbfe
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/ports/meson_uart/Jamfile
+@@ -0,0 +1,10 @@
++SubDir HAIKU_TOP src add-ons kernel drivers ports meson_uart ;
++
++UsePrivateKernelHeaders ;
++UsePrivateHeaders drivers ;
++
++if $(TARGET_ARCH) = arm64 {
++	KernelAddon meson_uart :
++		meson_uart.cpp
++	;
++}
+diff --git a/src/add-ons/kernel/drivers/ports/meson_uart/meson_uart.cpp b/src/add-ons/kernel/drivers/ports/meson_uart/meson_uart.cpp
+new file mode 100644
+index 0000000000..e2ca1a4d25
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/ports/meson_uart/meson_uart.cpp
+@@ -0,0 +1,1008 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * The ODROID-C2 header's serial port: the Amlogic S905's UART A on pins 8
++ * (TX) and 10 (RX), 3.3 V, as /dev/ports/header (BSerialPort's "header"),
++ * through the generic tty module. Programs get the slave side of a tty
++ * pair, as with a pty, so termios applies as on a terminal (VMIN and VTIME,
++ * BSerialPort's timeouts, included); the driver is the master side: a
++ * thread passes received bytes in, another sends what comes out.
++ *
++ * The device tree has this UART disabled, and its pins are GPIO until the
++ * port is opened: opening claims pins 8 and 10 in the meson_header module
++ * (B_BUSY while a program has one as GPIO) and selects UART A on them;
++ * closing lets the bytes written go out and gives the pins back as GPIO, as
++ * they were. The console is the AO UART, which this driver never touches.
++ *
++ * The UART has a 128-byte FIFO each way and one interrupt (GIC 58, edge)
++ * for a byte received and for the transmit FIFO dropping below half full.
++ * No modem lines reach the header, so it runs in two-wire mode: no RTS/CTS
++ * flow control (XON/XOFF is the tty module's). Its baud clock is the 24 MHz
++ * crystal divided by 3 and then by a 23-bit divider: 500000, 1000000,
++ * 2000000 and 4000000 are exact, 9600 to 230400 within 0.8 %; 460800 is
++ * 2 % off, 921600 3.5 % and 1500000 6.7 %. A break holds TX low by
++ * inverting it. The facts are in the port's docs/m27-irq-uart-i2c-facts.md
++ * (from Linux and the S905 datasheet).
++ */
++
++
++#include <new>
++#include <stdio.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <termios.h>
++
++#include <AutoDeleterDrivers.h>
++#include <KernelExport.h>
++#include <arch/int.h>
++#include <bus/FDT.h>
++#include <device_manager.h>
++#include <kernel.h>
++#include <lock.h>
++#include <tty/tty_module.h>
++#include <util/AutoLock.h>
++
++#include <meson_header.h>
++
++
++#define DRIVER_MODULE_NAME	"drivers/ports/meson_uart/driver_v1"
++#define DEVICE_MODULE_NAME	"drivers/ports/meson_uart/device_v1"
++
++#define INFO(x...) dprintf("meson_uart: " x)
++
++
++static const phys_addr_t kUartA = 0xc11084c0;
++static const char* kNodeName = "serial@84c0";
++	// UART A in the device tree's CBUS ("serial@84dc" and "serial@8700" are
++	// B and C, "serial@4c0" the AO console)
++static const int32 kDefaultInterrupt = 58;
++
++static const phys_addr_t kHhiBase = 0xc883c000;
++static const uint32 kHhiGateMpeg0 = 0x140;
++static const uint32 kHhiGateUartA = 1 << 13;
++
++// register words
++enum {
++	kWriteFifo = 0,
++	kReadFifo,
++	kControl,
++	kStatus,
++	kMisc,
++	kBaud,
++};
++
++enum {
++	kControlTxEnable		= 1 << 12,
++	kControlRxEnable		= 1 << 13,
++	kControlTwoWire			= 1 << 15,
++	kControlTwoStopBits		= 1 << 16,
++	kControlStopBitsMask	= 3 << 16,
++	kControlOddParity		= 1 << 18,
++	kControlParity			= 1 << 19,
++	kControlSevenBits		= 1 << 20,
++	kControlLengthMask		= 3 << 20,
++	kControlTxReset			= 1 << 22,
++	kControlRxReset			= 1 << 23,
++	kControlClearError		= 1 << 24,
++	kControlInvertTx		= 1 << 26,
++	kControlRxInterrupt		= 1 << 27,
++	kControlTxInterrupt		= 1 << 28,
++};
++
++enum {
++	kStatusParityError		= 1 << 16,
++	kStatusFrameError		= 1 << 17,
++	kStatusTxOverrun		= 1 << 18,
++	kStatusRxEmpty			= 1 << 20,
++	kStatusTxFull			= 1 << 21,
++	kStatusTxEmpty			= 1 << 22,
++	kStatusRxOverflow		= 1 << 24,
++	kStatusTxBusy			= 1 << 25,
++};
++
++static const uint32 kBaudCrystal = 1 << 24;
++static const uint32 kBaudNewDivider = 1 << 23;
++static const uint32 kBaudClock = 8000000;
++	// the crystal divided by 3
++static const uint32 kMinSpeed = 50;
++static const uint32 kMaxSpeed = 4000000;
++static const uint32 kFifoSize = 128;
++static const uint32 kTxThreshold = 64;
++static const uint32 kReceiveBufferSize = 4096;
++
++
++static device_manager_info* gDeviceManager;
++static tty_module_info* gTTYModule;
++static meson_header_module_info* gHeader;
++
++
++class MesonUart {
++public:
++								MesonUart(device_node* node);
++								~MesonUart();
++
++			status_t			Init();
++			device_node*		Node() const { return fNode; }
++
++			status_t			Open();
++			status_t			Close();
++			status_t			Free();
++			status_t			Read(void* buffer, size_t* _length);
++			status_t			Write(const void* buffer, size_t* _length);
++			status_t			Control(uint32 op, void* buffer,
++									size_t length);
++			status_t			Select(uint8 event, uint32 ref,
++									selectsync* sync);
++			status_t			Deselect(uint8 event, selectsync* sync);
++
++	static	bool				Service(struct tty* tty, uint32 op,
++									void* buffer, size_t length);
++
++private:
++			uint32				_Status() { return fRegisters[kStatus]; }
++			void				_ChangeControl(uint32 clear, uint32 set);
++			void				_SetModes(const termios& config);
++			bigtime_t			_FifoTime() const;
++			void				_WaitTxIdle();
++			void				_WaitOutputSent();
++			void				_Flush(int what);
++			bool				_Service(uint32 op, void* buffer);
++	static	int32				_Interrupt(void* data);
++	static	status_t			_ReceiveThread(void* data);
++	static	status_t			_TransmitThread(void* data);
++
++			device_node*		fNode;
++			area_id				fArea;
++			volatile uint32*	fRegisters;
++			int32				fInterrupt;
++			int32				fPins[2];		// TX, RX: header indexes
++
++			mutex				fLock;
++			spinlock			fSpinlock;
++				// CONTROL, the receive buffer and the counters
++			bool				fOpen;
++	volatile bool				fClosed;
++	volatile bool				fSending;
++			uint32				fSpeed;
++
++			struct tty*			fMasterTTY;
++			struct tty*			fSlaveTTY;
++			tty_cookie*			fUserCookie;
++				// the programs': the slave side
++			tty_cookie*			fDriverCookie;
++				// the driver's: the master side
++			termios				fConfig;
++
++			thread_id			fReceiveThread;
++			thread_id			fTransmitThread;
++			sem_id				fReceiveSem;
++			sem_id				fTransmitSem;
++			uint8				fReceiveBuffer[kReceiveBufferSize];
++			uint32				fReceiveFirst;
++			uint32				fReceiveCount;
++			uint32				fParityErrors;
++			uint32				fFrameErrors;
++			uint32				fOverruns;
++			bool				fOverflowing;
++};
++
++
++static MesonUart* sUart;
++	// for Service(): the tty module calls it with the tty only
++
++
++MesonUart::MesonUart(device_node* node)
++	:
++	fNode(node),
++	fArea(-1),
++	fRegisters(NULL),
++	fInterrupt(kDefaultInterrupt),
++	fOpen(false),
++	fClosed(false),
++	fSending(false),
++	fSpeed(9600),
++	fMasterTTY(NULL),
++	fSlaveTTY(NULL),
++	fUserCookie(NULL),
++	fDriverCookie(NULL),
++	fReceiveThread(-1),
++	fTransmitThread(-1),
++	fReceiveSem(-1),
++	fTransmitSem(-1),
++	fReceiveFirst(0),
++	fReceiveCount(0),
++	fParityErrors(0),
++	fFrameErrors(0),
++	fOverruns(0),
++	fOverflowing(false)
++{
++	mutex_init(&fLock, "meson uart");
++	B_INITIALIZE_SPINLOCK(&fSpinlock);
++	fPins[0] = fPins[1] = -1;
++
++	// raw, 9600 bits/s, 8N1
++	memset(&fConfig, 0, sizeof(fConfig));
++	fConfig.c_cflag = B9600 | CS8 | CREAD | CLOCAL;
++}
++
++
++MesonUart::~MesonUart()
++{
++	if (fArea >= 0)
++		delete_area(fArea);
++	mutex_destroy(&fLock);
++}
++
++
++status_t
++MesonUart::Init()
++{
++	DeviceNodePutter<&gDeviceManager> parent(
++		gDeviceManager->get_parent_node(fNode));
++	fdt_device_module_info* fdtModule;
++	fdt_device* fdtDevice;
++	status_t status = gDeviceManager->get_driver(parent.Get(),
++		(driver_module_info**)&fdtModule, (void**)&fdtDevice);
++	if (status != B_OK)
++		return status;
++	uint64 interrupt;
++	if (fdtModule->get_interrupt(fdtDevice, 0, NULL, &interrupt)
++		&& interrupt > 0) {
++		fInterrupt = interrupt;
++	}
++
++	fPins[0] = gHeader->find_pin("8");
++	fPins[1] = gHeader->find_pin("10");
++	if (fPins[0] < 0 || fPins[1] < 0)
++		return B_ERROR;
++
++	void* page;
++	fArea = map_physical_memory("meson uart", ROUNDDOWN(kUartA, B_PAGE_SIZE),
++		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &page);
++	if (fArea < 0)
++		return fArea;
++	fRegisters = (volatile uint32*)((addr_t)page + kUartA % B_PAGE_SIZE);
++	INFO("UART A (header pins 8 and 10) at /dev/ports/header, interrupt "
++		"%" B_PRId32 "\n", fInterrupt);
++	return B_OK;
++}
++
++
++void
++MesonUart::_ChangeControl(uint32 clear, uint32 set)
++{
++	InterruptsSpinLocker locker(fSpinlock);
++	fRegisters[kControl] = (fRegisters[kControl] & ~clear) | set;
++}
++
++
++/*!	How long the transmit FIFO takes to empty, at the most (12 bits a byte:
++	start, 8 data, parity, 2 stop), with some to spare.
++*/
++bigtime_t
++MesonUart::_FifoTime() const
++{
++	return (bigtime_t)kFifoSize * 12 * 1000000 / fSpeed + 20000;
++}
++
++
++/*!	Until the last byte has gone out, or the FIFO's time has passed. */
++void
++MesonUart::_WaitTxIdle()
++{
++	bigtime_t end = system_time() + _FifoTime();
++	while (system_time() < end) {
++		uint32 status = _Status();
++		if ((status & kStatusTxEmpty) != 0 && (status & kStatusTxBusy) == 0)
++			return;
++		snooze(min_c(_FifoTime() / 64, (bigtime_t)10000));
++	}
++}
++
++
++/*!	Until what programs wrote has gone out: what the tty holds, then the
++	FIFO; or until it stops going out (nothing for a FIFO's time).
++*/
++void
++MesonUart::_WaitOutputSent()
++{
++	int last = -1;
++	bigtime_t progress = system_time();
++	while (true) {
++		int readable = 0;
++		gTTYModule->tty_control(fDriverCookie, FIONREAD, &readable,
++			sizeof(readable));
++		if (readable <= 0 && !fSending)
++			break;
++		if (readable != last) {
++			last = readable;
++			progress = system_time();
++		} else if (system_time() - progress > _FifoTime())
++			break;
++		snooze(min_c(_FifoTime() / 16, (bigtime_t)10000));
++	}
++	_WaitTxIdle();
++}
++
++
++status_t
++MesonUart::Open()
++{
++	MutexLocker locker(fLock);
++	if (fOpen)
++		return B_BUSY;
++
++	if (gHeader->claim(fPins[0], this, "UART A") != B_OK)
++		return B_BUSY;
++	if (gHeader->claim(fPins[1], this, "UART A") != B_OK) {
++		gHeader->release(fPins[0], this);
++		return B_BUSY;
++	}
++
++	status_t status = gTTYModule->tty_create(&Service, NULL, &fMasterTTY);
++	if (status == B_OK) {
++		status = gTTYModule->tty_create(&Service, fMasterTTY, &fSlaveTTY);
++		if (status != B_OK) {
++			gTTYModule->tty_destroy(fMasterTTY);
++			fMasterTTY = NULL;
++		}
++	}
++	if (status == B_OK) {
++		status = gTTYModule->tty_create_cookie(fSlaveTTY, fMasterTTY, O_RDWR,
++			&fUserCookie);
++	}
++	if (status == B_OK) {
++		status = gTTYModule->tty_create_cookie(fMasterTTY, fSlaveTTY, O_RDWR,
++			&fDriverCookie);
++		if (status != B_OK) {
++			gTTYModule->tty_destroy_cookie(fUserCookie);
++			fUserCookie = NULL;
++		}
++	}
++	if (status == B_OK) {
++		fReceiveSem = create_sem(0, "meson uart receive");
++		fTransmitSem = create_sem(0, "meson uart transmit");
++		if (fReceiveSem < 0 || fTransmitSem < 0)
++			status = B_NO_MORE_SEMS;
++	}
++
++	if (status == B_OK) {
++		// the clock (on in practice; Linux never turns it off either)
++		void* hhi;
++		area_id hhiArea = map_physical_memory("meson uart hhi", kHhiBase,
++			B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &hhi);
++		if (hhiArea >= 0) {
++			volatile uint32& gate = ((volatile uint32*)hhi)[kHhiGateMpeg0 / 4];
++			if ((gate & kHhiGateUartA) == 0) {
++				InterruptsLocker interruptsLocker;
++				gate |= kHhiGateUartA;
++			}
++			delete_area(hhiArea);
++		}
++
++		// reset, 8N1 in two-wire mode, an interrupt for each byte received
++		// and below half full for sending; 9600 bits/s until the tty sets
++		// its modes
++		fRegisters[kControl] = kControlTwoWire | kControlTxReset
++			| kControlRxReset | kControlClearError;
++		fRegisters[kControl] = kControlTwoWire;
++		fRegisters[kMisc] = (kTxThreshold << 8) | 1;
++		fSpeed = 9600;
++		fRegisters[kBaud] = kBaudCrystal | kBaudNewDivider
++			| (kBaudClock / fSpeed - 1);
++		fReceiveFirst = fReceiveCount = 0;
++		fParityErrors = fFrameErrors = fOverruns = 0;
++		fOverflowing = false;
++		fSending = false;
++		fClosed = false;
++
++		arch_int_configure_io_interrupt(fInterrupt, B_EDGE_TRIGGERED,
++			B_RISING_EDGE_POLARITY);
++		status = install_io_interrupt_handler(fInterrupt, &_Interrupt, this,
++			0);
++	}
++	if (status == B_OK) {
++		fReceiveThread = spawn_kernel_thread(&_ReceiveThread,
++			"meson uart receive", B_REAL_TIME_DISPLAY_PRIORITY, this);
++		fTransmitThread = spawn_kernel_thread(&_TransmitThread,
++			"meson uart transmit", B_REAL_TIME_DISPLAY_PRIORITY, this);
++		if (fReceiveThread < 0 || fTransmitThread < 0) {
++			status = fReceiveThread < 0 ? fReceiveThread : fTransmitThread;
++			if (fReceiveThread >= 0)
++				kill_thread(fReceiveThread);
++			if (fTransmitThread >= 0)
++				kill_thread(fTransmitThread);
++			fReceiveThread = fTransmitThread = -1;
++			remove_io_interrupt_handler(fInterrupt, &_Interrupt, this);
++		}
++	}
++	if (status != B_OK) {
++		if (fUserCookie != NULL) {
++			gTTYModule->tty_destroy_cookie(fUserCookie);
++			gTTYModule->tty_destroy_cookie(fDriverCookie);
++		}
++		if (fMasterTTY != NULL) {
++			gTTYModule->tty_destroy(fMasterTTY);
++			gTTYModule->tty_destroy(fSlaveTTY);
++		}
++		fMasterTTY = fSlaveTTY = NULL;
++		fUserCookie = fDriverCookie = NULL;
++		delete_sem(fReceiveSem);
++		delete_sem(fTransmitSem);
++		fReceiveSem = fTransmitSem = -1;
++		gHeader->release(fPins[0], this);
++		gHeader->release(fPins[1], this);
++		return status;
++	}
++	resume_thread(fReceiveThread);
++	resume_thread(fTransmitThread);
++
++	// TX idles high once enabled, before it reaches the pin
++	_ChangeControl(0, kControlTxEnable | kControlRxEnable
++		| kControlRxInterrupt);
++	gHeader->select(fPins[0], "UART A");
++	gHeader->select(fPins[1], "UART A");
++	fOpen = true;
++
++	gTTYModule->tty_hardware_signal(fUserCookie, TTYHWDCD, true);
++	gTTYModule->tty_hardware_signal(fUserCookie, TTYHWCTS, true);
++	gTTYModule->tty_control(fUserCookie, TCSETA, &fConfig, sizeof(fConfig));
++	return B_OK;
++}
++
++
++/*!	The last file is closed (calls may still be under way): what was
++	written goes out, then input stops and blocked calls return.
++*/
++status_t
++MesonUart::Close()
++{
++	MutexLocker locker(fLock);
++	if (!fOpen || fClosed)
++		return B_OK;
++	_WaitOutputSent();
++	fClosed = true;
++	_ChangeControl(kControlRxInterrupt | kControlTxInterrupt
++		| kControlRxEnable, 0);
++	remove_io_interrupt_handler(fInterrupt, &_Interrupt, this);
++
++	gTTYModule->tty_close_cookie(fUserCookie);
++	gTTYModule->tty_close_cookie(fDriverCookie);
++	delete_sem(fReceiveSem);
++	delete_sem(fTransmitSem);
++	fReceiveSem = fTransmitSem = -1;
++	status_t result;
++	wait_for_thread(fReceiveThread, &result);
++	wait_for_thread(fTransmitThread, &result);
++	fReceiveThread = fTransmitThread = -1;
++	if (fParityErrors + fFrameErrors + fOverruns > 0) {
++		INFO("closed: %" B_PRIu32 " parity errors, %" B_PRIu32 " framing "
++			"errors, %" B_PRIu32 " bytes lost\n", fParityErrors, fFrameErrors,
++			fOverruns);
++	}
++	return B_OK;
++}
++
++
++/*!	The calls are done: the pins go back to GPIO, as they were. */
++status_t
++MesonUart::Free()
++{
++	MutexLocker locker(fLock);
++	if (!fOpen)
++		return B_OK;
++	_WaitTxIdle();
++	_ChangeControl(kControlTxEnable | kControlInvertTx, 0);
++	gHeader->select(fPins[0], NULL);
++	gHeader->select(fPins[1], NULL);
++	gHeader->release(fPins[0], this);
++	gHeader->release(fPins[1], this);
++
++	gTTYModule->tty_destroy_cookie(fUserCookie);
++	gTTYModule->tty_destroy_cookie(fDriverCookie);
++	gTTYModule->tty_destroy(fMasterTTY);
++	gTTYModule->tty_destroy(fSlaveTTY);
++	fMasterTTY = fSlaveTTY = NULL;
++	fUserCookie = fDriverCookie = NULL;
++	fOpen = false;
++	return B_OK;
++}
++
++
++status_t
++MesonUart::Read(void* buffer, size_t* _length)
++{
++	return gTTYModule->tty_read(fUserCookie, buffer, _length);
++}
++
++
++/*!	Into the tty: the transmit thread takes it from there. */
++status_t
++MesonUart::Write(const void* buffer, size_t* _length)
++{
++	return gTTYModule->tty_write(fUserCookie, buffer, _length);
++}
++
++
++status_t
++MesonUart::Control(uint32 op, void* buffer, size_t length)
++{
++	return gTTYModule->tty_control(fUserCookie, op, buffer, length);
++}
++
++
++status_t
++MesonUart::Select(uint8 event, uint32 ref, selectsync* sync)
++{
++	return gTTYModule->tty_select(fUserCookie, event, ref, sync);
++}
++
++
++status_t
++MesonUart::Deselect(uint8 event, selectsync* sync)
++{
++	return gTTYModule->tty_deselect(fUserCookie, event, sync);
++}
++
++
++static uint32
++speed_of(const termios& config)
++{
++	static const uint32 kSpeeds[] = {
++		0, 50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800,
++		9600, 19200, 38400, 57600, 115200, 230400, 31250
++	};
++	uint32 index = config.c_cflag & CBAUD;
++	if (index == CBAUD)
++		return config.c_ospeed | ((uint32)config.c_ospeed_high << 16);
++	return index < B_COUNT_OF(kSpeeds) ? kSpeeds[index] : 0;
++}
++
++
++/*!	The line format and speed (a speed of 0, "hang up", keeps the last one;
++	the speed changes once the bytes in the FIFO have gone out).
++*/
++void
++MesonUart::_SetModes(const termios& config)
++{
++	fConfig = config;
++	uint32 set = kControlTwoWire;
++	if ((config.c_cflag & CS8) == 0)
++		set |= kControlSevenBits;
++	if ((config.c_cflag & PARENB) != 0) {
++		set |= kControlParity;
++		if ((config.c_cflag & PARODD) != 0)
++			set |= kControlOddParity;
++	}
++	if ((config.c_cflag & CSTOPB) != 0)
++		set |= kControlTwoStopBits;
++	_ChangeControl(kControlLengthMask | kControlParity | kControlOddParity
++		| kControlStopBitsMask, set);
++
++	uint32 speed = speed_of(config);
++	if (speed == 0 || speed == fSpeed)
++		return;
++	speed = max_c(min_c(speed, kMaxSpeed), kMinSpeed);
++	_WaitTxIdle();
++	uint32 divider = (kBaudClock + speed / 2) / speed;
++	fRegisters[kBaud] = kBaudCrystal | kBaudNewDivider | (divider - 1);
++	fSpeed = speed;
++}
++
++
++/*!	tcflush(): the tty has dropped its buffers; these are the UART's. */
++void
++MesonUart::_Flush(int what)
++{
++	InterruptsSpinLocker locker(fSpinlock);
++	if ((what & TCIFLUSH) != 0) {
++		fReceiveFirst = fReceiveCount = 0;
++		while ((fRegisters[kStatus] & kStatusRxEmpty) == 0)
++			fRegisters[kReadFifo];
++	}
++	if ((what & TCOFLUSH) != 0) {
++		fRegisters[kControl] |= kControlTxReset;
++		fRegisters[kControl] &= ~kControlTxReset;
++	}
++}
++
++
++/*static*/ bool
++MesonUart::Service(struct tty* tty, uint32 op, void* buffer, size_t length)
++{
++	MesonUart* uart = sUart;
++	if (uart == NULL || !uart->fOpen || tty != uart->fSlaveTTY)
++		return false;
++	return uart->_Service(op, buffer);
++}
++
++
++bool
++MesonUart::_Service(uint32 op, void* buffer)
++{
++	switch (op) {
++		case TTYGETSIGNALS:
++			// no modem lines: carrier and CTS are always there
++			gTTYModule->tty_hardware_signal(fUserCookie, TTYHWDCD, true);
++			gTTYModule->tty_hardware_signal(fUserCookie, TTYHWCTS, true);
++			gTTYModule->tty_hardware_signal(fUserCookie, TTYHWDSR, false);
++			gTTYModule->tty_hardware_signal(fUserCookie, TTYHWRI, false);
++			return true;
++
++		case TTYSETMODES:
++			_SetModes(*(termios*)buffer);
++			return true;
++
++		case TTYSETBREAK:
++			// TX inverted: low while idle
++			if (*(bool*)buffer) {
++				_WaitTxIdle();
++				_ChangeControl(0, kControlInvertTx);
++			} else
++				_ChangeControl(kControlInvertTx, 0);
++			return true;
++
++		case TTYFLUSH:
++			_Flush(*(int*)buffer);
++			return true;
++
++		case TTYENABLE:
++		case TTYISTOP:
++		case TTYSETDTR:
++		case TTYSETRTS:
++		case TTYOSTART:
++		case TTYOSYNC:
++			return true;
++	}
++	return false;
++}
++
++
++/*!	Takes the bytes received into the buffer (the receive thread passes them
++	on to the tty), and wakes the transmit thread once the FIFO is below half
++	full. The UART has no interrupt status: STATUS tells what happened.
++*/
++/*static*/ int32
++MesonUart::_Interrupt(void* data)
++{
++	MesonUart* uart = (MesonUart*)data;
++	volatile uint32* registers = uart->fRegisters;
++	bool received = false;
++	bool transmit = false;
++
++	SpinLocker locker(uart->fSpinlock);
++	uint32 status;
++	while (((status = registers[kStatus]) & kStatusRxEmpty) == 0) {
++		bool bad = false;
++		if ((status & (kStatusParityError | kStatusFrameError)) != 0) {
++			if ((status & kStatusParityError) != 0)
++				uart->fParityErrors++;
++			if ((status & kStatusFrameError) != 0)
++				uart->fFrameErrors++;
++			registers[kControl] |= kControlClearError;
++			registers[kControl] &= ~kControlClearError;
++			bad = (uart->fConfig.c_iflag & INPCK) != 0;
++		}
++		uint8 byte = registers[kReadFifo] & 0xff;
++		if (bad)
++			continue;
++		if (uart->fReceiveCount == kReceiveBufferSize) {
++			uart->fOverruns++;
++			continue;
++		}
++		uart->fReceiveBuffer[(uart->fReceiveFirst + uart->fReceiveCount)
++			% kReceiveBufferSize] = byte;
++		uart->fReceiveCount++;
++		received = true;
++	}
++	bool overflowing = (status & kStatusRxOverflow) != 0;
++	if (overflowing && !uart->fOverflowing)
++		uart->fOverruns++;
++	uart->fOverflowing = overflowing;
++
++	uint32 control = registers[kControl];
++	if ((control & kControlTxInterrupt) != 0
++		&& (status & kStatusTxFull) == 0) {
++		registers[kControl] = control & ~kControlTxInterrupt;
++		transmit = true;
++	}
++	locker.Unlock();
++
++	if (received)
++		release_sem_etc(uart->fReceiveSem, 1, B_DO_NOT_RESCHEDULE);
++	if (transmit)
++		release_sem_etc(uart->fTransmitSem, 1, B_DO_NOT_RESCHEDULE);
++	return received || transmit ? B_INVOKE_SCHEDULER : B_HANDLED_INTERRUPT;
++}
++
++
++/*!	Passes received bytes on to the tty (the master side writes into the
++	slave's input, with the termios input processing), until the port is
++	closed. Not from the interrupt: the tty may block.
++*/
++/*static*/ status_t
++MesonUart::_ReceiveThread(void* data)
++{
++	MesonUart* uart = (MesonUart*)data;
++	while (acquire_sem(uart->fReceiveSem) == B_OK) {
++		while (true) {
++			uint8 chunk[256];
++			size_t length = 0;
++			{
++				InterruptsSpinLocker locker(uart->fSpinlock);
++				while (length < sizeof(chunk) && uart->fReceiveCount > 0) {
++					chunk[length++] = uart->fReceiveBuffer[uart->fReceiveFirst];
++					uart->fReceiveFirst = (uart->fReceiveFirst + 1)
++						% kReceiveBufferSize;
++					uart->fReceiveCount--;
++				}
++			}
++			if (length == 0)
++				break;
++			if (uart->fClosed
++				|| gTTYModule->tty_write(uart->fDriverCookie, chunk, &length)
++					!= B_OK) {
++				return B_OK;
++			}
++		}
++	}
++	return B_OK;
++}
++
++
++/*!	Sends what comes out of the tty (programs' writes after the output
++	processing, and echoes), waiting for room in the FIFO, until the port is
++	closed.
++*/
++/*static*/ status_t
++MesonUart::_TransmitThread(void* data)
++{
++	MesonUart* uart = (MesonUart*)data;
++	uint8 chunk[kFifoSize];
++	while (!uart->fClosed) {
++		size_t length = sizeof(chunk);
++		if (gTTYModule->tty_read(uart->fDriverCookie, chunk, &length) != B_OK)
++			break;
++		uart->fSending = true;
++		for (size_t i = 0; i < length; i++) {
++			while ((uart->_Status() & kStatusTxFull) != 0) {
++				if (uart->fClosed)
++					return B_OK;
++				// wait for the FIFO to drop below half full
++				uart->_ChangeControl(0, kControlTxInterrupt);
++				if ((uart->_Status() & kStatusTxFull) == 0) {
++					uart->_ChangeControl(kControlTxInterrupt, 0);
++					break;
++				}
++				status_t status = acquire_sem_etc(uart->fTransmitSem, 1,
++					B_RELATIVE_TIMEOUT, uart->_FifoTime());
++				if (status != B_OK && status != B_TIMED_OUT)
++					return B_OK;
++			}
++			uart->fRegisters[kWriteFifo] = chunk[i];
++		}
++		uart->fSending = false;
++	}
++	return B_OK;
++}
++
++
++//	#pragma mark - driver module
++
++
++static float
++supports_device(device_node* parent)
++{
++	const char* bus;
++	const char* compatible;
++	if (gDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false)
++			!= B_OK || strcmp(bus, "fdt") != 0
++		|| gDeviceManager->get_attr_string(parent, "fdt/compatible",
++			&compatible, false) != B_OK
++		|| strcmp(compatible, "amlogic,meson-gx-uart") != 0) {
++		return 0.0f;
++	}
++	// UART A only, though the device tree has it disabled
++	fdt_device_module_info* fdtModule;
++	fdt_device* fdtDevice;
++	if (gDeviceManager->get_driver(parent, (driver_module_info**)&fdtModule,
++			(void**)&fdtDevice) != B_OK) {
++		return 0.0f;
++	}
++	const char* name = fdtModule->get_name(fdtDevice);
++	uint64 reg, size;
++	if (name == NULL || strcmp(name, kNodeName) != 0
++		|| !fdtModule->get_reg(fdtDevice, 0, &reg, &size)
++		|| (reg & 0xfff) != (kUartA & 0xfff) || size < 0x18) {
++		return 0.0f;
++	}
++	return 0.8f;
++}
++
++
++static status_t
++register_device(device_node* parent)
++{
++	device_attr attrs[] = {
++		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE,
++			{ .string = "Amlogic Meson GX UART A (ODROID-C2 header)" } },
++		{ NULL }
++	};
++	return gDeviceManager->register_node(parent, DRIVER_MODULE_NAME, attrs,
++		NULL, NULL);
++}
++
++
++static status_t
++init_driver(device_node* node, void** _cookie)
++{
++	if (sUart != NULL)
++		return B_BUSY;
++	MesonUart* uart = new(std::nothrow) MesonUart(node);
++	if (uart == NULL)
++		return B_NO_MEMORY;
++	status_t status = uart->Init();
++	if (status != B_OK) {
++		delete uart;
++		return status;
++	}
++	sUart = uart;
++	*_cookie = uart;
++	return B_OK;
++}
++
++
++static void
++uninit_driver(void* cookie)
++{
++	sUart = NULL;
++	delete (MesonUart*)cookie;
++}
++
++
++static status_t
++register_child_devices(void* cookie)
++{
++	MesonUart* uart = (MesonUart*)cookie;
++	return gDeviceManager->publish_device(uart->Node(), "ports/header",
++		DEVICE_MODULE_NAME);
++}
++
++
++//	#pragma mark - device module
++
++
++static status_t
++device_init(void* driverCookie, void** _deviceCookie)
++{
++	*_deviceCookie = driverCookie;
++	return B_OK;
++}
++
++
++static void
++device_uninit(void* deviceCookie)
++{
++}
++
++
++static status_t
++device_open(void* deviceCookie, const char* path, int openMode,
++	void** _cookie)
++{
++	MesonUart* uart = (MesonUart*)deviceCookie;
++	status_t status = uart->Open();
++	if (status != B_OK)
++		return status;
++	*_cookie = uart;
++	return B_OK;
++}
++
++
++static status_t
++device_close(void* cookie)
++{
++	return ((MesonUart*)cookie)->Close();
++}
++
++
++static status_t
++device_free(void* cookie)
++{
++	return ((MesonUart*)cookie)->Free();
++}
++
++
++static status_t
++device_read(void* cookie, off_t position, void* buffer, size_t* _length)
++{
++	return ((MesonUart*)cookie)->Read(buffer, _length);
++}
++
++
++static status_t
++device_write(void* cookie, off_t position, const void* buffer,
++	size_t* _length)
++{
++	return ((MesonUart*)cookie)->Write(buffer, _length);
++}
++
++
++static status_t
++device_control(void* cookie, uint32 op, void* buffer, size_t length)
++{
++	return ((MesonUart*)cookie)->Control(op, buffer, length);
++}
++
++
++static status_t
++device_select(void* cookie, uint8 event, selectsync* sync)
++{
++	return ((MesonUart*)cookie)->Select(event, 0, sync);
++}
++
++
++static status_t
++device_deselect(void* cookie, uint8 event, selectsync* sync)
++{
++	return ((MesonUart*)cookie)->Deselect(event, sync);
++}
++
++
++module_dependency module_dependencies[] = {
++	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&gDeviceManager },
++	{ B_TTY_MODULE_NAME, (module_info**)&gTTYModule },
++	{ MESON_HEADER_MODULE_NAME, (module_info**)&gHeader },
++	{}
++};
++
++
++static struct device_module_info sMesonUartDevice = {
++	{
++		DEVICE_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	device_init,
++	device_uninit,
++	NULL,	// remove
++
++	device_open,
++	device_close,
++	device_free,
++	device_read,
++	device_write,
++	NULL,	// io
++	device_control,
++
++	device_select,
++	device_deselect,
++};
++
++
++static struct driver_module_info sMesonUartDriver = {
++	{
++		DRIVER_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	supports_device,
++	register_device,
++	init_driver,
++	uninit_driver,
++	register_child_devices,
++	NULL,	// rescan
++	NULL,	// removed
++};
++
++
++module_info* modules[] = {
++	(module_info*)&sMesonUartDriver,
++	(module_info*)&sMesonUartDevice,
++	NULL
++};

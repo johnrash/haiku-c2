@@ -1,0 +1,5 @@
+PyQt_OpenGL_ES2
+PyQt_Metal
+PyQt_XCB
+PyQt_Wayland
+PyQt_Vulkan

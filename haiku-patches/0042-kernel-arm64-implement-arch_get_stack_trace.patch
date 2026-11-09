@@ -1,0 +1,152 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 02:13:03 -0400
+Subject: [PATCH 042/342] kernel/arm64: implement arch_get_stack_trace()
+
+It returned nothing, so the profiler ("profile") and other users of
+arch_debug_get_stack_trace() got no samples on arm64. It walks the frame
+records (x29/x30) like arch_debug_stack_trace(), switching to the
+interrupted code at each iframe of the thread's iframe stack. With only
+STACK_TRACE_USER it starts at the innermost iframe from EL0; userland
+frames are read with user_memcpy().
+
+Tested on the ODROID-C2: "profile -S membench" attributes 88% to memcpy
+and 9% to memset, with no unknown ticks.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/kernel/arch/arm64/arch_debug.cpp | 110 +++++++++++++++++++-
+ 1 file changed, 109 insertions(+), 1 deletion(-)
+
+diff --git a/src/system/kernel/arch/arm64/arch_debug.cpp b/src/system/kernel/arch/arm64/arch_debug.cpp
+index 8c7843777b..4ac108ad42 100644
+--- a/src/system/kernel/arch/arm64/arch_debug.cpp
++++ b/src/system/kernel/arch/arm64/arch_debug.cpp
+@@ -6,6 +6,9 @@
+ 
+ #include <arch/debug.h>
+ 
++#include <limits.h>
++#include <string.h>
++
+ #include <arch_cpu.h>
+ #include <debug.h>
+ #include <debug_heap.h>
+@@ -367,11 +370,116 @@ arch_debug_stack_trace(void)
+ }
+ 
+ 
++/*!	Reads the frame record at \a fp outside the kernel debugger (from the
++	profiler's timer interrupt, too): user frames through user_memcpy(),
++	which fails instead of faulting.
++*/
++static status_t
++get_next_frame_no_debugger(addr_t fp, addr_t* _next, addr_t* _ip,
++	bool onKernelStack, Thread* thread)
++{
++	addr_t frame[2]; // [0] = saved fp, [1] = return address
++	if (onKernelStack) {
++		if (fp < thread->kernel_stack_base
++			|| fp + sizeof(frame) > thread->kernel_stack_top) {
++			return B_BAD_ADDRESS;
++		}
++		memcpy(frame, (void*)fp, sizeof(frame));
++	} else {
++		if (!IS_USER_ADDRESS(fp)
++			|| user_memcpy(frame, (void*)fp, sizeof(frame)) != B_OK) {
++			return B_BAD_ADDRESS;
++		}
++	}
++
++	*_next = frame[0];
++	*_ip = frame[1];
++	return B_OK;
++}
++
++
++static iframe*
++find_iframe(Thread* thread, addr_t fp)
++{
++	iframe_stack* frames = &thread->arch_info.iframes;
++	for (int32 i = 0; i < frames->index; i++) {
++		if (fp == (addr_t)frames->frames[i])
++			return frames->frames[i];
++	}
++	return NULL;
++}
++
++
++/*!	Walks the frame records of the current thread, as the profiler and
++	tracing need: a frame pointer that is the address of one of the thread's
++	iframes continues at the interrupted code (the kernel's exception entry
++	leaves x29 so).
++*/
+ int32
+ arch_get_stack_trace(addr_t* returnAddresses, int32 maxCount,
+ 	int32 skipIframes, int32 skipFrames, uint32 flags)
+ {
+-	return 0;
++	// keep skipping frames until the iframes to be skipped are
++	if (skipIframes > 0)
++		skipFrames = INT_MAX;
++
++	Thread* thread = thread_get_current_thread();
++	if (thread == NULL)
++		return 0;
++
++	int32 count = 0;
++	addr_t fp = arm64_get_fp();
++	bool onKernelStack = true;
++
++	if ((flags & (STACK_TRACE_KERNEL | STACK_TRACE_USER)) == STACK_TRACE_USER) {
++		// start at the innermost userland iframe
++		iframe_stack* frames = &thread->arch_info.iframes;
++		iframe* userFrame = NULL;
++		for (int32 i = frames->index - 1; i >= 0; i--) {
++			if ((frames->frames[i]->spsr & PSR_M_MASK) == PSR_M_EL0t) {
++				userFrame = frames->frames[i];
++				break;
++			}
++		}
++		if (userFrame == NULL)
++			return 0;
++		fp = (addr_t)userFrame;
++	}
++
++	while (fp != 0 && count < maxCount) {
++		onKernelStack = onKernelStack && fp >= thread->kernel_stack_base
++			&& fp < thread->kernel_stack_top;
++		if (!onKernelStack && (flags & STACK_TRACE_USER) == 0)
++			break;
++
++		addr_t ip;
++		addr_t nextFp;
++		iframe* frame = onKernelStack ? find_iframe(thread, fp) : NULL;
++		if (frame != NULL) {
++			ip = frame->elr;
++			nextFp = frame->fp;
++
++			if (skipIframes > 0 && --skipIframes == 0)
++				skipFrames = 0;
++		} else if (get_next_frame_no_debugger(fp, &nextFp, &ip, onKernelStack,
++				thread) != B_OK) {
++			break;
++		}
++
++		if (ip == 0)
++			break;
++
++		if (skipFrames > 0)
++			skipFrames--;
++		else
++			returnAddresses[count++] = ip;
++
++		if (nextFp == fp)
++			break;
++		fp = nextFp;
++	}
++
++	return count;
+ }
+ 
+ 

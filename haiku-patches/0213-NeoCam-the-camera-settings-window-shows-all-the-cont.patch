@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 11:54:33 -0500
+Subject: [PATCH 213/342] NeoCam: the camera settings window shows all the
+ controls
+
+The media theme puts the controls into a 600x400 scroll view; the window
+is made as large as they want (within the screen), and there is one of
+them at a time.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apps/neocam/MainWindow.cpp | 58 +++++++++++++++++++++-------------
+ src/apps/neocam/MainWindow.h   |  2 ++
+ 2 files changed, 38 insertions(+), 22 deletions(-)
+
+diff --git a/src/apps/neocam/MainWindow.cpp b/src/apps/neocam/MainWindow.cpp
+index 5e4df38758..1b20c46486 100644
+--- a/src/apps/neocam/MainWindow.cpp
++++ b/src/apps/neocam/MainWindow.cpp
+@@ -29,6 +29,7 @@
+ #include <Path.h>
+ #include <PopUpMenu.h>
+ #include <RadioButton.h>
++#include <Screen.h>
+ #include <Roster.h>
+ #include <ScrollView.h>
+ #include <SeparatorView.h>
+@@ -136,35 +137,36 @@ private:
+ */
+ class CameraSettingsWindow : public BWindow {
+ public:
+-	CameraSettingsWindow(BParameterWeb* web)
++	CameraSettingsWindow(BParameterWeb* web, BView* view)
+ 		:
+-		BWindow(BRect(140, 140, 500, 500), B_TRANSLATE("Camera settings"),
+-			B_TITLED_WINDOW, B_AUTO_UPDATE_SIZE_LIMITS
+-				| B_ASYNCHRONOUS_CONTROLS),
++		// as large as the theme made the view
++		BWindow(view->Bounds().OffsetToCopy(140, 140),
++			B_TRANSLATE("Camera settings"), B_TITLED_WINDOW,
++			B_ASYNCHRONOUS_CONTROLS),
+ 		fWeb(web),
+-		fView(BMediaTheme::ViewFor(web))
++		fView(view)
+ 	{
+-		if (fView == NULL) {
+-			fView = new BStringView("none",
+-				B_TRANSLATE("The camera has no settings."));
++		fView->SetResizingMode(B_FOLLOW_ALL_SIDES);
++		AddChild(fView);
++
++		// the theme makes a scroll view of 600x400 around the controls:
++		// as large as they want, as far as the screen allows
++		BScrollView* scrollView = dynamic_cast<BScrollView*>(fView);
++		if (scrollView != NULL && scrollView->Target() != NULL) {
++			BSize wanted = scrollView->Target()->PreferredSize();
++			BRect screen = BScreen(this).Frame();
++			ResizeTo(fminf(wanted.width + B_V_SCROLL_BAR_WIDTH + 1,
++					screen.Width() * 0.9f),
++				fminf(wanted.height + B_H_SCROLL_BAR_HEIGHT + 1,
++					screen.Height() * 0.9f));
+ 		}
+-		BScrollView* scrollView = new BScrollView("scroller", fView, 0,
+-			false, true, B_NO_BORDER);
+-		BLayoutBuilder::Group<>(this, B_VERTICAL, 0)
+-			.Add(scrollView);
+-		BSize preferred = fView->PreferredSize();
+-		ResizeTo(fminf(preferred.width + 20, 600),
+-			fminf(preferred.height + 10, 600));
+ 	}
+ 
+ 	~CameraSettingsWindow()
+ 	{
+ 		// the views use the web's parameters: they go first
+-		BView* scrollView = ChildAt(0);
+-		if (scrollView != NULL) {
+-			scrollView->RemoveSelf();
+-			delete scrollView;
+-		}
++		fView->RemoveSelf();
++		delete fView;
+ 		delete fWeb;
+ 	}
+ 
+@@ -347,12 +349,16 @@ MainWindow::MessageReceived(BMessage* message)
+ 		{
+ 			BParameterWeb* web = NULL;
+ 			message->FindPointer("web", (void**)&web);
+-			if (web == NULL) {
++			BView* view = web != NULL ? BMediaTheme::ViewFor(web) : NULL;
++			if (view == NULL) {
++				delete web;
+ 				_SetStatus(B_TRANSLATE("The camera has no settings to show."),
+ 					true);
+ 				break;
+ 			}
+-			(new CameraSettingsWindow(web))->Show();
++			BWindow* window = new CameraSettingsWindow(web, view);
++			fCameraSettings = BMessenger(window);
++			window->Show();
+ 			break;
+ 		}
+ 
+@@ -1227,6 +1233,14 @@ MainWindow::_SetStatus(const char* text, bool error)
+ void
+ MainWindow::_ShowCameraSettings()
+ {
++	// one window of them at a time
++	BLooper* looper;
++	if (fCameraSettings.Target(&looper) != NULL && looper != NULL
++		&& fCameraSettings.LockTarget()) {
++		((BWindow*)looper)->Activate();
++		looper->Unlock();
++		return;
++	}
+ 	if (fController != NULL)
+ 		BMessenger(fController).SendMessage(CameraController::kMsgGetWeb);
+ }
+diff --git a/src/apps/neocam/MainWindow.h b/src/apps/neocam/MainWindow.h
+index 366cde89d3..c64c153c81 100644
+--- a/src/apps/neocam/MainWindow.h
++++ b/src/apps/neocam/MainWindow.h
+@@ -6,6 +6,7 @@
+ #define MAIN_WINDOW_H
+ 
+ 
++#include <Messenger.h>
+ #include <String.h>
+ #include <Window.h>
+ 
+@@ -110,6 +111,7 @@ private:
+ 			CameraController*	fController;
+ 			CaptureManager*		fCaptureManager;
+ 			BMessageRunner*		fPulseRunner;
++			BMessenger			fCameraSettings;
+ 			BString				fAskPassProgram;
+ 
+ 			// the camera

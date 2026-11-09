@@ -1,0 +1,1072 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 02:12:54 -0400
+Subject: [PATCH 041/342] libroot, kernel: arm64 memcpy, memmove and memset
+ from Arm Optimized Routines
+
+The generic C memcpy copies byte by byte when source and destination are
+not aligned alike. These are Arm's optimized-routines v26.07
+(MIT OR Apache-2.0 WITH LLVM-exception), unmodified: memcpy-advsimd.S
+(which also provides memmove), memcpy.S, memset.S, memset-scalar.S and
+asmdefs.h. Small MIT wrappers give them Haiku's names:
+
+- libroot (arch_memcpy.S, arch_memset.S): the Advanced SIMD memcpy and
+  memmove, and memset. musl's C memmove is left out on arm64, also in
+  the runtime_loader.
+- kernel (kernel_memcpy.S, kernel_memset.S): the scalar versions, which
+  need no FPU state; the kernel keeps its own C memmove.
+
+On the ODROID-C2 (MB/s, aligned / misaligned): memcpy 64 B 1637 -> 3637,
+1 KiB 3632 -> 6345, 16 KiB 4041 -> 6764 / 499 -> 5398; memset 1 KiB
+5194 -> 12895, 16 KiB 6060 -> 14147. Copies of 4 MiB and more are bound
+by memory either way. Both Cortex-A53 erratum scans are clean.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/kernel/lib/arch/arm64/Jamfile      |   4 +-
+ src/system/libroot/posix/musl/string/Jamfile  |   8 +-
+ .../libroot/posix/string/arch/arm64/Jamfile   |   8 +-
+ .../posix/string/arch/arm64/arch_memcpy.S     |  14 +
+ .../posix/string/arch/arm64/arch_memset.S     |  12 +
+ .../libroot/posix/string/arch/arm64/asmdefs.h |  91 +++++++
+ .../posix/string/arch/arm64/kernel_memcpy.S   |  16 ++
+ .../posix/string/arch/arm64/kernel_memset.S   |  13 +
+ .../posix/string/arch/arm64/memcpy-advsimd.S  | 209 +++++++++++++++
+ .../libroot/posix/string/arch/arm64/memcpy.S  | 242 ++++++++++++++++++
+ .../posix/string/arch/arm64/memset-scalar.S   | 165 ++++++++++++
+ .../libroot/posix/string/arch/arm64/memset.S  | 121 +++++++++
+ src/system/runtime_loader/Jamfile             |   9 +-
+ 13 files changed, 904 insertions(+), 8 deletions(-)
+ create mode 100644 src/system/libroot/posix/string/arch/arm64/arch_memcpy.S
+ create mode 100644 src/system/libroot/posix/string/arch/arm64/arch_memset.S
+ create mode 100644 src/system/libroot/posix/string/arch/arm64/asmdefs.h
+ create mode 100644 src/system/libroot/posix/string/arch/arm64/kernel_memcpy.S
+ create mode 100644 src/system/libroot/posix/string/arch/arm64/kernel_memset.S
+ create mode 100644 src/system/libroot/posix/string/arch/arm64/memcpy-advsimd.S
+ create mode 100644 src/system/libroot/posix/string/arch/arm64/memcpy.S
+ create mode 100644 src/system/libroot/posix/string/arch/arm64/memset-scalar.S
+ create mode 100644 src/system/libroot/posix/string/arch/arm64/memset.S
+
+diff --git a/src/system/kernel/lib/arch/arm64/Jamfile b/src/system/kernel/lib/arch/arm64/Jamfile
+index 2cd850907e..a304c6a780 100644
+--- a/src/system/kernel/lib/arch/arm64/Jamfile
++++ b/src/system/kernel/lib/arch/arm64/Jamfile
+@@ -27,8 +27,8 @@ KernelMergeObject kernel_lib_posix_arch_$(TARGET_ARCH).o :
+ 	kernel_longjmp_return.c
+ 	kernel_setjmp_save_sigs.c
+ 
+-	generic_memset.c
+-	generic_memcpy.c
++	kernel_memset.S
++	kernel_memcpy.S
+ 
+ 	: $(TARGET_KERNEL_PIC_CCFLAGS)
+ ;
+diff --git a/src/system/libroot/posix/musl/string/Jamfile b/src/system/libroot/posix/musl/string/Jamfile
+index 2bae858cd8..d046377735 100644
+--- a/src/system/libroot/posix/musl/string/Jamfile
++++ b/src/system/libroot/posix/musl/string/Jamfile
+@@ -10,12 +10,18 @@ for architectureObject in [ MultiArchSubDirSetup ] {
+ 	on $(architectureObject) {
+ 		local architecture = $(TARGET_PACKAGING_ARCH) ;
+ 
++		# arm64 has Arm's optimized memcpy, which does memmove too
++		local memmove = memmove.c ;
++		if $(TARGET_ARCH) = arm64 {
++			memmove = ;
++		}
++
+ 		MergeObject <$(architecture)>posix_musl_string.o :
+ 			index.c
+ 			memccpy.c
+ 			memchr.c
+ 			memmem.c
+-			memmove.c
++			$(memmove)
+ 			memrchr.c
+ 			stpcpy.c
+ 			stpncpy.c
+diff --git a/src/system/libroot/posix/string/arch/arm64/Jamfile b/src/system/libroot/posix/string/arch/arm64/Jamfile
+index dc5b49afc7..ea2555ed23 100644
+--- a/src/system/libroot/posix/string/arch/arm64/Jamfile
++++ b/src/system/libroot/posix/string/arch/arm64/Jamfile
+@@ -10,11 +10,11 @@ for architectureObject in [ MultiArchSubDirSetup arm64 ] {
+ 
+ 		UsePrivateSystemHeaders ;
+ 
+-		SEARCH_SOURCE += [ FDirName $(SUBDIR) $(DOTDOT) generic ] ;
+-
++		# Arm Optimized Routines' memcpy (also memmove) and memset, with
++		# Advanced SIMD (arch_*.S; the kernel's are kernel_*.S)
+ 		MergeObject <$(architecture)>posix_string_arch_$(TARGET_ARCH).o :
+-			generic_memcpy.c
+-			generic_memset.c
++			arch_memcpy.S
++			arch_memset.S
+ 			;
+ 	}
+ }
+diff --git a/src/system/libroot/posix/string/arch/arm64/arch_memcpy.S b/src/system/libroot/posix/string/arch/arm64/arch_memcpy.S
+new file mode 100644
+index 0000000000..057e1892d6
+--- /dev/null
++++ b/src/system/libroot/posix/string/arch/arm64/arch_memcpy.S
+@@ -0,0 +1,14 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * memcpy() and memmove() for libroot: Advanced SIMD, any alignment, overlaps
++ * allowed.
++ * The routine itself is Arm Optimized Routines' (optimized-routines v26.07,
++ * string/aarch64, MIT OR Apache-2.0 WITH LLVM-exception), unmodified.
++ */
++
++#define WANT_GNU_PROPERTY 0
++#define __memcpy_aarch64_simd memcpy
++#define __memmove_aarch64_simd memmove
++#include "memcpy-advsimd.S"
+diff --git a/src/system/libroot/posix/string/arch/arm64/arch_memset.S b/src/system/libroot/posix/string/arch/arm64/arch_memset.S
+new file mode 100644
+index 0000000000..d273f60cd0
+--- /dev/null
++++ b/src/system/libroot/posix/string/arch/arm64/arch_memset.S
+@@ -0,0 +1,12 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * memset() for libroot: Advanced SIMD.
++ * The routine itself is Arm Optimized Routines' (optimized-routines v26.07,
++ * string/aarch64, MIT OR Apache-2.0 WITH LLVM-exception), unmodified.
++ */
++
++#define WANT_GNU_PROPERTY 0
++#define __memset_aarch64 memset
++#include "memset.S"
+diff --git a/src/system/libroot/posix/string/arch/arm64/asmdefs.h b/src/system/libroot/posix/string/arch/arm64/asmdefs.h
+new file mode 100644
+index 0000000000..7a0a2ef39c
+--- /dev/null
++++ b/src/system/libroot/posix/string/arch/arm64/asmdefs.h
+@@ -0,0 +1,91 @@
++/*
++ * Macros for asm code.  AArch64 version.
++ *
++ * Copyright (c) 2019-2025, Arm Limited.
++ * SPDX-License-Identifier: MIT OR Apache-2.0 WITH LLVM-exception
++ */
++
++#ifndef _ASMDEFS_H
++#define _ASMDEFS_H
++
++/* Set the line separator for the assembler.  */
++#if defined (__APPLE__)
++# define SEP %%
++# define PREF _
++#else
++# define SEP ;
++# define PREF
++#endif
++
++/* Branch Target Identitication support.  */
++#define BTI_C		hint	34
++#define BTI_J		hint	36
++/* Return address signing support (pac-ret).  */
++#define PACIASP		hint	25 SEP .cfi_negate_ra_state
++#define AUTIASP		hint	29 SEP .cfi_negate_ra_state
++
++/* GNU_PROPERTY_AARCH64_* macros from elf.h.  */
++#define FEATURE_1_AND 0xc0000000
++#define FEATURE_1_BTI 1
++#define FEATURE_1_PAC 2
++
++/* Add a NT_GNU_PROPERTY_TYPE_0 note.  */
++#define GNU_PROPERTY(type, value)	\
++  .section .note.gnu.property, "a"  SEP \
++  .p2align 3			    SEP \
++  .word 4			    SEP \
++  .word 16			    SEP \
++  .word 5			    SEP \
++  .asciz "GNU"			    SEP \
++  .word type			    SEP \
++  .word 4			    SEP \
++  .word value			    SEP \
++  .word 0			    SEP \
++  .text
++
++/* If set then the GNU Property Note section will be added to
++   mark objects to support BTI and PAC-RET.  */
++#ifndef WANT_GNU_PROPERTY
++#define WANT_GNU_PROPERTY 1
++#endif
++
++#if WANT_GNU_PROPERTY
++/* Add property note with supported features to all asm files.  */
++GNU_PROPERTY (FEATURE_1_AND, FEATURE_1_BTI|FEATURE_1_PAC)
++#endif
++
++#define ENTRY_ALIGN(name, alignment)	\
++  .align alignment		    SEP \
++  ENTRY_ALIAS(name)		    SEP \
++  .cfi_startproc		    SEP \
++  BTI_C
++
++#define ENTRY(name)	ENTRY_ALIGN(name, 6)
++
++#if defined (__APPLE__)
++/* Darwin is an underscore platform, symbols need an extra _ prefix.  */
++# define ENTRY_ALIAS(name)	\
++  .global _ ## name	    SEP \
++  _ ## name:
++
++# define END(name)	.cfi_endproc
++#elif defined (_WIN32) || defined (__CYGWIN__)
++# define ENTRY_ALIAS(name)	\
++  .global name		   SEP  \
++  name:
++
++# define END(name)	.cfi_endproc
++#else
++# define ENTRY_ALIAS(name)	\
++  .global name;			\
++  .type name,%function;		\
++  name:
++
++# define END(name)	\
++  .cfi_endproc;		\
++  .size name, .-name
++#endif
++
++#define L(l) .L ## l
++
++#endif
+diff --git a/src/system/libroot/posix/string/arch/arm64/kernel_memcpy.S b/src/system/libroot/posix/string/arch/arm64/kernel_memcpy.S
+new file mode 100644
+index 0000000000..0b7f411036
+--- /dev/null
++++ b/src/system/libroot/posix/string/arch/arm64/kernel_memcpy.S
+@@ -0,0 +1,16 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * memcpy() for the kernel: general-purpose registers only (the kernel has
++ * its own memmove()).
++ * The routine itself is Arm Optimized Routines' (optimized-routines v26.07,
++ * string/aarch64, MIT OR Apache-2.0 WITH LLVM-exception), unmodified.
++ */
++
++#define WANT_GNU_PROPERTY 0
++#define __memcpy_aarch64 memcpy
++#define __memcpy_aarch64_sc __kernel_memcpy_sc
++#define __memmove_aarch64 __kernel_memmove
++#define __memmove_aarch64_sc __kernel_memmove_sc
++#include "memcpy.S"
+diff --git a/src/system/libroot/posix/string/arch/arm64/kernel_memset.S b/src/system/libroot/posix/string/arch/arm64/kernel_memset.S
+new file mode 100644
+index 0000000000..5ec6048c33
+--- /dev/null
++++ b/src/system/libroot/posix/string/arch/arm64/kernel_memset.S
+@@ -0,0 +1,13 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * memset() for the kernel: general-purpose registers only.
++ * The routine itself is Arm Optimized Routines' (optimized-routines v26.07,
++ * string/aarch64, MIT OR Apache-2.0 WITH LLVM-exception), unmodified.
++ */
++
++#define WANT_GNU_PROPERTY 0
++#define __memset_scalar memset
++#define __memset_scalar_sc __kernel_memset_sc
++#include "memset-scalar.S"
+diff --git a/src/system/libroot/posix/string/arch/arm64/memcpy-advsimd.S b/src/system/libroot/posix/string/arch/arm64/memcpy-advsimd.S
+new file mode 100644
+index 0000000000..cbf4c58150
+--- /dev/null
++++ b/src/system/libroot/posix/string/arch/arm64/memcpy-advsimd.S
+@@ -0,0 +1,209 @@
++/*
++ * memcpy - copy memory area
++ *
++ * Copyright (c) 2019-2023, Arm Limited.
++ * SPDX-License-Identifier: MIT OR Apache-2.0 WITH LLVM-exception
++ */
++
++/* Assumptions:
++ *
++ * ARMv8-a, AArch64, Advanced SIMD, unaligned accesses.
++ *
++ */
++
++#include "asmdefs.h"
++
++#define dstin	x0
++#define src	x1
++#define count	x2
++#define dst	x3
++#define srcend	x4
++#define dstend	x5
++#define A_l	x6
++#define A_lw	w6
++#define A_h	x7
++#define B_l	x8
++#define B_lw	w8
++#define B_h	x9
++#define C_lw	w10
++#define tmp1	x14
++
++#define A_q	q0
++#define B_q	q1
++#define C_q	q2
++#define D_q	q3
++#define E_q	q4
++#define F_q	q5
++#define G_q	q6
++#define H_q	q7
++
++/* This implementation handles overlaps and supports both memcpy and memmove
++   from a single entry point.  It uses unaligned accesses and branchless
++   sequences to keep the code small, simple and improve performance.
++
++   Copies are split into 3 main cases: small copies of up to 32 bytes, medium
++   copies of up to 128 bytes, and large copies.  The overhead of the overlap
++   check is negligible since it is only required for large copies.
++
++   Large copies use a software pipelined loop processing 64 bytes per iteration.
++   The source pointer is 16-byte aligned to minimize unaligned accesses.
++   The loop tail is handled by always copying 64 bytes from the end.
++*/
++
++ENTRY_ALIAS (__memmove_aarch64_simd)
++ENTRY (__memcpy_aarch64_simd)
++	add	srcend, src, count
++	cmp	count, 128
++	b.hi	L(copy_long)
++	add	dstend, dstin, count
++	cmp	count, 32
++	b.hi	L(copy32_128)
++	nop
++
++	/* Small copies: 0..32 bytes.  */
++	cmp	count, 16
++	b.lo	L(copy16)
++	ldr	A_q, [src]
++	ldr	B_q, [srcend, -16]
++	str	A_q, [dstin]
++	str	B_q, [dstend, -16]
++	ret
++
++	.p2align 4
++	/* Medium copies: 33..128 bytes.  */
++L(copy32_128):
++	ldp	A_q, B_q, [src]
++	ldp	C_q, D_q, [srcend, -32]
++	cmp	count, 64
++	b.hi	L(copy128)
++	stp	A_q, B_q, [dstin]
++	stp	C_q, D_q, [dstend, -32]
++	ret
++
++	.p2align 4
++	/* Copy 8-15 bytes.  */
++L(copy16):
++	tbz	count, 3, L(copy8)
++	ldr	A_l, [src]
++	ldr	A_h, [srcend, -8]
++	str	A_l, [dstin]
++	str	A_h, [dstend, -8]
++	ret
++
++	/* Copy 4-7 bytes.  */
++L(copy8):
++	tbz	count, 2, L(copy4)
++	ldr	A_lw, [src]
++	ldr	B_lw, [srcend, -4]
++	str	A_lw, [dstin]
++	str	B_lw, [dstend, -4]
++	ret
++
++	/* Copy 65..128 bytes.  */
++L(copy128):
++	ldp	E_q, F_q, [src, 32]
++	cmp	count, 96
++	b.ls	L(copy96)
++	ldp	G_q, H_q, [srcend, -64]
++	stp	G_q, H_q, [dstend, -64]
++L(copy96):
++	stp	A_q, B_q, [dstin]
++	stp	E_q, F_q, [dstin, 32]
++	stp	C_q, D_q, [dstend, -32]
++	ret
++
++	/* Copy 0..3 bytes using a branchless sequence.  */
++L(copy4):
++	cbz	count, L(copy0)
++	lsr	tmp1, count, 1
++	ldrb	A_lw, [src]
++	ldrb	C_lw, [srcend, -1]
++	ldrb	B_lw, [src, tmp1]
++	strb	A_lw, [dstin]
++	strb	B_lw, [dstin, tmp1]
++	strb	C_lw, [dstend, -1]
++L(copy0):
++	ret
++
++	.p2align 3
++	/* Copy more than 128 bytes.  */
++L(copy_long):
++	add	dstend, dstin, count
++
++	/* Use backwards copy if there is an overlap.  */
++	sub	tmp1, dstin, src
++	cmp	tmp1, count
++	b.lo	L(copy_long_backwards)
++
++	/* Copy 16 bytes and then align src to 16-byte alignment.  */
++	ldr	D_q, [src]
++	and	tmp1, src, 15
++	bic	src, src, 15
++	sub	dst, dstin, tmp1
++	add	count, count, tmp1	/* Count is now 16 too large.  */
++	ldp	A_q, B_q, [src, 16]
++	str	D_q, [dstin]
++	ldp	C_q, D_q, [src, 48]
++	subs	count, count, 128 + 16	/* Test and readjust count.  */
++	b.ls	L(copy64_from_end)
++L(loop64):
++	stp	A_q, B_q, [dst, 16]
++	ldp	A_q, B_q, [src, 80]
++	stp	C_q, D_q, [dst, 48]
++	ldp	C_q, D_q, [src, 112]
++	add	src, src, 64
++	add	dst, dst, 64
++	subs	count, count, 64
++	b.hi	L(loop64)
++
++	/* Write the last iteration and copy 64 bytes from the end.  */
++L(copy64_from_end):
++	ldp	E_q, F_q, [srcend, -64]
++	stp	A_q, B_q, [dst, 16]
++	ldp	A_q, B_q, [srcend, -32]
++	stp	C_q, D_q, [dst, 48]
++	stp	E_q, F_q, [dstend, -64]
++	stp	A_q, B_q, [dstend, -32]
++	ret
++
++	.p2align 4
++	nop
++
++	/* Large backwards copy for overlapping copies.
++	   Copy 16 bytes and then align srcend to 16-byte alignment.  */
++L(copy_long_backwards):
++	cbz	tmp1, L(copy0)
++	ldr	D_q, [srcend, -16]
++	and	tmp1, srcend, 15
++	bic	srcend, srcend, 15
++	sub	count, count, tmp1
++	ldp	A_q, B_q, [srcend, -32]
++	str	D_q, [dstend, -16]
++	ldp	C_q, D_q, [srcend, -64]
++	sub	dstend, dstend, tmp1
++	subs	count, count, 128
++	b.ls	L(copy64_from_start)
++
++L(loop64_backwards):
++	str	B_q, [dstend, -16]
++	str	A_q, [dstend, -32]
++	ldp	A_q, B_q, [srcend, -96]
++	str	D_q, [dstend, -48]
++	str	C_q, [dstend, -64]!
++	ldp	C_q, D_q, [srcend, -128]
++	sub	srcend, srcend, 64
++	subs	count, count, 64
++	b.hi	L(loop64_backwards)
++
++	/* Write the last iteration and copy 64 bytes from the start.  */
++L(copy64_from_start):
++	ldp	E_q, F_q, [src, 32]
++	stp	A_q, B_q, [dstend, -32]
++	ldp	A_q, B_q, [src]
++	stp	C_q, D_q, [dstend, -64]
++	stp	E_q, F_q, [dstin, 32]
++	stp	A_q, B_q, [dstin]
++	ret
++
++END (__memcpy_aarch64_simd)
++
+diff --git a/src/system/libroot/posix/string/arch/arm64/memcpy.S b/src/system/libroot/posix/string/arch/arm64/memcpy.S
+new file mode 100644
+index 0000000000..67eb9276f1
+--- /dev/null
++++ b/src/system/libroot/posix/string/arch/arm64/memcpy.S
+@@ -0,0 +1,242 @@
++/*
++ * memcpy - copy memory area
++ *
++ * Copyright (c) 2012-2022, Arm Limited.
++ * SPDX-License-Identifier: MIT OR Apache-2.0 WITH LLVM-exception
++ */
++
++/* Assumptions:
++ *
++ * ARMv8-a, AArch64, unaligned accesses.
++ *
++ */
++
++#include "asmdefs.h"
++
++#define dstin	x0
++#define src	x1
++#define count	x2
++#define dst	x3
++#define srcend	x4
++#define dstend	x5
++#define A_l	x6
++#define A_lw	w6
++#define A_h	x7
++#define B_l	x8
++#define B_lw	w8
++#define B_h	x9
++#define C_l	x10
++#define C_lw	w10
++#define C_h	x11
++#define D_l	x12
++#define D_h	x13
++#define E_l	x14
++#define E_h	x15
++#define F_l	x16
++#define F_h	x17
++#define G_l	count
++#define G_h	dst
++#define H_l	src
++#define H_h	srcend
++#define tmp1	x14
++
++/* This implementation handles overlaps and supports both memcpy and memmove
++   from a single entry point.  It uses unaligned accesses and branchless
++   sequences to keep the code small, simple and improve performance.
++
++   Copies are split into 3 main cases: small copies of up to 32 bytes, medium
++   copies of up to 128 bytes, and large copies.  The overhead of the overlap
++   check is negligible since it is only required for large copies.
++
++   Large copies use a software pipelined loop processing 64 bytes per iteration.
++   The destination pointer is 16-byte aligned to minimize unaligned accesses.
++   The loop tail is handled by always copying 64 bytes from the end.
++*/
++
++ENTRY_ALIAS (__memmove_aarch64_sc)
++ENTRY_ALIAS (__memcpy_aarch64_sc)
++ENTRY_ALIAS (__memmove_aarch64)
++ENTRY (__memcpy_aarch64)
++	add	srcend, src, count
++	add	dstend, dstin, count
++	cmp	count, 128
++	b.hi	L(copy_long)
++	cmp	count, 32
++	b.hi	L(copy32_128)
++
++	/* Small copies: 0..32 bytes.  */
++	cmp	count, 16
++	b.lo	L(copy16)
++	ldp	A_l, A_h, [src]
++	ldp	D_l, D_h, [srcend, -16]
++	stp	A_l, A_h, [dstin]
++	stp	D_l, D_h, [dstend, -16]
++	ret
++
++	/* Copy 8-15 bytes.  */
++L(copy16):
++	tbz	count, 3, L(copy8)
++	ldr	A_l, [src]
++	ldr	A_h, [srcend, -8]
++	str	A_l, [dstin]
++	str	A_h, [dstend, -8]
++	ret
++
++	.p2align 3
++	/* Copy 4-7 bytes.  */
++L(copy8):
++	tbz	count, 2, L(copy4)
++	ldr	A_lw, [src]
++	ldr	B_lw, [srcend, -4]
++	str	A_lw, [dstin]
++	str	B_lw, [dstend, -4]
++	ret
++
++	/* Copy 0..3 bytes using a branchless sequence.  */
++L(copy4):
++	cbz	count, L(copy0)
++	lsr	tmp1, count, 1
++	ldrb	A_lw, [src]
++	ldrb	C_lw, [srcend, -1]
++	ldrb	B_lw, [src, tmp1]
++	strb	A_lw, [dstin]
++	strb	B_lw, [dstin, tmp1]
++	strb	C_lw, [dstend, -1]
++L(copy0):
++	ret
++
++	.p2align 4
++	/* Medium copies: 33..128 bytes.  */
++L(copy32_128):
++	ldp	A_l, A_h, [src]
++	ldp	B_l, B_h, [src, 16]
++	ldp	C_l, C_h, [srcend, -32]
++	ldp	D_l, D_h, [srcend, -16]
++	cmp	count, 64
++	b.hi	L(copy128)
++	stp	A_l, A_h, [dstin]
++	stp	B_l, B_h, [dstin, 16]
++	stp	C_l, C_h, [dstend, -32]
++	stp	D_l, D_h, [dstend, -16]
++	ret
++
++	.p2align 4
++	/* Copy 65..128 bytes.  */
++L(copy128):
++	ldp	E_l, E_h, [src, 32]
++	ldp	F_l, F_h, [src, 48]
++	cmp	count, 96
++	b.ls	L(copy96)
++	ldp	G_l, G_h, [srcend, -64]
++	ldp	H_l, H_h, [srcend, -48]
++	stp	G_l, G_h, [dstend, -64]
++	stp	H_l, H_h, [dstend, -48]
++L(copy96):
++	stp	A_l, A_h, [dstin]
++	stp	B_l, B_h, [dstin, 16]
++	stp	E_l, E_h, [dstin, 32]
++	stp	F_l, F_h, [dstin, 48]
++	stp	C_l, C_h, [dstend, -32]
++	stp	D_l, D_h, [dstend, -16]
++	ret
++
++	.p2align 4
++	/* Copy more than 128 bytes.  */
++L(copy_long):
++	/* Use backwards copy if there is an overlap.  */
++	sub	tmp1, dstin, src
++	cbz	tmp1, L(copy0)
++	cmp	tmp1, count
++	b.lo	L(copy_long_backwards)
++
++	/* Copy 16 bytes and then align dst to 16-byte alignment.  */
++
++	ldp	D_l, D_h, [src]
++	and	tmp1, dstin, 15
++	bic	dst, dstin, 15
++	sub	src, src, tmp1
++	add	count, count, tmp1	/* Count is now 16 too large.  */
++	ldp	A_l, A_h, [src, 16]
++	stp	D_l, D_h, [dstin]
++	ldp	B_l, B_h, [src, 32]
++	ldp	C_l, C_h, [src, 48]
++	ldp	D_l, D_h, [src, 64]!
++	subs	count, count, 128 + 16	/* Test and readjust count.  */
++	b.ls	L(copy64_from_end)
++
++L(loop64):
++	stp	A_l, A_h, [dst, 16]
++	ldp	A_l, A_h, [src, 16]
++	stp	B_l, B_h, [dst, 32]
++	ldp	B_l, B_h, [src, 32]
++	stp	C_l, C_h, [dst, 48]
++	ldp	C_l, C_h, [src, 48]
++	stp	D_l, D_h, [dst, 64]!
++	ldp	D_l, D_h, [src, 64]!
++	subs	count, count, 64
++	b.hi	L(loop64)
++
++	/* Write the last iteration and copy 64 bytes from the end.  */
++L(copy64_from_end):
++	ldp	E_l, E_h, [srcend, -64]
++	stp	A_l, A_h, [dst, 16]
++	ldp	A_l, A_h, [srcend, -48]
++	stp	B_l, B_h, [dst, 32]
++	ldp	B_l, B_h, [srcend, -32]
++	stp	C_l, C_h, [dst, 48]
++	ldp	C_l, C_h, [srcend, -16]
++	stp	D_l, D_h, [dst, 64]
++	stp	E_l, E_h, [dstend, -64]
++	stp	A_l, A_h, [dstend, -48]
++	stp	B_l, B_h, [dstend, -32]
++	stp	C_l, C_h, [dstend, -16]
++	ret
++
++	.p2align 4
++
++	/* Large backwards copy for overlapping copies.
++	   Copy 16 bytes and then align dst to 16-byte alignment.  */
++L(copy_long_backwards):
++	ldp	D_l, D_h, [srcend, -16]
++	and	tmp1, dstend, 15
++	sub	srcend, srcend, tmp1
++	sub	count, count, tmp1
++	ldp	A_l, A_h, [srcend, -16]
++	stp	D_l, D_h, [dstend, -16]
++	ldp	B_l, B_h, [srcend, -32]
++	ldp	C_l, C_h, [srcend, -48]
++	ldp	D_l, D_h, [srcend, -64]!
++	sub	dstend, dstend, tmp1
++	subs	count, count, 128
++	b.ls	L(copy64_from_start)
++
++L(loop64_backwards):
++	stp	A_l, A_h, [dstend, -16]
++	ldp	A_l, A_h, [srcend, -16]
++	stp	B_l, B_h, [dstend, -32]
++	ldp	B_l, B_h, [srcend, -32]
++	stp	C_l, C_h, [dstend, -48]
++	ldp	C_l, C_h, [srcend, -48]
++	stp	D_l, D_h, [dstend, -64]!
++	ldp	D_l, D_h, [srcend, -64]!
++	subs	count, count, 64
++	b.hi	L(loop64_backwards)
++
++	/* Write the last iteration and copy 64 bytes from the start.  */
++L(copy64_from_start):
++	ldp	G_l, G_h, [src, 48]
++	stp	A_l, A_h, [dstend, -16]
++	ldp	A_l, A_h, [src, 32]
++	stp	B_l, B_h, [dstend, -32]
++	ldp	B_l, B_h, [src, 16]
++	stp	C_l, C_h, [dstend, -48]
++	ldp	C_l, C_h, [src]
++	stp	D_l, D_h, [dstend, -64]
++	stp	G_l, G_h, [dstin, 48]
++	stp	A_l, A_h, [dstin, 32]
++	stp	B_l, B_h, [dstin, 16]
++	stp	C_l, C_h, [dstin]
++	ret
++
++END (__memcpy_aarch64)
++
+diff --git a/src/system/libroot/posix/string/arch/arm64/memset-scalar.S b/src/system/libroot/posix/string/arch/arm64/memset-scalar.S
+new file mode 100644
+index 0000000000..a66373d584
+--- /dev/null
++++ b/src/system/libroot/posix/string/arch/arm64/memset-scalar.S
+@@ -0,0 +1,165 @@
++/*
++ * __arm_sc_memset - fill memory with a constant byte
++ *
++ * Copyright (c) 2012-2026, Arm Limited.
++ * SPDX-License-Identifier: MIT OR Apache-2.0 WITH LLVM-exception
++ */
++
++/* Assumptions:
++ *
++ * ARMv8-a, AArch64, unaligned accesses.
++ *
++ */
++
++#include "asmdefs.h"
++
++#define dstin	x0
++#define val	x1
++#define valw	w1
++#define count	x2
++#define dst	x3
++#define dstend	x4
++#define zva_val	x5
++#define off	x3
++#define dstend2	x5
++
++/* This implementation is similar to __memset_aarch64 but avoids FP/AdvSIMD
++   register instructions.  */
++
++ENTRY_ALIAS (__memset_scalar_sc)
++ENTRY (__memset_scalar)
++	/* Replicate the fill byte across the last half of the word.  */
++	and	valw, valw, 255
++	orr	valw, valw, valw, lsl 8
++	orr	valw, valw, valw, lsl 16
++
++	cmp	count, 16
++	b.lo	L(set_lt16)
++
++	/* Replicate the fill byte across the rest of the word.  */
++	orr	val, val, val, lsl 32
++
++	add	dstend, dstin, count
++	cmp	count, 64
++	b.hi	L(set_gt64)
++
++L(set_16_64):
++	/* Calculate an interior store offset based on half the count, This will be
++	  one of 0, 16 or 32 bytes. Then perform four overlapping stores.  */
++	mov	off, 48
++	and	off, off, count, lsr 1
++	sub	dstend2, dstend, off
++
++	stp	val, val, [dstin]
++	add	off, dstin, off
++	stp	val, val, [off]
++	stp	val, val, [dstend2, -16]
++	stp	val, val, [dstend, -16]
++	ret
++
++	.p2align 4
++L(set_lt16):
++	add	dstend, dstin, count
++	cmp	count, 4
++	b.lo	1f
++
++	/* For sizes 4..15, salculate an interior offset based on the count. Then
++	   perform four overlapping 32 bit stores.  */
++	lsr	off, count, 3				/* off = count >> 3.  */
++	sub	dstend2, dstend, off, lsl 2
++	str	valw, [dstin]
++	str	valw, [dstin, off, lsl 2]
++	str	valw, [dstend2, -4]
++	str	valw, [dstend, -4]
++	ret
++
++	/* Potentially overlapping stores for sizes 0..3. */
++1:	cbz	count, 2f		/* Skip stores entirely for a zero-length memset.  */
++	lsr	off, count, 1
++	strb	valw, [dstin]
++	strb	valw, [dstin, off]
++	strb	valw, [dstend, -1]
++2:	ret
++
++	.p2align 4
++L(set_gt64):
++	bic	dst, dstin, 15		/* Align dst down to 16 bytes.  */
++	cmp	count, 128
++	b.hi	L(set_gt128)
++
++	/* For sizes 64..128, perform eight overlapping 16-byte stores.  */
++	stp	val, val, [dstin]
++	stp	val, val, [dstin, 16]
++	stp	val, val, [dstin, 32]
++	stp	val, val, [dstin, 48]
++	stp	val, val, [dstend, -64]
++	stp	val, val, [dstend, -48]
++	stp	val, val, [dstend, -32]
++	stp	val, val, [dstend, -16]
++	ret
++
++	.p2align 4
++L(set_gt128):
++	/* For sizes above 128, perform initial stores before entering loop on
++	   aligned addresses.  */
++	stp	val, val, [dstin]
++	stp	val, val, [dst, 16]
++
++	/* We can use DC ZVA to zero memory when the fill byte is zero and the block
++	   size reported by DCZID_EL0 is 64 bytes.  */
++	cbnz valw, L(no_zva)
++#ifndef SKIP_ZVA_CHECK
++	mrs	zva_val, dczid_el0
++	and	zva_val, zva_val, 31
++	cmp	zva_val, 4
++	b.ne	L(no_zva)
++#endif
++	/* Complete stores up to the first 64 byte aligned block.  */
++	stp	val, val, [dst, 32]
++	stp	val, val, [dst, 48]
++
++	bic	dst, dstin, 63		/* Align dst down to 64 bytes.  */
++	/* Compute count, accounting for the stores above and bias for the loop
++	   exit.  */
++	sub	count, dstend, dst
++	sub	count, count, 64 + 64
++
++	/* Write last bytes before entering ZVA loop.  */
++	stp	val, val, [dstend, -64]
++	stp	val, val, [dstend, -48]
++	stp	val, val, [dstend, -32]
++	stp	val, val, [dstend, -16]
++
++	.p2align 4
++L(zva64_loop):
++	add	dst, dst, 64
++	dc	zva, dst		/* Zero the 64-byte cache block containing dst.  */
++	subs	count, count, 64
++	b.hi	L(zva64_loop)
++	ret
++
++	.p2align 3
++L(no_zva):
++	/* Compute count, accounting for the two stores in set_gt128 and bias for
++	   the loop exit.  */
++	sub	count, dstend, dst
++	sub	count, count, 64 + 32
++
++L(no_zva_loop):
++	/* Perform eight contiguous 16-byte stores per iteration.  */
++	stp	val, val, [dst, 32]
++	stp	val, val, [dst, 48]
++	stp	val, val, [dst, 64]
++	stp	val, val, [dst, 80]
++	add	dst, dst, 64
++	subs	count, count, 64
++	b.hi	L(no_zva_loop)
++
++	/* Perform final stores for the tail of the range, potentially overlapping
++	   with previous ones.  */
++	stp	val, val, [dstend, -64]
++	stp	val, val, [dstend, -48]
++	stp	val, val, [dstend, -32]
++	stp	val, val, [dstend, -16]
++	ret
++END (__memset_scalar)
+diff --git a/src/system/libroot/posix/string/arch/arm64/memset.S b/src/system/libroot/posix/string/arch/arm64/memset.S
+new file mode 100644
+index 0000000000..520ccc556d
+--- /dev/null
++++ b/src/system/libroot/posix/string/arch/arm64/memset.S
+@@ -0,0 +1,121 @@
++/*
++ * memset - fill memory with a constant byte
++ *
++ * Copyright (c) 2012-2024, Arm Limited.
++ * SPDX-License-Identifier: MIT OR Apache-2.0 WITH LLVM-exception
++ */
++
++/* Assumptions:
++ *
++ * ARMv8-a, AArch64, Advanced SIMD, unaligned accesses.
++ *
++ */
++
++#include "asmdefs.h"
++
++#define dstin	x0
++#define val	x1
++#define valw	w1
++#define count	x2
++#define dst	x3
++#define dstend	x4
++#define zva_val	x5
++#define off	x3
++#define dstend2	x5
++
++ENTRY (__memset_aarch64)
++	dup	v0.16B, valw
++	cmp	count, 16
++	b.lo	L(set_small)
++
++	add	dstend, dstin, count
++	cmp	count, 64
++	b.hi	L(set_128)
++
++	/* Set 16..64 bytes.  */
++	mov	off, 48
++	and	off, off, count, lsr 1
++	sub	dstend2, dstend, off
++	str	q0, [dstin]
++	str	q0, [dstin, off]
++	str	q0, [dstend2, -16]
++	str	q0, [dstend, -16]
++	ret
++
++	.p2align 4
++	/* Set 0..15 bytes.  */
++L(set_small):
++	add	dstend, dstin, count
++	cmp	count, 4
++	b.lo	2f
++	lsr	off, count, 3
++	sub	dstend2, dstend, off, lsl 2
++	str	s0, [dstin]
++	str	s0, [dstin, off, lsl 2]
++	str	s0, [dstend2, -4]
++	str	s0, [dstend, -4]
++	ret
++
++	/* Set 0..3 bytes.  */
++2:	cbz	count, 3f
++	lsr	off, count, 1
++	strb	valw, [dstin]
++	strb	valw, [dstin, off]
++	strb	valw, [dstend, -1]
++3:	ret
++
++	.p2align 4
++L(set_128):
++	bic	dst, dstin, 15
++	cmp	count, 128
++	b.hi	L(set_long)
++	stp	q0, q0, [dstin]
++	stp	q0, q0, [dstin, 32]
++	stp	q0, q0, [dstend, -64]
++	stp	q0, q0, [dstend, -32]
++	ret
++
++	.p2align 4
++L(set_long):
++	str	q0, [dstin]
++	str	q0, [dst, 16]
++	tst	valw, 255
++	b.ne	L(no_zva)
++#ifndef SKIP_ZVA_CHECK
++	mrs	zva_val, dczid_el0
++	and	zva_val, zva_val, 31
++	cmp	zva_val, 4		/* ZVA size is 64 bytes.  */
++	b.ne	L(no_zva)
++#endif
++	stp	q0, q0, [dst, 32]
++	bic	dst, dstin, 63
++	sub	count, dstend, dst	/* Count is now 64 too large.  */
++	sub	count, count, 64 + 64	/* Adjust count and bias for loop.  */
++
++	/* Write last bytes before ZVA loop.  */
++	stp	q0, q0, [dstend, -64]
++	stp	q0, q0, [dstend, -32]
++
++	.p2align 4
++L(zva64_loop):
++	add	dst, dst, 64
++	dc	zva, dst
++	subs	count, count, 64
++	b.hi	L(zva64_loop)
++	ret
++
++	.p2align 3
++L(no_zva):
++	sub	count, dstend, dst	/* Count is 32 too large.  */
++	sub	count, count, 64 + 32	/* Adjust count and bias for loop.  */
++L(no_zva_loop):
++	stp	q0, q0, [dst, 32]
++	stp	q0, q0, [dst, 64]
++	add	dst, dst, 64
++	subs	count, count, 64
++	b.hi	L(no_zva_loop)
++	stp	q0, q0, [dstend, -64]
++	stp	q0, q0, [dstend, -32]
++	ret
++
++END (__memset_aarch64)
+diff --git a/src/system/runtime_loader/Jamfile b/src/system/runtime_loader/Jamfile
+index 4e814a9635..5772353811 100644
+--- a/src/system/runtime_loader/Jamfile
++++ b/src/system/runtime_loader/Jamfile
+@@ -11,6 +11,13 @@ for architectureObject in [ MultiArchSubDirSetup ] {
+ 	on $(architectureObject) {
+ 		local architecture = $(TARGET_PACKAGING_ARCH) ;
+ 
++		# arm64's memmove comes with Arm's memcpy in posix_string_arch_arm64.o
++		local memmoveObject
++			= <src!system!libroot!posix!musl!string!$(architecture)>memmove.o ;
++		if $(TARGET_ARCH) = arm64 {
++			memmoveObject = ;
++		}
++
+ 		UsePrivateHeaders libroot runtime_loader shared ;
+ 		UsePrivateHeaders kernel ;
+ 			# for <util/KMessage.h>
+@@ -53,7 +60,7 @@ for architectureObject in [ MultiArchSubDirSetup ] {
+ 			<src!system!libroot!posix!locale!$(architecture)>LocaleData.o
+ 
+ 			<src!system!libroot!posix!musl!string!$(architecture)>memchr.o
+-			<src!system!libroot!posix!musl!string!$(architecture)>memmove.o
++			$(memmoveObject)
+ 			<src!system!libroot!posix!musl!string!$(architecture)>stpcpy.o
+ 			<src!system!libroot!posix!musl!string!$(architecture)>strcat.o
+ 			<src!system!libroot!posix!musl!string!$(architecture)>strchr.o

@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 15:09:27 -0400
+Subject: [PATCH 110/342] scheduler: a CPU about to idle takes a thread waiting
+ on a busy core
+
+Threads change cores only when they are enqueued. A thread woken onto a
+core that is busy at that moment waited there even when other cores
+went idle right after: on the ODROID-C2, with four threads woken in a
+row (tools/probes/condwake.c in the port's project), the third and
+fourth started 0.5 to 1.3 ms late, behind a thread that had taken their
+core.
+
+In low latency mode, a CPU that is about to run its idle thread now
+takes the thread at the head of the run queue of a busy core in the
+same package, if its CPU mask allows. The other thread's scheduler lock
+is only tried, as the current thread's is held.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/kernel/scheduler/scheduler.cpp | 69 +++++++++++++++++++++++
+ 1 file changed, 69 insertions(+)
+
+diff --git a/src/system/kernel/scheduler/scheduler.cpp b/src/system/kernel/scheduler/scheduler.cpp
+index 4f2ca80642..69fd95bfc8 100644
+--- a/src/system/kernel/scheduler/scheduler.cpp
++++ b/src/system/kernel/scheduler/scheduler.cpp
+@@ -314,6 +314,70 @@ switch_thread(Thread* fromThread, Thread* toThread)
+ }
+ 
+ 
++/*!	This CPU is about to idle: takes the thread at the head of the run queue
++	of a busy core in the same package, which would otherwise wait there
++	while this CPU idles. Threads only change cores when they are enqueued,
++	so without this a thread woken onto a busy core waits for it even when
++	other cores go idle right after.
++	Called with interrupts disabled and the current thread's scheduler lock
++	held; the other thread's lock is only tried, to keep the lock order.
++*/
++static void
++steal_thread(CPUEntry* cpu, CoreEntry* core)
++{
++	SCHEDULER_ENTER_FUNCTION();
++
++	{
++		CoreRunQueueLocker coreLocker(core);
++		if (core->PeekThread() != NULL)
++			return;
++	}
++	{
++		CPURunQueueLocker cpuLocker(cpu);
++		ThreadData* pinned = cpu->PeekThread();
++		if (pinned != NULL && !pinned->IsIdle())
++			return;
++	}
++
++	PackageEntry* package = core->Package();
++	for (int32 i = 0; i < gCoreCount; i++) {
++		CoreEntry* other = &gCoreEntries[i];
++		if (other == core || other->Package() != package
++			|| other->HasIdleCPU()) {
++			// an idle CPU of that core runs its threads itself
++			continue;
++		}
++
++		other->LockRunQueue();
++		ThreadData* threadData = other->PeekThread();
++		if (threadData == NULL) {
++			other->UnlockRunQueue();
++			continue;
++		}
++		CPUSet mask = threadData->GetCPUMask();
++		Thread* thread = threadData->GetThread();
++		if ((!mask.IsEmpty() && !mask.GetBit(cpu->ID()))
++			|| !try_acquire_spinlock(&thread->scheduler_lock)) {
++			other->UnlockRunQueue();
++			continue;
++		}
++		other->Remove(threadData);
++		other->UnlockRunQueue();
++
++		CoreEntry* targetCore = core;
++		CPUEntry* targetCPU = cpu;
++		threadData->ChooseCoreAndCPU(targetCore, targetCPU);
++		bool wasRunQueueEmpty;
++		threadData->Enqueue(wasRunQueueEmpty);
++		NotifySchedulerListeners(&SchedulerListener::ThreadEnqueuedInRunQueue,
++			thread);
++
++		release_spinlock(&thread->scheduler_lock);
++		return;
++	}
++}
++
++
+ static void
+ reschedule(int32 nextState)
+ {
+@@ -410,6 +474,11 @@ reschedule(int32 nextState)
+ 		if (oldThreadShouldMigrate)
+ 			enqueueOldThread = false;
+ 
++		if (gCurrentModeID == SCHEDULER_MODE_LOW_LATENCY && !gSingleCore
++			&& (!enqueueOldThread || oldThreadData->IsIdle())) {
++			steal_thread(cpu, core);
++		}
++
+ 		nextThreadData
+ 			= cpu->ChooseNextThread(enqueueOldThread ? oldThreadData : NULL,
+ 				putOldThreadAtBack);

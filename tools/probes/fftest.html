@@ -1,0 +1,123 @@
+<!doctype html>
+<!-- Copyright 2026, haiku-odroid-c2 port authors. Distributed under the terms
+     of the MIT License. Firefox on the C2 (milestone M78 (docs/milestones.md)): layout, CSS, canvas,
+     the JavaScript JIT and WebAssembly, with a trap through the signal handler. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>Firefox test</title>
+<style>
+body { font: 16px sans-serif; margin: 16px; background: #f4f6fa; color: #1a2230; }
+h1 { margin: 0 0 8px; font-size: 26px; color: #0b5cad; }
+.box { background: linear-gradient(90deg, #0b5cad, #e0473d); color: white;
+	padding: 10px 14px; border-radius: 10px; box-shadow: 2px 3px 8px #0006; margin-bottom: 12px; }
+table { border-collapse: collapse; margin-bottom: 12px; }
+td { border: 1px solid #99a3b3; padding: 4px 10px; background: white; }
+td.ok { color: #0a7a32; font-weight: bold; }
+td.bad { color: #c11; font-weight: bold; }
+</style>
+</head>
+<body>
+<h1>Firefox on the ODROID-C2</h1>
+<div class="box">CSS gradient, rounded corners and a shadow · ä ö ü é 日本語</div>
+<table id="results"></table>
+<canvas id="c" width="480" height="110"></canvas>
+<script>
+const table = document.getElementById("results");
+function report(name, ok, detail) {
+	const row = table.insertRow();
+	row.insertCell().textContent = name;
+	const cell = row.insertCell();
+	cell.textContent = ok ? "ok" : "FAILED";
+	cell.className = ok ? "ok" : "bad";
+	row.insertCell().textContent = detail;
+}
+function attempt(name, test) {
+	try {
+		const [ok, detail] = test();
+		report(name, ok, detail);
+	} catch (e) {
+		report(name, false, String(e));
+	}
+}
+
+report("user agent", true, navigator.userAgent);
+
+// long enough for the JIT tiers to take over
+attempt("JavaScript (JIT)", () => {
+	const start = performance.now();
+	let count = 0;
+	for (let n = 2; n < 200000; n++) {
+		let prime = true;
+		for (let d = 2; d * d <= n; d++) {
+			if (n % d === 0) {
+				prime = false;
+				break;
+			}
+		}
+		if (prime)
+			count++;
+	}
+	return [count === 17984, count + " primes in "
+		+ (performance.now() - start).toFixed(0) + " ms"];
+});
+
+// (func add (param i32 i32) (result i32)), (func oob (result i32)): a load
+// 256 MB past a one page memory
+const wasm = new Uint8Array([
+	0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+	0x01, 0x0b, 0x02, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f, 0x60, 0x00, 0x01, 0x7f,
+	0x03, 0x03, 0x02, 0x00, 0x01,
+	0x05, 0x03, 0x01, 0x00, 0x01,
+	0x07, 0x0d, 0x02, 0x03, 0x61, 0x64, 0x64, 0x00, 0x00, 0x03, 0x6f, 0x6f, 0x62, 0x00, 0x01,
+	0x0a, 0x15, 0x02,
+	0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b,
+	0x0b, 0x00, 0x41, 0x80, 0x80, 0x80, 0x80, 0x01, 0x28, 0x02, 0x00, 0x0b,
+]);
+let instance = null;
+attempt("WebAssembly", () => {
+	instance = new WebAssembly.Instance(new WebAssembly.Module(wasm));
+	let sum = 0;
+	for (let i = 0; i < 1000000; i++)
+		sum = instance.exports.add(sum, 1);
+	return [sum === 1000000, "add() a million times: " + sum];
+});
+attempt("WebAssembly trap", () => {
+	try {
+		instance.exports.oob();
+		return [false, "no trap"];
+	} catch (e) {
+		return [e instanceof WebAssembly.RuntimeError, String(e)];
+	}
+});
+
+attempt("canvas 2D", () => {
+	const context = document.getElementById("c").getContext("2d");
+	const gradient = context.createLinearGradient(0, 0, 480, 0);
+	gradient.addColorStop(0, "#ffb000");
+	gradient.addColorStop(1, "#7a1fa2");
+	context.fillStyle = gradient;
+	context.fillRect(0, 0, 480, 110);
+	context.fillStyle = "white";
+	context.font = "24px sans-serif";
+	context.fillText("Drawn on a canvas", 20, 44);
+	context.beginPath();
+	context.arc(400, 55, 40, 0, Math.PI * 2);
+	context.fillStyle = "#ffffffaa";
+	context.fill();
+	const pixel = context.getImageData(5, 5, 1, 1).data;
+	return [pixel[3] === 255, "pixel 5,5: " + Array.from(pixel).join(",")];
+});
+
+attempt("WebGL 1", () => {
+	const gl = document.createElement("canvas").getContext("webgl");
+	if (!gl)
+		return [false, "no context"];
+	return [true, gl.getParameter(gl.VERSION) + " / "
+		+ gl.getParameter(gl.RENDERER)];
+});
+
+report("hardware threads", true, String(navigator.hardwareConcurrency));
+</script>
+</body>
+</html>

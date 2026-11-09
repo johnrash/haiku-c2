@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 17:27:01 -0400
+Subject: [PATCH 122/342] meson_vdec: the frames area is user writable too
+
+arm64 can't map memory user read-only and kernel writable at once, so
+create_area() refused the frames; the caller still clones it read only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/drivers/video/meson_vdec/meson_vdec.cpp     | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+index fa93412953..0043bacbdd 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+@@ -540,7 +540,9 @@ MesonVdec::_ParserInterrupt(void* data)
+ 
+ 
+ /*!	Physically contiguous memory below 4 GB, cleared and its cache lines
+-	written back. With \a userReadable, other teams can clone it to read.
++	written back. With \a userReadable, other teams can clone it to read
++	(the area itself is user writable too: arm64 can't map memory user
++	read-only and kernel writable at once).
+ */
+ status_t
+ MesonVdec::_AllocateBuffer(const char* name, size_t size, dma_buffer& buffer,
+@@ -550,7 +552,8 @@ MesonVdec::_AllocateBuffer(const char* name, size_t size, dma_buffer& buffer,
+ 	void* address;
+ 	buffer.area = create_area(name, &address, B_ANY_KERNEL_ADDRESS, size,
+ 		B_32_BIT_CONTIGUOUS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA
+-			| (userReadable ? B_READ_AREA | B_CLONEABLE_AREA : 0));
++			| (userReadable
++				? B_READ_AREA | B_WRITE_AREA | B_CLONEABLE_AREA : 0));
+ 	if (buffer.area < 0)
+ 		return buffer.area;
+ 	physical_entry entry;
+@@ -769,7 +772,8 @@ MesonVdec::_Start(meson_vdec_start& start, const void* userFirmware)
+ 			kInputSize + kMinimumFetch + kMarkerSize, fInput, false)) != B_OK
+ 		|| (status = _AllocateBuffer("meson_vdec frames",
+ 			kFrameCount * fFrameSize, fFrames, true)) != B_OK) {
+-		INFO("no memory for a session: %s\n", strerror(status));
++		INFO("no memory for a session (%" B_PRIuSIZE " bytes of frames): "
++			"%s\n", kFrameCount * fFrameSize, strerror(status));
+ 		_Stop();
+ 		return status;
+ 	}

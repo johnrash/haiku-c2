@@ -1,0 +1,1558 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 17:25:23 -0400
+Subject: [PATCH 121/342] meson_vdec: the S905's video decoder (VDEC_1),
+ MPEG-1/2 bring-up
+
+A driver for the Amlogic GXBB video decoder, published as
+video/meson_vdec/0 (headers/private/drivers/meson_vdec.h): it powers
+VDEC_1 up, loads the AMRISC firmware the caller hands in, sets up the
+VIFIFO ring and the stream parser, gives the firmware eight NV12 frames
+(two canvases each, from canvas 0x80 on), feeds the elementary stream
+through the parser with its 00 00 01 FF marker, and hands out the
+frames the firmware reports until the caller gives them back.
+
+Written from facts read from Linux's GPL staging driver (register
+names, offsets, values and their order; no code), in the port's
+docs/m26-vdec-facts.md. The interrupts are rising edges that the GIC
+takes as levels, so every wait also polls the registers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/jam/packages/Haiku                      |    1 +
+ headers/private/drivers/meson_vdec.h          |   72 +
+ src/add-ons/kernel/drivers/video/Jamfile      |    1 +
+ .../kernel/drivers/video/meson_vdec/Jamfile   |   10 +
+ .../drivers/video/meson_vdec/meson_vdec.cpp   | 1406 +++++++++++++++++
+ 5 files changed, 1490 insertions(+)
+ create mode 100644 headers/private/drivers/meson_vdec.h
+ create mode 100644 src/add-ons/kernel/drivers/video/meson_vdec/Jamfile
+ create mode 100644 src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index fa50a20ce7..fd10fa268e 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -146,6 +146,7 @@ AddNewDriversToPackage power
+ AddNewDriversToPackage power : meson_scpi@arm64 ;
+ AddNewDriversToPackage rtc : pcf8563@arm64 ;
+ AddNewDriversToPackage misc : meson_gpio@arm64 ;
++AddNewDriversToPackage video : meson_vdec@arm64 ;
+ AddNewDriversToPackage sensor
+ 	: $(SYSTEM_ADD_ONS_DRIVERS_SENSOR) ;
+ AddNewDriversToPackage network :
+diff --git a/headers/private/drivers/meson_vdec.h b/headers/private/drivers/meson_vdec.h
+new file mode 100644
+index 0000000000..28f71b17c8
+--- /dev/null
++++ b/headers/private/drivers/meson_vdec.h
+@@ -0,0 +1,72 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef _MESON_VDEC_H
++#define _MESON_VDEC_H
++
++
++#include <Drivers.h>
++
++
++/*!	The Amlogic S905's (Meson GXBB) video decoder, /dev/video/meson_vdec/0.
++	One session at a time: start it with the codec's firmware, write the
++	compressed stream (an elementary stream: MPEG-1/2 so far), take the
++	decoded frames in display order and give each back when done with it.
++	The frames are NV12 (a Y plane, then interleaved Cb and Cr at half the
++	height) in one area the caller clones; their contents are valid from
++	GET_FRAME until RECYCLE_FRAME.
++*/
++
++#define MESON_VDEC_DEVICE		"/dev/video/meson_vdec/0"
++
++enum {
++	MESON_VDEC_START = B_DEVICE_OP_CODES_END + 1,
++		// meson_vdec_start
++	MESON_VDEC_WRITE,
++		// meson_vdec_write: returns once the decoder took the data
++	MESON_VDEC_GET_FRAME,
++		// meson_vdec_frame: waits for the next decoded frame
++	MESON_VDEC_RECYCLE_FRAME,
++		// uint32: the index of a frame GET_FRAME gave
++	MESON_VDEC_END_OF_STREAM,
++		// no data: the stream ends, the decoder hands out what it holds
++	MESON_VDEC_STOP,
++		// no data: ends the session (closing the device does too)
++};
++
++enum {
++	MESON_VDEC_MPEG12 = 1,
++};
++
++struct meson_vdec_start {
++	uint32			codec;			// in: MESON_VDEC_*
++	const void*		firmware;		// in: the codec's firmware image
++	size_t			firmware_size;	// in
++	uint32			width;			// in: the picture's, from the stream
++	uint32			height;			// in
++	uint32			frame_count;	// out: frames in the area
++	size_t			frame_size;		// out: bytes per frame
++	area_id			frames;			// out: all frames, one after the other
++};
++
++struct meson_vdec_write {
++	const void*		data;
++	size_t			size;
++};
++
++#define MESON_VDEC_FRAME_END_OF_STREAM	0x1
++	// no frame: the stream ended and every frame was handed out
++
++struct meson_vdec_frame {
++	bigtime_t		timeout;		// in: relative
++	uint32			index;			// out: which frame of the area
++	uint32			flags;			// out: MESON_VDEC_FRAME_*
++	uint32			width;			// out: the picture's
++	uint32			height;
++	uint32			bytes_per_row;	// out: of Y and of CbCr
++	uint32			chroma_offset;	// out: CbCr, from the frame's start
++};
++
++
++#endif	// _MESON_VDEC_H
+diff --git a/src/add-ons/kernel/drivers/video/Jamfile b/src/add-ons/kernel/drivers/video/Jamfile
+index 9c40f09ee8..285ac98e6a 100644
+--- a/src/add-ons/kernel/drivers/video/Jamfile
++++ b/src/add-ons/kernel/drivers/video/Jamfile
+@@ -1,3 +1,4 @@
+ SubDir HAIKU_TOP src add-ons kernel drivers video ; 
+ 
++SubInclude HAIKU_TOP src add-ons kernel drivers video meson_vdec ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers video usb_vision ;
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/Jamfile b/src/add-ons/kernel/drivers/video/meson_vdec/Jamfile
+new file mode 100644
+index 0000000000..668b307144
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/Jamfile
+@@ -0,0 +1,10 @@
++SubDir HAIKU_TOP src add-ons kernel drivers video meson_vdec ;
++
++UsePrivateKernelHeaders ;
++UsePrivateHeaders drivers ;
++
++if $(TARGET_ARCH) = arm64 {
++	KernelAddon meson_vdec :
++		meson_vdec.cpp
++	;
++}
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+new file mode 100644
+index 0000000000..fa93412953
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+@@ -0,0 +1,1406 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * meson_vdec: the Amlogic S905's (Meson GXBB) video decoder, VDEC_1, for
++ * MPEG-1/2 so far, as video/meson_vdec/0 (headers/private/drivers/
++ * meson_vdec.h).
++ *
++ * The decoder is an AMRISC processor running Amlogic's firmware, which the
++ * caller hands in. The elementary stream goes through the stream parser
++ * (ESPARSER) into a ring in memory (the VIFIFO) that the decoder reads; it
++ * decodes into eight NV12 frames, each two canvases, and reports each
++ * decoded frame in a scratch register with a mailbox interrupt. The
++ * register facts are in the port's docs/m26-vdec-facts.md.
++ *
++ * Both interrupts are rising edges, which the GIC takes as levels here, so
++ * every wait also looks at the registers itself every few milliseconds.
++ */
++
++
++#include <new>
++#include <stdio.h>
++#include <string.h>
++
++#include <AutoDeleter.h>
++#include <AutoDeleterDrivers.h>
++#include <bus/FDT.h>
++#include <device_manager.h>
++#include <debug.h>
++#include <kernel.h>
++#include <lock.h>
++#include <util/AutoLock.h>
++#include <vm/vm.h>
++
++#include <meson_vdec.h>
++
++
++#define DRIVER_MODULE_NAME	"drivers/video/meson_vdec/driver_v1"
++#define DEVICE_MODULE_NAME	"drivers/video/meson_vdec/device_v1"
++
++#define INFO(x...)			dprintf("meson_vdec: " x)
++
++
++// blocks besides the DOS and the parser, which come from the device tree
++static const phys_addr_t kAoBase = 0xc8100000;
++static const phys_addr_t kHhiBase = 0xc883c000;
++static const phys_addr_t kResetBase = 0xc1104000;
++static const phys_addr_t kDmcBase = 0xc8838000;
++
++// AO (byte offsets)
++enum {
++	AO_RTI_GEN_PWR_SLEEP0		= 0xe8,
++	AO_RTI_GEN_PWR_ISO0			= 0xec,
++};
++#define AO_SLEEP_VDEC1				(3 << 2)
++#define AO_ISO_VDEC1				(3 << 6)
++
++// HHI (byte offsets)
++enum {
++	HHI_GCLK_MPEG0				= 0x140,
++	HHI_GCLK_MPEG1				= 0x144,
++	HHI_VDEC_CLK_CNTL			= 0x1e0,
++};
++#define GCLK_MPEG0_DOS				(1 << 1)
++#define GCLK_MPEG1_DOS_PARSER		(1 << 25)
++#define VDEC_CLK_DIVIDER_MASK		0x7f
++#define VDEC_CLK_SOURCE_SHIFT		9
++#define VDEC_CLK_SOURCE_MASK		(3 << VDEC_CLK_SOURCE_SHIFT)
++#define VDEC_CLK_SOURCE_FCLK_DIV3	1			// 666.67 MHz
++#define VDEC_CLK_GATE				(1 << 8)
++
++// reset controller (byte offsets)
++enum {
++	RESET1						= 0x408,
++};
++#define RESET1_PARSER				(1 << 8)	// a pulse
++
++// DMC canvas lookup table (byte offsets)
++enum {
++	DMC_CAV_LUT_DATAL			= 0x48,
++	DMC_CAV_LUT_DATAH			= 0x4c,
++	DMC_CAV_LUT_ADDR			= 0x50,
++};
++#define CANVAS_LUT_WRITE			(1 << 9)
++#define CANVAS_ENDIAN_SHIFT			26
++#define CANVAS_SWAP_64				7
++
++// the decoder's canvases: 2 a frame (Y, CbCr); the display uses 0x4e, 0x60
++// and 0x61
++static const uint32 kFirstCanvas = 0x80;
++
++// DOS (byte offsets)
++enum {
++	ASSIST_MBOX1_CLR_REG		= 0x01d4,
++	ASSIST_MBOX1_MASK			= 0x01d8,
++	MPSR						= 0x0c04,
++	CPSR						= 0x0c84,
++	IMEM_DMA_CTRL				= 0x0d00,
++	IMEM_DMA_ADR				= 0x0d04,
++	IMEM_DMA_COUNT				= 0x0d08,
++	PSCALE_CTRL					= 0x2444,
++	GCLK_EN						= 0x260c,
++	MDEC_PIC_DC_CTRL			= 0x2638,
++	AV_SCRATCH_0				= 0x2700,	// to _7: the frames' canvases
++	AV_SCRATCH_4				= 0x2710,	// later: sequence info
++	AV_SCRATCH_5				= 0x2714,	// later: picture info
++	AV_SCRATCH_6				= 0x2718,	// later: the width
++	AV_SCRATCH_7				= 0x271c,	// later: the height
++	AV_SCRATCH_8				= 0x2720,	// frame handed back
++	AV_SCRATCH_9				= 0x2724,	// frame decoded
++	AV_SCRATCH_A				= 0x2728,	// (width << 16) | height
++	AV_SCRATCH_B				= 0x272c,	// workspace + 5 KB
++	AV_SCRATCH_C				= 0x2730,	// error count
++	AV_SCRATCH_D				= 0x2734,	// the frame's stream offset
++	AV_SCRATCH_E				= 0x2738,	// waiting for a frame?
++	AV_SCRATCH_F				= 0x273c,	// 1: fatal error
++	MPEG1_2_REG					= 0x3004,
++	PIC_HEAD_INFO				= 0x300c,
++	POWER_CTL_VLD				= 0x3020,
++	M4_CONTROL_REG				= 0x30a4,
++	VLD_MEM_VIFIFO_START_PTR	= 0x3100,
++	VLD_MEM_VIFIFO_CURR_PTR		= 0x3104,
++	VLD_MEM_VIFIFO_END_PTR		= 0x3108,
++	VLD_MEM_VIFIFO_CONTROL		= 0x3110,
++	VLD_MEM_VIFIFO_WP			= 0x3114,
++	VLD_MEM_VIFIFO_RP			= 0x3118,
++	VLD_MEM_VIFIFO_LEVEL		= 0x311c,
++	VLD_MEM_VIFIFO_BUF_CNTL		= 0x3120,
++	VLD_MEM_VIFIFO_WRAP_COUNT	= 0x3144,
++	DOS_SW_RESET0				= 0xfc00,
++	DOS_GCLK_EN0				= 0xfc04,
++	DOS_GEN_CTRL0				= 0xfc08,
++	DOS_MEM_PD_VDEC				= 0xfcc0,
++	DOS_VDEC_MCRCC_STALL_CTRL	= 0xfd00,
++};
++#define IMEM_DMA_BUSY				(1 << 15)
++#define MDEC_PIC_DC_NV12			(1 << 17)
++#define MDEC_PIC_DC_BIT31			(1u << 31)
++#define VIFIFO_CONTROL_INIT			(1 << 0)
++#define VIFIFO_CONTROL_RUN			0x00110406
++	// FIFO count 0x11, fill on level, empty and fill enable
++#define VIFIFO_BUF_CNTL_INIT		(1 << 0)
++#define VIFIFO_BUF_CNTL_MANUAL		(1 << 1)
++#define BUFFEROUT_SKIP				0x00fe0000
++#define PIC_INFO_PROGRESSIVE		(1 << 15)
++
++// ESPARSER (byte offsets from its base)
++enum {
++	PARSER_CONTROL				= 0x00,
++	PARSER_FETCH_ADDR			= 0x04,
++	PARSER_FETCH_CMD			= 0x08,
++	PARSER_CONFIG				= 0x14,
++	PFIFO_WR_PTR				= 0x18,
++	PFIFO_RD_PTR				= 0x1c,
++	PARSER_SEARCH_PATTERN		= 0x24,
++	PARSER_SEARCH_MASK			= 0x28,
++	PARSER_INT_ENABLE			= 0x2c,
++	PARSER_INT_STATUS			= 0x30,
++	PARSER_ES_CONTROL			= 0x5c,
++	PARSER_VIDEO_START_PTR		= 0x80,
++	PARSER_VIDEO_END_PTR		= 0x84,
++	PARSER_VIDEO_WP				= 0x88,
++	PARSER_VIDEO_HOLE			= 0x90,
++};
++#define PARSER_START_SEARCH			0x03
++#define PARSER_START_WRITE_SEARCH	0x23	// with the pack size at bit 8
++#define PARSER_FETCH_ENDIAN_64		(7 << 27)
++#define PARSER_INT_START_CODE		(1 << 0)
++#define PARSER_INT_HOST_START_CODE	(1 << 8)
++
++static const uint32 kFirmwareSize = 16 * 1024;
++static const size_t kVififoSize = 8 * 1024 * 1024;
++static const size_t kWorkspaceSize = 128 * 1024;
++static const uint32 kWorkspaceOffset = 0x1400;
++	// the firmware takes the address 5 KB in
++static const size_t kInputSize = 256 * 1024;
++	// one parser fetch; plus the padding and the marker
++static const uint32 kMinimumFetch = 4096;
++static const uint32 kMarkerSize = 512;
++static const size_t kVififoMargin = 6 * 1024;
++	// the parser's own FIFO
++static const uint32 kFrameCount = 8;
++static const uint32 kMaxWidth = 1920;
++static const uint32 kMaxHeight = 1088;
++static const bigtime_t kPollInterval = 2000;
++
++
++device_manager_info* gDeviceManager;
++
++
++/*!	Writes back and invalidates the cache lines of a physical range through
++	the kernel's cached map of all memory: before the device reads what the
++	CPU wrote, and before the CPU reads what the device wrote.
++*/
++static void
++flush_cache_range(phys_addr_t physical, size_t size)
++{
++	uint64 ctr;
++	asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
++	const addr_t lineSize = 4 << ((ctr >> 16) & 0xf);
++	addr_t start = (KERNEL_PMAP_BASE + physical) & ~(lineSize - 1);
++	for (addr_t line = start; line < KERNEL_PMAP_BASE + physical + size;
++			line += lineSize) {
++		asm volatile("dc civac, %0" : : "r"(line) : "memory");
++	}
++	asm volatile("dsb sy" : : : "memory");
++}
++
++
++static inline uint32
++align_up(uint32 value, uint32 alignment)
++{
++	return (value + alignment - 1) & ~(alignment - 1);
++}
++
++
++struct dma_buffer {
++	area_id			area;
++	uint8*			address;
++	phys_addr_t		physical;
++	size_t			size;
++
++	dma_buffer() : area(-1), address(NULL), physical(0), size(0) {}
++};
++
++
++class MesonVdec {
++public:
++								MesonVdec(device_node* node);
++								~MesonVdec();
++
++			status_t			Init(phys_addr_t dos, phys_addr_t parser,
++									int32 vdecIrq, int32 parserIrq);
++			device_node*		Node() const { return fNode; }
++
++			status_t			Open();
++			void				Close();
++			status_t			Control(uint32 op, void* buffer,
++									size_t length);
++			void				Dump();
++
++private:
++	static	int32				_VdecInterrupt(void* data);
++	static	int32				_ParserInterrupt(void* data);
++			bool				_CheckDecoder();
++			bool				_CheckParser();
++
++			status_t			_Start(meson_vdec_start& start,
++									const void* userFirmware);
++			void				_Stop();
++			status_t			_Write(const uint8* userData, size_t size);
++			status_t			_Submit(size_t payload, bool marker);
++			status_t			_EndOfStream();
++			status_t			_GetFrame(meson_vdec_frame& frame);
++			status_t			_Recycle(uint32 index);
++
++			void				_PowerUp();
++			void				_PowerDown();
++			void				_SetupVififo();
++			status_t			_LoadFirmware(const void* userFirmware);
++			void				_StartCodec();
++			void				_InitParser();
++			void				_WriteCanvas(uint32 index,
++									phys_addr_t address, uint32 bytesPerRow,
++									uint32 height);
++
++			status_t			_AllocateBuffer(const char* name, size_t size,
++									dma_buffer& buffer, bool userReadable);
++			void				_FreeBuffer(dma_buffer& buffer);
++
++			uint32				_Dos(uint32 offset)
++									{ return fDos[offset / 4]; }
++			void				_SetDos(uint32 offset, uint32 value)
++									{ fDos[offset / 4] = value; }
++			uint32				_Parser(uint32 offset)
++									{ return fParser[offset / 4]; }
++			void				_SetParser(uint32 offset, uint32 value)
++									{ fParser[offset / 4] = value; }
++
++private:
++			device_node*		fNode;
++			area_id				fDosArea;
++			area_id				fParserArea;
++			area_id				fAoArea;
++			area_id				fHhiArea;
++			area_id				fResetArea;
++			area_id				fDmcArea;
++			volatile uint32*	fDos;
++			volatile uint32*	fParser;
++			volatile uint32*	fAo;
++			volatile uint32*	fHhi;
++			volatile uint32*	fReset;
++			volatile uint32*	fDmc;
++			int32				fVdecIrq;
++			int32				fParserIrq;
++
++			mutex				fLock;
++				// one session, its calls one at a time (but GET_FRAME)
++			spinlock			fStateLock;
++				// the frame queue, the interrupt handlers
++			bool				fOpen;
++			bool				fRunning;
++			bool				fEndOfStream;
++
++			dma_buffer			fFirmware;
++			dma_buffer			fVififo;
++			dma_buffer			fWorkspace;
++			dma_buffer			fInput;
++			dma_buffer			fFrames;
++			uint32				fWidth;
++			uint32				fHeight;
++			uint32				fBytesPerRow;
++			uint32				fLumaSize;
++			size_t				fFrameSize;
++
++			sem_id				fFrameSem;
++			sem_id				fParserSem;
++			uint32				fQueue[kFrameCount];
++			uint32				fQueueInfo[kFrameCount];
++			uint32				fQueueHead;
++			uint32				fQueueCount;
++			uint32				fHeld;
++				// bit per frame: with the caller
++			bool				fFatal;
++
++			// counters, for the KDL command
++			uint32				fVdecInterrupts;
++			uint32				fParserInterrupts;
++			uint32				fFramesDecoded;
++			uint32				fFramesSkipped;
++			uint32				fSubmitted;
++			uint32				fParserTimeouts;
++};
++
++
++static MesonVdec* sDevice;
++
++
++MesonVdec::MesonVdec(device_node* node)
++	:
++	fNode(node),
++	fDosArea(-1),
++	fParserArea(-1),
++	fAoArea(-1),
++	fHhiArea(-1),
++	fResetArea(-1),
++	fDmcArea(-1),
++	fDos(NULL),
++	fParser(NULL),
++	fAo(NULL),
++	fHhi(NULL),
++	fReset(NULL),
++	fDmc(NULL),
++	fVdecIrq(-1),
++	fParserIrq(-1),
++	fOpen(false),
++	fRunning(false),
++	fEndOfStream(false),
++	fWidth(0),
++	fHeight(0),
++	fBytesPerRow(0),
++	fLumaSize(0),
++	fFrameSize(0),
++	fFrameSem(-1),
++	fParserSem(-1),
++	fQueueHead(0),
++	fQueueCount(0),
++	fHeld(0),
++	fFatal(false),
++	fVdecInterrupts(0),
++	fParserInterrupts(0),
++	fFramesDecoded(0),
++	fFramesSkipped(0),
++	fSubmitted(0),
++	fParserTimeouts(0)
++{
++	mutex_init(&fLock, "meson_vdec");
++	B_INITIALIZE_SPINLOCK(&fStateLock);
++}
++
++
++MesonVdec::~MesonVdec()
++{
++	if (fRunning)
++		_Stop();
++	if (fVdecIrq >= 0)
++		remove_io_interrupt_handler(fVdecIrq, &_VdecInterrupt, this);
++	if (fParserIrq >= 0)
++		remove_io_interrupt_handler(fParserIrq, &_ParserInterrupt, this);
++	delete_sem(fFrameSem);
++	delete_sem(fParserSem);
++	area_id areas[] = { fDosArea, fParserArea, fAoArea, fHhiArea, fResetArea,
++		fDmcArea };
++	for (size_t i = 0; i < B_COUNT_OF(areas); i++) {
++		if (areas[i] >= 0)
++			delete_area(areas[i]);
++	}
++	mutex_destroy(&fLock);
++}
++
++
++static status_t
++map_registers(const char* name, phys_addr_t base, size_t size, area_id& area,
++	volatile uint32*& registers)
++{
++	phys_addr_t page = base & ~(phys_addr_t)(B_PAGE_SIZE - 1);
++	size_t mapSize = ROUNDUP(base + size - page, B_PAGE_SIZE);
++	void* address;
++	area = map_physical_memory(name, page, mapSize, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++	if (area < 0)
++		return area;
++	registers = (volatile uint32*)((addr_t)address + (base - page));
++	return B_OK;
++}
++
++
++status_t
++MesonVdec::Init(phys_addr_t dos, phys_addr_t parser, int32 vdecIrq,
++	int32 parserIrq)
++{
++	status_t status;
++	if ((status = map_registers("meson_vdec dos", dos, 0x10000, fDosArea,
++			fDos)) != B_OK
++		|| (status = map_registers("meson_vdec parser", parser, 0xe4,
++			fParserArea, fParser)) != B_OK
++		|| (status = map_registers("meson_vdec ao", kAoBase, B_PAGE_SIZE,
++			fAoArea, fAo)) != B_OK
++		|| (status = map_registers("meson_vdec hhi", kHhiBase, B_PAGE_SIZE,
++			fHhiArea, fHhi)) != B_OK
++		|| (status = map_registers("meson_vdec reset", kResetBase,
++			B_PAGE_SIZE, fResetArea, fReset)) != B_OK
++		|| (status = map_registers("meson_vdec dmc", kDmcBase, B_PAGE_SIZE,
++			fDmcArea, fDmc)) != B_OK) {
++		return status;
++	}
++
++	fFrameSem = create_sem(0, "meson_vdec frames");
++	fParserSem = create_sem(0, "meson_vdec parser");
++	if (fFrameSem < 0 || fParserSem < 0)
++		return B_NO_MORE_SEMS;
++
++	// interrupts are masked at the source until a session starts
++	if (vdecIrq > 0 && install_io_interrupt_handler(vdecIrq,
++			&_VdecInterrupt, this, 0) == B_OK) {
++		fVdecIrq = vdecIrq;
++	}
++	if (parserIrq > 0 && install_io_interrupt_handler(parserIrq,
++			&_ParserInterrupt, this, 0) == B_OK) {
++		fParserIrq = parserIrq;
++	}
++	INFO("DOS %#" B_PRIxPHYSADDR ", parser %#" B_PRIxPHYSADDR
++		", interrupts %" B_PRId32 " and %" B_PRId32 "\n", dos, parser,
++		fVdecIrq, fParserIrq);
++	return B_OK;
++}
++
++
++//	#pragma mark - interrupts
++
++
++/*!	Takes a frame the firmware reported, or its fatal error. Called with
++	fStateLock held, from the interrupt or from a waiting thread.
++*/
++bool
++MesonVdec::_CheckDecoder()
++{
++	if (!fRunning)
++		return false;
++	_SetDos(ASSIST_MBOX1_CLR_REG, 1);
++	if (_Dos(AV_SCRATCH_F) == 1) {
++		if (!fFatal)
++			release_sem_etc(fFrameSem, 1, B_DO_NOT_RESCHEDULE);
++		fFatal = true;
++		return true;
++	}
++	uint32 report = _Dos(AV_SCRATCH_9);
++	if (report == 0)
++		return false;
++	if ((report & BUFFEROUT_SKIP) == BUFFEROUT_SKIP) {
++		fFramesSkipped++;
++	} else {
++		uint32 index = ((report & 0xf) - 1) & (kFrameCount - 1);
++		if (fQueueCount < kFrameCount) {
++			uint32 slot = (fQueueHead + fQueueCount) % kFrameCount;
++			fQueue[slot] = index;
++			fQueueInfo[slot] = _Dos(AV_SCRATCH_5);
++			fQueueCount++;
++			fFramesDecoded++;
++			release_sem_etc(fFrameSem, 1, B_DO_NOT_RESCHEDULE);
++		}
++	}
++	_SetDos(AV_SCRATCH_9, 0);
++	return true;
++}
++
++
++/*!	Whether the parser found the marker after the data it was given (all of
++	it is in the VIFIFO then). Called with fStateLock held.
++*/
++bool
++MesonVdec::_CheckParser()
++{
++	uint32 status = _Parser(PARSER_INT_STATUS);
++	if (status == 0)
++		return false;
++	_SetParser(PARSER_INT_STATUS, status);
++	if ((status & PARSER_INT_START_CODE) == 0)
++		return false;
++	_SetParser(PFIFO_RD_PTR, 0);
++	_SetParser(PFIFO_WR_PTR, 0);
++	release_sem_etc(fParserSem, 1, B_DO_NOT_RESCHEDULE);
++	return true;
++}
++
++
++/*static*/ int32
++MesonVdec::_VdecInterrupt(void* data)
++{
++	MesonVdec* device = (MesonVdec*)data;
++	SpinLocker locker(device->fStateLock);
++	device->fVdecInterrupts++;
++	return device->_CheckDecoder() ? B_HANDLED_INTERRUPT
++		: B_UNHANDLED_INTERRUPT;
++}
++
++
++/*static*/ int32
++MesonVdec::_ParserInterrupt(void* data)
++{
++	MesonVdec* device = (MesonVdec*)data;
++	SpinLocker locker(device->fStateLock);
++	device->fParserInterrupts++;
++	return device->_CheckParser() ? B_HANDLED_INTERRUPT
++		: B_UNHANDLED_INTERRUPT;
++}
++
++
++//	#pragma mark - buffers
++
++
++/*!	Physically contiguous memory below 4 GB, cleared and its cache lines
++	written back. With \a userReadable, other teams can clone it to read.
++*/
++status_t
++MesonVdec::_AllocateBuffer(const char* name, size_t size, dma_buffer& buffer,
++	bool userReadable)
++{
++	size = ROUNDUP(size, B_PAGE_SIZE);
++	void* address;
++	buffer.area = create_area(name, &address, B_ANY_KERNEL_ADDRESS, size,
++		B_32_BIT_CONTIGUOUS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA
++			| (userReadable ? B_READ_AREA | B_CLONEABLE_AREA : 0));
++	if (buffer.area < 0)
++		return buffer.area;
++	physical_entry entry;
++	get_memory_map(address, B_PAGE_SIZE, &entry, 1);
++	buffer.address = (uint8*)address;
++	buffer.physical = entry.address;
++	buffer.size = size;
++	memset(address, 0, size);
++	flush_cache_range(buffer.physical, size);
++	return B_OK;
++}
++
++
++void
++MesonVdec::_FreeBuffer(dma_buffer& buffer)
++{
++	if (buffer.area >= 0)
++		delete_area(buffer.area);
++	buffer = dma_buffer();
++}
++
++
++void
++MesonVdec::_WriteCanvas(uint32 index, phys_addr_t address,
++	uint32 bytesPerRow, uint32 height)
++{
++	uint32 width = bytesPerRow / 8;
++	fDmc[DMC_CAV_LUT_DATAL / 4] = (address / 8) | (width << 29);
++	fDmc[DMC_CAV_LUT_DATAH / 4] = (width >> 3) | (height << 9)
++		| (CANVAS_SWAP_64 << CANVAS_ENDIAN_SHIFT);
++	fDmc[DMC_CAV_LUT_ADDR / 4] = CANVAS_LUT_WRITE | index;
++	(void)fDmc[DMC_CAV_LUT_DATAH / 4];
++}
++
++
++//	#pragma mark - hardware sequences
++
++
++void
++MesonVdec::_PowerUp()
++{
++	fHhi[HHI_GCLK_MPEG1 / 4] |= GCLK_MPEG1_DOS_PARSER;
++	fHhi[HHI_GCLK_MPEG0 / 4] |= GCLK_MPEG0_DOS;
++	uint32 clock = fHhi[HHI_VDEC_CLK_CNTL / 4]
++		& ~(VDEC_CLK_SOURCE_MASK | VDEC_CLK_DIVIDER_MASK | VDEC_CLK_GATE);
++	fHhi[HHI_VDEC_CLK_CNTL / 4]
++		= clock | (VDEC_CLK_SOURCE_FCLK_DIV3 << VDEC_CLK_SOURCE_SHIFT);
++	fHhi[HHI_VDEC_CLK_CNTL / 4] |= VDEC_CLK_GATE;
++
++	fAo[AO_RTI_GEN_PWR_SLEEP0 / 4] &= ~AO_SLEEP_VDEC1;
++	spin(20);
++
++	_SetDos(DOS_SW_RESET0, 0xfffffffc);
++	_SetDos(DOS_SW_RESET0, 0);
++	_SetDos(DOS_GCLK_EN0, 0x3ff);
++	_SetDos(DOS_MEM_PD_VDEC, 0);
++	fAo[AO_RTI_GEN_PWR_ISO0 / 4] &= ~AO_ISO_VDEC1;
++	_SetDos(DOS_VDEC_MCRCC_STALL_CTRL, 0);
++	_SetDos(GCLK_EN, 0x3ff);
++	_SetDos(MDEC_PIC_DC_CTRL, _Dos(MDEC_PIC_DC_CTRL) & ~MDEC_PIC_DC_BIT31);
++}
++
++
++void
++MesonVdec::_PowerDown()
++{
++	_SetDos(MPSR, 0);
++	_SetDos(CPSR, 0);
++	_SetDos(ASSIST_MBOX1_MASK, 0);
++	_SetDos(DOS_SW_RESET0, (1 << 12) | (1 << 11));
++	_SetDos(DOS_SW_RESET0, 0);
++	(void)_Dos(DOS_SW_RESET0);
++	fAo[AO_RTI_GEN_PWR_ISO0 / 4] |= AO_ISO_VDEC1;
++	_SetDos(DOS_MEM_PD_VDEC, 0xffffffff);
++	fAo[AO_RTI_GEN_PWR_SLEEP0 / 4] |= AO_SLEEP_VDEC1;
++	fHhi[HHI_VDEC_CLK_CNTL / 4] &= ~VDEC_CLK_GATE;
++	fHhi[HHI_GCLK_MPEG0 / 4] &= ~GCLK_MPEG0_DOS;
++	fHhi[HHI_GCLK_MPEG1 / 4] &= ~GCLK_MPEG1_DOS_PARSER;
++}
++
++
++void
++MesonVdec::_SetupVififo()
++{
++	uint32 start = fVififo.physical;
++	uint32 end = start + fVififo.size - 8;
++	_SetDos(VLD_MEM_VIFIFO_CONTROL, 0);
++	_SetDos(VLD_MEM_VIFIFO_WRAP_COUNT, 0);
++	_SetDos(POWER_CTL_VLD, 1 << 4);
++	_SetDos(VLD_MEM_VIFIFO_START_PTR, start);
++	_SetDos(VLD_MEM_VIFIFO_CURR_PTR, start);
++	_SetDos(VLD_MEM_VIFIFO_END_PTR, end);
++	_SetDos(VLD_MEM_VIFIFO_CONTROL,
++		_Dos(VLD_MEM_VIFIFO_CONTROL) | VIFIFO_CONTROL_INIT);
++	_SetDos(VLD_MEM_VIFIFO_CONTROL,
++		_Dos(VLD_MEM_VIFIFO_CONTROL) & ~VIFIFO_CONTROL_INIT);
++	_SetDos(VLD_MEM_VIFIFO_BUF_CNTL, VIFIFO_BUF_CNTL_MANUAL);
++	_SetDos(VLD_MEM_VIFIFO_WP, start);
++	_SetDos(VLD_MEM_VIFIFO_BUF_CNTL,
++		_Dos(VLD_MEM_VIFIFO_BUF_CNTL) | VIFIFO_BUF_CNTL_INIT);
++	_SetDos(VLD_MEM_VIFIFO_BUF_CNTL,
++		_Dos(VLD_MEM_VIFIFO_BUF_CNTL) & ~VIFIFO_BUF_CNTL_INIT);
++	_SetDos(VLD_MEM_VIFIFO_CONTROL,
++		_Dos(VLD_MEM_VIFIFO_CONTROL) | VIFIFO_CONTROL_RUN);
++}
++
++
++status_t
++MesonVdec::_LoadFirmware(const void* userFirmware)
++{
++	if (!IS_USER_ADDRESS(userFirmware)
++		|| user_memcpy(fFirmware.address, userFirmware, kFirmwareSize)
++			!= B_OK) {
++		return B_BAD_ADDRESS;
++	}
++	flush_cache_range(fFirmware.physical, kFirmwareSize);
++
++	_SetDos(MPSR, 0);
++	_SetDos(CPSR, 0);
++	_SetDos(MDEC_PIC_DC_CTRL, _Dos(MDEC_PIC_DC_CTRL) & ~MDEC_PIC_DC_BIT31);
++	_SetDos(IMEM_DMA_ADR, fFirmware.physical);
++	_SetDos(IMEM_DMA_COUNT, kFirmwareSize / 4);
++	_SetDos(IMEM_DMA_CTRL, 0x00078000);
++	bigtime_t timeout = system_time() + 10000;
++	while ((_Dos(IMEM_DMA_CTRL) & IMEM_DMA_BUSY) != 0) {
++		if (system_time() > timeout) {
++			INFO("firmware DMA does not finish\n");
++			return B_TIMED_OUT;
++		}
++	}
++	return B_OK;
++}
++
++
++/*!	The MPEG-1/2 firmware's registers: the frames' canvases, the workspace,
++	the picture size.
++*/
++void
++MesonVdec::_StartCodec()
++{
++	for (uint32 i = 0; i < kFrameCount; i++) {
++		phys_addr_t frame = fFrames.physical + i * fFrameSize;
++		uint32 luma = kFirstCanvas + 2 * i;
++		uint32 chroma = luma + 1;
++		_WriteCanvas(luma, frame, fBytesPerRow, align_up(fHeight, 32));
++		_WriteCanvas(chroma, frame + fLumaSize, fBytesPerRow,
++			align_up(fHeight, 32) / 2);
++		_SetDos(AV_SCRATCH_0 + 4 * i, luma | (chroma << 8) | (chroma << 16));
++	}
++	_SetDos(POWER_CTL_VLD, 1 << 4);
++	_SetDos(AV_SCRATCH_B, fWorkspace.physical + kWorkspaceOffset);
++	_SetDos(MPEG1_2_REG, 0);
++	_SetDos(PSCALE_CTRL, 0);
++	_SetDos(PIC_HEAD_INFO, 0x380);
++	_SetDos(M4_CONTROL_REG, 0);
++	_SetDos(AV_SCRATCH_8, 0);
++	_SetDos(AV_SCRATCH_9, 0);
++	_SetDos(AV_SCRATCH_A, (fWidth << 16) | fHeight);
++	_SetDos(AV_SCRATCH_C, 0);
++	_SetDos(AV_SCRATCH_F, 0);
++	_SetDos(AV_SCRATCH_E, 0);
++}
++
++
++void
++MesonVdec::_InitParser()
++{
++	fReset[RESET1 / 4] = RESET1_PARSER;
++	_SetParser(PARSER_CONFIG, 0x000a1010);
++	_SetParser(PFIFO_RD_PTR, 0);
++	_SetParser(PFIFO_WR_PTR, 0);
++	_SetParser(PARSER_SEARCH_PATTERN, 0x00000100);
++	_SetParser(PARSER_SEARCH_MASK, 0xffffff00);
++	_SetParser(PARSER_CONFIG, 0x000a1810);
++	_SetParser(PARSER_CONTROL, PARSER_START_SEARCH);
++	_SetParser(PARSER_VIDEO_START_PTR, fVififo.physical);
++	_SetParser(PARSER_VIDEO_END_PTR, fVififo.physical + fVififo.size - 8);
++	_SetParser(PARSER_ES_CONTROL, _Parser(PARSER_ES_CONTROL) & ~1u);
++	_SetDos(DOS_GEN_CTRL0, 0);
++	_SetDos(VLD_MEM_VIFIFO_BUF_CNTL, 1);
++	_SetDos(VLD_MEM_VIFIFO_BUF_CNTL, _Dos(VLD_MEM_VIFIFO_BUF_CNTL) & ~1u);
++	_SetParser(PARSER_INT_STATUS, 0xffff);
++	_SetParser(PARSER_INT_ENABLE, PARSER_INT_HOST_START_CODE);
++}
++
++
++//	#pragma mark - session
++
++
++status_t
++MesonVdec::_Start(meson_vdec_start& start, const void* userFirmware)
++{
++	if (fRunning)
++		return B_BUSY;
++	if (start.codec != MESON_VDEC_MPEG12
++		|| start.firmware_size != kFirmwareSize
++		|| start.width < 16 || start.width > kMaxWidth
++		|| start.height < 16 || start.height > kMaxHeight) {
++		return B_BAD_VALUE;
++	}
++
++	fWidth = start.width;
++	fHeight = start.height;
++	fBytesPerRow = align_up(fWidth, 32);
++	fLumaSize = align_up(fBytesPerRow * align_up(fHeight, 32), 64 * 1024);
++	fFrameSize = ROUNDUP(fLumaSize + fLumaSize / 2, B_PAGE_SIZE);
++
++	status_t status;
++	if ((status = _AllocateBuffer("meson_vdec firmware", kFirmwareSize,
++			fFirmware, false)) != B_OK
++		|| (status = _AllocateBuffer("meson_vdec vififo", kVififoSize,
++			fVififo, false)) != B_OK
++		|| (status = _AllocateBuffer("meson_vdec workspace", kWorkspaceSize,
++			fWorkspace, false)) != B_OK
++		|| (status = _AllocateBuffer("meson_vdec input",
++			kInputSize + kMinimumFetch + kMarkerSize, fInput, false)) != B_OK
++		|| (status = _AllocateBuffer("meson_vdec frames",
++			kFrameCount * fFrameSize, fFrames, true)) != B_OK) {
++		INFO("no memory for a session: %s\n", strerror(status));
++		_Stop();
++		return status;
++	}
++
++	{
++		InterruptsSpinLocker locker(fStateLock);
++		fQueueHead = 0;
++		fQueueCount = 0;
++		fHeld = 0;
++		fFatal = false;
++		fEndOfStream = false;
++	}
++	int32 count;
++	if (get_sem_count(fFrameSem, &count) == B_OK && count > 0)
++		acquire_sem_etc(fFrameSem, count, 0, 0);
++	if (get_sem_count(fParserSem, &count) == B_OK && count > 0)
++		acquire_sem_etc(fParserSem, count, 0, 0);
++
++	_PowerUp();
++	_SetupVififo();
++	status = _LoadFirmware(userFirmware);
++	if (status != B_OK) {
++		_PowerDown();
++		_Stop();
++		return status;
++	}
++	_StartCodec();
++	_SetDos(ASSIST_MBOX1_CLR_REG, 1);
++	_SetDos(ASSIST_MBOX1_MASK, 1);
++	_SetDos(MDEC_PIC_DC_CTRL, _Dos(MDEC_PIC_DC_CTRL) | MDEC_PIC_DC_NV12);
++	fRunning = true;
++	_SetDos(MPSR, 1);
++	spin(20);
++	_InitParser();
++
++	start.frame_count = kFrameCount;
++	start.frame_size = fFrameSize;
++	start.frames = fFrames.area;
++	INFO("session: MPEG-1/2 %" B_PRIu32 "x%" B_PRIu32 ", frames of %"
++		B_PRIuSIZE " bytes at %#" B_PRIxPHYSADDR ", VIFIFO at %#"
++		B_PRIxPHYSADDR "\n", fWidth, fHeight, fFrameSize, fFrames.physical,
++		fVififo.physical);
++	return B_OK;
++}
++
++
++void
++MesonVdec::_Stop()
++{
++	if (fRunning) {
++		// the firmware may still be writing; wait until it is quiet
++		snooze(50000);
++		InterruptsSpinLocker locker(fStateLock);
++		fRunning = false;
++		locker.Unlock();
++		_PowerDown();
++		INFO("session ended: %" B_PRIu32 " frames decoded, %" B_PRIu32
++			" skipped, %" B_PRIu32 " buffers submitted, %" B_PRIu32
++			" parser timeouts\n", fFramesDecoded, fFramesSkipped, fSubmitted,
++			fParserTimeouts);
++	}
++	_FreeBuffer(fFirmware);
++	_FreeBuffer(fVififo);
++	_FreeBuffer(fWorkspace);
++	_FreeBuffer(fInput);
++	_FreeBuffer(fFrames);
++}
++
++
++/*!	Hands the first \a payload bytes of fInput to the parser and waits until
++	they are in the VIFIFO. With \a marker, the data is padded to the
++	parser's minimum and followed by the 00 00 01 FF marker whose start code
++	the parser reports; without (the end of the stream), the wait may end
++	without it.
++*/
++status_t
++MesonVdec::_Submit(size_t payload, bool marker)
++{
++	size_t length = payload;
++	if (marker) {
++		if (length < kMinimumFetch) {
++			memset(fInput.address + length, 0, kMinimumFetch - length);
++			length = kMinimumFetch;
++		}
++		uint8* trailer = fInput.address + length;
++		memset(trailer, 0, kMarkerSize);
++		trailer[2] = 0x01;
++		trailer[3] = 0xff;
++	} else
++		memset(fInput.address + length, 0, kMarkerSize);
++	flush_cache_range(fInput.physical, length + kMarkerSize);
++
++	int32 count;
++	if (get_sem_count(fParserSem, &count) == B_OK && count > 0)
++		acquire_sem_etc(fParserSem, count, 0, 0);
++
++	_SetParser(PFIFO_RD_PTR, 0);
++	_SetParser(PFIFO_WR_PTR, 0);
++	_SetParser(PARSER_CONTROL, (length << 8) | PARSER_START_WRITE_SEARCH);
++	_SetParser(PARSER_FETCH_ADDR, fInput.physical);
++	_SetParser(PARSER_FETCH_CMD,
++		PARSER_FETCH_ENDIAN_64 | (length + kMarkerSize));
++	fSubmitted++;
++
++	bigtime_t timeout = system_time() + (marker ? 1000000 : 200000);
++	while (true) {
++		if (acquire_sem_etc(fParserSem, 1, B_RELATIVE_TIMEOUT, kPollInterval)
++				== B_OK) {
++			return B_OK;
++		}
++		InterruptsSpinLocker locker(fStateLock);
++		bool done = _CheckParser();
++		locker.Unlock();
++		if (done) {
++			acquire_sem_etc(fParserSem, 1, B_RELATIVE_TIMEOUT, 0);
++			return B_OK;
++		}
++		if (system_time() > timeout)
++			break;
++	}
++	_SetParser(PARSER_FETCH_CMD, 0);
++	if (marker) {
++		fParserTimeouts++;
++		INFO("parser timeout: control %#" B_PRIx32 ", status %#" B_PRIx32
++			", video WP %#" B_PRIx32 ", VIFIFO level %" B_PRIu32 "\n",
++			_Parser(PARSER_CONTROL), _Parser(PARSER_INT_STATUS),
++			_Parser(PARSER_VIDEO_WP), _Dos(VLD_MEM_VIFIFO_LEVEL));
++	}
++	return marker ? B_TIMED_OUT : B_OK;
++}
++
++
++status_t
++MesonVdec::_Write(const uint8* userData, size_t size)
++{
++	if (!fRunning)
++		return B_NOT_ALLOWED;
++	if (!IS_USER_ADDRESS(userData))
++		return B_BAD_ADDRESS;
++
++	while (size > 0) {
++		size_t piece = size < kInputSize ? size : kInputSize;
++
++		// room in the VIFIFO: decoding frees it, which needs the caller to
++		// take frames meanwhile
++		bigtime_t timeout = system_time() + 5000000;
++		while (true) {
++			size_t used = _Dos(VLD_MEM_VIFIFO_LEVEL)
++				+ _Parser(PARSER_VIDEO_HOLE) + kVififoMargin;
++			if (used < fVififo.size && fVififo.size - used >= piece)
++				break;
++			if (fFatal)
++				return B_ERROR;
++			if (system_time() > timeout)
++				return B_TIMED_OUT;
++			snooze(kPollInterval);
++		}
++
++		if (user_memcpy(fInput.address, userData, piece) != B_OK)
++			return B_BAD_ADDRESS;
++		status_t status = _Submit(piece, true);
++		if (status != B_OK)
++			return status;
++		userData += piece;
++		size -= piece;
++	}
++	return B_OK;
++}
++
++
++/*!	A sequence end code, for the firmware to put out the frames it holds. */
++status_t
++MesonVdec::_EndOfStream()
++{
++	if (!fRunning)
++		return B_NOT_ALLOWED;
++	memset(fInput.address, 0, 1024);
++	fInput.address[2] = 0x01;
++	fInput.address[3] = 0xb7;
++	_Submit(1024, false);
++	fEndOfStream = true;
++	return B_OK;
++}
++
++
++status_t
++MesonVdec::_GetFrame(meson_vdec_frame& frame)
++{
++	if (!fRunning)
++		return B_NOT_ALLOWED;
++
++	// after the end of the stream, a pause in the output is its end
++	bigtime_t timeout = system_time()
++		+ (fEndOfStream ? min_c(frame.timeout, 300000) : frame.timeout);
++	while (true) {
++		if (acquire_sem_etc(fFrameSem, 1, B_RELATIVE_TIMEOUT | B_CAN_INTERRUPT,
++				kPollInterval) == B_OK) {
++			break;
++		}
++		InterruptsSpinLocker locker(fStateLock);
++		bool reported = _CheckDecoder();
++		locker.Unlock();
++		if (reported)
++			continue;
++		if (system_time() > timeout) {
++			if (fEndOfStream) {
++				memset(&frame, 0, sizeof(frame));
++				frame.flags = MESON_VDEC_FRAME_END_OF_STREAM;
++				return B_OK;
++			}
++			return B_TIMED_OUT;
++		}
++	}
++
++	InterruptsSpinLocker locker(fStateLock);
++	if (fFatal) {
++		locker.Unlock();
++		INFO("the firmware reports a fatal error\n");
++		return B_ERROR;
++	}
++	if (fQueueCount == 0)
++		return B_ERROR;
++	uint32 index = fQueue[fQueueHead];
++	fQueueHead = (fQueueHead + 1) % kFrameCount;
++	fQueueCount--;
++	fHeld |= 1 << index;
++	locker.Unlock();
++
++	flush_cache_range(fFrames.physical + index * fFrameSize, fFrameSize);
++	memset(&frame, 0, sizeof(frame));
++	frame.index = index;
++	frame.width = fWidth;
++	frame.height = fHeight;
++	frame.bytes_per_row = fBytesPerRow;
++	frame.chroma_offset = fLumaSize;
++	return B_OK;
++}
++
++
++/*!	Gives a frame back to the firmware: one at a time, once it took the
++	last.
++*/
++status_t
++MesonVdec::_Recycle(uint32 index)
++{
++	if (!fRunning)
++		return B_NOT_ALLOWED;
++	{
++		InterruptsSpinLocker locker(fStateLock);
++		if (index >= kFrameCount || (fHeld & (1 << index)) == 0)
++			return B_BAD_VALUE;
++	}
++	bigtime_t timeout = system_time() + 500000;
++	while (_Dos(AV_SCRATCH_8) != 0) {
++		if (system_time() > timeout) {
++			INFO("the firmware does not take frame %" B_PRIu32 " back\n",
++				index);
++			return B_TIMED_OUT;
++		}
++		snooze(500);
++	}
++	InterruptsSpinLocker locker(fStateLock);
++	fHeld &= ~(1 << index);
++	locker.Unlock();
++	_SetDos(AV_SCRATCH_8, index + 1);
++	return B_OK;
++}
++
++
++//	#pragma mark - device
++
++
++status_t
++MesonVdec::Open()
++{
++	MutexLocker locker(fLock);
++	if (fOpen)
++		return B_BUSY;
++	fOpen = true;
++	return B_OK;
++}
++
++
++void
++MesonVdec::Close()
++{
++	MutexLocker locker(fLock);
++	if (fRunning || fFrames.area >= 0)
++		_Stop();
++	fOpen = false;
++}
++
++
++status_t
++MesonVdec::Control(uint32 op, void* buffer, size_t length)
++{
++	switch (op) {
++		case MESON_VDEC_START:
++		{
++			meson_vdec_start start;
++			if (length < sizeof(start) || !IS_USER_ADDRESS(buffer)
++				|| user_memcpy(&start, buffer, sizeof(start)) != B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			MutexLocker locker(fLock);
++			status_t status = _Start(start, start.firmware);
++			if (status != B_OK)
++				return status;
++			return user_memcpy(buffer, &start, sizeof(start));
++		}
++
++		case MESON_VDEC_WRITE:
++		{
++			meson_vdec_write write;
++			if (length < sizeof(write) || !IS_USER_ADDRESS(buffer)
++				|| user_memcpy(&write, buffer, sizeof(write)) != B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			MutexLocker locker(fLock);
++			return _Write((const uint8*)write.data, write.size);
++		}
++
++		case MESON_VDEC_END_OF_STREAM:
++		{
++			MutexLocker locker(fLock);
++			return _EndOfStream();
++		}
++
++		case MESON_VDEC_GET_FRAME:
++		{
++			// not under fLock: the caller takes frames while a WRITE waits
++			// for room
++			meson_vdec_frame frame;
++			if (length < sizeof(frame) || !IS_USER_ADDRESS(buffer)
++				|| user_memcpy(&frame, buffer, sizeof(frame)) != B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			status_t status = _GetFrame(frame);
++			if (status != B_OK)
++				return status;
++			return user_memcpy(buffer, &frame, sizeof(frame));
++		}
++
++		case MESON_VDEC_RECYCLE_FRAME:
++		{
++			uint32 index;
++			if (length < sizeof(index) || !IS_USER_ADDRESS(buffer)
++				|| user_memcpy(&index, buffer, sizeof(index)) != B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			return _Recycle(index);
++		}
++
++		case MESON_VDEC_STOP:
++		{
++			MutexLocker locker(fLock);
++			_Stop();
++			return B_OK;
++		}
++	}
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++void
++MesonVdec::Dump()
++{
++	kprintf("meson_vdec: %s, %" B_PRIu32 "x%" B_PRIu32 ", %" B_PRIu32
++		" frames decoded, %" B_PRIu32 " skipped, queue %" B_PRIu32
++		", held %#" B_PRIx32 "%s\n", fRunning ? "running" : "stopped",
++		fWidth, fHeight, fFramesDecoded, fFramesSkipped, fQueueCount, fHeld,
++		fFatal ? ", fatal error" : "");
++	kprintf("  interrupts: decoder %" B_PRIu32 ", parser %" B_PRIu32
++		"; %" B_PRIu32 " buffers submitted, %" B_PRIu32 " parser timeouts\n",
++		fVdecInterrupts, fParserInterrupts, fSubmitted, fParserTimeouts);
++	if (!fRunning)
++		return;
++	kprintf("  MPSR %#" B_PRIx32 ", scratch 4-9 %#" B_PRIx32 " %#" B_PRIx32
++		" %" B_PRIu32 " %" B_PRIu32 " %#" B_PRIx32 " %#" B_PRIx32
++		", C %" B_PRIu32 ", D %#" B_PRIx32 ", E %#" B_PRIx32 ", F %#"
++		B_PRIx32 "\n", _Dos(MPSR), _Dos(AV_SCRATCH_4), _Dos(AV_SCRATCH_5),
++		_Dos(AV_SCRATCH_6), _Dos(AV_SCRATCH_7), _Dos(AV_SCRATCH_8),
++		_Dos(AV_SCRATCH_9), _Dos(AV_SCRATCH_C), _Dos(AV_SCRATCH_D),
++		_Dos(AV_SCRATCH_E), _Dos(AV_SCRATCH_F));
++	kprintf("  VIFIFO: start %#" B_PRIx32 ", WP %#" B_PRIx32 ", RP %#"
++		B_PRIx32 ", level %" B_PRIu32 ", control %#" B_PRIx32 ", buf %#"
++		B_PRIx32 "\n", _Dos(VLD_MEM_VIFIFO_START_PTR),
++		_Dos(VLD_MEM_VIFIFO_WP), _Dos(VLD_MEM_VIFIFO_RP),
++		_Dos(VLD_MEM_VIFIFO_LEVEL), _Dos(VLD_MEM_VIFIFO_CONTROL),
++		_Dos(VLD_MEM_VIFIFO_BUF_CNTL));
++	kprintf("  parser: control %#" B_PRIx32 ", status %#" B_PRIx32
++		", video WP %#" B_PRIx32 ", hole %" B_PRIu32 "\n",
++		_Parser(PARSER_CONTROL), _Parser(PARSER_INT_STATUS),
++		_Parser(PARSER_VIDEO_WP), _Parser(PARSER_VIDEO_HOLE));
++}
++
++
++static int
++dump_meson_vdec(int argc, char** argv)
++{
++	if (sDevice == NULL)
++		kprintf("meson_vdec: no device\n");
++	else
++		sDevice->Dump();
++	return 0;
++}
++
++
++//	#pragma mark - driver module
++
++
++static bool
++fdt_device_enabled(fdt_device_module_info* module, fdt_device* device)
++{
++	int length;
++	const char* status = (const char*)module->get_prop(device, "status",
++		&length);
++	return status == NULL || strcmp(status, "okay") == 0
++		|| strcmp(status, "ok") == 0;
++}
++
++
++static float
++supports_device(device_node* parent)
++{
++	const char* bus;
++	const char* compatible;
++	if (gDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false)
++			!= B_OK || strcmp(bus, "fdt") != 0
++		|| gDeviceManager->get_attr_string(parent, "fdt/compatible",
++			&compatible, false) != B_OK
++		|| strcmp(compatible, "amlogic,gxbb-vdec") != 0) {
++		return 0.0f;
++	}
++	return 0.8f;
++}
++
++
++static status_t
++register_device(device_node* parent)
++{
++	device_attr attrs[] = {
++		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE,
++			{ .string = "Amlogic Meson GXBB video decoder" } },
++		{ NULL }
++	};
++	return gDeviceManager->register_node(parent, DRIVER_MODULE_NAME, attrs,
++		NULL, NULL);
++}
++
++
++static status_t
++init_driver(device_node* node, void** _cookie)
++{
++	DeviceNodePutter<&gDeviceManager> fdtNode(
++		gDeviceManager->get_parent_node(node));
++	fdt_device_module_info* fdtModule;
++	fdt_device* fdtDevice;
++	if (gDeviceManager->get_driver(fdtNode.Get(),
++			(driver_module_info**)&fdtModule, (void**)&fdtDevice) != B_OK) {
++		return B_ERROR;
++	}
++	if (!fdt_device_enabled(fdtModule, fdtDevice))
++		return B_DEVICE_NOT_FOUND;
++
++	// the node sits in "soc", whose ranges are the identity
++	uint64 dos;
++	uint64 parser;
++	uint64 length;
++	if (!fdtModule->get_reg(fdtDevice, 0, &dos, &length)
++		|| !fdtModule->get_reg(fdtDevice, 1, &parser, &length)) {
++		return B_ERROR;
++	}
++	uint64 vdecIrq = 0;
++	uint64 parserIrq = 0;
++	fdtModule->get_interrupt(fdtDevice, 0, NULL, &vdecIrq);
++	fdtModule->get_interrupt(fdtDevice, 1, NULL, &parserIrq);
++
++	MesonVdec* device = new(std::nothrow) MesonVdec(node);
++	if (device == NULL)
++		return B_NO_MEMORY;
++	status_t status = device->Init(dos, parser, (int32)vdecIrq,
++		(int32)parserIrq);
++	if (status != B_OK) {
++		delete device;
++		return status;
++	}
++	sDevice = device;
++	add_debugger_command("meson_vdec", &dump_meson_vdec,
++		"Shows the video decoder's state");
++	*_cookie = device;
++	return B_OK;
++}
++
++
++static void
++uninit_driver(void* cookie)
++{
++	remove_debugger_command("meson_vdec", &dump_meson_vdec);
++	sDevice = NULL;
++	delete (MesonVdec*)cookie;
++}
++
++
++static status_t
++register_child_devices(void* cookie)
++{
++	MesonVdec* device = (MesonVdec*)cookie;
++	return gDeviceManager->publish_device(device->Node(),
++		"video/meson_vdec/0", DEVICE_MODULE_NAME);
++}
++
++
++//	#pragma mark - device module
++
++
++static status_t
++device_init(void* driverCookie, void** _deviceCookie)
++{
++	*_deviceCookie = driverCookie;
++	return B_OK;
++}
++
++
++static void
++device_uninit(void* deviceCookie)
++{
++}
++
++
++static status_t
++device_open(void* deviceCookie, const char* path, int openMode,
++	void** _cookie)
++{
++	MesonVdec* device = (MesonVdec*)deviceCookie;
++	status_t status = device->Open();
++	if (status != B_OK)
++		return status;
++	*_cookie = device;
++	return B_OK;
++}
++
++
++static status_t
++device_close(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++device_free(void* cookie)
++{
++	((MesonVdec*)cookie)->Close();
++	return B_OK;
++}
++
++
++static status_t
++device_read(void* cookie, off_t position, void* buffer, size_t* _length)
++{
++	*_length = 0;
++	return B_NOT_SUPPORTED;
++}
++
++
++static status_t
++device_write(void* cookie, off_t position, const void* buffer,
++	size_t* _length)
++{
++	*_length = 0;
++	return B_NOT_SUPPORTED;
++}
++
++
++static status_t
++device_control(void* cookie, uint32 op, void* buffer, size_t length)
++{
++	return ((MesonVdec*)cookie)->Control(op, buffer, length);
++}
++
++
++module_dependency module_dependencies[] = {
++	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&gDeviceManager },
++	{}
++};
++
++
++static struct device_module_info sMesonVdecDevice = {
++	{
++		DEVICE_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	device_init,
++	device_uninit,
++	NULL,	// remove
++
++	device_open,
++	device_close,
++	device_free,
++	device_read,
++	device_write,
++	NULL,	// io
++	device_control,
++
++	NULL,	// select
++	NULL,	// deselect
++};
++
++
++static struct driver_module_info sMesonVdecDriver = {
++	{
++		DRIVER_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	supports_device,
++	register_device,
++	init_driver,
++	uninit_driver,
++	register_child_devices,
++	NULL,	// rescan
++	NULL,	// removed
++};
++
++
++module_info* modules[] = {
++	(module_info*)&sMesonVdecDriver,
++	(module_info*)&sMesonVdecDevice,
++	NULL
++};

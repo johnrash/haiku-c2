@@ -1,0 +1,357 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Mon, 2 Nov 2026 00:56:26 -0500
+Subject: [PATCH 249/342] usb_audio: recorded buffers in order, four of them
+
+An exchange named the newest buffer recorded. A client late by more than
+a buffer (the media node waiting for a buffer of its own, for one) got
+the newest twice and skipped the second, as the multi_audio node does
+with a buffer named twice: the buffer before it was lost. With two 128 ms
+buffers at the C920's 16 kHz, a 300 ms delay lost two (0.26 s); NeoCam
+clips lost 0.23 s about once in five. audiotest with a late client: 10
+of 94 buffers named twice in 12 s with five 300 ms delays; at 48 kHz (42
+ms buffers) 31 of 287, and once even on time.
+
+Recording now names the buffers recorded in order, each with the time it
+was done, and has four (DWC2 queues up to four transfers a stream; it
+copies recorded data into a buffer when its transfer completes, so a
+buffer lasts until it is recorded into again). A client late by up to
+three buffers misses nothing; later, the oldest is lost and counted.
+Playback keeps two, as before.
+
+Also: a stream started again begins at its first buffer, as after
+Init(), not where it stopped (a recording's first buffer was named
+wrong after a stop), and buffers done before a stop no longer count
+for the next start. GetBuffers() checks that the client has room for
+the buffers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/drivers/audio/usb/Device.cpp       |  11 ++
+ src/add-ons/kernel/drivers/audio/usb/Driver.h |   5 +
+ .../kernel/drivers/audio/usb/Stream.cpp       | 119 ++++++++++++++----
+ src/add-ons/kernel/drivers/audio/usb/Stream.h |  11 ++
+ 4 files changed, 120 insertions(+), 26 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Device.cpp b/src/add-ons/kernel/drivers/audio/usb/Device.cpp
+index 12bf18537c..6f73250cba 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Device.cpp
++++ b/src/add-ons/kernel/drivers/audio/usb/Device.cpp
+@@ -703,10 +703,21 @@ Device::_MultiBufferExchange(multi_buffer_info* multiInfo)
+ 	if (fRemoved)
+ 		return _ExchangeWhileRemoved(&Info, multiInfo);
+ 
++	bool started = false;
+ 	for (int i = 0; i < fStreams.Count(); i++) {
+ 		if (!fStreams[i]->IsRunning()) {
++			if (!started) {
++				// buffers done before a stop and never exchanged
++				int32 stale;
++				if (get_sem_count(fBuffersReadySem, &stale) == B_OK
++					&& stale > 0) {
++					acquire_sem_etc(fBuffersReadySem, stale,
++						B_RELATIVE_TIMEOUT, 0);
++				}
++			}
+ 			fStreams[i]->Start();
+ 			fStalled = false;
++			started = true;
+ 		}
+ 	}
+ 
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Driver.h b/src/add-ons/kernel/drivers/audio/usb/Driver.h
+index 960d057b8b..d2a7da7fba 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Driver.h
++++ b/src/add-ons/kernel/drivers/audio/usb/Driver.h
+@@ -21,6 +21,11 @@ const char* const kVersion = "ver.0.0.5";
+ const uint32 kSamplesBufferSize = 2048;
+ // [sub]buffers count
+ const uint32 kSamplesBufferCount = 2;
++// Recording takes more: a client late for a buffer still gets it, until the
++// buffer is recorded into again (four transfers are in flight; DWC2 queues
++// up to four a stream). At 16 kHz that is half a second.
++const uint32 kRecordBufferCount = 4;
++const uint32 kMaxBufferCount = 4;
+ // how long a buffer exchange waits before going on without the device
+ const bigtime_t kStallTimeout = 500000;
+ 
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Stream.cpp b/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
+index f6f7157e00..f0ca1fbeb2 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
++++ b/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
+@@ -28,11 +28,16 @@ Stream::Stream(Device* device, size_t interface, usb_interface_list* List)
+ 	fDescriptors(NULL),
+ 	fDescriptorsCount(0),
+ 	fCurrentBuffer(0),
++	fBufferCount(kSamplesBufferCount),
+ 	fSamplesCount(0),
+ 	fRealTime(0),
+ 	fStartingFrame(0),
+ 	fProcessedBuffers(0),
+-	fInsideNotify(0)
++	fInsideNotify(0),
++	fCompletedLock(B_SPINLOCK_INITIALIZER),
++	fCompletedFirst(0),
++	fCompletedCount(0),
++	fLostBuffers(0)
+ {
+ }
+ 
+@@ -132,6 +137,7 @@ Stream::_ChooseAlternate()
+ 	fIsInput = (endpoint->fEndpointAddress & USB_ENDPOINT_ADDR_DIR_IN)
+ 		== USB_ENDPOINT_ADDR_DIR_IN;
+ 
++	fBufferCount = fIsInput ? kRecordBufferCount : kSamplesBufferCount;
+ 	if (fIsInput)
+ 		fCurrentBuffer = (size_t)-1;
+ 
+@@ -210,7 +216,7 @@ Stream::_SetupBuffers()
+ 		delete fDescriptors;
+ 	}
+ 
+-	fAreaSize = sampleSize * framesPerBuffer * kSamplesBufferCount;
++	fAreaSize = sampleSize * framesPerBuffer * fBufferCount;
+ 	TRACE(INF, "estimate fAreaSize:%d\n", fAreaSize);
+ 
+ 	// round up to B_PAGE_SIZE and create area
+@@ -240,12 +246,12 @@ Stream::_SetupBuffers()
+ 	TRACE(INF, "Created area id:%d at addr:%#010x size:%#010lx\n",
+ 		fArea, fDescriptors, fAreaSize);
+ 
+-	fDescriptorsCount = packetsPerBuffer * kSamplesBufferCount;
++	fDescriptorsCount = packetsPerBuffer * fBufferCount;
+ 	fDescriptors = new usb_iso_packet_descriptor[fDescriptorsCount];
+ 	TRACE(INF, "descriptorsCount:%d\n", fDescriptorsCount);
+ 
+ 	// samples count
+-	fSamplesCount = framesPerBuffer * kSamplesBufferCount;
++	fSamplesCount = framesPerBuffer * fBufferCount;
+ 	TRACE(INF, "samplesCount:%d\n", fSamplesCount);
+ 
+ 	// initialize descriptors array: the frames up to the end of packet i
+@@ -308,7 +314,13 @@ Stream::Start()
+ {
+ 	status_t result = B_BUSY;
+ 	if (!fIsRunning) {
+-		for (size_t i = 0; i < kSamplesBufferCount; i++)
++		// from the first buffer again, as after Init(), with nothing left
++		// from before a stop
++		fCurrentBuffer = fIsInput ? fBufferCount - 1 : 0;
++		fProcessedBuffers = 0;
++		fCompletedFirst = 0;
++		fCompletedCount = 0;
++		for (size_t i = 0; i < fBufferCount; i++)
+ 			result = _QueueNextTransfer(i, i == 0);
+ 		fIsRunning = result == B_OK;
+ 	}
+@@ -338,9 +350,9 @@ Stream::_QueueNextTransfer(size_t queuedBuffer, bool start)
+ 		fAlternates[fActiveAlternate]->Format());
+ 
+ 	size_t bufferSize = format->fNumChannels * format->fSubframeSize;
+-	bufferSize *= fSamplesCount / kSamplesBufferCount;
++	bufferSize *= fSamplesCount / fBufferCount;
+ 
+-	size_t packetsCount = fDescriptorsCount / kSamplesBufferCount;
++	size_t packetsCount = fDescriptorsCount / fBufferCount;
+ 
+ 	TRACE(DTA, "buffers:%#010x[%#x]\ndescrs:%#010x[%#x]\n",
+ 		fKernelBuffers + bufferSize * queuedBuffer, bufferSize,
+@@ -379,14 +391,46 @@ Stream::_TransferCallback(void* cookie, status_t status, void* data,
+ 	stream->_DumpDescriptors();
+ #endif
+ 
+-	if (atomic_add(&stream->fProcessedBuffers, 1) > (int32)kSamplesBufferCount)
+-		TRACE(ERR, "Processed buffers overflow:%d\n", stream->fProcessedBuffers);
++	uint32 count = stream->fBufferCount;
++	uint32 completed = (stream->fCurrentBuffer + 1) % count;
+ 	stream->fRealTime = system_time();
+ 
+-	release_sem_etc(stream->fDevice->fBuffersReadySem, 1, B_DO_NOT_RESCHEDULE);
++	// Recording: the buffer joins those the client has yet to take. When the
++	// client is so late that all of them wait, the oldest is this one,
++	// recorded into again: it is lost (and its place in the semaphore count
++	// goes to the new one).
++	bool lost = false;
++	if (stream->fIsInput) {
++		cpu_status state = disable_interrupts();
++		acquire_spinlock(&stream->fCompletedLock);
++		if (stream->fCompletedCount == count) {
++			stream->fCompletedFirst = (stream->fCompletedFirst + 1) % count;
++			stream->fCompletedCount--;
++			stream->fLostBuffers++;
++			lost = true;
++		}
++		uint32 last = (stream->fCompletedFirst + stream->fCompletedCount)
++			% count;
++		stream->fCompleted[last] = completed;
++		stream->fCompletedTime[last] = stream->fRealTime;
++		stream->fCompletedCount++;
++		release_spinlock(&stream->fCompletedLock);
++		restore_interrupts(state);
++	}
++	if (lost) {
++		TRACE(ERR, "recording: the client was late, %" B_PRIu32 " buffers "
++			"lost so far\n", stream->fLostBuffers);
++	} else {
++		if (atomic_add(&stream->fProcessedBuffers, 1) > (int32)count) {
++			TRACE(ERR, "Processed buffers overflow:%d\n",
++				stream->fProcessedBuffers);
++		}
++		release_sem_etc(stream->fDevice->fBuffersReadySem, 1,
++			B_DO_NOT_RESCHEDULE);
++	}
+ 
+-	stream->fCurrentBuffer = (stream->fCurrentBuffer + 1) % kSamplesBufferCount;
+-	status = stream->_QueueNextTransfer(stream->fCurrentBuffer, false);
++	stream->fCurrentBuffer = completed;
++	status = stream->_QueueNextTransfer(completed, false);
+ 
+ 	atomic_add(&stream->fInsideNotify, -1);
+ }
+@@ -517,17 +561,24 @@ Stream::_SetSamplingRate()
+ status_t
+ Stream::GetBuffers(multi_buffer_list* List)
+ {
+-// TODO: check the available buffers count!
+ 	if (fAreaSize == 0)
+ 		return B_NO_INIT;
++	if ((fIsInput ? List->request_record_buffers
++			: List->request_playback_buffers) < (int32)fBufferCount) {
++		TRACE(ERR, "%s: room for %" B_PRId32 " buffers, %" B_PRIu32
++			" needed\n", fIsInput ? "recording" : "playback",
++			fIsInput ? List->request_record_buffers
++				: List->request_playback_buffers, fBufferCount);
++		return B_BAD_VALUE;
++	}
+ 
+ 	int32 startChannel = List->return_playback_channels;
+ 	buffer_desc** Buffers = List->playback_buffers;
+ 
+ 	if (fIsInput) {
+ 		List->flags |= B_MULTI_BUFFER_RECORD;
+-		List->return_record_buffer_size = fSamplesCount / kSamplesBufferCount;
+-		List->return_record_buffers = kSamplesBufferCount;
++		List->return_record_buffer_size = fSamplesCount / fBufferCount;
++		List->return_record_buffers = fBufferCount;
+ 		startChannel = List->return_record_channels;
+ 		Buffers = List->record_buffers;
+ 
+@@ -536,8 +587,8 @@ Stream::GetBuffers(multi_buffer_list* List)
+ 			List->return_record_buffer_size, List->return_record_buffers);
+ 	} else {
+ 		List->flags |= B_MULTI_BUFFER_PLAYBACK;
+-		List->return_playback_buffer_size = fSamplesCount / kSamplesBufferCount;
+-		List->return_playback_buffers = kSamplesBufferCount;
++		List->return_playback_buffer_size = fSamplesCount / fBufferCount;
++		List->return_playback_buffers = fBufferCount;
+ 
+ 		TRACE(DTA, "flags:%#10x\nreturn_playback_buffer_size:%#010x\n"
+ 			"return_playback_buffers:%#010x\n", List->flags,
+@@ -548,7 +599,7 @@ Stream::GetBuffers(multi_buffer_list* List)
+ 		fAlternates[fActiveAlternate]->Format());
+ 
+ 	// [buffer][channel] init buffers
+-	for (size_t buffer = 0; buffer < kSamplesBufferCount; buffer++) {
++	for (size_t buffer = 0; buffer < fBufferCount; buffer++) {
+ 		TRACE(DTA, "%s buffer #%d:\n", fIsInput ? "input" : "output", buffer + 1);
+ 
+ 		struct buffer_desc descs[format->fNumChannels];
+@@ -558,7 +609,7 @@ Stream::GetBuffers(multi_buffer_list* List)
+ 			uint32 stride = format->fSubframeSize * format->fNumChannels;
+ 			descs[channel].stride = stride;
+ 
+-			size_t bufferSize = (fSamplesCount / kSamplesBufferCount) * stride;
++			size_t bufferSize = (fSamplesCount / fBufferCount) * stride;
+ 			descs[channel].base = (char*)fBuffers;
+ 			descs[channel].base += buffer * bufferSize;
+ 			descs[channel].base += channel * format->fSubframeSize;
+@@ -591,7 +642,7 @@ bigtime_t
+ Stream::BufferDuration()
+ {
+ 	uint32 rate = fAlternates[fActiveAlternate]->GetSamplingRate();
+-	size_t frames = fSamplesCount / kSamplesBufferCount;
++	size_t frames = fSamplesCount / fBufferCount;
+ 	if (rate == 0 || frames == 0)
+ 		return 0;
+ 	return (bigtime_t)frames * 1000000 / rate;
+@@ -604,9 +655,9 @@ Stream::BufferDuration()
+ void
+ Stream::SimulateExchange(multi_buffer_info* Info)
+ {
+-	size_t frames = fSamplesCount / kSamplesBufferCount;
++	size_t frames = fSamplesCount / fBufferCount;
+ 	fRealTime = system_time();
+-	fCurrentBuffer = (fCurrentBuffer + 1) % kSamplesBufferCount;
++	fCurrentBuffer = (fCurrentBuffer + 1) % fBufferCount;
+ 	if (fIsInput) {
+ 		Info->recorded_real_time = fRealTime;
+ 		Info->recorded_frames_count += frames;
+@@ -626,12 +677,28 @@ Stream::ExchangeBuffer(multi_buffer_info* Info)
+ 		return false;
+ 
+ 	if (fIsInput) {
+-		Info->recorded_real_time = fRealTime;
+-		Info->recorded_frames_count += fSamplesCount / kSamplesBufferCount;
+-		Info->record_buffer_cycle = fCurrentBuffer;
++		// the oldest buffer recorded, with its own time: a client that was
++		// late gets each in turn, not the newest twice (which it skips)
++		cpu_status state = disable_interrupts();
++		acquire_spinlock(&fCompletedLock);
++		bool empty = fCompletedCount == 0;
++		uint32 buffer = fCompleted[fCompletedFirst];
++		bigtime_t time = fCompletedTime[fCompletedFirst];
++		if (!empty) {
++			fCompletedFirst = (fCompletedFirst + 1) % fBufferCount;
++			fCompletedCount--;
++		}
++		release_spinlock(&fCompletedLock);
++		restore_interrupts(state);
++		if (empty)
++			return false;
++
++		Info->recorded_real_time = time;
++		Info->recorded_frames_count += fSamplesCount / fBufferCount;
++		Info->record_buffer_cycle = buffer;
+ 	} else {
+ 		Info->played_real_time = fRealTime;
+-		Info->played_frames_count += fSamplesCount / kSamplesBufferCount;
++		Info->played_frames_count += fSamplesCount / fBufferCount;
+ 		Info->playback_buffer_cycle = fCurrentBuffer;
+ 	}
+ 
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Stream.h b/src/add-ons/kernel/drivers/audio/usb/Stream.h
+index b7cd7315a5..7ea92def42 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Stream.h
++++ b/src/add-ons/kernel/drivers/audio/usb/Stream.h
+@@ -9,6 +9,7 @@
+ 
+ 
+ #include "AudioStreamingInterface.h"
++#include "Driver.h"
+ 
+ 
+ class Device;
+@@ -57,6 +58,7 @@ protected:
+ 			uint8*			fBuffers;
+ 			uint8*			fKernelBuffers;
+ 			size_t			fCurrentBuffer;
++			uint32			fBufferCount;
+ 			size_t			fSamplesCount;
+ 
+ 			bigtime_t		fRealTime;
+@@ -64,6 +66,15 @@ protected:
+ 			int32			fProcessedBuffers;
+ 			int32			fInsideNotify;
+ 
++			// recording: the buffers recorded into and not yet exchanged,
++			// oldest first, with the times they were done
++			spinlock		fCompletedLock;
++			uint32			fCompleted[kMaxBufferCount];
++			bigtime_t		fCompletedTime[kMaxBufferCount];
++			uint32			fCompletedFirst;
++			uint32			fCompletedCount;
++			uint32			fLostBuffers;
++
+ private:
+ 			status_t		_ChooseAlternate();
+ 			status_t		_SetupBuffers();

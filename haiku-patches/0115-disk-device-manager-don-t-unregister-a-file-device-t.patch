@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 15:54:03 -0400
+Subject: [PATCH 115/342] disk device manager: don't unregister a file device
+ that is mounted
+
+DeleteFileDevice() removed a disk image's device even with a volume
+mounted from it, which then lost its device under it ("diskimage
+unregister" on a mounted image ended in a panic). It now fails with
+B_BUSY while the device or any of its partitions is mounted.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/kernel/disk_device_manager/KDiskDeviceManager.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/system/kernel/disk_device_manager/KDiskDeviceManager.cpp b/src/system/kernel/disk_device_manager/KDiskDeviceManager.cpp
+index bd6813f5db..b5e197da54 100644
+--- a/src/system/kernel/disk_device_manager/KDiskDeviceManager.cpp
++++ b/src/system/kernel/disk_device_manager/KDiskDeviceManager.cpp
+@@ -828,6 +828,9 @@ KDiskDeviceManager::DeleteFileDevice(partition_id id)
+ 		if (!dynamic_cast<KFileDiskDevice*>(device) || id != device->ID())
+ 			return B_ENTRY_NOT_FOUND;
+ 		if (DeviceWriteLocker locker = device) {
++			// a mounted file system would lose its device under it
++			if (device->IsMounted() || device->IsChildMounted())
++				return B_BUSY;
+ 			if (_RemoveDevice(device))
+ 				return B_OK;
+ 		}

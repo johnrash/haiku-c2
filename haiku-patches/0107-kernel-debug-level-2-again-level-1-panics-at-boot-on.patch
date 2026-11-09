@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 14:23:07 -0400
+Subject: [PATCH 107/342] kernel debug level 2 again: level 1 panics at boot on
+ arm64
+
+With KDEBUG_LEVEL 1 the ODROID-C2 panicked during the boot's device
+registration (fdt, meson_i2c, the I2C bus, devfs publish_device): a
+synchronous exception whose iframe could not be pushed, a write to a
+read-only page of main2's kernel stack, 4.6 KB into a 16 KB stack. Not
+understood yet. The fixes the level 1 build needed (a signal frame read
+compiled out with ASSERT, the FDT bus manager's calls in ASSERTs, three
+build failures) stay: they are right at any level.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/config_headers/kernel_debug_config.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/build/config_headers/kernel_debug_config.h b/build/config_headers/kernel_debug_config.h
+index a3c598b9e5..404cb94e48 100644
+--- a/build/config_headers/kernel_debug_config.h
++++ b/build/config_headers/kernel_debug_config.h
+@@ -5,7 +5,7 @@
+ // 0: Disables all debug code that hasn't been enabled otherwise.
+ // 1: Enables some lightweight debug code.
+ // 2: Enables more debug code. Will impact performance.
+-#define KDEBUG_LEVEL 1
++#define KDEBUG_LEVEL 2
+ 
+ #define KDEBUG_LEVEL_2	(KDEBUG_LEVEL >= 2)
+ #define KDEBUG_LEVEL_1	(KDEBUG_LEVEL >= 1)

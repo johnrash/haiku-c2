@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 4 Nov 2026 18:57:08 -0500
+Subject: [PATCH 298/342] meson_dwmac: operate on second frame, and repair a
+ stuck ring
+
+At a stall the slot behind the transmit engine's position was still its own and the
+one at its position had lost OWN, with its length intact: a frame's status had closed
+the next descriptor. Linux's stmmac uses "operate on second frame" with store and
+forward; this driver didn't. Set it now.
+
+The check in the link thread now looks at the whole ring, puts lost OWN bits back
+and restarts the engine from the oldest frame. Restarting from the slot after the
+engine's, as before, left the hole behind: the link stopped again 38 s later.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../network/ether/meson_dwmac/meson_dwmac.cpp | 75 +++++++++----------
+ 1 file changed, 34 insertions(+), 41 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp b/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
+index 857139ad41..08626b7406 100644
+--- a/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
++++ b/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
+@@ -134,6 +134,7 @@ enum {
+ 	| DMA_STATUS_GPI)
+ 
+ #define OPERATION_SR			(1 << 1)	// start receive
++#define OPERATION_OSF			(1 << 2)	// operate on second frame
+ #define OPERATION_ST			(1 << 13)	// start transmit
+ #define OPERATION_TSF			(1 << 21)	// TX store and forward
+ #define OPERATION_RSF			(1 << 25)	// RX store and forward
+@@ -323,7 +324,6 @@ private:
+ 			uint32				fSpeed;			// Mbit/s
+ 			sem_id				fLinkStateSemaphore;
+ 
+-			uint32				fTxLastCurrent;
+ 			int32				fTxStuckSeconds;
+ };
+ 
+@@ -357,7 +357,6 @@ MesonDwmac::MesonDwmac(device_node* node)
+ 	fFullDuplex(true),
+ 	fSpeed(0),
+ 	fLinkStateSemaphore(-1),
+-	fTxLastCurrent(0),
+ 	fTxStuckSeconds(0)
+ {
+ 	memset(fMacAddress, 0, sizeof(fMacAddress));
+@@ -564,8 +563,8 @@ MesonDwmac::_Start()
+ 	_Write(kDmaStatus, DMA_STATUS_CLEAR_MASK);
+ 	_Write(kDmaInterruptEnable, INTERRUPT_NIE | INTERRUPT_AIE | INTERRUPT_FBE
+ 		| INTERRUPT_RUE | INTERRUPT_RIE | INTERRUPT_TIE);
+-	_Write(kDmaOperationMode, OPERATION_RSF | OPERATION_TSF | OPERATION_ST
+-		| OPERATION_SR);
++	_Write(kDmaOperationMode, OPERATION_RSF | OPERATION_TSF | OPERATION_OSF
++		| OPERATION_ST | OPERATION_SR);
+ }
+ 
+ 
+@@ -897,9 +896,15 @@ MesonDwmac::_ConfigureEee()
+ }
+ 
+ 
+-/*!	The transmit engine can stay suspended with frames waiting, whatever
+-	the poll demands say. Seen under sustained sending; everything else goes
+-	on working. Restarted here, without the frame that's lost in the ring.
++/*!	The transmit engine can stay suspended with frames waiting, whatever the
++	poll demands say: it read ahead while the last frame was still going out,
++	and that frame's status then closed the next descriptor instead of its own.
++	One slot is left owned by the engine behind its position, the next one has
++	lost its OWN bit, and the engine rightly won't go on from it.
++
++	After 2 s of that, gives the ring back to the engine in order, from the
++	oldest frame. A frame that had gone out may go out again, which TCP copes
++	with, and which nothing else on a LAN minds much.
+ */
+ void
+ MesonDwmac::_CheckTransmit()
+@@ -908,23 +913,24 @@ MesonDwmac::_CheckTransmit()
+ 		return;
+ 
+ 	MutexLocker locker(fTxLock);
+-	bool suspended = ((_Read(kDmaStatus) >> 20) & 7) == 6;
+-	uint32 current = (_Read(kDmaCurrentTxDesc)
+-		- (uint32)_DescriptorPhysical(kRxCount)) / kDescriptorStride;
+-	if (current >= kTxCount)
++	if (((_Read(kDmaStatus) >> 20) & 7) != 6) {
++		fTxStuckSeconds = 0;
+ 		return;
++	}
+ 
+-	// the engine's slot is the last one it read, or the one it waits for
+-	bool waiting = false;
+-	for (uint32 i = 0; i < 2 && !waiting; i++) {
+-		uint32 slot = (current + i) % kTxCount;
++	// In ring order from the driver's position: first what has gone, then
++	// what is waiting; any frame past the first waiting one was given over too.
++	uint32 first = kTxCount;
++	for (uint32 i = 0; i < kTxCount; i++) {
++		uint32 slot = (fTxHead + i) % kTxCount;
+ 		_SyncDescriptor(kRxCount + slot, true);
+-		waiting = (_TxDescriptor(slot)->status & DESC_OWN) != 0;
++		if ((_TxDescriptor(slot)->status & DESC_OWN) != 0) {
++			first = slot;
++			break;
++		}
+ 	}
+-
+-	if (!suspended || !waiting || current != fTxLastCurrent) {
++	if (first == kTxCount) {
+ 		fTxStuckSeconds = 0;
+-		fTxLastCurrent = current;
+ 		return;
+ 	}
+ 	if (++fTxStuckSeconds < 2)
+@@ -934,39 +940,26 @@ MesonDwmac::_CheckTransmit()
+ 	ERROR("transmit suspended with frames waiting\n");
+ 	DumpState(&dprintf);
+ 
+-	_Write(kDmaTxPollDemand, 1);
+-	spin(1000);
+-	uint32 status = _Read(kDmaStatus);
+-	ERROR("after a poll demand: state %" B_PRIu32 ", slot %" B_PRIu32 "\n",
+-		(status >> 20) & 7, (_Read(kDmaCurrentTxDesc)
+-			- (uint32)_DescriptorPhysical(kRxCount)) / kDescriptorStride);
+-	if (((status >> 20) & 7) != 6)
+-		return;
+-
+ 	uint32 operation = _Read(kDmaOperationMode);
+ 	_Write(kDmaOperationMode, operation & ~OPERATION_ST);
+ 	for (int32 i = 0; i < 100 && ((_Read(kDmaStatus) >> 20) & 7) != 0; i++)
+ 		spin(100);
+ 
+-	uint32 first = current;
+-	for (uint32 i = 0; i < kTxCount; i++) {
+-		uint32 slot = (current + i) % kTxCount;
++	uint32 holes = 0;
++	for (uint32 slot = first; slot != fTxHead; slot = (slot + 1) % kTxCount) {
+ 		_SyncDescriptor(kRxCount + slot, true);
+-		if ((_TxDescriptor(slot)->status & DESC_OWN) != 0) {
+-			first = slot;
+-			break;
++		volatile descriptor* desc = _TxDescriptor(slot);
++		if ((desc->status & DESC_OWN) == 0) {
++			desc->status = DESC_OWN;
++			_SyncDescriptor(kRxCount + slot, false);
++			holes++;
+ 		}
+ 	}
+ 	_Write(kDmaTxDescList, (uint32)_DescriptorPhysical(kRxCount + first));
+ 	_Write(kDmaOperationMode, operation);
+ 	_Write(kDmaTxPollDemand, 1);
+-	spin(1000);
+-
+-	status = _Read(kDmaStatus);
+-	ERROR("transmit restarted at slot %" B_PRIu32 ": state %" B_PRIu32
+-		", slot %" B_PRIu32 "\n", first, (status >> 20) & 7,
+-		(_Read(kDmaCurrentTxDesc) - (uint32)_DescriptorPhysical(kRxCount))
+-			/ kDescriptorStride);
++	ERROR("transmit restarted at slot %" B_PRIu32 ", %" B_PRIu32 " lost OWN bits\n",
++		first, holes);
+ }
+ 
+ 

@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 21:31:29 -0500
+Subject: [PATCH 247/342] Terminal: characters from U+10000 on (four-byte
+ UTF-8)
+
+The UTF-8 ground table sent the lead bytes 0xf0 to 0xf7 to the
+three-byte case, which kept the first three bytes of the four: every
+character from U+10000 on (most emoji, CJK Extension B, the
+mathematical alphanumerics) was stored cut off and drawn as nothing.
+They take a case of their own now that collects three continuation
+bytes. UTF8Char already holds four bytes, and its East Asian Width
+makes the emoji two cells wide.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apps/terminal/TermParse.cpp |  7 ++++++-
+ src/apps/terminal/VTPrsTbl.c    | 16 ++++++++--------
+ src/apps/terminal/VTparse.h     |  1 +
+ 3 files changed, 15 insertions(+), 9 deletions(-)
+
+diff --git a/src/apps/terminal/TermParse.cpp b/src/apps/terminal/TermParse.cpp
+index ed81ff3719..aeb1617184 100644
+--- a/src/apps/terminal/TermParse.cpp
++++ b/src/apps/terminal/TermParse.cpp
+@@ -516,6 +516,10 @@ TermParse::EscParse()
+ 					break;
+ 
+ 				case CASE_UTF8_3BYTE:
++				case CASE_UTF8_4BYTE:
++				{
++					// the characters from U+10000 on (emoji) take four
++					int32 length = parsestate[c] == CASE_UTF8_4BYTE ? 4 : 3;
+ 					cbuf[srcLen++] = c;
+ 
+ 					do {
+@@ -526,11 +530,12 @@ TermParse::EscParse()
+ 						}
+ 						cbuf[srcLen++] = c;
+ 
+-					} while (srcLen != 3);
++					} while (srcLen != length);
+ 
+ 					if (srcLen > 0)
+ 						fBuffer->InsertChar(UTF8Char(cbuf, srcLen));
+ 					break;
++				}
+ 
+ 				case CASE_SCS_STATE:
+ 				{
+diff --git a/src/apps/terminal/VTPrsTbl.c b/src/apps/terminal/VTPrsTbl.c
+index 46ea4d49f5..892dc80f26 100644
+--- a/src/apps/terminal/VTPrsTbl.c
++++ b/src/apps/terminal/VTPrsTbl.c
+@@ -319,15 +319,15 @@ CASE_UTF8_3BYTE,
+ CASE_UTF8_3BYTE,
+ CASE_UTF8_3BYTE,
+ /*      0xf0		0xf1		0xf2		0xf3	*/
+-CASE_UTF8_3BYTE,
+-CASE_UTF8_3BYTE,
+-CASE_UTF8_3BYTE,
+-CASE_UTF8_3BYTE,
++CASE_UTF8_4BYTE,
++CASE_UTF8_4BYTE,
++CASE_UTF8_4BYTE,
++CASE_UTF8_4BYTE,
+ /*      0xf4		0xf5		0xf6		0xf7	*/
+-CASE_UTF8_3BYTE,
+-CASE_UTF8_3BYTE,
+-CASE_UTF8_3BYTE,
+-CASE_UTF8_3BYTE,
++CASE_UTF8_4BYTE,
++CASE_UTF8_4BYTE,
++CASE_UTF8_4BYTE,
++CASE_UTF8_4BYTE,
+ /*      0xf8		0xf9		0xfa		0xfb	*/
+ CASE_UTF8_3BYTE,
+ CASE_UTF8_3BYTE,
+diff --git a/src/apps/terminal/VTparse.h b/src/apps/terminal/VTparse.h
+index cba5809916..0592e11b4a 100644
+--- a/src/apps/terminal/VTparse.h
++++ b/src/apps/terminal/VTparse.h
+@@ -107,3 +107,4 @@
+ #define CASE_CSI_EXCL 104
+ #define CASE_DECSTR 105
+ #define CASE_CSI_DOL 106
++#define CASE_UTF8_4BYTE 107

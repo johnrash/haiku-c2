@@ -1,0 +1,768 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 04:19:46 -0400
+Subject: [PATCH 161/342] meson_vdec, meson_hdmi, MediaPlayer: show the
+ decoder's frames without a copy
+
+The hardware decoder's frames were copied into MediaPlayer's overlay
+bitmaps, about 3 ms a 1080p frame into write-combining memory. Now the
+decoder can write a reference to its frame into the bitmap instead, and
+the overlay shows the frame where it is.
+
+- MediaPlayer asks for this per frame (media_decode_info.codec_data, a
+  video_frame_reference_request; VideoFrameReference.h), only for B_NV12
+  while its decoder writes into the overlay's own bitmaps and the overlay
+  is shown. Decoders that don't know the request ignore it.
+- meson_decoder writes a meson_vdec_frame_reference (the frame area,
+  offsets, rows, a check value) and keeps the frame until that buffer
+  comes back to be written again, which means it is no longer shown; all
+  held frames go back before the session stops. The environment variable
+  MESON_DECODER_NO_REFERENCES turns this off.
+- meson_hdmi takes a reference only for an area of the kernel's named
+  "meson_vdec frame", physically contiguous, with the frame inside it,
+  and points the video layer's canvases at the frame; chroma has its own
+  offset now.
+- The decoders' frame pools have three frames more (H.264: references + 8,
+  HEVC: + 10), for the ones the screen holds.
+
+MediaPlayer's CPU, share of all 4 cores over 10 s, copy against
+reference: HEVC 1080p60 6.9% -> 1.8%, H.264 1080p60 5.4% -> 1.6%, HEVC
+1080p30 3.9% -> 1.3%; the frame generator thread 5.5% -> 0.5% at HEVC
+1080p60. HDMI recordings of a clip with its frame number in bit boxes
+show every frame once, in order, at 60 fps, and each twice at 30 fps;
+no tears; seeks, pause, a playlist and a window partly off screen work.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/drivers/meson_vdec.h          |  31 ++++++
+ headers/private/media/VideoFrameReference.h   |  29 +++++
+ .../graphics/meson_hdmi/meson_hdmi.cpp        |  94 ++++++++++++++--
+ .../drivers/video/meson_vdec/meson_vdec.cpp   |   5 +-
+ .../video/meson_vdec/meson_vdec_hevc.cpp      |   6 +-
+ .../meson_decoder/MesonVdecDecoder.cpp        | 100 +++++++++++++++++-
+ .../plugins/meson_decoder/MesonVdecDecoder.h  |  14 +++
+ src/apps/mediaplayer/Controller.cpp           |  12 +++
+ src/apps/mediaplayer/Controller.h             |   6 +-
+ src/apps/mediaplayer/Jamfile                  |   2 +-
+ .../media_node_framework/NodeManager.cpp      |  10 ++
+ .../media_node_framework/NodeManager.h        |   2 +
+ .../video/VideoConsumer.cpp                   |   6 +-
+ .../video/VideoConsumer.h                     |   5 +
+ .../supplier/MediaTrackVideoSupplier.cpp      |  17 ++-
+ .../supplier/MediaTrackVideoSupplier.h        |   5 +
+ .../mediaplayer/supplier/VideoTrackSupplier.h |  15 +++
+ 17 files changed, 340 insertions(+), 19 deletions(-)
+ create mode 100644 headers/private/media/VideoFrameReference.h
+
+diff --git a/headers/private/drivers/meson_vdec.h b/headers/private/drivers/meson_vdec.h
+index a627cae4e8..b6766fd783 100644
+--- a/headers/private/drivers/meson_vdec.h
++++ b/headers/private/drivers/meson_vdec.h
+@@ -83,4 +83,35 @@ struct meson_vdec_frame {
+ };
+ 
+ 
++/*!	A reference to a decoded frame, written by meson_decoder into a
++	meson_hdmi overlay buffer instead of the picture (see the media kit's
++	private VideoFrameReference.h): the video overlay then shows the frame
++	from the decoder's memory, without a copy. meson_hdmi takes it only for
++	a frame area of meson_vdec's (owned by the kernel, named "meson_vdec
++	frame", physically contiguous).
++*/
++#define MESON_VDEC_FRAME_REFERENCE_MAGIC	0x4d564652	// 'MVFR'
++
++struct meson_vdec_frame_reference {
++	uint32			magic;			// MESON_VDEC_FRAME_REFERENCE_MAGIC
++	uint32			check;			// meson_vdec_frame_reference_check()
++	area_id			frames;			// as meson_vdec_frame's
++	uint32			bytes_per_row;
++	uint64			offset;
++	uint32			chroma_offset;
++	uint32			width;
++	uint32			height;
++	uint32			_reserved;
++};
++
++
++static inline uint32
++meson_vdec_frame_reference_check(const struct meson_vdec_frame_reference* r)
++{
++	return r->magic ^ (uint32)r->frames ^ r->bytes_per_row
++		^ (uint32)r->offset ^ (uint32)(r->offset >> 32) ^ r->chroma_offset
++		^ (r->width << 16) ^ r->height ^ 0x5a5a5a5a;
++}
++
++
+ #endif	// _MESON_VDEC_H
+diff --git a/headers/private/media/VideoFrameReference.h b/headers/private/media/VideoFrameReference.h
+new file mode 100644
+index 0000000000..5120e06a55
+--- /dev/null
++++ b/headers/private/media/VideoFrameReference.h
+@@ -0,0 +1,29 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef _VIDEO_FRAME_REFERENCE_H
++#define _VIDEO_FRAME_REFERENCE_H
++
++
++#include <SupportDefs.h>
++
++
++/*!	A request a reader passes to a video decoder with a frame
++	(media_decode_info::codec_data): the decoder may write a reference to
++	its own decoded frame into the buffer instead of the picture, if the
++	graphics driver shows such references (the ODROID-C2's meson_hdmi with
++	meson_decoder's frames). For a buffer that only the video overlay
++	shows: an overlay bitmap shared with the decoder. The decoder keeps
++	the frame until it is given the same buffer again.
++*/
++#define B_VIDEO_FRAME_REFERENCE_REQUEST	'vfrq'
++
++struct video_frame_reference_request {
++	uint32		magic;		// B_VIDEO_FRAME_REFERENCE_REQUEST
++	bool		allowed;	// in: a reference may go into this buffer
++	bool		written;	// out: the buffer holds a reference
++};
++
++
++#endif	// _VIDEO_FRAME_REFERENCE_H
+diff --git a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+index e5f99cb64a..da1fe97407 100644
+--- a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
++++ b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+@@ -55,6 +55,7 @@
+ #include <arch/arm64/arch_kernel.h>
+ 
+ #include <meson_canvas.h>
++#include <meson_vdec.h>
+ 
+ #include "meson_hdmi_audio.h"
+ #include "meson_hdmi_info.h"
+@@ -745,8 +746,16 @@ private:
+ 				size_t			size;
+ 			};
+ 			overlay_buffer_info	fOverlayBuffers[kMaxOverlayBuffers];
++			status_t			_ResolveFrameReference(
++									const overlay_buffer_info& info,
++									const meson_hdmi_overlay_config& config,
++									phys_addr_t& _physical,
++									uint32& _bytesPerRow,
++									uint32& _chromaOffset);
+ 			meson_hdmi_overlay_config fOverlay;		// buffer -1: hidden
+ 			phys_addr_t			fOverlayPhysical;
++			uint64				fOverlayChromaOffset;
++				// NV12: the CbCr plane's, from fOverlayPhysical
+ 			uint32				fOverlayCanvas;		// index into kVideoCanvas
+ 			uint32				fOverlayEndian;
+ };
+@@ -814,6 +823,7 @@ MesonHdmi::MesonHdmi(device_node* node)
+ 	fHotPlugSem(-1),
+ 	fDisplayChangeSem(-1),
+ 	fOverlayPhysical(0),
++	fOverlayChromaOffset(0),
+ 	fOverlayCanvas(0),
+ 	fOverlayEndian(CANVAS_SWAP_64)
+ {
+@@ -1932,13 +1942,31 @@ MesonHdmi::ConfigureOverlay(const meson_hdmi_overlay_config& config)
+ 		return B_BAD_VALUE;
+ 	}
+ 
+-	bool newFrame = info->physical != fOverlayPhysical;
++	// the buffer's picture, or the decoder's frame it names (shown in its
++	// place, without a copy)
++	phys_addr_t physical = info->physical;
++	meson_hdmi_overlay_config shown = config;
++	uint64 chromaOffset = (uint64)config.bytes_per_row * config.height;
++	if (nv12) {
++		phys_addr_t framePhysical;
++		uint32 frameBytesPerRow;
++		uint32 frameChromaOffset;
++		if (_ResolveFrameReference(*info, config, framePhysical,
++				frameBytesPerRow, frameChromaOffset) == B_OK) {
++			physical = framePhysical;
++			shown.bytes_per_row = frameBytesPerRow;
++			chromaOffset = frameChromaOffset;
++		}
++	}
++
++	bool newFrame = physical != fOverlayPhysical;
+ 	if (newFrame) {
+ 		// a new frame: the other canvas, so that the shown one stays intact
+ 		fOverlayCanvas ^= 1;
+-		fOverlayPhysical = info->physical;
++		fOverlayPhysical = physical;
+ 	}
+-	fOverlay = config;
++	fOverlay = shown;
++	fOverlayChromaOffset = chromaOffset;
+ 
+ 	// The video layer takes a new canvas at once, not at the next frame:
+ 	// switched while it scans the buffer out, the picture tears where it
+@@ -1953,6 +1981,62 @@ MesonHdmi::ConfigureOverlay(const meson_hdmi_overlay_config& config)
+ }
+ 
+ 
++/*!	The decoder frame an NV12 overlay buffer names instead of holding the
++	picture (meson_vdec_frame_reference, written by meson_decoder): its
++	physical address, rows and CbCr plane. Only a frame in an area of
++	meson_vdec's (the kernel's, named "meson_vdec frame"), contiguous, and as
++	large as what the overlay shows; anything else is the buffer's own
++	picture.
++*/
++status_t
++MesonHdmi::_ResolveFrameReference(const overlay_buffer_info& info,
++	const meson_hdmi_overlay_config& config, phys_addr_t& _physical,
++	uint32& _bytesPerRow, uint32& _chromaOffset)
++{
++	area_info bufferArea;
++	if (get_area_info(info.mapArea, &bufferArea) != B_OK
++		|| bufferArea.size < sizeof(meson_vdec_frame_reference)) {
++		return B_BAD_VALUE;
++	}
++	meson_vdec_frame_reference reference;
++	memcpy(&reference, bufferArea.address, sizeof(reference));
++	if (reference.magic != MESON_VDEC_FRAME_REFERENCE_MAGIC
++		|| reference.check != meson_vdec_frame_reference_check(&reference)) {
++		return B_NAME_NOT_FOUND;
++	}
++	if (reference.width < config.width || reference.height < config.height
++		|| reference.bytes_per_row < reference.width
++		|| reference.bytes_per_row % 8 != 0
++		|| reference.chroma_offset
++			< (uint64)reference.bytes_per_row * config.height
++		|| reference.chroma_offset % 8 != 0 || reference.offset % 8 != 0) {
++		return B_BAD_VALUE;
++	}
++
++	area_info frameArea;
++	if (get_area_info(reference.frames, &frameArea) != B_OK
++		|| frameArea.team != B_SYSTEM_TEAM
++		|| strncmp(frameArea.name, "meson_vdec frame", 16) != 0) {
++		return B_NOT_ALLOWED;
++	}
++	uint64 length = reference.chroma_offset
++		+ (uint64)reference.bytes_per_row * ((config.height + 1) / 2);
++	if (reference.offset > frameArea.size
++		|| length > frameArea.size - reference.offset) {
++		return B_BAD_VALUE;
++	}
++	physical_entry entry;
++	if (get_memory_map((uint8*)frameArea.address + reference.offset, length,
++			&entry, 1) != B_OK || entry.size < length) {
++		return B_BAD_VALUE;
++	}
++	_physical = entry.address;
++	_bytesPerRow = reference.bytes_per_row;
++	_chromaOffset = reference.chroma_offset;
++	return B_OK;
++}
++
++
+ /*!	Waits for the video encoder's vertical blank: from the line after the
+ 	active area to a few lines before the next one begins (the video layer
+ 	reads ahead). Sleeps through most of the active area and polls the line
+@@ -2057,9 +2141,7 @@ MesonHdmi::_ApplyOverlay()
+ 	if (nv12) {
+ 		// the CbCr plane: half the lines, after the Y plane
+ 		chromaCanvas = kVideoChromaCanvas[fOverlayCanvas];
+-		_WriteCanvas(chromaCanvas,
+-			fOverlayPhysical + (phys_addr_t)config.bytes_per_row
+-				* config.height,
++		_WriteCanvas(chromaCanvas, fOverlayPhysical + fOverlayChromaOffset,
+ 			config.bytes_per_row, (config.height + 1) / 2, fOverlayEndian);
+ 	}
+ 
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+index 41dad56520..d208fca9ab 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+@@ -977,7 +977,10 @@ MesonVdec::_SetupH264Frames(const uint32* info)
+ 			mbWidth, mbHeight);
+ 		return B_BAD_VALUE;
+ 	}
+-	uint32 count = min_c(max_c(maxReferences + 5, 2), kMaxFrames);
++	// the references, the picture being decoded, the output queue, and
++	// the frames a reader holds: 3 more when they are shown in place
++	// (references in overlay buffers, see VideoFrameReference.h)
++	uint32 count = min_c(max_c(maxReferences + 8, 2), kMaxFrames);
+ 	uint32 bytesPerRow = align_up(16 * mbWidth, 32);
+ 	uint32 rows = align_up(16 * mbHeight, 32);
+ 	uint32 lumaSize = align_up(bytesPerRow * rows, 64 * 1024);
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp
+index 546fcb62fb..96c3ab7997 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp
+@@ -230,8 +230,10 @@ static const uint32 kWorkRpm = 0x1a0000;
+ static const uint32 kWorkLmem = 0x1a0100;
+ static const size_t kHevcWorkspaceSize = 0x1b0000;
+ static const size_t kHevcAuxSize = 16 * 1024;
+-static const uint32 kHevcFrameMargin = 7;
+-	// frames beyond the reordering depth (the vendor's choice), at most 16
++static const uint32 kHevcFrameMargin = 10;
++	// frames beyond the reordering depth (the vendor's choice, 7), at most
++	// 16; and 3 for a reader that shows frames in place (references in
++	// overlay buffers)
+ static const uint32 kHevcTableSlots = 48;
+ 	// the reference address table: 24 pictures of two planes
+ 
+diff --git a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
+index 8d1eabc43f..5b3cd85f66 100644
+--- a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
++++ b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
+@@ -7,14 +7,18 @@
+  * to the driver as an Annex B stream, the decoded NV12 frames (8 bits, also
+  * for 10-bit HEVC) come back in display order and are written to the
+  * caller's buffer as B_NV12 (a copy, for the video overlay), B_YCbCr422 (for
+- * an overlay without NV12) or B_RGB32.
++ * an overlay without NV12) or B_RGB32. A reader that shows the buffer only
++ * through meson_hdmi's video overlay may ask for a reference to the frame
++ * instead of B_NV12's copy (VideoFrameReference.h): the overlay then shows
++ * the frame from the decoder's memory.
+  *
+  * Setup() fails when the decoder is in use, the firmware is missing or the
+  * stream is one the hardware can't decode (beyond 1920x1088, not 4:2:0;
+  * H.264: 10 bits, fields; HEVC: more than 10 bits): the Media Kit then
+  * takes the next decoder (FFmpeg's).
+  * MESON_DECODER_DISABLE in the environment makes it fail always (to compare
+- * with FFmpeg); MESON_DECODER_TRACE logs what it is asked to stderr.
++ * with FFmpeg); MESON_DECODER_NO_REFERENCES makes it copy every frame;
++ * MESON_DECODER_TRACE logs what it is asked to stderr.
+  */
+ 
+ 
+@@ -31,6 +35,7 @@
+ #include <new>
+ 
+ #include <FindDirectory.h>
++#include <VideoFrameReference.h>
+ 
+ extern "C" {
+ #include "libavcodec/codec_id.h"
+@@ -42,6 +47,7 @@ extern "C" {
+ 
+ // MESON_DECODER_TRACE=1 in the environment: what the decoder is asked
+ static bool sTrace = getenv("MESON_DECODER_TRACE") != NULL;
++static bool sNoReferences = getenv("MESON_DECODER_NO_REFERENCES") != NULL;
+ #define TRACE(x...)		do { if (sTrace) fprintf(stderr, "meson_vdec: " x); } \
+ 							while (false)
+ #define ERROR(x...)		fprintf(stderr, "meson_vdec: " x)
+@@ -73,6 +79,7 @@ MesonVdecDecoder::MesonVdecDecoder()
+ 	fOutputEnded(false),
+ 	fMappingCount(0),
+ 	fHaveFrame(false),
++	fReferenceCount(0),
+ 	fChunksInFlight(0),
+ 	fSessionChunks(0),
+ 	fSessionStart(-1),
+@@ -302,6 +309,10 @@ MesonVdecDecoder::_StopSession()
+ {
+ 	if (!fRunning)
+ 		return;
++	// the frames shown in place too: the next session may write into them
++	// (a seek, for a frame time; after the stream the reader hides its
++	// overlay)
++	_ReleaseReferences();
+ 	ioctl(fDevice, MESON_VDEC_STOP, NULL, 0);
+ 	fRunning = false;
+ 	fHaveFrame = false;
+@@ -497,6 +508,66 @@ MesonVdecDecoder::_ReleaseFrame()
+ }
+ 
+ 
++/*!	Writes a reference to fFrame into \a buffer (B_NV12 only), and keeps the
++	frame until the buffer comes again: shown in place by the overlay.
++*/
++bool
++MesonVdecDecoder::_WriteReference(void* buffer)
++{
++	if (fReferenceCount == kMaxReferences || fFrame.frames < 0
++		|| fFrame.width < fWidth || fFrame.height < fHeight) {
++		return false;
++	}
++	meson_vdec_frame_reference reference;
++	memset(&reference, 0, sizeof(reference));
++	reference.magic = MESON_VDEC_FRAME_REFERENCE_MAGIC;
++	reference.frames = fFrame.frames;
++	reference.bytes_per_row = fFrame.bytes_per_row;
++	reference.offset = fFrame.offset;
++	reference.chroma_offset = fFrame.chroma_offset;
++	reference.width = fFrame.width;
++	reference.height = fFrame.height;
++	reference.check = meson_vdec_frame_reference_check(&reference);
++	memcpy(buffer, &reference, sizeof(reference));
++	// out of the write combining buffer before the overlay reads it
++	__sync_synchronize();
++
++	fReferences[fReferenceCount].buffer = buffer;
++	fReferences[fReferenceCount].index = fFrame.index;
++	fReferenceCount++;
++	fHaveFrame = false;
++	return true;
++}
++
++
++/*!	The buffer comes again: the frame it showed goes back to the driver. */
++void
++MesonVdecDecoder::_ReleaseReference(const void* buffer)
++{
++	for (uint32 i = 0; i < fReferenceCount; i++) {
++		if (fReferences[i].buffer != buffer)
++			continue;
++		if (fRunning) {
++			ioctl(fDevice, MESON_VDEC_RECYCLE_FRAME, &fReferences[i].index,
++				sizeof(fReferences[i].index));
++		}
++		fReferences[i] = fReferences[--fReferenceCount];
++		return;
++	}
++}
++
++
++void
++MesonVdecDecoder::_ReleaseReferences()
++{
++	for (uint32 i = 0; fRunning && i < fReferenceCount; i++) {
++		ioctl(fDevice, MESON_VDEC_RECYCLE_FRAME, &fReferences[i].index,
++			sizeof(fReferences[i].index));
++	}
++	fReferenceCount = 0;
++}
++
++
+ void
+ MesonVdecDecoder::_AddTime(uint32 offset, bigtime_t time)
+ {
+@@ -721,6 +792,19 @@ MesonVdecDecoder::Decode(void* buffer, int64* frameCount,
+ {
+ 	if (fDevice < 0)
+ 		return B_NO_INIT;
++
++	// may a reference go into this buffer instead of the picture?
++	video_frame_reference_request* request = NULL;
++	if (info != NULL && info->codec_data != NULL
++		&& info->codec_data_size == sizeof(video_frame_reference_request)
++		&& ((video_frame_reference_request*)info->codec_data)->magic
++			== B_VIDEO_FRAME_REFERENCE_REQUEST) {
++		request = (video_frame_reference_request*)info->codec_data;
++		request->written = false;
++	}
++	// what this buffer showed until now is done with
++	_ReleaseReference(buffer);
++
+ 	bigtime_t begin = system_time();
+ 	status_t status = _NextFrame();
+ 	if (status != B_OK) {
+@@ -729,9 +813,15 @@ MesonVdecDecoder::Decode(void* buffer, int64* frameCount,
+ 	}
+ 	bigtime_t decoded = system_time();
+ 
+-	status = _Convert(buffer);
+-	_FillHeader(mediaHeader);
+-	_ReleaseFrame();
++	if (request != NULL && request->allowed && !sNoReferences
++		&& fOutputColorSpace == B_NV12 && _WriteReference(buffer)) {
++		request->written = true;
++		_FillHeader(mediaHeader);
++	} else {
++		status = _Convert(buffer);
++		_FillHeader(mediaHeader);
++		_ReleaseFrame();
++	}
+ 	fSessionFrames++;
+ 	TRACE("frame %" B_PRIu32 ": buffer %" B_PRIu32 ", time %" B_PRIdBIGTIME
+ 		", offset %#" B_PRIx32 ", %" B_PRIu32 " chunks ahead; %" B_PRIdBIGTIME
+diff --git a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h
+index 1383ae4daa..c8e1965643 100644
+--- a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h
++++ b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h
+@@ -46,6 +46,9 @@ private:
+ 			void				_UnmapFrames();
+ 			void				_ReleaseFrame();
+ 			status_t			_Convert(void* buffer);
++			bool				_WriteReference(void* buffer);
++			void				_ReleaseReference(const void* buffer);
++			void				_ReleaseReferences();
+ 	static	void				_CopyPlane(const uint8* source,
+ 									uint32 sourceBytesPerRow, uint8* target,
+ 									uint32 targetBytesPerRow, uint32 width,
+@@ -91,6 +94,17 @@ private:
+ 			// the frame taken from the driver, not yet given back
+ 			meson_vdec_frame	fFrame;
+ 			bool				fHaveFrame;
++
++			// frames shown in place: the buffer with a reference to each
++			// (VideoFrameReference.h), given back when that buffer comes
++			// again
++			struct reference {
++				const void*		buffer;
++				uint32			index;
++			};
++	static	const uint32		kMaxReferences = 8;
++			reference			fReferences[kMaxReferences];
++			uint32				fReferenceCount;
+ 			uint32				fChunksInFlight;
+ 				// written, their frames not taken yet
+ 			uint32				fSessionChunks;
+diff --git a/src/apps/mediaplayer/Controller.cpp b/src/apps/mediaplayer/Controller.cpp
+index 005fb9193e..efa89a5c1d 100644
+--- a/src/apps/mediaplayer/Controller.cpp
++++ b/src/apps/mediaplayer/Controller.cpp
+@@ -607,6 +607,7 @@ Controller::SelectVideoTrack(int n)
+ 	DurationChanged();
+ 	// TODO: notify duration changed!
+ 
++	fVideoTrackSupplier->SetFrameReferencePolicy(this);
+ 	fVideoSupplier->SetSupplier(fVideoTrackSupplier);
+ 
+ 	_NotifyVideoTrackChanged(n);
+@@ -1094,6 +1095,17 @@ Controller::IsOverlayActive()
+ }
+ 
+ 
++/*!	The decoder may show its own frames instead of copying them (the
++	ODROID-C2's hardware decoder) while it writes straight into overlay
++	bitmaps that the overlay alone shows.
++*/
++bool
++Controller::FrameReferencesAllowed()
++{
++	return VideoSharesOverlayBuffers() && IsOverlayActive();
++}
++
++
+ // #pragma mark -
+ 
+ 
+diff --git a/src/apps/mediaplayer/Controller.h b/src/apps/mediaplayer/Controller.h
+index 786a8918c5..7a67781667 100644
+--- a/src/apps/mediaplayer/Controller.h
++++ b/src/apps/mediaplayer/Controller.h
+@@ -21,6 +21,7 @@
+ 
+ #include "ListenerAdapter.h"
+ #include "NodeManager.h"
++#include "VideoTrackSupplier.h"
+ #include "PlaylistItem.h"
+ 
+ 
+@@ -34,7 +35,7 @@ class VideoTrackSupplier;
+ class VideoView;
+ 
+ 
+-class Controller : public NodeManager {
++class Controller : public NodeManager, public VideoFrameReferencePolicy {
+ public:
+ 	class Listener {
+ 	public:
+@@ -140,6 +141,9 @@ public:
+ 
+ 			bool				IsOverlayActive();
+ 
++	// VideoFrameReferencePolicy
++	virtual	bool				FrameReferencesAllowed();
++
+ 	// notification support
+ 			bool				AddListener(Listener* listener);
+ 			void				RemoveListener(Listener* listener);
+diff --git a/src/apps/mediaplayer/Jamfile b/src/apps/mediaplayer/Jamfile
+index ac5a47d822..9f6b958d51 100644
+--- a/src/apps/mediaplayer/Jamfile
++++ b/src/apps/mediaplayer/Jamfile
+@@ -2,7 +2,7 @@ SubDir HAIKU_TOP src apps mediaplayer ;
+ 
+ # for BRecentItems
+ UsePublicHeaders [ FDirName be_apps Tracker ] ;
+-UsePrivateHeaders interface shared ;
++UsePrivateHeaders interface media shared ;
+ UseLibraryHeaders agg ;
+ 
+ local architectureObject ;
+diff --git a/src/apps/mediaplayer/media_node_framework/NodeManager.cpp b/src/apps/mediaplayer/media_node_framework/NodeManager.cpp
+index 298427ba56..9ff7f367df 100644
+--- a/src/apps/mediaplayer/media_node_framework/NodeManager.cpp
++++ b/src/apps/mediaplayer/media_node_framework/NodeManager.cpp
+@@ -133,6 +133,16 @@ NodeManager::CleanupNodes()
+ }
+ 
+ 
++/*!	Whether the decoder writes straight into overlay bitmaps, which only
++	the overlay shows (see VideoFrameReference.h).
++*/
++bool
++NodeManager::VideoSharesOverlayBuffers() const
++{
++	return fVideoConsumer != NULL && fVideoConsumer->SharesOverlayBuffers();
++}
++
++
+ status_t
+ NodeManager::FormatChanged(BRect videoBounds, float videoFrameRate,
+ 	color_space preferredVideoFormat, float audioFrameRate,
+diff --git a/src/apps/mediaplayer/media_node_framework/NodeManager.h b/src/apps/mediaplayer/media_node_framework/NodeManager.h
+index 21b1dd478d..77981d3431 100644
+--- a/src/apps/mediaplayer/media_node_framework/NodeManager.h
++++ b/src/apps/mediaplayer/media_node_framework/NodeManager.h
+@@ -75,6 +75,8 @@ public:
+ 
+ 			void				SetPeakListener(BHandler* handler);
+ 
++			bool				VideoSharesOverlayBuffers() const;
++
+  private:
+ 			status_t			_SetUpNodes(color_space preferredVideoFormat,
+ 									uint32 enabledNodes, bool useOverlays,
+diff --git a/src/apps/mediaplayer/media_node_framework/video/VideoConsumer.cpp b/src/apps/mediaplayer/media_node_framework/video/VideoConsumer.cpp
+index 6baabc18d2..b54d648d37 100644
+--- a/src/apps/mediaplayer/media_node_framework/video/VideoConsumer.cpp
++++ b/src/apps/mediaplayer/media_node_framework/video/VideoConsumer.cpp
+@@ -63,7 +63,8 @@ VideoConsumer::VideoConsumer(const char* name, BMediaAddOn* addon,
+ 	  fTarget(target),
+ 	  fLastBufferIndex(-1),
+ 	  fTryOverlay(true),
+-	  fShareBuffers(false)
++	  fShareBuffers(false),
++	  fOverlayBuffersShared(false)
+ {
+ 	FUNCTION("VideoConsumer::VideoConsumer\n");
+ 
+@@ -275,6 +276,7 @@ void
+ VideoConsumer::DeleteBuffers()
+ {
+ 	FUNCTION("VideoConsumer::DeleteBuffers\n");
++	fOverlayBuffersShared = false;
+ 	if (fBuffers) {
+ 		fTargetLock.Lock();
+ 		if (fLastBufferIndex >= 0) {
+@@ -344,6 +346,8 @@ VideoConsumer::Connected(const media_source& producer,
+ 				fBuffers, &userData, &changeTag, true);
+ 			if (ret != B_OK)
+ 				ERROR("SetOutputBuffersFor() failed: %s\n", strerror(ret));
++			else
++				fOverlayBuffersShared = fTryOverlay && fShareBuffers;
+ 		}
+ 		fIn.format.u.raw_video.display.bytes_per_row
+ 			= fBitmap[0]->BytesPerRow();
+diff --git a/src/apps/mediaplayer/media_node_framework/video/VideoConsumer.h b/src/apps/mediaplayer/media_node_framework/video/VideoConsumer.h
+index 74125ebefd..20780dc4c2 100644
+--- a/src/apps/mediaplayer/media_node_framework/video/VideoConsumer.h
++++ b/src/apps/mediaplayer/media_node_framework/video/VideoConsumer.h
+@@ -92,6 +92,10 @@ public:
+ 
+ 			void				SetTarget(VideoTarget* target);
+ 			void				SetTryOverlay(bool tryOverlay);
++			bool				SharesOverlayBuffers() const
++									{ return fOverlayBuffersShared; }
++									// the producer writes into the overlay
++									// bitmaps, which only the overlay shows
+ 
+ private:
+ 			void				_SetPerformanceTimeBase(
+@@ -120,6 +124,7 @@ private:
+ 
+ 			bool				fTryOverlay;
+ 			bool				fShareBuffers;
++	volatile bool				fOverlayBuffersShared;
+ 				// the producer may write into the bitmaps
+ };
+ 
+diff --git a/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.cpp b/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.cpp
+index 49c872ecc6..464ba3a30b 100644
+--- a/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.cpp
++++ b/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.cpp
+@@ -9,6 +9,7 @@
+ #include <string.h>
+ 
+ #include <MediaTrack.h>
++#include <VideoFrameReference.h>
+ 
+ #include "ColorSpaceToString.h"
+ 
+@@ -33,7 +34,8 @@ MediaTrackVideoSupplier::MediaTrackVideoSupplier(BMediaTrack* track,
+ 	fDuration(0),
+ 	fCurrentFrame(0),
+ 
+-	fTrackIndex(trackIndex)
++	fTrackIndex(trackIndex),
++	fFrameReferencePolicy(NULL)
+ {
+ 	if (!fVideoTrack) {
+ 		printf("MediaTrackVideoSupplier() - no video track\n");
+@@ -123,7 +125,18 @@ MediaTrackVideoSupplier::ReadFrame(void* buffer, bigtime_t* performanceTime,
+ 	int64 frameCount = 1;
+ 	// TODO: how does this work for interlaced video (field count > 1)?
+ 	media_header mediaHeader;
+-	ret = fVideoTrack->ReadFrames(buffer, &frameCount, &mediaHeader);
++	// the decoder may show its own frame instead of copying it, while only
++	// the overlay shows this buffer (VideoFrameReference.h)
++	video_frame_reference_request request;
++	request.magic = B_VIDEO_FRAME_REFERENCE_REQUEST;
++	request.allowed = format.display.format == B_NV12
++		&& fFrameReferencePolicy != NULL
++		&& fFrameReferencePolicy->FrameReferencesAllowed();
++	request.written = false;
++	media_decode_info info;
++	info.codec_data = &request;
++	info.codec_data_size = sizeof(request);
++	ret = fVideoTrack->ReadFrames(buffer, &frameCount, &mediaHeader, &info);
+ 
+ 	if (ret < B_OK && ret != B_LAST_BUFFER_ERROR) {
+ 		fprintf(stderr, "MediaTrackVideoSupplier::ReadFrame() - "
+diff --git a/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.h b/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.h
+index 6547c3705e..fc2e877ed3 100644
+--- a/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.h
++++ b/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.h
+@@ -49,6 +49,10 @@ class MediaTrackVideoSupplier : public VideoTrackSupplier {
+ 	virtual	int32				TrackIndex() const
+ 									{ return fTrackIndex; }
+ 
++	virtual	void				SetFrameReferencePolicy(
++									VideoFrameReferencePolicy* policy)
++									{ fFrameReferencePolicy = policy; }
++
+  private:
+ 	static	uint32				_MinBytesPerRow(color_space format,
+ 									uint32 width);
+@@ -66,6 +70,7 @@ class MediaTrackVideoSupplier : public VideoTrackSupplier {
+ 			int64				fCurrentFrame;
+ 
+ 			int32				fTrackIndex;
++			VideoFrameReferencePolicy* fFrameReferencePolicy;
+ };
+ 
+ #endif // MEDIA_TRACK_VIDEO_SUPPLIER_H
+diff --git a/src/apps/mediaplayer/supplier/VideoTrackSupplier.h b/src/apps/mediaplayer/supplier/VideoTrackSupplier.h
+index 7977fb5169..b0903ae42e 100644
+--- a/src/apps/mediaplayer/supplier/VideoTrackSupplier.h
++++ b/src/apps/mediaplayer/supplier/VideoTrackSupplier.h
+@@ -12,6 +12,18 @@
+ #include <MediaDefs.h>
+ #include <MediaFormats.h>
+ 
++/*!	Asked for each frame: may the decoder put a reference to its own frame
++	into the buffer instead of the picture (headers/private/media/
++	VideoFrameReference.h)? Only if the buffer is shown by the video overlay
++	alone.
++*/
++class VideoFrameReferencePolicy {
++public:
++	virtual						~VideoFrameReferencePolicy() {}
++	virtual	bool				FrameReferencesAllowed() = 0;
++};
++
++
+ class VideoTrackSupplier {
+ public:
+ 								VideoTrackSupplier();
+@@ -39,6 +51,9 @@ public:
+ 									uint32 bytesPerRow)
+ 									{ return B_NOT_SUPPORTED; }
+ 									// to decode to before playing
++
++	virtual	void				SetFrameReferencePolicy(
++									VideoFrameReferencePolicy* policy) {}
+ };
+ 
+ #endif // VIDEO_TRACK_SUPPLIER_H

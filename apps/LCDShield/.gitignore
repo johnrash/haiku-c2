@@ -1,0 +1,7 @@
+LCDShield
+LCDShield.rsrc
+*.o
+/pkg/
+*.hpkg
+icon.rdef
+__pycache__/

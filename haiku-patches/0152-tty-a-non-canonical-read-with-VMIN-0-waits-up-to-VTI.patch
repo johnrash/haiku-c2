@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 01:45:41 -0400
+Subject: [PATCH 152/342] tty: a non-canonical read with VMIN 0 waits up to
+ VTIME
+
+With VMIN 0 and VTIME set, read() returned at once whether or not a
+byte had come: it asked for 0 bytes, which are always there. POSIX says
+it waits up to VTIME for one. BSerialPort's timeouts are this case.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/generic/tty/tty.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/generic/tty/tty.cpp b/src/add-ons/kernel/generic/tty/tty.cpp
+index d142198e20..317342038e 100644
+--- a/src/add-ons/kernel/generic/tty/tty.cpp
++++ b/src/add-ons/kernel/generic/tty/tty.cpp
+@@ -1588,8 +1588,12 @@ tty_read(tty_cookie* cookie, void* _buffer, size_t* _length)
+ 
+ 			if (bytesNeeded == 0) {
+ 				// In this case VTIME specifies a relative total timeout. We
+-				// have no inter-char timeout, though.
++				// have no inter-char timeout, though. The read returns once
++				// a byte has come, or VTIME has passed (POSIX): it waits for
++				// one; without VTIME it doesn't wait at all.
+ 				timeout = vtime;
++				if (vtime > 0)
++					bytesNeeded = 1;
+ 			} else {
+ 				// VTIME specifies the inter-char timeout. 0 is indefinitely.
+ 				if (vtime == 0)

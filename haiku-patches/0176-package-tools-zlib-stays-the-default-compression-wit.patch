@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 16:19:38 -0400
+Subject: [PATCH 176/342] package tools: zlib stays the default compression
+ with zstd enabled
+
+The project enables the zstd build feature (its own arm64 zstd port), so
+that pkgman, packagefs and the boot loader read packages compressed with
+zstd, as HaikuPorts' are now. Upstream then makes the package tools
+write zstd by default (ZSTD_DEFAULT): the haiku package itself would be
+compressed with zstd, and the loaders on the boards' EFI partitions
+(older, not updated by pkgman) read only zlib. The tools still write
+zstd when asked (-z zstd).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/bin/package/Jamfile   | 7 ++++---
+ src/tools/package/Jamfile | 7 ++++---
+ 2 files changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/src/bin/package/Jamfile b/src/bin/package/Jamfile
+index f2930f6377..3802d34938 100644
+--- a/src/bin/package/Jamfile
++++ b/src/bin/package/Jamfile
+@@ -2,9 +2,10 @@ SubDir HAIKU_TOP src bin package ;
+ 
+ UsePrivateHeaders libroot shared storage support ;
+ 
+-if [ FIsBuildFeatureEnabled zstd ] {
+-	SubDirC++Flags -DZSTD_DEFAULT ;
+-}
++# Packages stay compressed with zlib by default (they can be read and
++# written with zstd too): the ODROID-C2 boards boot older loaders from their
++# EFI partitions, which pkgman doesn't update, and those read only zlib.
++# (Upstream defines ZSTD_DEFAULT when the zstd build feature is enabled.)
+ 
+ Application package :
+ 	command_add.cpp
+diff --git a/src/tools/package/Jamfile b/src/tools/package/Jamfile
+index ee40be5d83..11c731b86d 100644
+--- a/src/tools/package/Jamfile
++++ b/src/tools/package/Jamfile
+@@ -6,9 +6,10 @@ SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src bin package ] ;
+ 
+ USES_BE_API on <build>package = true ;
+ 
+-if [ FIsBuildFeatureEnabled zstd ] {
+-	SubDirC++Flags -DZSTD_DEFAULT ;
+-}
++# Packages stay compressed with zlib by default (they can be read and
++# written with zstd too): the ODROID-C2 boards boot older loaders from their
++# EFI partitions, which pkgman doesn't update, and those read only zlib.
++# (Upstream defines ZSTD_DEFAULT when the zstd build feature is enabled.)
+ 
+ BuildPlatformMain <build>package :
+ 	command_add.cpp

@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 16:14:10 -0400
+Subject: [PATCH 117/342] meson_hdmi: "meson_hdmi regs" dumps every display
+ register
+
+The HHI clock words, the HDMI TX top, the DesignWare controller's
+blocks and the VPU's VIU, encoder, VPP and control words: for comparing
+the state U-Boot leaves with a display and without one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../graphics/meson_hdmi/meson_hdmi.cpp        | 62 ++++++++++++++++++-
+ 1 file changed, 60 insertions(+), 2 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+index f3cc998272..0a374cbd60 100644
+--- a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
++++ b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+@@ -591,6 +591,7 @@ public:
+ 			status_t			SetDpmsMode(uint32 mode);
+ 			void				RestoreBootMode();
+ 			void				DumpState();
++			void				DumpRegisters();
+ 
+ 			status_t			AllocateOverlayBuffer(
+ 									meson_hdmi_overlay_buffer& buffer);
+@@ -2165,6 +2166,58 @@ MesonHdmi::DumpState()
+ }
+ 
+ 
++/*!	Every register of the display path, for comparing the state U-Boot
++	leaves with and without a display: the HHI clocks, the HDMI TX top, the
++	DesignWare controller's blocks and the VPU's VIU, encoders, VPP and
++	VPU control words.
++*/
++void
++MesonHdmi::DumpRegisters()
++{
++	for (uint32 offset = 0; offset < 0x400; offset += 0x20) {
++		kprintf("hhi %03" B_PRIx32 ":", offset);
++		for (uint32 i = 0; i < 0x20; i += 4)
++			kprintf(" %08" B_PRIx32, _Hhi(offset + i));
++		kprintf("\n");
++	}
++	kprintf("top 00:");
++	for (uint32 reg = 0; reg < 0x20; reg++)
++		kprintf(" %" B_PRIx32, _TopRead(reg));
++	kprintf("\n");
++
++	static const struct { uint32 start, count; } kDwBlocks[] = {
++		{ 0x0000, 0x08 }, { 0x0100, 0x90 }, { 0x0200, 0x08 },
++		{ 0x0800, 0x08 }, { 0x1000, 0x100 }, { 0x1100, 0x40 },
++		{ 0x1200, 0x20 }, { 0x3000, 0x40 }, { 0x3100, 0x10 },
++		{ 0x3200, 0x10 }, { 0x3300, 0x10 }, { 0x3400, 0x10 },
++		{ 0x4000, 0x10 }, { 0x4100, 0x20 }, { 0x5000, 0x20 },
++		{ 0x7e00, 0x30 },
++	};
++	for (size_t b = 0; b < B_COUNT_OF(kDwBlocks); b++) {
++		for (uint32 reg = kDwBlocks[b].start;
++				reg < kDwBlocks[b].start + kDwBlocks[b].count; reg += 16) {
++			kprintf("dw %04" B_PRIx32 ":", reg);
++			for (uint32 i = 0; i < 16; i++)
++				kprintf(" %02x", _DwRead(reg + i));
++			kprintf("\n");
++		}
++	}
++
++	static const struct { uint32 start, count; } kVpuBlocks[] = {
++		{ 0x1a00, 0x400 }, { 0x2700, 0x100 },
++	};
++	for (size_t b = 0; b < B_COUNT_OF(kVpuBlocks); b++) {
++		for (uint32 word = kVpuBlocks[b].start;
++				word < kVpuBlocks[b].start + kVpuBlocks[b].count; word += 8) {
++			kprintf("vpu %04" B_PRIx32 ":", word);
++			for (uint32 i = 0; i < 8; i++)
++				kprintf(" %08" B_PRIx32, _Vpu(word + i));
++			kprintf("\n");
++		}
++	}
++}
++
++
+ static int
+ dump_meson_hdmi(int argc, char** argv)
+ {
+@@ -2181,6 +2234,10 @@ dump_meson_hdmi(int argc, char** argv)
+ 		sDevice->DumpOverlay();
+ 		return 0;
+ 	}
++	if (argc > 1 && strcmp(argv[1], "regs") == 0) {
++		sDevice->DumpRegisters();
++		return 0;
++	}
+ 	if (argc > 2 && strcmp(argv[1], "endian") == 0) {
+ 		sDevice->SetOverlayEndian(parse_expression(argv[2]));
+ 		return 0;
+@@ -2298,11 +2355,12 @@ init_driver(device_node* node, void** _cookie)
+ 	sDevice = device;
+ 	add_debugger_command_etc("meson_hdmi", &dump_meson_hdmi,
+ 		"Show the Meson HDMI display state",
+-		"[restore | overlay | endian <n> | vpu <word> [<value>]\n"
++		"[restore | overlay | regs | endian <n> | vpu <word> [<value>]\n"
+ 		"  | dw|top|hhi <register> [<value>]\n"
+ 		"  | audio [tone | stop | aiu <word> [<value>]]]\n"
+ 		"Shows the display state; or puts U-Boot's mode back, shows the\n"
+-		"video overlay, sets its canvas byte order (0-15), reads or writes\n"
++		"video overlay, dumps every display register, sets its canvas\n"
++		"byte order (0-15), reads or writes\n"
+ 		"a VPU, DesignWare, HDMI TX top or HHI register; or shows HDMI\n"
+ 		"audio, plays a test tone, stops it, reads or writes an AIU\n"
+ 		"register.\n", 0);

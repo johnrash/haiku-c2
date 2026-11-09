@@ -1,0 +1,9 @@
+#!/bin/sh
+# make with Haiku's makefile-engine set up for cross builds (see cc):
+# DEVEL_DIRECTORY is deps/develop (the engine, headers and libraries), the
+# resource tools are the build's host tools.
+exec /usr/bin/make CC=cc CXX=c++ \
+	DEVEL_DIRECTORY="$HAIKU_PROJECT/deps/develop" \
+	RESCOMP="$HAIKU_HOST_TOOLS/rc/rc" XRES="$HAIKU_HOST_TOOLS/xres" \
+	MIMESET="$HAIKU_HOST_TOOLS/mimeset --mimedb $HAIKU_GEN/objects/common/data/mime_db/mime_db" \
+	"$@"

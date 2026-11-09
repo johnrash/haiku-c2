@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 18:34:20 -0400
+Subject: [PATCH 071/342] MediaPlayer: peak notifications go through a
+ messenger
+
+AudioProducer queues a peak notification per buffer in the global event
+queue, up to its latency ahead of time, with the level meter's BHandler
+pointer. Closing the window deletes the meter while such events are
+still queued, and the event queue thread then called Looper() on the
+deleted handler: a crash on quitting, seen on x86_64 (beta 6). The events now carry a BMessenger, which fails
+safely when its target is gone; MessageEvent got a constructor for a
+messenger with a message.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../media_node_framework/audio/AudioProducer.cpp         | 8 +++++++-
+ .../media_node_framework/audio/AudioProducer.h           | 2 ++
+ src/apps/mediaplayer/support/MessageEvent.cpp            | 9 +++++++++
+ src/apps/mediaplayer/support/MessageEvent.h              | 3 +++
+ 4 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/src/apps/mediaplayer/media_node_framework/audio/AudioProducer.cpp b/src/apps/mediaplayer/media_node_framework/audio/AudioProducer.cpp
+index 036763a0df..f8290f22c7 100644
+--- a/src/apps/mediaplayer/media_node_framework/audio/AudioProducer.cpp
++++ b/src/apps/mediaplayer/media_node_framework/audio/AudioProducer.cpp
+@@ -682,6 +682,10 @@ void
+ AudioProducer::SetPeakListener(BHandler* handler)
+ {
+ 	fPeakListener = handler;
++	// The peak notifications are queued ahead of their time and outlive
++	// the listener when its window closes: a messenger fails safely where
++	// the handler pointer was used after it was deleted.
++	fPeakMessenger = handler != NULL ? BMessenger(handler) : BMessenger();
+ }
+ 
+ 
+@@ -889,8 +893,10 @@ AudioProducer::_FillNextBuffer(bigtime_t eventTime)
+ 		}
+ 		bigtime_t realTime = TimeSource()->RealTimeFor(
+ 			fStartTime + startTime, 0);
++		if (!fPeakMessenger.IsValid() && fPeakListener != NULL)
++			fPeakMessenger = BMessenger(fPeakListener);
+ 		MessageEvent* event = new (std::nothrow) MessageEvent(realTime,
+-			fPeakListener, message);
++			fPeakMessenger, message);
+ 		if (event != NULL)
+ 			EventQueue::Default().AddEvent(event);
+ 	}
+diff --git a/src/apps/mediaplayer/media_node_framework/audio/AudioProducer.h b/src/apps/mediaplayer/media_node_framework/audio/AudioProducer.h
+index f6650054bb..97e79cfc24 100644
+--- a/src/apps/mediaplayer/media_node_framework/audio/AudioProducer.h
++++ b/src/apps/mediaplayer/media_node_framework/audio/AudioProducer.h
+@@ -11,6 +11,7 @@
+ 
+ #include <BufferProducer.h>
+ #include <MediaEventLooper.h>
++#include <Messenger.h>
+ 
+ 
+ class AudioSupplier;
+@@ -131,6 +132,7 @@ private:
+ 			AudioSupplier*		fSupplier;
+ 
+ 			BHandler*			fPeakListener;
++			BMessenger			fPeakMessenger;
+ };
+ 
+ #endif // AUDIO_PRODUCER_H
+diff --git a/src/apps/mediaplayer/support/MessageEvent.cpp b/src/apps/mediaplayer/support/MessageEvent.cpp
+index e60bf419d9..9cb1ab495f 100644
+--- a/src/apps/mediaplayer/support/MessageEvent.cpp
++++ b/src/apps/mediaplayer/support/MessageEvent.cpp
+@@ -32,6 +32,15 @@ MessageEvent::MessageEvent(bigtime_t time, const BMessenger& messenger)
+ }
+ 
+ 
++MessageEvent::MessageEvent(bigtime_t time, const BMessenger& messenger,
++		const BMessage& message)
++	: Event(time),
++	  AbstractLOAdapter(messenger),
++	  fMessage(message)
++{
++}
++
++
+ MessageEvent::~MessageEvent()
+ {
+ }
+diff --git a/src/apps/mediaplayer/support/MessageEvent.h b/src/apps/mediaplayer/support/MessageEvent.h
+index 9f8ea7e9e3..07cbb6611d 100644
+--- a/src/apps/mediaplayer/support/MessageEvent.h
++++ b/src/apps/mediaplayer/support/MessageEvent.h
+@@ -28,6 +28,9 @@ class MessageEvent : public Event, public AbstractLOAdapter {
+ 									const BMessage& message);
+ 								MessageEvent(bigtime_t time,
+ 									const BMessenger& messenger);
++								MessageEvent(bigtime_t time,
++									const BMessenger& messenger,
++									const BMessage& message);
+ 	virtual						~MessageEvent();
+ 
+ 	virtual	void				Execute();

@@ -1,0 +1,886 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 02:16:45 -0500
+Subject: [PATCH 199/342] usb_webcam: frame sizes as asked, MJPEG through
+ libjpeg-turbo (M45)
+
+The UVC device keeps a mode per frame descriptor of YUY2 or MJPEG, with
+the frame interval closest to 30 frames a second, and takes the size a
+connection asks for: YUY2 where it is as fast as MJPEG (on the C920 up
+to 640x480), else MJPEG. A size left open gets 640x480, else 320x240.
+The probe asks for the mode's format, frame and interval.
+
+MJPEG frames go to two decoder threads that take them in turn and decode
+into their own buffers with libjpeg-turbo (TurboJPEG, NEON, to B_RGB32);
+the newest whole frame becomes the ready one, which FillFrameBuffer()
+copies. A 1080p frame of the C920 takes a Cortex-A53 37 ms, 720p 18 ms.
+Built only with the turbojpeg build feature; without it, YUY2 as before.
+
+The deframer takes MJPEG frames up to the probe's maximum size. The
+producer no longer forces 320x240, answers raw video format suggestions
+(it refused all but encoded video), fills in bytes_per_row, sizes its
+buffer group by the frame (8 buffers, 4 of a 1080p frame), restarts a
+running stream on a new connection, and sends nothing when no frame
+came.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../media/media-add-ons/usb_webcam/Jamfile    |  11 +-
+ .../media-add-ons/usb_webcam/Producer.cpp     |  37 +-
+ .../usb_webcam/addons/uvc/UVCCamDevice.cpp    | 432 +++++++++++++++---
+ .../usb_webcam/addons/uvc/UVCCamDevice.h      |  59 ++-
+ .../usb_webcam/addons/uvc/UVCDeframer.cpp     |   8 +-
+ .../usb_webcam/addons/uvc/UVCDeframer.h       |  14 +-
+ 6 files changed, 478 insertions(+), 83 deletions(-)
+
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/Jamfile b/src/add-ons/media/media-add-ons/usb_webcam/Jamfile
+index 6cfc85bbf3..faac38385a 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/Jamfile
++++ b/src/add-ons/media/media-add-ons/usb_webcam/Jamfile
+@@ -86,6 +86,14 @@ for architectureObject in [ MultiArchSubDirSetup ] {
+ 				media-add-ons usb_webcam $(sourceDir) ] ;
+ 		}
+ 
++		# MJPEG, for the frame sizes a UVC camera sends faster that way
++		local turbojpegLibrary ;
++		if [ FIsBuildFeatureEnabled turbojpeg ] {
++			UseBuildFeatureHeaders turbojpeg ;
++			ObjectDefines UVCCamDevice.cpp : HAVE_TURBOJPEG ;
++			turbojpegLibrary = [ BuildFeatureAttribute turbojpeg : library ] ;
++		}
++
+ 		Addon [ MultiArchDefaultGristFiles usb_webcam.media_addon ] :
+ 			$(addonSources)
+ 			$(csTransformsSources)
+@@ -101,7 +109,8 @@ for architectureObject in [ MultiArchSubDirSetup ] {
+ 			CamRoster.cpp
+ 			CamSensor.cpp
+ 			CamStreamingDeframer.cpp
+-			: be media $(usbKitLibraryName) [ TargetLibsupc++ ]
++			: be media $(usbKitLibraryName) $(turbojpegLibrary)
++			[ TargetLibsupc++ ]
+ 		;
+ 	}
+ }
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp b/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
+index bdee00917f..2c37cafb75 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
+@@ -28,8 +28,9 @@
+ // don't separate parameters from addon, device and sensor
+ #define SINGLE_PARAMETER_GROUP 1
+ 
+-// CodyCam and eXposer prefer 320x240
+-#define FORCE_320_240 1
++// CodyCam and eXposer ask for 320x240 themselves; a size left open gets the
++// camera's suggestion
++//#define FORCE_320_240 1
+ //#define FORCE_160_120 1
+ //#define FORCE_MAX_FRAME 1
+ 
+@@ -335,7 +336,7 @@ status_t
+ VideoProducer::FormatSuggestionRequested(
+ 		media_type type, int32 quality, media_format *format)
+ {
+-	if (type != B_MEDIA_ENCODED_VIDEO)
++	if (type != B_MEDIA_RAW_VIDEO && type != B_MEDIA_UNKNOWN_TYPE)
+ 		return B_MEDIA_BAD_FORMAT;
+ 
+ 	TOUCH(quality);
+@@ -349,6 +350,7 @@ VideoProducer::FormatSuggestionRequested(
+ 	if (fCamDevice && fCamDevice->SuggestVideoFrame(width, height) == B_OK) {
+ 		format->u.raw_video.display.line_width = width;
+ 		format->u.raw_video.display.line_count = height;
++		format->u.raw_video.display.bytes_per_row = width * 4;
+ 	}
+ 	format->u.raw_video.field_rate = FIELD_RATE;
+ 	return B_OK;
+@@ -383,6 +385,7 @@ VideoProducer::FormatProposal(const media_source &output, media_format *format)
+ 		if (err >= B_OK) {
+ 			format->u.raw_video.display.line_width = width;
+ 			format->u.raw_video.display.line_count = height;
++			format->u.raw_video.display.bytes_per_row = width * 4;
+ 		}
+ 	}
+ 
+@@ -525,6 +528,8 @@ VideoProducer::PrepareToConnect(const media_source &source,
+ 			format->u.raw_video.display.line_count);
+ 		if (err < B_OK)
+ 			return err;
++		format->u.raw_video.display.bytes_per_row
++			= format->u.raw_video.display.line_width * 4;
+ 	}
+ 
+ 	if (format->u.raw_video.field_rate == 0)
+@@ -599,9 +604,16 @@ VideoProducer::Connect(status_t error, const media_source &source,
+ 	fProcessingLatency = system_time() - now;
+ 	free(buffer);
+ 
+-	/* Create the buffer group */
+-	fBufferGroup = new BBufferGroup(4 * fConnectedFormat.display.line_width *
+-			fConnectedFormat.display.line_count, 8);
++	/* Create the buffer group: 8 buffers, fewer of a large frame (a 1080p
++	 * one is 8 MB) */
++	size_t bufferSize = 4 * fConnectedFormat.display.line_width
++		* fConnectedFormat.display.line_count;
++	int32 bufferCount = bufferSize > 0 ? (32 << 20) / bufferSize : 8;
++	if (bufferCount > 8)
++		bufferCount = 8;
++	if (bufferCount < 4)
++		bufferCount = 4;
++	fBufferGroup = new BBufferGroup(bufferSize, bufferCount);
+ 	if (fBufferGroup->InitCheck() < B_OK) {
+ 		delete fBufferGroup;
+ 		fBufferGroup = NULL;
+@@ -611,6 +623,15 @@ VideoProducer::Connect(status_t error, const media_source &source,
+ 	fConnected = true;
+ 	fEnabled = true;
+ 
++	if (fRunning) {
++		/* Started before the connection: the camera streams the size the
++		 * connection asked for from now on */
++		lock.Unlock();
++		HandleStop();
++		HandleStart(TimeSource()->Now());
++		return;
++	}
++
+ 	/* Tell frame generation thread to recalculate delay value */
+ 	release_sem(fFrameSync);
+ }
+@@ -994,8 +1015,10 @@ VideoProducer::FrameGenerator()
+ //#ifdef UseFillFrameBuffer
+ 		err = fCamDevice->FillFrameBuffer(buffer, &stamp);
+ 		if (err < B_OK) {
+-			;//XXX handle error
++			/* no frame: send nothing rather than an old or empty buffer */
+ 			fStats[0].missed++;
++			buffer->Recycle();
++			continue;
+ 		}
+ //#endif
+ #ifdef UseGetFrameBitmap
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+index 56ac63e0e5..272e981cb2 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+@@ -11,9 +11,14 @@
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <string.h>
+ #include <ParameterWeb.h>
+ #include <media/Buffer.h>
+ 
++#ifdef HAVE_TURBOJPEG
++#	include <turbojpeg.h>
++#endif
++
+ 
+ usb_webcam_support_descriptor kSupportedDevices[] = {
+ 	// ofcourse we support a generic UVC device...
+@@ -70,11 +75,31 @@ UVCCamDevice::UVCCamDevice(CamDeviceAddon& _addon, BUSBDevice* _device)
+ 	fHeaderDescriptor(NULL),
+ 	fInterruptIn(NULL),
+ 	fUncompressedFormatIndex(1),
+-	fUncompressedFrameIndex(1),
+ 	fMaxVideoFrameSize(0),
+ 	fMaxPayloadTransferSize(0),
+-	fAlternatePayload(0)
++	fAlternatePayload(0),
++	fModeCount(0),
++	fMode(NULL),
++	fParsingFormatIndex(0),
++	fParsingFormatUsable(false),
++	fStreamWidth(0),
++	fStreamHeight(0),
++	fStreamCompressed(false),
++	fReadyBuffer(NULL),
++	fReadingBuffer(NULL),
++	fDecodeLock("UVC decoding"),
++	fDecodedSem(-1),
++	fFramesTaken(0),
++	fNewestDecoded(0),
++	fReadyStamp(0),
++	fReadyPending(false),
++	fDecoding(false)
+ {
++	for (int32 i = 0; i < kDecoderCount; i++) {
++		fDecoders[i] = -1;
++		fDecodeBuffers[i] = NULL;
++	}
++
+ 	fDeframer = new UVCDeframer(this);
+ 	SetDataInput(fDeframer);
+ 
+@@ -149,6 +174,7 @@ UVCCamDevice::UVCCamDevice(CamDeviceAddon& _addon, BUSBDevice* _device)
+ 
+ UVCCamDevice::~UVCCamDevice()
+ {
++	_StopDecoders();
+ 	free(fHeaderDescriptor);
+ }
+ 
+@@ -194,6 +220,10 @@ UVCCamDevice::_ParseVideoStreaming(const usbvc_class_descriptor* _descriptor,
+ 			const usbvc_format_descriptor* descriptor
+ 				= (const usbvc_format_descriptor*)_descriptor;
+ 			fUncompressedFormatIndex = descriptor->formatIndex;
++			// YUY2 is the uncompressed format converted
++			fParsingFormatIndex = descriptor->formatIndex;
++			fParsingFormatUsable = memcmp(descriptor->uncompressed.format,
++				kYUY2Guid, sizeof(usbvc_guid)) == 0;
+ 			printf("VS_FORMAT_UNCOMPRESSED:\tbFormatIdx=%d,#frmdesc=%d,guid=",
+ 				descriptor->formatIndex, descriptor->numFrameDescriptors);
+ 			print_guid(descriptor->uncompressed.format);
+@@ -225,14 +255,11 @@ UVCCamDevice::_ParseVideoStreaming(const usbvc_class_descriptor* _descriptor,
+ 		{
+ 			const usb_video_frame_descriptor* descriptor
+ 				= (const usb_video_frame_descriptor*)_descriptor;
+-			if (_descriptor->descriptorSubtype == USB_VIDEO_VS_FRAME_UNCOMPRESSED) {
+-				printf("VS_FRAME_UNCOMPRESSED:");
+-				fUncompressedFrames.AddItem(
+-					new usb_video_frame_descriptor(*descriptor));
+-			} else {
+-				printf("VS_FRAME_MJPEG:");
+-				fMJPEGFrames.AddItem(new usb_video_frame_descriptor(*descriptor));
+-			}
++			bool compressed
++				= _descriptor->descriptorSubtype == USB_VIDEO_VS_FRAME_MJPEG;
++			if (fParsingFormatUsable)
++				_AddMode(descriptor, compressed, len);
++			printf(compressed ? "VS_FRAME_MJPEG:" : "VS_FRAME_UNCOMPRESSED:");
+ 			printf("\tbFrameIdx=%d,stillsupported=%s,"
+ 				"fixedframerate=%s\n", descriptor->frame_index,
+ 				(descriptor->capabilities & 1) ? "yes" : "no",
+@@ -339,6 +366,12 @@ UVCCamDevice::_ParseVideoStreaming(const usbvc_class_descriptor* _descriptor,
+ 			const usbvc_format_descriptor* descriptor
+ 				= (const usbvc_format_descriptor*)_descriptor;
+ 			fMJPEGFormatIndex = descriptor->formatIndex;
++			fParsingFormatIndex = descriptor->formatIndex;
++#ifdef HAVE_TURBOJPEG
++			fParsingFormatUsable = true;
++#else
++			fParsingFormatUsable = false;
++#endif
+ 			printf("VS_FORMAT_MJPEG:\tbFormatIdx=%d,#frmdesc=%d\n",
+ 				descriptor->formatIndex, descriptor->numFrameDescriptors);
+ 			printf("\t#flgs=%d,optfrmidx=%d,aspRX=%d,aspRY=%d\n",
+@@ -552,13 +585,36 @@ UVCCamDevice::SupportsIsochronous()
+ status_t
+ UVCCamDevice::StartTransfer()
+ {
+-	if (_ProbeCommitFormat() != B_OK || _SelectBestAlternate() != B_OK)
++	if (fMode == NULL || _ProbeCommitFormat() != B_OK
++		|| _SelectBestAlternate() != B_OK) {
+ 		return B_ERROR;
+-	// YUY2: two bytes a pixel, whole frames only
++	}
++
+ 	BRect frame = VideoFrame();
+-	((UVCDeframer*)fDeframer)->Start((size_t)(frame.IntegerWidth() + 1)
+-		* (frame.IntegerHeight() + 1) * 2);
+-	return CamDevice::StartTransfer();
++	fStreamWidth = frame.IntegerWidth() + 1;
++	fStreamHeight = frame.IntegerHeight() + 1;
++	fStreamCompressed = fMode->compressed;
++	size_t pixels = (size_t)fStreamWidth * fStreamHeight;
++	UVCDeframer* deframer = (UVCDeframer*)fDeframer;
++	if (fStreamCompressed) {
++		// MJPEG: any size up to what the camera said in the probe
++		deframer->Start(fMaxVideoFrameSize != 0
++			? fMaxVideoFrameSize : pixels * 2, false);
++		if (_StartDecoders() != B_OK) {
++			_SelectIdleAlternate();
++			return B_NO_MEMORY;
++		}
++	} else {
++		// YUY2: two bytes a pixel, whole frames only
++		deframer->Start(pixels * 2, true);
++	}
++
++	status_t status = CamDevice::StartTransfer();
++	if (status != B_OK) {
++		_StopDecoders();
++		_SelectIdleAlternate();
++	}
++	return status;
+ }
+ 
+ 
+@@ -568,65 +624,148 @@ UVCCamDevice::StopTransfer()
+ 	// the pump finishes the transfers it has queued first: then the
+ 	// alternate setting goes back to the one without bandwidth
+ 	status_t status = CamDevice::StopTransfer();
++	_StopDecoders();
+ 	_SelectIdleAlternate();
+ 	return status;
+ }
+ 
+ 
++/*!	640x480, what most applications expect of a webcam, else the 320x240
++	CodyCam & co. ask for, else the first size there is.
++*/
+ status_t
+ UVCCamDevice::SuggestVideoFrame(uint32& width, uint32& height)
+ {
+-	printf("UVCCamDevice::SuggestVideoFrame(%" B_PRIu32 ", %" B_PRIu32 ")\n", width, height);
+-	// As in AcceptVideoFrame(), the suggestion should probably just be the
+-	// first advertised uncompressed format, but current applications prefer
+-	// 320x240, so this is tried first here as a suggestion.
+-	width = 320;
+-	height = 240;
+-	if (!AcceptVideoFrame(width, height)) {
+-		const usb_video_frame_descriptor* descriptor
+-			= (const usb_video_frame_descriptor*)fUncompressedFrames.FirstItem();
+-		width  = (*descriptor).width;
+-		height = (*descriptor).height;
++	static const uint32 kSizes[][2] = { { 640, 480 }, { 320, 240 } };
++	for (size_t i = 0; i < sizeof(kSizes) / sizeof(kSizes[0]); i++) {
++		if (_FindMode(kSizes[i][0], kSizes[i][1]) != NULL) {
++			width = kSizes[i][0];
++			height = kSizes[i][1];
++			return B_OK;
++		}
+ 	}
++	if (fModeCount == 0)
++		return B_ERROR;
++	width = fModes[0].width;
++	height = fModes[0].height;
+ 	return B_OK;
+ }
+ 
+ 
++/*!	A frame size of either format; 0x0 asks for the suggested one. */
+ status_t
+ UVCCamDevice::AcceptVideoFrame(uint32& width, uint32& height)
+ {
+-	printf("UVCCamDevice::AcceptVideoFrame(%" B_PRIu32 ", %" B_PRIu32 ")\n", width, height);
+-	if (width <= 0 || height <= 0) {
+-		// Uncomment below when applications support dimensions other than 320x240
+-		// This code selects the first listed available uncompressed frame format
+-		/*
+-		const usbvc_frame_descriptor* descriptor
+-			= (const usbvc_frame_descriptor*)fUncompressedFrames.FirstItem();
+-		width = (*descriptor).width;
+-		height = (*descriptor).height;
+-		SetVideoFrame(BRect(0, 0, width - 1, height - 1));
+-		return B_OK;
+-		*/
++	if ((width == 0 || height == 0)
++		&& SuggestVideoFrame(width, height) != B_OK) {
++		return B_ERROR;
++	}
+ 
+-		width  = 320;
+-		height = 240;
++	const Mode* mode = _FindMode(width, height);
++	if (mode == NULL) {
++		fprintf(stderr, "UVCCamDevice::AcceptVideoFrame(): no %" B_PRIu32
++			"x%" B_PRIu32 " mode\n", width, height);
++		return B_ERROR;
+ 	}
+ 
+-	for (int i = 0; i<fUncompressedFrames.CountItems(); i++) {
+-		const usb_video_frame_descriptor* descriptor
+-			= (const usb_video_frame_descriptor*)fUncompressedFrames.ItemAt(i);
+-		if ((*descriptor).width == width && (*descriptor).height == height) {
+-			// the descriptor's own (1-based) index, not its place in the
+-			// list
+-			fUncompressedFrameIndex = descriptor->frame_index;
+-			SetVideoFrame(BRect(0, 0, width - 1, height - 1));
+-			return B_OK;
++	fMode = mode;
++	printf("UVCCamDevice::AcceptVideoFrame(): %" B_PRIu32 "x%" B_PRIu32
++		" %s, format %u frame %u, %.1f frames a second\n", width, height,
++		mode->compressed ? "MJPEG" : "YUY2", mode->formatIndex,
++		mode->frameIndex, 10000000.0 / mode->interval);
++	SetVideoFrame(BRect(0, 0, width - 1, height - 1));
++	return B_OK;
++}
++
++
++/*!	A frame descriptor of a usable format becomes a mode, with the frame
++	interval closest to 30 frames a second without going faster (the
++	producer's rate), else the slowest of the faster ones.
++*/
++void
++UVCCamDevice::_AddMode(const usb_video_frame_descriptor* descriptor,
++	bool compressed, size_t len)
++{
++	if (fModeCount >= (int32)(sizeof(fModes) / sizeof(fModes[0])))
++		return;
++
++	// 30 frames a second, allowing for cameras that round 333333 down
++	const uint32 kInterval = 330000;
++	uint32 interval = 0;
++	if (descriptor->frame_interval_type == 0) {
++		uint32 minimum = descriptor->continuous.min_frame_interval;
++		uint32 maximum = descriptor->continuous.max_frame_interval;
++		uint32 step = descriptor->continuous.frame_interval_step;
++		if (minimum >= kInterval)
++			interval = minimum;
++		else if (maximum <= kInterval)
++			interval = maximum;
++		else {
++			interval = 333333;
++			if (step != 0) {
++				interval = minimum
++					+ (333333 - minimum + step - 1) / step * step;
++				if (interval > maximum)
++					interval = maximum;
++			}
++		}
++	} else {
++		// only the intervals the descriptor really holds
++		size_t offset = (const uint8*)descriptor->discrete_frame_intervals
++			- (const uint8*)descriptor;
++		size_t count = len > offset ? (len - offset) / sizeof(uint32) : 0;
++		if (count > descriptor->frame_interval_type)
++			count = descriptor->frame_interval_type;
++		uint32 slower = 0;
++		uint32 faster = 0;
++		for (size_t i = 0; i < count; i++) {
++			uint32 value = descriptor->discrete_frame_intervals[i];
++			if (value >= kInterval) {
++				if (slower == 0 || value < slower)
++					slower = value;
++			} else if (value > faster)
++				faster = value;
+ 		}
++		interval = slower != 0 ? slower : faster;
+ 	}
++	if (interval == 0)
++		interval = descriptor->default_frame_interval;
++	if (interval == 0)
++		return;
++
++	Mode& mode = fModes[fModeCount++];
++	mode.formatIndex = fParsingFormatIndex;
++	mode.frameIndex = descriptor->frame_index;
++	mode.compressed = compressed;
++	mode.width = descriptor->width;
++	mode.height = descriptor->height;
++	mode.interval = interval;
++}
++
+ 
+-	fprintf(stderr, "UVCCamDevice::AcceptVideoFrame() Invalid frame dimensions"
+-		"\n");
+-	return B_ERROR;
++/*!	The mode for a frame size: uncompressed (no decoding, no compression
++	artefacts) when it is as fast as MJPEG, else MJPEG; the C920's YUY2
++	runs at 30 frames a second only up to 640x480.
++*/
++const UVCCamDevice::Mode*
++UVCCamDevice::_FindMode(uint32 width, uint32 height) const
++{
++	const Mode* uncompressed = NULL;
++	const Mode* compressed = NULL;
++	for (int32 i = 0; i < fModeCount; i++) {
++		const Mode& mode = fModes[i];
++		if (mode.width != width || mode.height != height)
++			continue;
++		if (mode.compressed) {
++			if (compressed == NULL)
++				compressed = &mode;
++		} else if (uncompressed == NULL)
++			uncompressed = &mode;
++	}
++	if (uncompressed != NULL
++		&& (compressed == NULL || uncompressed->interval <= compressed->interval))
++		return uncompressed;
++	return compressed;
+ }
+ 
+ 
+@@ -648,9 +787,9 @@ UVCCamDevice::_ProbeCommitFormat()
+ 	usb_video_probe_and_commit_controls request;
+ 	memset(&request, 0, sizeof(request));
+ 	request._hint.frame_interval = 1;
+-	request.frame_interval = 333333;
+-	request.format_index = fUncompressedFormatIndex;
+-	request.frame_index = fUncompressedFrameIndex;
++	request.frame_interval = fMode->interval;
++	request.format_index = fMode->formatIndex;
++	request.frame_index = fMode->frameIndex;
+ 	size_t length = fHeaderDescriptor->version > 0x100 ? 34 : 26;
+ 	size_t actualLength = fDevice->ControlTransfer(
+ 		USB_REQTYPE_CLASS | USB_REQTYPE_INTERFACE_OUT, USB_VIDEO_RC_SET_CUR,
+@@ -713,8 +852,9 @@ UVCCamDevice::_ProbeCommitFormat()
+ 	fMaxVideoFrameSize = response.max_video_frame_size;
+ 	fMaxPayloadTransferSize = response.max_payload_transfer_size;
+ 	printf("usbvc_probecommit setup done maxVideoFrameSize:%" B_PRIu32 ""
+-		" maxPayloadTransferSize:%" B_PRIu32 "\n", fMaxVideoFrameSize,
+-		fMaxPayloadTransferSize);
++		" maxPayloadTransferSize:%" B_PRIu32 " frameInterval:%" B_PRIu32 "\n",
++		fMaxVideoFrameSize, fMaxPayloadTransferSize,
++		(uint32)response.frame_interval);
+ 
+ 	printf("UVCCamDevice::_ProbeCommitFormat()\n --> SUCCESSFUL\n");
+ 	return B_OK;
+@@ -1267,7 +1407,9 @@ UVCCamDevice::_SetParameterValue(uint16 wValue, int8 setValue)
+ status_t
+ UVCCamDevice::FillFrameBuffer(BBuffer* buffer, bigtime_t* stamp)
+ {
+-	memset(buffer->Data(), 0, buffer->SizeAvailable());
++	if (fStreamCompressed)
++		return _FillFromDecoder(buffer, stamp);
++
+ 	status_t err = fDeframer->WaitFrame(2000000);
+ 	if (err < B_OK) {
+ 		fprintf(stderr, "WaitFrame: %" B_PRIx32 "\n", err);
+@@ -1281,9 +1423,8 @@ UVCCamDevice::FillFrameBuffer(BBuffer* buffer, bigtime_t* stamp)
+ 		return err;
+ 	}
+ 
+-	long int w = (long)(VideoFrame().right - VideoFrame().left + 1);
+-	long int h = (long)(VideoFrame().bottom - VideoFrame().top + 1);
+-
++	int32 w = fStreamWidth;
++	int32 h = fStreamHeight;
+ 	if (buffer->SizeAvailable() >= (size_t)w * h * 4
+ 		&& f->BufferLength() >= (size_t)w * h * 2) {
+ 		// TODO: The Video Producer only outputs B_RGB32.  This is OK for most
+@@ -1291,9 +1432,176 @@ UVCCamDevice::FillFrameBuffer(BBuffer* buffer, bigtime_t* stamp)
+ 		// consume B_YUV422.
+ 		_ConvertYUY2((uint32*)buffer->Data(), (const uint8*)f->Buffer(), w,
+ 			h);
+-	}
++	} else
++		err = B_BAD_VALUE;
+ 	delete f;
++	return err;
++}
++
++
++/*!	The newest MJPEG frame the decoders finished, copied into \a buffer. */
++status_t
++UVCCamDevice::_FillFromDecoder(BBuffer* buffer, bigtime_t* stamp)
++{
++	status_t status = acquire_sem_etc(fDecodedSem, 1, B_RELATIVE_TIMEOUT,
++		2000000);
++	if (status != B_OK)
++		return status;
++
++	fDecodeLock.Lock();
++	uint8* swap = fReadyBuffer;
++	fReadyBuffer = fReadingBuffer;
++	fReadingBuffer = swap;
++	fReadyPending = false;
++	if (stamp != NULL)
++		*stamp = fReadyStamp;
++	fDecodeLock.Unlock();
++
++	// the decoders don't touch the reading buffer
++	size_t size = (size_t)fStreamWidth * fStreamHeight * 4;
++	if (buffer->SizeAvailable() < size || fReadingBuffer == NULL)
++		return B_BAD_VALUE;
++	memcpy(buffer->Data(), fReadingBuffer, size);
++	return B_OK;
++}
++
++
++status_t
++UVCCamDevice::_StartDecoders()
++{
++#ifdef HAVE_TURBOJPEG
++	size_t size = (size_t)fStreamWidth * fStreamHeight * 4;
++	fReadyBuffer = (uint8*)malloc(size);
++	fReadingBuffer = (uint8*)malloc(size);
++	bool allocated = fReadyBuffer != NULL && fReadingBuffer != NULL;
++	for (int32 i = 0; i < kDecoderCount; i++) {
++		fDecodeBuffers[i] = (uint8*)malloc(size);
++		allocated &= fDecodeBuffers[i] != NULL;
++	}
++	fDecodedSem = create_sem(0, "UVC decoded frame");
++	if (!allocated || fDecodedSem < 0) {
++		_StopDecoders();
++		return B_NO_MEMORY;
++	}
++
++	fFramesTaken = 0;
++	fNewestDecoded = 0;
++	fReadyPending = false;
++	fDecoding = true;
++	for (int32 i = 0; i < kDecoderCount; i++) {
++		fDecoderStarts[i].device = this;
++		fDecoderStarts[i].index = i;
++		fDecoders[i] = spawn_thread(_DecoderEntry, "UVC MJPEG decoder",
++			B_DISPLAY_PRIORITY, &fDecoderStarts[i]);
++		if (fDecoders[i] >= 0)
++			resume_thread(fDecoders[i]);
++	}
++	return B_OK;
++#else
++	return B_NOT_SUPPORTED;
++#endif
++}
++
++
++void
++UVCCamDevice::_StopDecoders()
++{
++	fDecoding = false;
++	for (int32 i = 0; i < kDecoderCount; i++) {
++		if (fDecoders[i] >= 0) {
++			status_t result;
++			wait_for_thread(fDecoders[i], &result);
++			fDecoders[i] = -1;
++		}
++	}
++	if (fDecodedSem >= 0) {
++		delete_sem(fDecodedSem);
++		fDecodedSem = -1;
++	}
++	for (int32 i = 0; i < kDecoderCount; i++) {
++		free(fDecodeBuffers[i]);
++		fDecodeBuffers[i] = NULL;
++	}
++	free(fReadyBuffer);
++	fReadyBuffer = NULL;
++	free(fReadingBuffer);
++	fReadingBuffer = NULL;
++}
++
++
++status_t
++UVCCamDevice::_DecoderEntry(void* data)
++{
++	DecoderStart* start = (DecoderStart*)data;
++	return start->device->_DecoderThread(start->index);
++}
++
++
++/*!	One of the decoders: takes the newest frame the deframer has (the
++	other decoder may still work on the one before), decodes it into its
++	own buffer, and makes that the ready one unless a newer frame got
++	there first. libjpeg-turbo turns the C920's 4:2:2 JPEG into B_RGB32
++	(BGRA in memory) with NEON; a 1080p frame takes a core 37 ms, so two
++	decoders keep up with 30 frames a second.
++*/
++status_t
++UVCCamDevice::_DecoderThread(int32 index)
++{
++#ifdef HAVE_TURBOJPEG
++	tjhandle handle = tj3Init(TJINIT_DECOMPRESS);
++	if (handle == NULL)
++		return B_NO_MEMORY;
++
++	const int width = fStreamWidth;
++	const int height = fStreamHeight;
++	while (fDecoding) {
++		if (fDeframer->WaitFrame(100000) != B_OK)
++			continue;
++
++		CamFrame* frame;
++		bigtime_t stamp;
++		fDecodeLock.Lock();
++		status_t status = fDeframer->GetFrame(&frame, &stamp);
++		int32 sequence = ++fFramesTaken;
++		fDecodeLock.Unlock();
++		if (status != B_OK)
++			continue;
++
++		const uint8* data = (const uint8*)frame->Buffer();
++		size_t length = frame->BufferLength();
++		bool good = tj3DecompressHeader(handle, data, length) == 0
++			&& tj3Get(handle, TJPARAM_JPEGWIDTH) == width
++			&& tj3Get(handle, TJPARAM_JPEGHEIGHT) == height;
++		if (good && tj3Decompress8(handle, data, length,
++				fDecodeBuffers[index], width * 4, TJPF_BGRA) != 0) {
++			// damaged data only warns: the frame decodes as far as it goes
++			good = tj3GetErrorCode(handle) == TJERR_WARNING;
++		}
++		delete frame;
++		if (!good)
++			continue;
++
++		fDecodeLock.Lock();
++		bool wake = false;
++		if (sequence > fNewestDecoded) {
++			fNewestDecoded = sequence;
++			uint8* swap = fReadyBuffer;
++			fReadyBuffer = fDecodeBuffers[index];
++			fDecodeBuffers[index] = swap;
++			fReadyStamp = stamp;
++			wake = !fReadyPending;
++			fReadyPending = true;
++		}
++		fDecodeLock.Unlock();
++		if (wake)
++			release_sem(fDecodedSem);
++	}
++
++	tj3Destroy(handle);
+ 	return B_OK;
++#else
++	return B_NOT_SUPPORTED;
++#endif
+ }
+ 
+ 
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+index e950a8bc11..d817ca5d02 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+@@ -12,6 +12,8 @@
+ #include "USB_video.h"
+ #include <usb/USB_video.h>
+ 
++#include <Locker.h>
++
+ 
+ class UVCCamDevice : public CamDevice {
+ public:
+@@ -38,6 +40,26 @@ public:
+ 	virtual status_t			DataPumpThread();
+ 
+ private:
++			struct Mode {
++				uint8			formatIndex;
++				uint8			frameIndex;
++				bool			compressed;
++				uint16			width;
++				uint16			height;
++				uint32			interval;
++					// the frame interval asked for (100 ns units)
++			};
++
++			const Mode*			_FindMode(uint32 width, uint32 height) const;
++			void				_AddMode(const usb_video_frame_descriptor*
++									descriptor, bool compressed, size_t len);
++			status_t			_StartDecoders();
++			void				_StopDecoders();
++			status_t			_DecoderThread(int32 index);
++	static	status_t			_DecoderEntry(void* data);
++			status_t			_FillFromDecoder(BBuffer* buffer,
++									bigtime_t* stamp);
++
+ 			void				_ParseVideoControl(
+ 									const usbvc_class_descriptor* descriptor,
+ 									size_t len);
+@@ -73,16 +95,45 @@ private:
+ 			uint16				fControlRequestIndex;
+ 			uint32				fStreamingIndex;
+ 			uint32				fUncompressedFormatIndex;
+-			uint32				fUncompressedFrameIndex;
+ 			uint32				fMJPEGFormatIndex;
+-			uint32				fMJPEGFrameIndex;
+ 			uint32				fMaxVideoFrameSize;
+ 			uint32				fMaxPayloadTransferSize;
+ 			uint32				fAlternatePayload;
+ 				// bytes per microframe of the chosen alternate setting
+ 
+-			BList				fUncompressedFrames;
+-			BList				fMJPEGFrames;
++			Mode				fModes[64];
++			int32				fModeCount;
++			const Mode*			fMode;
++				// the one AcceptVideoFrame() chose
++			uint8				fParsingFormatIndex;
++			bool				fParsingFormatUsable;
++				// the format the frame descriptors being parsed belong to
++			int32				fStreamWidth;
++			int32				fStreamHeight;
++			bool				fStreamCompressed;
++				// the stream StartTransfer() began (a format proposal may
++				// change fMode meanwhile)
++
++			// MJPEG: two threads decode frames in turn into their own
++			// buffers; the newest whole one becomes "ready", and
++			// FillFrameBuffer() swaps it with the one it copies from
++			enum { kDecoderCount = 2 };
++			struct DecoderStart {
++				UVCCamDevice*	device;
++				int32			index;
++			};
++			DecoderStart		fDecoderStarts[kDecoderCount];
++			thread_id			fDecoders[kDecoderCount];
++			uint8*				fDecodeBuffers[kDecoderCount];
++			uint8*				fReadyBuffer;
++			uint8*				fReadingBuffer;
++			BLocker				fDecodeLock;
++			sem_id				fDecodedSem;
++			int32				fFramesTaken;
++			int32				fNewestDecoded;
++			bigtime_t			fReadyStamp;
++			bool				fReadyPending;
++			volatile bool		fDecoding;
+ 
+ 			float				fBrightness;
+ 			float				fContrast;
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.cpp b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.cpp
+index 5f8e586741..19322dfcef 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.cpp
+@@ -23,7 +23,8 @@ UVCDeframer::UVCDeframer(CamDevice* device)
+ 	fID(-1),
+ 	fSynced(false),
+ 	fBad(false),
+-	fFrameSize(0)
++	fFrameSize(0),
++	fExactSize(true)
+ {
+ 	fInputBuffer.SetBlockSize(64 * 1024);
+ }
+@@ -35,10 +36,11 @@ UVCDeframer::~UVCDeframer()
+ 
+ 
+ void
+-UVCDeframer::Start(size_t frameSize)
++UVCDeframer::Start(size_t frameSize, bool exactSize)
+ {
+ 	BAutolock locker(fLocker);
+ 	fFrameSize = frameSize;
++	fExactSize = exactSize;
+ 	fID = -1;
+ 	fSynced = false;
+ 	fBad = false;
+@@ -106,7 +108,7 @@ UVCDeframer::_EndFrame()
+ 	size_t length = fInputBuffer.BufferLength();
+ 	if (length == 0)
+ 		return;
+-	if (fBad || (fFrameSize != 0 && length != fFrameSize)) {
++	if (fBad || (fExactSize && fFrameSize != 0 && length != fFrameSize)) {
+ 		fDropped++;
+ 		return;
+ 	}
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.h b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.h
+index c4707e7063..83fb5c7e16 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCDeframer.h
+@@ -13,10 +13,10 @@
+ 
+ /*!	Frames from UVC payload transfers (one Write() each: a header, then
+ 	data): a frame ends where the header's frame ID (FID) toggles or at its
+-	end-of-frame bit (EOF). Frames with the error bit (ERR) or, for an
+-	uncompressed format, the wrong size are dropped, as is the first,
+-	partial one. Only the newest frame waits to be taken: a consumer slower
+-	than the camera gets the latest picture, not an old one.
++	end-of-frame bit (EOF). Frames with the error bit (ERR), of the wrong
++	size (uncompressed) or too large (compressed) are dropped, as is the
++	first, partial one. Only the newest frame waits to be taken: a consumer
++	slower than the camera gets the latest picture, not an old one.
+ */
+ class UVCDeframer : public CamDeframer {
+ public:
+@@ -26,8 +26,9 @@ public:
+ 					// write from usb transfers
+ 	virtual ssize_t				Write(const void *buffer, size_t size);
+ 
+-			void				Start(size_t frameSize);
+-				// a new stream: frames of \a frameSize bytes, 0 any size
++			void				Start(size_t frameSize, bool exactSize);
++				// a new stream: frames of \a frameSize bytes (exactSize) or
++				// up to that many; 0 any size
+ 
+ 			int32				Frames() const { return fFrameCount; }
+ 			int32				Dropped() const { return fDropped; }
+@@ -43,6 +44,7 @@ private:
+ 		// a frame began after the stream started
+ 	bool						fBad;
+ 	size_t						fFrameSize;
++	bool						fExactSize;
+ 	BMallocIO					fInputBuffer;
+ };
+ 

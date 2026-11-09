@@ -1,0 +1,152 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 5 Nov 2026 21:03:52 -0500
+Subject: [PATCH 311/342] net_server: a DHCP client that asks for its old
+ address configures it
+
+Three faults in the path a client takes when it already has an address, which
+it does after a link loss now that the lease is kept:
+
+- An acknowledgement in REBOOTING went straight to BOUND without building the
+  interface configuration (only an offer did), so net_server got a message
+  without a device, refused it, and the interface stayed IFF_CONFIGURING. The
+  resolver's result then overwrote that error, and the log said "No error".
+  The configuration now comes from the acknowledgement in every state, and a
+  failure to configure the interface is reported and kept.
+- REBOOTING had no time of its own, so the first 250 ms without an answer made
+  it give up on the address. It's asked for again for 10 seconds now, then a
+  new discovery starts.
+- The socket was bound to the device only in INIT; with an address, a request
+  could leave through another interface on the same network.
+
+Found by a review of +319 (odroid-c2-plus319-open-issues-report.pdf).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/servers/net/DHCPClient.cpp | 75 +++++++++++++++++++++++++---------
+ 1 file changed, 55 insertions(+), 20 deletions(-)
+
+diff --git a/src/servers/net/DHCPClient.cpp b/src/servers/net/DHCPClient.cpp
+index a4a1a488fd..eb2d5dd55d 100644
+--- a/src/servers/net/DHCPClient.cpp
++++ b/src/servers/net/DHCPClient.cpp
+@@ -42,6 +42,7 @@
+ 
+ #define DEFAULT_TIMEOUT		0.25	// secs
+ #define MAX_TIMEOUT			64		// secs
++#define REBOOT_TIMEOUT		10		// secs
+ 
+ #define AS_USECS(t) (1000000 * t)
+ 
+@@ -659,16 +660,32 @@ DHCPClient::_Negotiate()
+ 	// configure interface
+ 	BMessage reply;
+ 	status = Target().SendMessage(&fConfiguration, &reply);
+-	if (status == B_OK)
+-		status = reply.FindInt32("status", &fStatus);
++	if (status == B_OK && reply.FindInt32("status", &status) != B_OK)
++		status = B_BAD_DATA;
++	if (status != B_OK) {
++		syslog(LOG_ERR, "%s: configuring the interface failed: %s\n",
++			Device(), strerror(status));
++		fStatus = status;
++		if (fNegotiateThread != -1)
++			Looper()->PostMessage(kMsgAutoConfigureFailed, Looper(), this);
++		return status;
++	}
+ 
+-	// configure resolver
++	// configure resolver; the interface is configured either way
+ 	reply.MakeEmpty();
+ 	fResolverConfiguration.AddString("device", Device());
+-	status = Target().SendMessage(&fResolverConfiguration, &reply);
+-	if (status == B_OK)
+-		status = reply.FindInt32("status", &fStatus);
+-	return status;
++	status_t resolverStatus = Target().SendMessage(&fResolverConfiguration,
++		&reply);
++	if (resolverStatus == B_OK
++		&& reply.FindInt32("status", &resolverStatus) != B_OK)
++		resolverStatus = B_BAD_DATA;
++	if (resolverStatus != B_OK) {
++		syslog(LOG_WARNING, "%s: configuring the resolver failed: %s\n",
++			Device(), strerror(resolverStatus));
++	}
++
++	fStatus = B_OK;
++	return B_OK;
+ }
+ 
+ 
+@@ -705,16 +722,26 @@ DHCPClient::_GotMessage(dhcp_state& state, dhcp_message* message)
+ 		case RENEWING:
+ 		case REQUESTING:
+ 			if (message->Type() == DHCP_ACK) {
+-				// TODO: we might want to configure the stuff, don't we?
++				// Our address request has been acknowledged. The interface is
++				// configured from the acknowledgement: a client that asks for
++				// the address it had (REBOOTING) never saw an offer, and the
++				// server may have changed the options since.
++				if (message->your_address != INADDR_ANY)
++					fAssignedAddress = message->your_address;
++
++				fConfiguration.MakeEmpty();
++				fConfiguration.AddString("device", Device());
++				fConfiguration.AddBool("auto_configured", true);
++
+ 				BMessage address;
++				address.AddString("family", "inet");
++				address.AddString("address", _AddressToString(fAssignedAddress));
+ 				fResolverConfiguration.MakeEmpty();
+ 				_ParseOptions(*message, address, fResolverConfiguration);
+-					// TODO: currently, only lease time and DNS is updated this
+-					// way
+ 
+-				// our address request has been acknowledged
+-				state = BOUND;
++				fConfiguration.AddMessage("address", &address);
+ 
++				state = BOUND;
+ 				return B_OK;
+ 			}
+ 
+@@ -735,13 +762,15 @@ DHCPClient::_GotMessage(dhcp_state& state, dhcp_message* message)
+ status_t
+ DHCPClient::_StateTransition(int socket, dhcp_state& state)
+ {
+-	if (state == INIT) {
+-		// The local interface does not have an address yet, bind the socket
+-		// to the device directly.
+-		BNetworkDevice device(Device());
+-		int index = device.Index();
+-
+-		setsockopt(socket, SOL_SOCKET, SO_BINDTODEVICE, &index, sizeof(int));
++	// Bind the socket to the device in every state: without an address yet
++	// it has no route, and with one the route may well go out through another
++	// interface on the same network.
++	BNetworkDevice device(Device());
++	int index = device.Index();
++	if (setsockopt(socket, SOL_SOCKET, SO_BINDTODEVICE, &index,
++			sizeof(int)) != 0) {
++		syslog(LOG_ERR, "%s: can't bind to the device: %s\n", Device(),
++			strerror(errno));
+ 	}
+ 
+ 	BNetworkAddress broadcast;
+@@ -1015,9 +1044,15 @@ DHCPClient::_TimeoutShift(int socket, dhcp_state& state,
+ 		stateMaxTime = fLeaseTime;
+ 	else if (state == SELECTING || state == REQUESTING)
+ 		stateMaxTime = fRequestTime + AS_USECS(MAX_TIMEOUT);
++	else if (state == REBOOTING) {
++		// Asking for the address we had: retransmitted for a while (the
++		// first requests after a wireless link comes back may go out before
++		// its keys), then over to a new discovery
++		stateMaxTime = fRequestTime + AS_USECS(REBOOT_TIMEOUT);
++	}
+ 
+ 	if (system_time() > stateMaxTime) {
+-		state = state == REBINDING ? INIT : REBINDING;
++		state = state == REBINDING || state == REBOOTING ? INIT : REBINDING;
+ 		return false;
+ 	}
+ 

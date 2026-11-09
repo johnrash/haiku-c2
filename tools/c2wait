@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""Wait for a regex in the C2 console output.
+
+c2wait <regex> <timeout-seconds> [--now]
+Searches output since the last c2send (run/console.mark), or only new output
+with --now. Prints the output it scanned and exits 0 on a match, 1 on timeout.
+"""
+import os
+import re
+import sys
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RUN = os.path.join(ROOT, "run")
+RAW = os.path.join(RUN, "console.raw")
+
+
+def size():
+	return os.path.getsize(RAW) if os.path.exists(RAW) else 0
+
+
+def main():
+	args = [a for a in sys.argv[1:] if a != "--now"]
+	if len(args) != 2:
+		sys.exit(__doc__)
+	pattern = re.compile(args[0].encode())
+	deadline = time.time() + float(args[1])
+	if "--now" in sys.argv:
+		start = size()
+	else:
+		try:
+			with open(os.path.join(RUN, "console.mark")) as f:
+				start = int(f.read())
+		except FileNotFoundError:
+			start = size()
+	while True:
+		with open(RAW, "rb") as f:
+			f.seek(start)
+			data = f.read()
+		if pattern.search(data):
+			sys.stdout.write(data.decode("utf-8", "replace").replace("\r", ""))
+			sys.exit(0)
+		if time.time() > deadline:
+			sys.stdout.write(data.decode("utf-8", "replace").replace("\r", ""))
+			print(f"\nc2wait: timeout waiting for {args[0]!r}", file=sys.stderr)
+			sys.exit(1)
+		time.sleep(0.1)
+
+
+if __name__ == "__main__":
+	main()

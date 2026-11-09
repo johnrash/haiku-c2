@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Tue, 3 Nov 2026 14:54:39 -0500
+Subject: [PATCH 269/342] dwc2: split parts in the microframe after the one
+ before
+
+The next part was armed for the microframe after the interrupt. With the
+interrupt in the microframe after the part, that left one out: the translator
+had the data of a complete-split then and dropped it, and all that followed got
+NYET until the packet was given up (a trace: start-split in .2, complete-splits
+in .4, .5, .6, .7, .0, all NYET). The part now goes for the microframe after the
+one before, which can still be the current one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/busses/usb/dwc2.h          |  2 +-
+ .../kernel/busses/usb/dwc2_isochronous.cpp    | 23 ++++++++++++++-----
+ 2 files changed, 18 insertions(+), 7 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.h b/src/add-ons/kernel/busses/usb/dwc2.h
+index f8d234317d..3966cf5b2b 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.h
++++ b/src/add-ons/kernel/busses/usb/dwc2.h
+@@ -133,7 +133,7 @@ struct dwc2_iso_stream {
+ 	bool					timerPending;
+ 	bool					stopping;
+ 	bigtime_t				timerTarget;
+-	uint32					partFrame;		// microframe of the last part
++	uint32					partFrame;		// microframe the part is for
+ 
+ 	dwc2_iso_statistics		stats;
+ };
+diff --git a/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp b/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
+index 6ad3598be9..57d3ec512c 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
+@@ -123,6 +123,7 @@ DWC2::_InitIsochronous(uint8* bounce, phys_addr_t physical)
+ 		stream.freeSlots = (1 << kIsoSlotCount) - 1;
+ 		stream.packet = 0;
+ 		stream.part = 0;
++		stream.partFrame = 0;
+ 		stream.size = 0;
+ 		stream.running = false;
+ 		stream.timerPending = false;
+@@ -667,16 +668,26 @@ DWC2::_IsoHalted(dwc2_iso_stream* stream, uint32 status)
+ 		return;
+ 	}
+ 
++	// A part belongs in the microframe right after the one before: the
++	// translator takes an OUT packet's parts only in a row, and a complete-
++	// split that does not come when the data is there loses it for good (all
++	// after it get NYET). The interrupt may come only in that microframe:
++	// then the part still goes out in it, armed with its parity. The first
++	// part ran in an even microframe.
+ 	uint32 frame = _Read(kHfnum) & 0x3fff;
+-	bool nextOdd = ((frame + 1) & 1) != 0;
++	uint32 nextFrame = (stream->part == 0 ? frame & ~(uint32)1
++		: stream->partFrame) + 1;
++	nextFrame &= 0x3fff;
++	if (((frame - nextFrame) & 0x3fff) < 0x2000 && frame != nextFrame) {
++		stream->stats.gaps++;
++		nextFrame = (frame + 1) & 0x3fff;
++	}
++	stream->partFrame = nextFrame;
++	bool nextOdd = (nextFrame & 1) != 0;
+ 	status_t error = dwc2_channel_error(status);
+ 
+ 	if (!stream->in) {
+-		// start-splits of isochronous OUT get no handshake; the translator
+-		// needs a packet's parts in consecutive microframes
+-		if (stream->part > 0 && frame != ((stream->partFrame + 1) & 0x3fff))
+-			stream->stats.gaps++;
+-		stream->partFrame = frame;
++		// start-splits of isochronous OUT get no handshake
+ 		if (error == B_OK && (status & HCINT_XFERCOMPL) != 0) {
+ 			uint32 length = stream->queue.Head()->length[stream->packet];
+ 			if ((stream->part + 1) * kSplitPayload < length) {

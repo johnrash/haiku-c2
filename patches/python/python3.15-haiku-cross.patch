@@ -1,0 +1,17 @@
+Cross builds for Haiku: the platform name (haiku-aarch64) in the second
+list of known cross targets; the first already has Haiku.
+
+Copyright 2026, haiku-odroid-c2 port authors. MIT License.
+
+--- a/configure.ac
++++ b/configure.ac
+@@ -831,6 +831,9 @@
+ 	*-*-vxworks*)
+ 		_host_ident=$host_cpu
+ 		;;
++	*-*-haiku*)
++		_host_ident=$host_cpu
++		;;
+ 	*-*-emscripten)
+ 		_host_ident=$(emcc -dumpversion | cut -f1 -d-)-$host_cpu
+ 		;;

@@ -1,0 +1,14 @@
+--- a/src/gallium/winsys/sw/hgl/hgl_sw_winsys.cpp
++++ b/src/gallium/winsys/sw/hgl/hgl_sw_winsys.cpp
+@@ -130,8 +130,10 @@
+ 
+ 	if (textureUsage & PIPE_BIND_DISPLAY_TARGET) {
+ 		haikuDisplayTarget->data = NULL;
++		// with Mesa's stride: BBitmap(BRect, color_space, int32) would be
++		// the (bool acceptsViews) constructor and use its own row length
+ 		haikuDisplayTarget->bitmap = new BBitmap(
+-			BRect(0, 0, width - 1, height - 1),
++			BRect(0, 0, width - 1, height - 1), 0,
+ 			haikuDisplayTarget->colorSpace,
+ 			haikuDisplayTarget->stride);
+ 	} else {

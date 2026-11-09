@@ -1,0 +1,1945 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Mon, 2 Nov 2026 04:36:54 -0500
+Subject: [PATCH 257/342] realtekwifi: RTL8822BU, phase 2 (association and
+ WPA2)
+
+Station mode for the RTL8822BU: media status and default port H2C on
+association, firmware rate adaptation (RA info, RSSI monitor, the
+firmware's rate reports shown as the node's Tx rate), management and
+EAPOL frames at fixed low rates, IQK once per channel (at join, not
+while scanning) and again on a temperature change of 8 or more,
+hardware crypto for pairwise and group keys with rtw88's CAM group bit,
+frames the hardware left encrypted handed to net80211, and the AID,
+RRSR, preamble and basic rate registers as rtw88 leaves them. From
+rtw88 (v7.0) under BSD-3-Clause, as phase 1.
+
+rtwn core: cam_group_bits, 0 on every other chip.
+
+Compile-tested only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../drivers/network/wlan/realtekwifi/Jamfile  |   1 +
+ .../wlan/realtekwifi/dev/rtwn/if_rtwn_cam.c   |   4 +-
+ .../wlan/realtekwifi/dev/rtwn/if_rtwnvar.h    |   6 +
+ .../wlan/realtekwifi/dev/rtwn/rtl8822b/r22b.h |  43 +-
+ .../realtekwifi/dev/rtwn/rtl8822b/r22b_chan.c |  17 +-
+ .../realtekwifi/dev/rtwn/rtl8822b/r22b_fw.c   |  22 +-
+ .../dev/rtwn/rtl8822b/r22b_fw_cmd.h           |  41 +
+ .../realtekwifi/dev/rtwn/rtl8822b/r22b_init.c |  25 +-
+ .../realtekwifi/dev/rtwn/rtl8822b/r22b_phy.c  |  93 +-
+ .../realtekwifi/dev/rtwn/rtl8822b/r22b_ra.c   | 845 ++++++++++++++++++
+ .../realtekwifi/dev/rtwn/rtl8822b/r22b_reg.h  |  15 +
+ .../realtekwifi/dev/rtwn/rtl8822b/r22b_rx.c   | 162 +++-
+ .../realtekwifi/dev/rtwn/rtl8822b/r22b_tx.c   | 135 ++-
+ .../realtekwifi/dev/rtwn/rtl8822b/r22b_var.h  |  41 +
+ .../dev/rtwn/rtl8822b/usb/r22bu_attach.c      |  28 +-
+ .../dev/rtwn/rtl8822b/usb/r22bu_rx.c          |  31 +-
+ 16 files changed, 1396 insertions(+), 113 deletions(-)
+ create mode 100644 src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_ra.c
+
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/Jamfile b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/Jamfile
+index 226f5187c8..639dfc4815 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/Jamfile
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/Jamfile
+@@ -160,6 +160,7 @@ KernelAddon realtekwifi :
+ 	r22b_fw.c
+ 	r22b_init.c
+ 	r22b_phy.c
++	r22b_ra.c
+ 	r22b_rom.c
+ 	r22b_rx.c
+ 	r22b_table.c
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn_cam.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn_cam.c
+index d142cd0476..7f47205752 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn_cam.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn_cam.c
+@@ -238,7 +238,9 @@ rtwn_key_set_cb0(struct rtwn_softc *sc, const struct ieee80211_key *k)
+ 	    SM(R92C_CAM_ALGO, algo) |
+ 	    SM(R92C_CAM_KEYID, keyid) |
+ 	    SM(R92C_CAM_MACLO, le16dec(&k->wk_macaddr[0])) |
+-	    R92C_CAM_VALID);
++	    R92C_CAM_VALID |
++	    ((sc->sc_hwcrypto == RTWN_CRYPTO_FULL &&
++	      k->wk_keyix < IEEE80211_WEP_NKID) ? sc->cam_group_bits : 0));
+ 	if (error != 0)
+ 		goto fail;
+ 
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwnvar.h b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwnvar.h
+index b7fb50cc1f..494a44cddd 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwnvar.h
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwnvar.h
+@@ -417,6 +417,12 @@ struct rtwn_softc {
+ 	int				macid_limit;
+ 	int				macid_rpt2_max_num;
+ 	int				cam_entry_limit;
++	/*
++	 * Extra bits for the first word of a group (default) key's CAM
++	 * entry in RTWN_CRYPTO_FULL mode; 0 except on the RTL8822B, where
++	 * rtw88 marks group keys with BIT(6).
++	 */
++	uint32_t			cam_group_bits;
+ 	int				fwsize_limit;
+ 	int				temp_delta;
+ 
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b.h b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b.h
+index 302cb17d84..5e96100256 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b.h
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b.h
+@@ -36,6 +36,7 @@
+ #define R22B_EFUSE_MAP_LEN		768	/* log_efuse_size */
+ 
+ #define R22B_MACID_MAX			31	/* RTW_MAX_MAC_ID_NUM - 1 */
++#define R22B_MACID_NUM			(R22B_MACID_MAX + 1)
+ #define R22B_CAM_ENTRY_COUNT		32	/* sec.total_cam_num */
+ #define R22B_MAX_FW_SIZE		0x40000
+ #define R22B_RF_PATH_MAX		2
+@@ -51,6 +52,32 @@
+ 
+ /* Hardware rates (enum rtw_trx_desc_rate), equal to rtwn's ridx. */
+ #define R22B_RATE_MAX			0x54	/* DESC_RATE_MAX */
++#define R22B_DESC_RATE1M		0x00
++#define R22B_DESC_RATE11M		0x03
++#define R22B_DESC_RATE6M		0x04
++#define R22B_DESC_RATE54M		0x0b
++#define R22B_DESC_RATEMCS0		0x0c
++#define R22B_DESC_RATEMCS7		0x13
++#define R22B_DESC_RATEMCS8		0x14
++#define R22B_DESC_RATEMCS15		0x1b
++#define R22B_DESC_RATEMCS16		0x1c
++#define R22B_DESC_RATEMCS24		0x24
++#define R22B_DESC_RATEVHT1SS_MCS0	0x2c
++#define R22B_DESC_RATEVHT2SS_MCS0	0x36
++#define R22B_DESC_RATEVHT3SS_MCS0	0x40
++#define R22B_DESC_RATEVHT4SS_MCS0	0x4a
++
++/* enum rtw_wireless_set */
++#define R22B_WIRELESS_CCK		0x01
++#define R22B_WIRELESS_OFDM		0x02
++#define R22B_WIRELESS_HT		0x04
++#define R22B_WIRELESS_VHT		0x08
++
++/* rtw_sta_info stbc_en / ldpc_en values (main.h) */
++#define R22B_HT_STBC_EN			0x01
++#define R22B_VHT_STBC_EN		0x02
++#define R22B_HT_LDPC_EN			0x01
++#define R22B_VHT_LDPC_EN		0x02
+ 
+ /* Rate sections (enum rtw_rate_section); only up to 2SS on the 8822B. */
+ #define R22B_RS_CCK			0
+@@ -138,7 +165,7 @@ void	r22b_fw_send_general_info(struct rtwn_softc *);
+ void	r22b_fw_send_phydm_info(struct rtwn_softc *);
+ int	r22b_ltecoex_read(struct rtwn_softc *, uint16_t, uint32_t *);
+ int	r22b_ltecoex_write(struct rtwn_softc *, uint16_t, uint32_t);
+-void	r22b_set_media_status(struct rtwn_softc *, int);
++void	r22b_fw_do_iqk(struct rtwn_softc *, int, int);
+ int	r22b_set_rsvd_page(struct rtwn_softc *, int, int, int);
+ int	r22b_set_pwrmode(struct rtwn_softc *, struct ieee80211vap *, int);
+ 
+@@ -179,12 +206,26 @@ void	r22b_dig_write(struct rtwn_softc *, uint8_t);
+ void	r22b_temp_measure(struct rtwn_softc *);
+ uint8_t	r22b_temp_read(struct rtwn_softc *);
+ void	r22b_lc_calib(struct rtwn_softc *);
++void	r22b_do_iqk(struct rtwn_softc *);
++void	r22b_iqk_check(struct rtwn_softc *, int);
+ void	r22b_iq_calib(struct rtwn_softc *);
+ 
++/* r22b_ra.c */
++void	r22b_set_media_status(struct rtwn_softc *, int);
++void	r22b_set_rssi(struct rtwn_softc *);
++void	r22b_handle_ra_report(struct rtwn_softc *, const uint8_t *, int);
++void	r22b_assoc_regs(struct rtwn_softc *, int);
++void	r22b_assoc_regs_reset(struct rtwn_softc *);
++void	r22b_ra_reset(struct rtwn_softc *);
++
+ /* r22b_rom.c */
+ void	r22b_parse_rom(struct rtwn_softc *, uint8_t *);
+ 
+ /* r22b_rx.c */
++#define R22B_C2H_ALL		0	/* r22b_c2h_walk() "want" */
++#define R22B_C2H_SHORT		1
++#define R22B_C2H_COUNT		2
++int	r22b_c2h_walk(struct rtwn_softc *, uint8_t *, int, int, int *);
+ void	r22b_handle_c2h_report(struct rtwn_softc *, uint8_t *, int);
+ int	r22b_check_frame(struct rtwn_softc *, struct mbuf *);
+ uint8_t	r22b_rx_radiotap_flags(const void *);
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_chan.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_chan.c
+index 0034866b42..444c4206ec 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_chan.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_chan.c
+@@ -433,10 +433,11 @@ r22b_set_chan(struct rtwn_softc *sc, struct ieee80211_channel *c)
+ 	r22b_set_tx_power_level(sc);
+ 
+ 	/*
+-	 * TODO (phase 2): rtw88 sets need_rfk here and runs the firmware
+-	 * IQK (r22b_iq_calib()) before the first transmission on a channel
+-	 * outside a scan (rtw_chip_prepare_tx() from mgd_prepare_tx).
++	 * rtw88 sets need_rfk here outside a scan and runs the firmware
++	 * IQK before the first transmission (rtw_chip_prepare_tx()); see
++	 * r22b_iqk_check() for when it runs here.
+ 	 */
++	r22b_iqk_check(sc, 0);
+ }
+ 
+ /*
+@@ -471,4 +472,14 @@ r22b_scan_end(struct ieee80211com *ic)
+ 	RTWN_UNLOCK(sc);
+ 
+ 	rs->rs_scan_end(ic);
++
++	/*
++	 * rtwn_scan_end() rewrites the RRSR and the initial RTS rate with
++	 * its basic rate set (a background scan while associated); put
++	 * back what r22b_assoc_regs() programs.
++	 */
++	RTWN_LOCK(sc);
++	if ((sc->sc_flags & RTWN_RUNNING) && rs->nsta > 0)
++		r22b_assoc_regs(sc, -1);
++	RTWN_UNLOCK(sc);
+ }
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_fw.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_fw.c
+index 7e7d487dbb..d58a964ade 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_fw.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_fw.c
+@@ -779,19 +779,21 @@ r22b_fw_send_phydm_info(struct rtwn_softc *sc)
+ }
+ 
+ /*
+- * TODO (phase 2): media status report.  rtw88 (rtw_fw_media_status_report())
+- * sends H2C_CMD_MEDIA_STATUS_RPT (0x01) with
+- *	byte 0 = 0x01, dword 0 BIT(8) = connected, dword 0 [23:16] = macid
+- * on association/disassociation; it is needed before firmware rate
+- * adaptation (H2C_CMD_RA_INFO, rtw_fw_send_ra_info()) and power save.
+- * "macid" here is rtwn's (id | RTWN_MACID_VALID) for connect and the
+- * plain id for disconnect, see rtwn_newassoc() / rtwn_node_free().
++ * rtw_fw_do_iqk(): start the firmware IQ calibration (H2C_PKT_IQK);
++ * r22b_do_iqk() waits for it.
+  */
+ void
+-r22b_set_media_status(struct rtwn_softc *sc, int macid)
++r22b_fw_do_iqk(struct rtwn_softc *sc, int clear, int segment_iqk)
+ {
+-	RTWN_DPRINTF(sc, RTWN_DEBUG_RA, "%s: macid 0x%x (not implemented)\n",
+-	    __func__, macid);
++	uint8_t h2c_pkt[R22B_H2C_PKT_SIZE] = { 0 };
++	const uint16_t total_size = R22B_H2C_PKT_HDR_SIZE + 1;
++
++	r22b_h2c_pkt_set_header(h2c_pkt, R22B_H2C_PKT_IQK);
++	r22b_h2c_set(h2c_pkt, 1, R22B_GENMASK(15, 0), total_size);
++	r22b_h2c_set(h2c_pkt, 2, R22B_IQK_CLEAR, clear != 0);
++	r22b_h2c_set(h2c_pkt, 2, R22B_IQK_SEGMENT_IQK, segment_iqk != 0);
++
++	(void)r22b_fw_send_h2c_pkt(sc, h2c_pkt);
+ }
+ 
+ /*
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_fw_cmd.h b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_fw_cmd.h
+index 0df56979ba..b3282f0469 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_fw_cmd.h
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_fw_cmd.h
+@@ -78,10 +78,43 @@ struct r22b_fw_hdr {
+ #define R22B_H2C_CMD_SET_PWR_MODE	0x20
+ #define R22B_H2C_CMD_RA_INFO		0x40
+ #define R22B_H2C_CMD_RSSI_MONITOR	0x42
++#define R22B_H2C_CMD_DEFAULT_PORT	0x2c
+ #define R22B_H2C_CMD_COEX_TDMA_TYPE	0x60
+ #define R22B_H2C_CMD_QUERY_BT_INFO	0x61
+ #define R22B_H2C_CMD_BT_WIFI_CONTROL	0x69
+ 
++/* Byte 0 of every command: SET_H2C_CMD_ID_CLASS(), GENMASK(7, 0). */
++#define R22B_H2C_CMD_ID			0x000000ff
++
++/* H2C_CMD_MEDIA_STATUS_RPT (MEDIA_STATUS_RPT_SET_*), dword 0 */
++#define R22B_MEDIA_STATUS_OP_MODE	0x00000100
++#define R22B_MEDIA_STATUS_MACID		0x00ff0000
++
++/* H2C_CMD_DEFAULT_PORT (RTW_H2C_DEFAULT_PORT_W0_*), dword 0 */
++#define R22B_DEFAULT_PORT_PORTID	0x0000ff00
++#define R22B_DEFAULT_PORT_MACID		0x00ff0000
++
++/* H2C_CMD_RA_INFO (SET_RA_INFO_*): dword 0, then the mask in dword 1 */
++#define R22B_RA_INFO_MACID		0x0000ff00
++#define R22B_RA_INFO_RATE_ID		0x001f0000
++#define R22B_RA_INFO_INIT_RA_LVL	0x00600000
++#define R22B_RA_INFO_SGI_EN		0x00800000
++#define R22B_RA_INFO_BW_MODE		0x03000000
++#define R22B_RA_INFO_LDPC		0x04000000
++#define R22B_RA_INFO_NO_UPDATE		0x08000000
++#define R22B_RA_INFO_VHT_EN		0x30000000
++#define R22B_RA_INFO_DIS_PT		0x40000000
++#define R22B_RA_INFO_RA_MASK		0xffffffff	/* dword 1 */
++
++/* H2C_CMD_RSSI_MONITOR (SET_RSSI_INFO_*) */
++#define R22B_RSSI_INFO_MACID		0x0000ff00	/* dword 0 */
++#define R22B_RSSI_INFO_RSSI		0xff000000	/* dword 0 */
++#define R22B_RSSI_INFO_STBC		0x00000002	/* dword 1 */
++
++/* H2C_PKT_IQK (IQK_SET_*), dword 2 of the H2C packet */
++#define R22B_IQK_CLEAR			0x00000001
++#define R22B_IQK_SEGMENT_IQK		0x00000002
++
+ /* H2C_CMD_BT_WIFI_CONTROL op codes (rtw88 coex.h). */
+ #define R22B_COEX_H2C69_WL_LEAKAP	0x0c
+ #define R22B_PARA1_H2C69_DIS_5MS	0x01
+@@ -93,4 +126,12 @@ struct r22b_fw_hdr {
+ #define R22B_C2H_HW_FEATURE_REPORT	0x19
+ #define R22B_C2H_HALMAC			0xff
+ 
++/* C2H_RA_RPT payload (rtw88 fw.h, struct rtw_c2h_ra_rpt) */
++#define R22B_C2H_RA_RPT_RATE_SGI	0	/* byte offsets */
++#define R22B_C2H_RA_RPT_MACID		1
++#define R22B_C2H_RA_RPT_BW		6
++#define R22B_C2H_RA_RPT_SIZE		7	/* c2h_ra_report_size */
++#define R22B_C2H_RA_RPT_RATE		0x7f	/* RTW_C2H_RA_RPT_RATE */
++#define R22B_C2H_RA_RPT_SGI		0x80	/* RTW_C2H_RA_RPT_SGI */
++
+ #endif	/* R22B_FW_CMD_H */
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_init.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_init.c
+index 740194f865..146b533490 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_init.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_init.c
+@@ -1247,8 +1247,20 @@ r22b_post_init(struct rtwn_softc *sc)
+ {
+ 	struct r22b_softc *rs = sc->sc_priv;
+ 
++	/* No stations and no IQK yet after a power on. */
++	r22b_ra_reset(sc);
++
+ 	r22b_restore_mac_defaults(sc);
+ 
++	/*
++	 * Registers rtwn writes on association but rtw88 does not (see
++	 * r22b_assoc_regs()): remember their initial values.
++	 */
++	rs->saved_bcn_psr_rpt = rtwn_read_2(sc, R22B_REG_BCN_PSR_RPT);
++	rs->saved_inirts_rate_sel = rtwn_read_1(sc, R22B_REG_INIRTS_RATE_SEL);
++	rs->saved_shpre = rtwn_read_4(sc, R22B_REG_WMAC_TRXPTCL_CTL) &
++	    R22B_BIT_RTWN_SHPRE;
++
+ 	/*
+ 	 * rtw_sec_enable_sec_engine(): REG_CR BIT(9); the other rtwn chips
+ 	 * set R92C_CR_ENSEC (the same bit) in their power-on code.
+@@ -1264,15 +1276,18 @@ r22b_post_init(struct rtwn_softc *sc)
+ 	r22b_coex_init_hw_config(sc, !rs->btcoex);
+ 
+ 	/*
+-	 * TODO (phase 2): firmware rate adaptation (H2C_CMD_RA_INFO) is not
+-	 * implemented; use net80211 rate control like the RTL8812AU does.
++	 * Rate control is done by the firmware, as in rtw88 (r22b_ra.c).
++	 * net80211 rate control (rtwn's default "ratectl" setting) would
++	 * need per-frame Tx reports, which this driver does not request,
++	 * so it selects firmware rate control as well; only "0 - disabled"
++	 * (fixed rates) is honoured.
+ 	 */
+ #ifndef RTWN_WITHOUT_UCODE
+ 	if (sc->sc_flags & RTWN_FW_LOADED) {
+-		if (sc->sc_ratectl_sysctl == RTWN_RATECTL_FW)
+-			sc->sc_ratectl = RTWN_RATECTL_NET80211;
++		if (sc->sc_ratectl_sysctl == RTWN_RATECTL_NONE)
++			sc->sc_ratectl = RTWN_RATECTL_NONE;
+ 		else
+-			sc->sc_ratectl = sc->sc_ratectl_sysctl;
++			sc->sc_ratectl = RTWN_RATECTL_FW;
+ 	} else
+ #endif
+ 		sc->sc_ratectl = RTWN_RATECTL_NONE;
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_phy.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_phy.c
+index 6ad9bc1313..0bdf41a5e1 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_phy.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_phy.c
+@@ -837,28 +837,95 @@ r22b_temp_read(struct rtwn_softc *sc)
+ }
+ 
+ /*
+- * TODO (phase 2/3): LC calibration.  rtw88 has no separate LCK for the
+- * 8822B; it is part of the firmware IQK and of power tracking
+- * (rtw_phy_pwrtrack_need_lck() is not used by rtw8822b.c).
++ * sc_lc_calib (rtwn_temp_calib() calls it with the IQK): rtw88 has no
++ * separate LC calibration for the 8822B (rtw8822b_phy_calibration() is
++ * the firmware IQK only, and rtw8822b.c never checks
++ * rtw_phy_pwrtrack_need_lck()), so there is nothing to do.
+  */
+ void
+ r22b_lc_calib(struct rtwn_softc *sc)
+ {
+-	RTWN_DPRINTF(sc, RTWN_DEBUG_CALIB, "%s: not implemented\n",
+-	    __func__);
+ }
+ 
+ /*
+- * TODO (phase 2): IQ calibration.  rtw88 (rtw8822b_do_iqk()) sends the
+- * H2C_PKT_IQK packet (clear = 0, segment_iqk = 0), polls RF_DTXLOK of
+- * path A until it reads 0xabcde (up to 300 x 20 ms), writes 0 back and
+- * reads REG_IQKFAILMSK.  It runs before the first transmission on a
+- * new channel (rtw_chip_prepare_tx(), i.e. before association) and from
+- * power tracking when the thermal delta exceeds iqk_threshold (8).
++ * rtw8822b_do_iqk(): firmware IQ calibration.  rtw_fw_do_iqk() starts
++ * it (clear = 0, segment_iqk = 0); the firmware writes 0xabcde to RF
++ * register 0x08 of path A when it is done.  The delays drop the driver
++ * lock (USB), so this may take a while without blocking the system.
++ */
++void
++r22b_do_iqk(struct rtwn_softc *sc)
++{
++	uint32_t rf_reg;
++	int counter, reload, fail_mask;
++
++	r22b_fw_do_iqk(sc, 0, 0);
++
++	for (counter = 0; counter < 300; counter++) {
++		rf_reg = r22b_rf_read(sc, R22B_RF_PATH_A, R22B_RF_DTXLOK);
++		if (rf_reg == 0xabcde)
++			break;
++		rtwn_delay(sc, 20000);	/* msleep(20) */
++	}
++	r22b_rf_write(sc, R22B_RF_PATH_A, R22B_RF_DTXLOK, 0x0);
++
++	reload = r22b_read32_mask(sc, R22B_REG_IQKFAILMSK, R22B_BIT(16));
++	fail_mask = r22b_read32_mask(sc, R22B_REG_IQKFAILMSK,
++	    R22B_GENMASK(7, 0));
++
++	/* rtw88 only logs this at debug level. */
++	if (counter == 300)
++		device_printf(sc->sc_dev, "IQK did not finish\n");
++	RTWN_DPRINTF(sc, RTWN_DEBUG_CALIB,
++	    "iqk counter=%d reload=%d n_iqk_fail(mask)=0x%02x\n",
++	    counter, reload, fail_mask);
++}
++
++/*
++ * When to run the IQK.  rtw88 marks every channel change outside a scan
++ * as needing calibration (rtw_set_channel(): need_rfk) and calibrates
++ * in rtw_chip_prepare_tx(), i.e. before authenticating; power tracking
++ * recalibrates when the temperature moved by iqk_threshold.  Here the
++ * IQK runs once per primary channel when rtwn is running and not
++ * scanning: in practice when net80211 tunes to the BSS channel to join
++ * (r22b_set_chan()), with r22b_set_media_status() as a fallback, and
++ * "force" again for the temperature trigger (r22b_iq_calib()).  The
++ * record is cleared at power on and when the last station leaves.
++ * 2.4 and 5 GHz channel numbers do not overlap, so the primary channel
++ * number identifies the channel.
++ */
++void
++r22b_iqk_check(struct rtwn_softc *sc, int force)
++{
++	struct ieee80211com *ic = &sc->sc_ic;
++	struct r22b_softc *rs = sc->sc_priv;
++
++	if ((sc->sc_flags & (RTWN_RUNNING | RTWN_FW_LOADED)) !=
++	    (RTWN_RUNNING | RTWN_FW_LOADED))
++		return;
++	if (ic->ic_flags & IEEE80211_F_SCAN)
++		return;
++	if (!force && rs->iqk_chan == rs->cur_pri_chan)
++		return;
++
++	RTWN_DPRINTF(sc, RTWN_DEBUG_CALIB, "%s: IQK on channel %u%s\n",
++	    __func__, rs->cur_pri_chan, force ? " (temperature)" : "");
++
++	r22b_do_iqk(sc);
++	rs->iqk_chan = rs->cur_pri_chan;
++}
++
++/*
++ * sc_iq_calib: rtwn_temp_calib() calls it when the thermal meter moved
++ * by more than sc->temp_delta from the last calibration, which is
++ * rtw_phy_pwrtrack_need_iqk() (delta >= iqk_threshold).  Only while
++ * associated, like rtw88's power tracking.
+  */
+ void
+ r22b_iq_calib(struct rtwn_softc *sc)
+ {
+-	RTWN_DPRINTF(sc, RTWN_DEBUG_CALIB, "%s: not implemented\n",
+-	    __func__);
++	struct r22b_softc *rs = sc->sc_priv;
++
++	if (rs->nsta > 0)
++		r22b_iqk_check(sc, 1);
+ }
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_ra.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_ra.c
+new file mode 100644
+index 0000000000..9038ecc5f7
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_ra.c
+@@ -0,0 +1,845 @@
++/*-
++ * SPDX-License-Identifier: BSD-3-Clause
++ *
++ * Copyright(c) 2018-2019  Realtek Corporation
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ *
++ * Derived from Linux's rtw88 driver (v7.0), used under its BSD-3-Clause option;
++ * see LICENSE.rtw88 in this directory.
++ */
++
++/*
++ * RTL8822B station state: firmware rate adaptation (H2C RA info, RSSI
++ * monitor, C2H rate reports), media status, the response rate set and
++ * the port registers written on association.
++ *
++ * rtwn calls sc_set_media_status from its command queue when a node gets
++ * a MAC id (rtwn_newassoc(): id | RTWN_MACID_VALID, in station mode when
++ * net80211 enters RUN) and when the node is freed (rtwn_node_free():
++ * plain id).  That is rtw88's rtw_sta_add() / rtw_sta_remove() plus the
++ * station part of rtw_ops_bss_info_changed(BSS_CHANGED_ASSOC).
++ *
++ * sc_set_rssi runs every 2 seconds from rtwn's calibration callout while
++ * sc_ratectl is RTWN_RATECTL_FW, the period of rtw88's watchdog; it does
++ * what rtw_phy_dynamic_mechanism() does for rate adaptation: the RSSI
++ * monitor H2C for every station, the RA info update every fourth run and
++ * the RRSR update.
++ *
++ * Sources (rtw88 v7.0): main.c (rtw_sta_add, rtw_sta_remove,
++ * rtw_update_sta_info, get_rate_id, get_vht_ra_mask, rtw_rate_mask_rssi,
++ * rtw_rate_mask_recover, rtw_vif_assoc_changed, rtw_vif_port_config),
++ * fw.c (rtw_fw_send_ra_info, rtw_fw_send_rssi_info,
++ * rtw_fw_media_status_report, rtw_fw_default_port,
++ * rtw_fw_ra_report_handle, rtw_fw_ra_report_iter), phy.c
++ * (rtw_phy_get_rssi_level, rtw_phy_stat_rssi, rtw_phy_ra_info_update,
++ * rtw_phy_get_rrsr_mask, rtw_phy_rrsr_update), tx.c
++ * (get_highest_ht_tx_rate, get_highest_vht_tx_rate,
++ * rtw_tx_data_pkt_info_update), mac80211.c (rtw_ops_bss_info_changed,
++ * rtw_vif_port[]).
++ */
++
++#include <sys/cdefs.h>
++#include "opt_wlan.h"
++
++#include <sys/param.h>
++#include <sys/lock.h>
++#include <sys/mutex.h>
++#include <sys/mbuf.h>
++#include <sys/kernel.h>
++#include <sys/socket.h>
++#include <sys/systm.h>
++#include <sys/malloc.h>
++#include <sys/queue.h>
++#include <sys/taskqueue.h>
++#include <sys/bus.h>
++#include <sys/endian.h>
++#include <sys/linker.h>
++
++#include <net/if.h>
++#include <net/ethernet.h>
++#include <net/if_media.h>
++
++#include <net80211/ieee80211_var.h>
++#include <net80211/ieee80211_radiotap.h>
++#include <net80211/ieee80211_ht.h>
++#include <net80211/ieee80211_vht.h>
++
++#include <dev/rtwn/if_rtwnreg.h>
++#include <dev/rtwn/if_rtwnvar.h>
++
++#include <dev/rtwn/if_rtwn_debug.h>
++#include <dev/rtwn/if_rtwn_ridx.h>
++
++#include <dev/rtwn/rtl8822b/r22b.h>
++#include <dev/rtwn/rtl8822b/r22b_fw_cmd.h>
++#include <dev/rtwn/rtl8822b/r22b_priv.h>
++#include <dev/rtwn/rtl8822b/r22b_reg.h>
++#include <dev/rtwn/rtl8822b/r22b_tx_desc.h>
++#include <dev/rtwn/rtl8822b/r22b_var.h>
++
++/* rtw88 main.c */
++#define R22B_RA_MASK_CCK_RATES		0x0000fULL
++#define R22B_RA_MASK_OFDM_RATES		0x00ff0ULL
++#define R22B_RA_MASK_HT_RATES_1SS	(0xff000ULL << 0)
++#define R22B_RA_MASK_HT_RATES_2SS	(0xff000ULL << 8)
++#define R22B_RA_MASK_HT_RATES_3SS	(0xff000ULL << 16)
++#define R22B_RA_MASK_HT_RATES		(R22B_RA_MASK_HT_RATES_1SS | \
++					 R22B_RA_MASK_HT_RATES_2SS | \
++					 R22B_RA_MASK_HT_RATES_3SS)
++#define R22B_RA_MASK_VHT_RATES_1SS	(0x3ff000ULL << 0)
++#define R22B_RA_MASK_VHT_RATES_2SS	(0x3ff000ULL << 10)
++#define R22B_RA_MASK_VHT_RATES_3SS	(0x3ff000ULL << 20)
++#define R22B_RA_MASK_VHT_RATES		(R22B_RA_MASK_VHT_RATES_1SS | \
++					 R22B_RA_MASK_VHT_RATES_2SS | \
++					 R22B_RA_MASK_VHT_RATES_3SS)
++#define R22B_RA_MASK_CCK_IN_BG		0x00005ULL
++#define R22B_RA_MASK_CCK_IN_HT		0x00005ULL
++#define R22B_RA_MASK_CCK_IN_VHT		0x00005ULL
++#define R22B_RA_MASK_OFDM_IN_VHT	0x00010ULL
++#define R22B_RA_MASK_OFDM_IN_HT_2G	0x00010ULL
++#define R22B_RA_MASK_OFDM_IN_HT_5G	0x00030ULL
++
++/* IEEE80211_VHT_MCS_SUPPORT_0_* */
++#define R22B_VHT_MCS_0_7		0
++#define R22B_VHT_MCS_0_8		1
++#define R22B_VHT_MCS_0_9		2
++
++/*
++ * Bit of a legacy rate (500 kb/s units) in the RA mask and in rtw88's
++ * supp_rates bitmaps: the hardware rate index, i.e. rtwn's ridx.
++ */
++static int
++r22b_legacy_rate_bit(uint8_t rate)
++{
++	switch (rate & IEEE80211_RATE_VAL) {
++	case 2:		return (RTWN_RIDX_CCK1);
++	case 4:		return (RTWN_RIDX_CCK2);
++	case 11:	return (RTWN_RIDX_CCK55);
++	case 22:	return (RTWN_RIDX_CCK11);
++	case 12:	return (RTWN_RIDX_OFDM6);
++	case 18:	return (RTWN_RIDX_OFDM9);
++	case 24:	return (RTWN_RIDX_OFDM12);
++	case 36:	return (RTWN_RIDX_OFDM18);
++	case 48:	return (RTWN_RIDX_OFDM24);
++	case 72:	return (RTWN_RIDX_OFDM36);
++	case 96:	return (RTWN_RIDX_OFDM48);
++	case 108:	return (RTWN_RIDX_OFDM54);
++	default:	return (-1);
++	}
++}
++
++/* get_vht_ra_mask(): from the station's VHT Rx MCS map */
++static uint64_t
++r22b_get_vht_ra_mask(uint16_t mcs_map)
++{
++	uint64_t ra_mask = 0;
++	int i, nss;
++
++	/* 4SS, every two bits for MCS7/8/9 */
++	for (i = 0, nss = 12; i < 4; i++, mcs_map >>= 2, nss += 10) {
++		switch (mcs_map & 0x3) {
++		case R22B_VHT_MCS_0_9:
++			ra_mask |= 0x3ffULL << nss;
++			break;
++		case R22B_VHT_MCS_0_8:
++			ra_mask |= 0x1ffULL << nss;
++			break;
++		case R22B_VHT_MCS_0_7:
++			ra_mask |= 0x0ffULL << nss;
++			break;
++		default:
++			break;
++		}
++	}
++
++	return (ra_mask);
++}
++
++/*
++ * get_rate_id().  The 8822B has at most two spatial streams, so the 3SS
++ * and 4SS rate ids are not needed; like rtw88, a wireless set that is
++ * not listed (CCK | OFDM | HT | VHT, i.e. VHT on 2.4 GHz) gives 0.
++ */
++static uint8_t
++r22b_get_rate_id(uint8_t wireless_set, uint8_t bw_mode, uint8_t tx_num)
++{
++	switch (wireless_set) {
++	case R22B_WIRELESS_CCK:
++		return (R22B_RATEID_B_20M);
++	case R22B_WIRELESS_OFDM:
++		return (R22B_RATEID_G);
++	case R22B_WIRELESS_CCK | R22B_WIRELESS_OFDM:
++		return (R22B_RATEID_BG);
++	case R22B_WIRELESS_OFDM | R22B_WIRELESS_HT:
++		return (tx_num == 1 ? R22B_RATEID_GN_N1SS :
++		    R22B_RATEID_GN_N2SS);
++	case R22B_WIRELESS_CCK | R22B_WIRELESS_OFDM | R22B_WIRELESS_HT:
++		if (bw_mode == R22B_CHANNEL_WIDTH_40)
++			return (tx_num == 1 ? R22B_RATEID_BGN_40M_1SS :
++			    R22B_RATEID_BGN_40M_2SS);
++		return (tx_num == 1 ? R22B_RATEID_BGN_20M_1SS :
++		    R22B_RATEID_BGN_20M_2SS);
++	case R22B_WIRELESS_OFDM | R22B_WIRELESS_VHT:
++		return (tx_num == 1 ? R22B_RATEID_ARFR1_AC_1SS :
++		    R22B_RATEID_ARFR0_AC_2SS);
++	case R22B_WIRELESS_CCK | R22B_WIRELESS_OFDM | R22B_WIRELESS_VHT:
++		if (bw_mode >= R22B_CHANNEL_WIDTH_80)
++			return (tx_num == 1 ? R22B_RATEID_ARFR1_AC_1SS :
++			    R22B_RATEID_ARFR0_AC_2SS);
++		return (tx_num == 1 ? R22B_RATEID_ARFR2_AC_2G_1SS :
++		    R22B_RATEID_ARFR3_AC_2G_2SS);
++	default:
++		return (0);
++	}
++}
++
++/* rtw_rate_mask_rssi() */
++static uint64_t
++r22b_rate_mask_rssi(uint8_t rssi_level, uint8_t wireless_set)
++{
++	if (wireless_set == R22B_WIRELESS_CCK)
++		return (0xffffffffffffffffULL);
++
++	switch (rssi_level) {
++	case 0:
++		return (0xffffffffffffffffULL);
++	case 1:
++		return (0xfffffffffffffff0ULL);
++	case 2:
++		return (0xffffffffffffefe0ULL);
++	case 3:
++		return (0xffffffffffffcfc0ULL);
++	case 4:
++		return (0xffffffffffff8f80ULL);
++	default:
++		return (0xffffffffffff0f00ULL);
++	}
++}
++
++/* rtw_rate_mask_recover() */
++static uint64_t
++r22b_rate_mask_recover(uint64_t ra_mask, uint64_t ra_mask_bak)
++{
++	const uint64_t legacy = R22B_RA_MASK_CCK_RATES |
++	    R22B_RA_MASK_OFDM_RATES;
++
++	if ((ra_mask & ~legacy) == 0)
++		ra_mask |= (ra_mask_bak & ~legacy);
++
++	if (ra_mask == 0)
++		ra_mask |= (ra_mask_bak & legacy);
++
++	return (ra_mask);
++}
++
++/* get_highest_vht_tx_rate(); rtw88 reads the station's Tx MCS map */
++static uint8_t
++r22b_highest_vht_rate(struct rtwn_softc *sc, uint16_t tx_mcs_map)
++{
++	struct r22b_softc *rs = sc->sc_priv;
++	uint8_t base;
++
++	if (rs->rf_path_num == 1)
++		base = R22B_DESC_RATEVHT1SS_MCS0;
++	else {
++		base = R22B_DESC_RATEVHT2SS_MCS0;
++		tx_mcs_map >>= 2;
++	}
++
++	switch (tx_mcs_map & 0x3) {
++	case R22B_VHT_MCS_0_7:
++		return (base + 7);
++	case R22B_VHT_MCS_0_8:
++		return (base + 8);
++	default:
++		return (base + 9);
++	}
++}
++
++/*
++ * rtw_update_sta_info() without the configured rate mask (net80211 has
++ * no per-station rate mask; a fixed rate goes through rtwn's
++ * ucastrate / force_rate instead).  Also computes the initial data rate
++ * rtw_tx_data_pkt_info_update() puts into the Tx descriptor.
++ *
++ * Called with the node table lock held ("ni" is node_list[id]).
++ */
++static void
++r22b_update_sta_info(struct rtwn_softc *sc, struct r22b_sta_info *si,
++    struct ieee80211_node *ni)
++{
++	struct ieee80211com *ic = &sc->sc_ic;
++	struct ieee80211vap *vap = ni->ni_vap;
++	struct r22b_softc *rs = sc->sc_priv;
++	struct ieee80211_channel *c;
++	uint64_t ra_mask = 0, ra_mask_bak, legacy = 0, ht_mask = 0;
++	uint8_t wireless_set, bw_mode, stbc_en = 0, ldpc_en = 0, tx_num = 1;
++	uint8_t init_rate;
++	int is_vht, is_ht, is5g, sgi, bit, i;
++
++	c = (ni->ni_chan != IEEE80211_CHAN_ANYC) ? ni->ni_chan :
++	    ic->ic_curchan;
++	is5g = (c != NULL && c != IEEE80211_CHAN_ANYC &&
++	    IEEE80211_IS_CHAN_5GHZ(c));
++	is_vht = (ni->ni_flags & IEEE80211_NODE_VHT) != 0;
++	is_ht = (ni->ni_flags & IEEE80211_NODE_HT) != 0;	/* ht_supported */
++
++	/* Legacy rates (sta->supp_rates[band]). */
++	for (i = 0; i < ni->ni_rates.rs_nrates; i++) {
++		bit = r22b_legacy_rate_bit(ni->ni_rates.rs_rates[i]);
++		if (bit >= 0)
++			legacy |= 1ULL << bit;
++	}
++
++	/* HT MCS set (sta->ht_cap.mcs.rx_mask). */
++	for (i = 0; i < ni->ni_htrates.rs_nrates; i++) {
++		bit = ni->ni_htrates.rs_rates[i] & IEEE80211_RATE_VAL;
++		if (bit < 32)
++			ht_mask |= 1ULL << (12 + bit);
++	}
++
++	if (is_vht) {
++		ra_mask |= r22b_get_vht_ra_mask(ni->ni_vht_mcsinfo.rx_mcs_map);
++		if (ni->ni_vhtcap & IEEE80211_VHTCAP_RXSTBC_MASK)
++			stbc_en = R22B_VHT_STBC_EN;
++		if (ni->ni_vhtcap & IEEE80211_VHTCAP_RXLDPC)
++			ldpc_en = R22B_VHT_LDPC_EN;
++	} else if (is_ht) {
++		ra_mask |= ht_mask;
++		if (ni->ni_htcap & IEEE80211_HTCAP_RXSTBC)
++			stbc_en = R22B_HT_STBC_EN;
++		if (ni->ni_htcap & IEEE80211_HTCAP_LDPC)
++			ldpc_en = R22B_HT_LDPC_EN;
++	}
++
++	if (rs->rf_path_num == 1) {
++		ra_mask &= R22B_RA_MASK_VHT_RATES_1SS |
++		    R22B_RA_MASK_HT_RATES_1SS;
++	} else {
++		ra_mask &= R22B_RA_MASK_VHT_RATES_2SS |
++		    R22B_RA_MASK_HT_RATES_2SS | R22B_RA_MASK_VHT_RATES_1SS |
++		    R22B_RA_MASK_HT_RATES_1SS;
++	}
++
++	if (is5g) {
++		ra_mask |= legacy & R22B_RA_MASK_OFDM_RATES;
++		ra_mask_bak = ra_mask;
++		if (is_vht) {
++			ra_mask &= R22B_RA_MASK_VHT_RATES |
++			    R22B_RA_MASK_OFDM_IN_VHT;
++			wireless_set = R22B_WIRELESS_OFDM | R22B_WIRELESS_VHT;
++		} else if (is_ht) {
++			ra_mask &= R22B_RA_MASK_HT_RATES |
++			    R22B_RA_MASK_OFDM_IN_HT_5G;
++			wireless_set = R22B_WIRELESS_OFDM | R22B_WIRELESS_HT;
++		} else
++			wireless_set = R22B_WIRELESS_OFDM;
++		rs->rrsr_val_init = R22B_RRSR_INIT_5G;
++	} else {
++		ra_mask |= legacy;
++		ra_mask_bak = ra_mask;
++		if (is_vht) {
++			ra_mask &= R22B_RA_MASK_VHT_RATES |
++			    R22B_RA_MASK_CCK_IN_VHT | R22B_RA_MASK_OFDM_IN_VHT;
++			wireless_set = R22B_WIRELESS_CCK | R22B_WIRELESS_OFDM |
++			    R22B_WIRELESS_HT | R22B_WIRELESS_VHT;
++		} else if (is_ht) {
++			ra_mask &= R22B_RA_MASK_HT_RATES |
++			    R22B_RA_MASK_CCK_IN_HT | R22B_RA_MASK_OFDM_IN_HT_2G;
++			wireless_set = R22B_WIRELESS_CCK | R22B_WIRELESS_OFDM |
++			    R22B_WIRELESS_HT;
++		} else if (legacy <= 0xf) {
++			wireless_set = R22B_WIRELESS_CCK;
++		} else {
++			ra_mask &= R22B_RA_MASK_OFDM_RATES |
++			    R22B_RA_MASK_CCK_IN_BG;
++			wireless_set = R22B_WIRELESS_CCK | R22B_WIRELESS_OFDM;
++		}
++		rs->rrsr_val_init = R22B_RRSR_INIT_2G;
++	}
++
++	/* sta->bandwidth: what both sides and the BSS channel allow. */
++	if (is_vht && ieee80211_vht_check_tx_bw(ni, NET80211_STA_RX_BW_80)) {
++		bw_mode = R22B_CHANNEL_WIDTH_80;
++		sgi = (ni->ni_vhtcap & IEEE80211_VHTCAP_SHORT_GI_80) &&
++		    (vap->iv_vht_cap.vht_cap_info &
++		     IEEE80211_VHTCAP_SHORT_GI_80);
++	} else if (is_ht && (ieee80211_ht_check_tx_ht40(ni) ||
++	    (is_vht && ieee80211_vht_check_tx_bw(ni,
++	     NET80211_STA_RX_BW_40)))) {
++		bw_mode = R22B_CHANNEL_WIDTH_40;
++		sgi = (ni->ni_htcap & IEEE80211_HTCAP_SHORTGI40) &&
++		    (vap->iv_flags_ht & IEEE80211_FHT_SHORTGI40);
++	} else {
++		bw_mode = R22B_CHANNEL_WIDTH_20;
++		sgi = is_ht && ieee80211_ht_check_tx_shortgi_20(ni);
++	}
++
++	/* efuse->hw_cap.nss, not the station's stream count */
++	if (is_vht || is_ht)
++		tx_num = rs->rf_path_num;
++
++	ra_mask &= r22b_rate_mask_rssi(si->rssi_level, wireless_set);
++	ra_mask = r22b_rate_mask_recover(ra_mask, ra_mask_bak);
++
++	/* rtw_tx_data_pkt_info_update(): initial ("highest") data rate */
++	if (is_vht)
++		init_rate = r22b_highest_vht_rate(sc,
++		    ni->ni_vht_mcsinfo.tx_mcs_map);
++	else if (is_ht) {
++		init_rate = (rs->rf_path_num == 2 &&
++		    (ht_mask & R22B_RA_MASK_HT_RATES_2SS) != 0) ?
++		    R22B_DESC_RATEMCS15 : R22B_DESC_RATEMCS7;
++	} else if (!is5g && legacy <= 0xf)
++		init_rate = R22B_DESC_RATE11M;
++	else
++		init_rate = R22B_DESC_RATE54M;
++
++	si->is_5g = is5g;
++	si->bw_mode = bw_mode;
++	si->stbc_en = stbc_en;
++	si->ldpc_en = ldpc_en;
++	si->sgi_enable = sgi ? 1 : 0;
++	si->vht_enable = is_vht ? 1 : 0;
++	si->ra_mask = ra_mask;
++	si->rate_id = r22b_get_rate_id(wireless_set, bw_mode, tx_num);
++	si->init_rate = init_rate;
++}
++
++/* rtw_fw_send_ra_info(); the 8822B takes a 32-bit mask (no RA_INFO_HI) */
++static void
++r22b_fw_send_ra_info(struct rtwn_softc *sc, int macid,
++    struct r22b_sta_info *si, int reset_ra_mask)
++{
++	uint8_t h2c[8] = { 0 };
++
++	r22b_h2c_set(h2c, 0, R22B_H2C_CMD_ID, R22B_H2C_CMD_RA_INFO);
++	r22b_h2c_set(h2c, 0, R22B_RA_INFO_MACID, macid);
++	r22b_h2c_set(h2c, 0, R22B_RA_INFO_RATE_ID, si->rate_id);
++	r22b_h2c_set(h2c, 0, R22B_RA_INFO_INIT_RA_LVL, si->init_ra_lv);
++	r22b_h2c_set(h2c, 0, R22B_RA_INFO_SGI_EN, si->sgi_enable);
++	r22b_h2c_set(h2c, 0, R22B_RA_INFO_BW_MODE, si->bw_mode);
++	r22b_h2c_set(h2c, 0, R22B_RA_INFO_LDPC, si->ldpc_en != 0);
++	r22b_h2c_set(h2c, 0, R22B_RA_INFO_NO_UPDATE, !reset_ra_mask);
++	r22b_h2c_set(h2c, 0, R22B_RA_INFO_VHT_EN, si->vht_enable);
++	r22b_h2c_set(h2c, 0, R22B_RA_INFO_DIS_PT, 1);
++	r22b_h2c_set(h2c, 1, R22B_RA_INFO_RA_MASK, (uint32_t)si->ra_mask);
++
++	si->init_ra_lv = 0;
++
++	RTWN_DPRINTF(sc, RTWN_DEBUG_RA,
++	    "%s: macid %d, rate id %u, bw %u, sgi %u, vht %u, ldpc %u, "
++	    "mask 0x%08x%s\n", __func__, macid, si->rate_id, si->bw_mode,
++	    si->sgi_enable, si->vht_enable, si->ldpc_en,
++	    (uint32_t)si->ra_mask, reset_ra_mask ? " (reset)" : "");
++
++	(void)r22b_fw_cmd(sc, h2c);
++}
++
++/* rtw_fw_send_rssi_info() */
++static void
++r22b_fw_send_rssi_info(struct rtwn_softc *sc, int macid,
++    const struct r22b_sta_info *si, uint8_t rssi)
++{
++	uint8_t h2c[8] = { 0 };
++
++	r22b_h2c_set(h2c, 0, R22B_H2C_CMD_ID, R22B_H2C_CMD_RSSI_MONITOR);
++	r22b_h2c_set(h2c, 0, R22B_RSSI_INFO_MACID, macid);
++	r22b_h2c_set(h2c, 0, R22B_RSSI_INFO_RSSI, rssi);
++	r22b_h2c_set(h2c, 1, R22B_RSSI_INFO_STBC, si->stbc_en != 0);
++
++	RTWN_DPRINTF(sc, RTWN_DEBUG_RSSI, "%s: macid %d, rssi %u, level %u\n",
++	    __func__, macid, rssi, si->rssi_level);
++
++	(void)r22b_fw_cmd(sc, h2c);
++}
++
++/* rtw_fw_media_status_report() */
++static void
++r22b_fw_media_status_report(struct rtwn_softc *sc, int macid, int connect)
++{
++	uint8_t h2c[8] = { 0 };
++
++	r22b_h2c_set(h2c, 0, R22B_H2C_CMD_ID, R22B_H2C_CMD_MEDIA_STATUS_RPT);
++	r22b_h2c_set(h2c, 0, R22B_MEDIA_STATUS_OP_MODE, connect != 0);
++	r22b_h2c_set(h2c, 0, R22B_MEDIA_STATUS_MACID, macid);
++
++	RTWN_DPRINTF(sc, RTWN_DEBUG_STATE, "%s: macid %d %s\n", __func__,
++	    macid, connect ? "connected" : "disconnected");
++
++	(void)r22b_fw_cmd(sc, h2c);
++}
++
++/* rtw_fw_default_port() (H2C_CMD_DEFAULT_PORT, mailbox command) */
++static void
++r22b_fw_default_port(struct rtwn_softc *sc, int port, int macid)
++{
++	uint8_t h2c[8] = { 0 };
++
++	r22b_h2c_set(h2c, 0, R22B_H2C_CMD_ID, R22B_H2C_CMD_DEFAULT_PORT);
++	r22b_h2c_set(h2c, 0, R22B_DEFAULT_PORT_PORTID, port);
++	r22b_h2c_set(h2c, 0, R22B_DEFAULT_PORT_MACID, macid);
++
++	(void)r22b_fw_cmd(sc, h2c);
++}
++
++/* rtw_phy_get_rssi_level() */
++static uint8_t
++r22b_get_rssi_level(uint8_t old_level, uint8_t rssi)
++{
++	uint8_t table[] = { 20, 34, 38, 42, 46, 50, 100 };
++	u_int i;
++
++	/* RA_FLOOR_UP_GAP */
++	for (i = 0; i < nitems(table); i++) {
++		if (i >= old_level)
++			table[i] += 3;
++	}
++
++	for (i = 0; i < nitems(table); i++) {
++		if (rssi < table[i])
++			return (i);
++	}
++
++	return (0);
++}
++
++/* rtw_phy_get_rrsr_mask() */
++static uint32_t
++r22b_get_rrsr_mask(uint8_t rate_idx)
++{
++	uint8_t rate_order = rate_idx;
++
++	if (rate_idx >= R22B_DESC_RATEVHT4SS_MCS0)
++		rate_order -= R22B_DESC_RATEVHT4SS_MCS0;
++	else if (rate_idx >= R22B_DESC_RATEVHT3SS_MCS0)
++		rate_order -= R22B_DESC_RATEVHT3SS_MCS0;
++	else if (rate_idx >= R22B_DESC_RATEVHT2SS_MCS0)
++		rate_order -= R22B_DESC_RATEVHT2SS_MCS0;
++	else if (rate_idx >= R22B_DESC_RATEVHT1SS_MCS0)
++		rate_order -= R22B_DESC_RATEVHT1SS_MCS0;
++	else if (rate_idx >= R22B_DESC_RATEMCS24)
++		rate_order -= R22B_DESC_RATEMCS24;
++	else if (rate_idx >= R22B_DESC_RATEMCS16)
++		rate_order -= R22B_DESC_RATEMCS16;
++	else if (rate_idx >= R22B_DESC_RATEMCS8)
++		rate_order -= R22B_DESC_RATEMCS8;
++	else if (rate_idx >= R22B_DESC_RATEMCS0)
++		rate_order -= R22B_DESC_RATEMCS0;
++	else if (rate_idx >= R22B_DESC_RATE6M)
++		rate_order -= R22B_DESC_RATE6M;
++	else
++		rate_order -= R22B_DESC_RATE1M;
++
++	if (rate_idx >= R22B_DESC_RATEMCS0 || rate_order == 0)
++		rate_order++;
++
++	/* GENMASK(rate_order + RRSR_RATE_ORDER_CCK_LEN - 1, 0) */
++	return ((2U << (rate_order + R22B_RRSR_RATE_ORDER_CCK_LEN - 1)) - 1);
++}
++
++/*
++ * rtw_phy_rrsr_update(): response rates up to the slowest station's
++ * current rate.  Unlike rtw88 this is only written while a station is
++ * connected (rtw88 writes rrsr_val_init, 0 until the first association,
++ * from its watchdog all the time).
++ */
++static void
++r22b_rrsr_update(struct rtwn_softc *sc)
++{
++	struct r22b_softc *rs = sc->sc_priv;
++	uint32_t mask, mask_min;
++	int id;
++
++	if (rs->nsta == 0)
++		return;
++
++	mask_min = R22B_RRSR_RATE_ORDER_MAX;
++	for (id = 0; id < R22B_MACID_NUM; id++) {
++		if (!rs->sta[id].valid)
++			continue;
++		mask = r22b_get_rrsr_mask(rs->sta[id].ra_rate);
++		if (mask < mask_min)
++			mask_min = mask;
++	}
++
++	rtwn_write_4(sc, R22B_REG_RRSR, rs->rrsr_val_init & mask_min);
++}
++
++/*
++ * Association registers.  rtwn_run() (and rtwn_scan_end() through
++ * rtwn_calc_basicrates()) write registers the 92C-family way:
++ *
++ *	R92C_BCN_PSR_RPT (0x6a8)	0xc000 | AID
++ *	R92C_WMAC_TRXPTCL_CTL (0x668)	bit 17 for a short preamble
++ *	R92C_RRSR (0x440)		basic rates of the BSS
++ *	R92C_INIRTS_RATE_SEL (0x480)	lowest basic rate
++ *
++ * rtw88's rtw_vif_port_config() only writes the AID into bits 10:0 of
++ * 0x6a8, the RRSR comes from rtw_phy_rrsr_update() and the other two are
++ * not written at all.  Make the registers match rtw88: the bits rtw88
++ * does not own get the value they had after initialization (saved by
++ * r22b_post_init()).  The MSR (network type), BSSID, beacon interval,
++ * BCN_CTRL, slot time and EDCA registers rtwn writes are the same
++ * registers and values as rtw88's (rtw_vif_port[0], rtw_conf_tx()).
++ *
++ * "aid" < 0: only the registers rtwn_scan_end() rewrites.
++ */
++void
++r22b_assoc_regs(struct rtwn_softc *sc, int aid)
++{
++	struct r22b_softc *rs = sc->sc_priv;
++	uint32_t val;
++
++	if (aid >= 0) {
++		rtwn_write_2(sc, R22B_REG_BCN_PSR_RPT,
++		    (rs->saved_bcn_psr_rpt & ~R22B_BIT_MASK_PORT0_AID) |
++		    (aid & R22B_BIT_MASK_PORT0_AID));
++
++		val = rtwn_read_4(sc, R22B_REG_WMAC_TRXPTCL_CTL);
++		val = (val & ~R22B_BIT_RTWN_SHPRE) | rs->saved_shpre;
++		rtwn_write_4(sc, R22B_REG_WMAC_TRXPTCL_CTL, val);
++	}
++
++	rtwn_write_1(sc, R22B_REG_INIRTS_RATE_SEL, rs->saved_inirts_rate_sel);
++	r22b_rrsr_update(sc);
++}
++
++/* rtw_fw_ra_report_iter(): tell net80211 the rate the firmware uses */
++static void
++r22b_set_node_txrate(struct ieee80211_node *ni, uint8_t rate)
++{
++	uint8_t idx;
++
++	if (rate < R22B_DESC_RATEMCS0)
++		ieee80211_node_set_txrate_dot11rate(ni, ridx2rate[rate]);
++	else if (rate < R22B_DESC_RATEVHT1SS_MCS0) {
++		ieee80211_node_set_txrate_ht_mcsrate(ni,
++		    rate - R22B_DESC_RATEMCS0);
++	} else {
++		idx = rate - R22B_DESC_RATEVHT1SS_MCS0;
++		ieee80211_node_set_txrate_vht_rate(ni, idx / 10 + 1, idx % 10);
++	}
++}
++
++/*
++ * C2H_RA_RPT (rtw_fw_ra_report_handle()): "payload" and "len" are the
++ * C2H payload after the id and sequence bytes.  Called from the Rx path.
++ */
++void
++r22b_handle_ra_report(struct rtwn_softc *sc, const uint8_t *payload,
++    int len)
++{
++	struct r22b_softc *rs = sc->sc_priv;
++	struct r22b_sta_info *si;
++	struct ieee80211_node *ni;
++	uint8_t rate, macid;
++
++	if (len < R22B_C2H_RA_RPT_SIZE) {
++		device_printf(sc->sc_dev,
++		    "invalid ra report c2h length %d\n", len);
++		return;
++	}
++
++	rate = payload[R22B_C2H_RA_RPT_RATE_SGI] & R22B_C2H_RA_RPT_RATE;
++	macid = payload[R22B_C2H_RA_RPT_MACID];
++	if (macid >= R22B_MACID_NUM || rate >= R22B_RATE_MAX)
++		return;
++
++	si = &rs->sta[macid];
++	if (!si->valid)
++		return;
++
++	si->ra_rate = rate;
++	si->ra_sgi = (payload[R22B_C2H_RA_RPT_RATE_SGI] &
++	    R22B_C2H_RA_RPT_SGI) != 0;
++	si->ra_bw = payload[R22B_C2H_RA_RPT_BW];
++
++	RTWN_DPRINTF(sc, RTWN_DEBUG_RA,
++	    "%s: macid %u, rate 0x%02x, sgi %u, bw %u\n", __func__, macid,
++	    rate, si->ra_sgi, si->ra_bw);
++
++	RTWN_NT_LOCK(sc);
++	ni = sc->node_list[macid];
++	if (ni != NULL)
++		r22b_set_node_txrate(ni, rate);
++	RTWN_NT_UNLOCK(sc);
++}
++
++/*
++ * sc_set_media_status: rtw_sta_add() / rtw_sta_remove() and the station
++ * part of rtw_ops_bss_info_changed(BSS_CHANGED_ASSOC).  "macid" is the
++ * node id, with RTWN_MACID_VALID set for a new station.
++ */
++void
++r22b_set_media_status(struct rtwn_softc *sc, int macid)
++{
++	struct r22b_softc *rs = sc->sc_priv;
++	struct r22b_sta_info *si;
++	struct ieee80211_node *ni;
++	struct ieee80211vap *vap;
++	int id, connect, aid, port, was_valid;
++
++	RTWN_ASSERT_LOCKED(sc);
++
++	connect = (macid & RTWN_MACID_VALID) != 0;
++	id = macid & ~RTWN_MACID_VALID;
++	if (id < 0 || id >= R22B_MACID_NUM)
++		return;
++	si = &rs->sta[id];
++	was_valid = si->valid;
++
++	if (!connect) {
++		si->valid = 0;
++		if (was_valid && rs->nsta > 0)
++			rs->nsta--;
++
++		/* rtw_sta_remove() */
++		r22b_fw_media_status_report(sc, id, 0);
++
++		if (rs->nsta == 0) {
++			/* rtw_vif_assoc_changed(): AID 0 */
++			r22b_assoc_regs_reset(sc);
++			/* Calibrate again for the next association. */
++			rs->iqk_chan = 0;
++		}
++		return;
++	}
++
++	aid = -1;
++	port = 0;
++	RTWN_NT_LOCK(sc);
++	ni = sc->node_list[id];
++	if (ni == NULL) {
++		/* Already gone again. */
++		RTWN_NT_UNLOCK(sc);
++		return;
++	}
++	/* rtw_sta_add() */
++	memset(si, 0, sizeof(*si));
++	si->init_ra_lv = 1;
++	r22b_update_sta_info(sc, si, ni);
++	vap = ni->ni_vap;
++	if (vap->iv_opmode == IEEE80211_M_STA) {
++		aid = IEEE80211_NODE_AID(ni);
++		port = RTWN_VAP(vap)->id;
++	}
++	RTWN_NT_UNLOCK(sc);
++
++	si->valid = 1;
++	if (!was_valid)
++		rs->nsta++;
++
++	r22b_fw_send_ra_info(sc, id, si, 1);
++	r22b_fw_media_status_report(sc, id, 1);
++
++	if (aid >= 0) {
++		/* rtw_vif_port_config(PORT_SET_AID), rtw_phy_rrsr_update() */
++		r22b_assoc_regs(sc, aid);
++		/* rtw_fw_default_port() */
++		r22b_fw_default_port(sc, port, id);
++	}
++
++	/*
++	 * rtw_chip_prepare_tx(): normally the IQK already ran when net80211
++	 * tuned to the BSS channel (r22b_set_chan()); this only catches the
++	 * case where that did not happen.
++	 */
++	r22b_iqk_check(sc, 0);
++}
++
++/* rtw_vif_assoc_changed(NULL) + rtw_vif_port_config(PORT_SET_AID) */
++void
++r22b_assoc_regs_reset(struct rtwn_softc *sc)
++{
++	struct r22b_softc *rs = sc->sc_priv;
++
++	rtwn_write_2(sc, R22B_REG_BCN_PSR_RPT,
++	    rs->saved_bcn_psr_rpt & ~R22B_BIT_MASK_PORT0_AID);
++}
++
++/*
++ * sc_set_rssi, every 2 seconds while associated (rtwn_calib_cb()):
++ * rtw_phy_stat_rssi() (RSSI level and RSSI monitor H2C per station),
++ * rtw_phy_ra_info_update() (every fourth run) and rtw_phy_rrsr_update().
++ * The RSSI is rtwn's per-node average (avg_pwdb), the same 0..100 scale
++ * as rtw88's ewma of pkt_stat->rssi.
++ *
++ * Not sent: H2C_CMD_WL_PHY_INFO (rtw_fw_update_wl_phy_info(), throughput,
++ * Rx rate and EVM statistics rtwn does not collect).
++ */
++void
++r22b_set_rssi(struct rtwn_softc *sc)
++{
++	struct r22b_softc *rs = sc->sc_priv;
++	struct r22b_sta_info *si;
++	struct ieee80211_node *ni;
++	int id, pwdb, update, found;
++
++	RTWN_ASSERT_LOCKED(sc);
++
++	if (rs->nsta == 0)
++		return;
++
++	/* rtw_phy_ra_info_update(): "if (rtwdev->watch_dog_cnt & 0x3)" */
++	update = (rs->ra_tick & 0x3) == 0;
++	rs->ra_tick++;
++
++	for (id = 0; id < R22B_MACID_NUM; id++) {
++		si = &rs->sta[id];
++		if (!si->valid)
++			continue;
++
++		RTWN_NT_LOCK(sc);
++		ni = sc->node_list[id];
++		found = (ni != NULL);
++		pwdb = found ? RTWN_NODE(ni)->avg_pwdb : -1;
++		RTWN_NT_UNLOCK(sc);
++		if (!found)
++			continue;
++
++		if (pwdb < 0)
++			pwdb = 0;	/* no samples yet (ewma_rssi starts at 0) */
++		else if (pwdb > 100)
++			pwdb = 100;
++
++		si->rssi_level = r22b_get_rssi_level(si->rssi_level, pwdb);
++		r22b_fw_send_rssi_info(sc, id, si, pwdb);
++	}
++
++	if (update) {
++		for (id = 0; id < R22B_MACID_NUM; id++) {
++			si = &rs->sta[id];
++			if (!si->valid)
++				continue;
++
++			RTWN_NT_LOCK(sc);
++			ni = sc->node_list[id];
++			found = (ni != NULL);
++			if (found)
++				r22b_update_sta_info(sc, si, ni);
++			RTWN_NT_UNLOCK(sc);
++
++			if (found)
++				r22b_fw_send_ra_info(sc, id, si, 0);
++		}
++	}
++
++	r22b_rrsr_update(sc);
++}
++
++/*
++ * Forget all stations (power on): the firmware starts without any, and
++ * rtwn hands out ids again.
++ */
++void
++r22b_ra_reset(struct rtwn_softc *sc)
++{
++	struct r22b_softc *rs = sc->sc_priv;
++
++	memset(rs->sta, 0, sizeof(rs->sta));
++	rs->nsta = 0;
++	rs->ra_tick = 0;
++	rs->rrsr_val_init = 0;
++	rs->iqk_chan = 0;
++}
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_reg.h b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_reg.h
+index c2f4460432..fe80089838 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_reg.h
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_reg.h
+@@ -174,6 +174,11 @@
+ #define R22B_REG_DARFRCH		0x0434
+ #define R22B_REG_RARFRC			0x0438
+ #define R22B_REG_RARFRCH		0x043c
++#define R22B_REG_RRSR			0x0440
++#define R22B_RRSR_INIT_2G		0x15f	/* rtw88 main.h RRSR_INIT_2G */
++#define R22B_RRSR_INIT_5G		0x150
++#define R22B_RRSR_RATE_ORDER_MAX	0xfffff	/* rtw88 phy.h */
++#define R22B_RRSR_RATE_ORDER_CCK_LEN	4
+ #define R22B_REG_CCK_CHECK		0x0454
+ #define R22B_BIT_CHECK_CCK_EN		R22B_BIT(7)
+ #define R22B_REG_AMPDU_MAX_TIME_V1	0x0455
+@@ -181,6 +186,11 @@
+ #define R22B_REG_TX_HANG_CTRL		0x045e
+ #define R22B_BIT_EN_EOF_V1		R22B_BIT(2)
+ #define R22B_REG_NDPA_OPT_CTRL		0x045f
++/*
++ * Not used by rtw88; rtwn's rtwn_set_rts_rate() writes it (as
++ * R92C_INIRTS_RATE_SEL) when associating, see r22b_assoc_regs().
++ */
++#define R22B_REG_INIRTS_RATE_SEL	0x0480
+ #define R22B_REG_DATA_SC		0x0483
+ #define R22B_BIT_TXSC_20M(x)		(((x) & 0xf) << 0)
+ #define R22B_BIT_TXSC_40M(x)		(((x) & 0xf) << 4)
+@@ -233,8 +243,13 @@
+ #define R22B_BIT_RFMOD			(R22B_BIT(7) | R22B_BIT(8))
+ #define R22B_BIT_RFMOD_80M		R22B_BIT(8)
+ #define R22B_BIT_RFMOD_40M		R22B_BIT(7)
++/* rtwn's R92C_WMAC_TRXPTCL_SHPRE; not used by rtw88 */
++#define R22B_BIT_RTWN_SHPRE		R22B_BIT(17)
+ #define R22B_REG_RXFLTMAP0		0x06a0
+ #define R22B_REG_RXFLTMAP2		0x06a4
++/* Port 0 AID (rtw88 mac80211.c rtw_vif_port[0].aid: 0x06a8, mask 0x7ff) */
++#define R22B_REG_BCN_PSR_RPT		0x06a8
++#define R22B_BIT_MASK_PORT0_AID		0x07ff
+ #define R22B_REG_BT_COEX_TABLE0		0x06c0
+ #define R22B_REG_BT_COEX_TABLE1		0x06c4
+ #define R22B_REG_BT_COEX_BRK_TABLE	0x06c8
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_rx.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_rx.c
+index 62d6cd3a6b..f199bdabcc 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_rx.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_rx.c
+@@ -16,7 +16,8 @@
+  * rtw_rx_query_rx_desc, rtw_rx_fill_rx_status), rtw8822b.h / rtw8822b.c
+  * (GET_PHY_STAT_*, query_phy_status, query_phy_status_page0,
+  * query_phy_status_page1), fw.c / fw.h (rtw_fw_c2h_cmd_rx_irqsafe,
+- * struct rtw_c2h_cmd, enum rtw_c2h_cmd_id).
++ * rtw_fw_c2h_cmd_handle, struct rtw_c2h_cmd, enum rtw_c2h_cmd_id),
++ * usb.c (rtw_usb_rx_handler).
+  */
+ 
+ #include <sys/cdefs.h>
+@@ -55,21 +56,44 @@
+ #include <dev/rtwn/rtl8822b/r22b_var.h>
+ 
+ /*
+- * C2H event in an Rx buffer (rtw_fw_c2h_cmd_rx_irqsafe()): the payload
+- * (struct rtw_c2h_cmd: id, seq, payload[]) starts after the Rx
+- * descriptor, the driver info and the shift.
++ * C2H events (rtw_fw_c2h_cmd_handle()).  "payload"/"plen" are the event
++ * data after the id and sequence bytes (struct rtw_c2h_cmd).
+  *
+- * TODO (phase 2): C2H_RA_RPT (firmware rate adaptation report),
+- * C2H_CCX_TX_RPT / C2H_HALMAC sub-id C2H_CCX_RPT (tx status, needed for
+- * net80211 rate control and EAPOL status), C2H_BT_INFO (coexistence).
++ * TODO: C2H_CCX_TX_RPT / C2H_HALMAC sub-id C2H_CCX_RPT (Tx status; not
++ * requested, the firmware does the rate adaptation), C2H_BT_INFO
++ * (coexistence with a BT core).
+  */
+-void
+-r22b_handle_c2h_report(struct rtwn_softc *sc, uint8_t *buf, int len)
++static void
++r22b_c2h_dispatch(struct rtwn_softc *sc, uint8_t id, uint8_t seq,
++    const uint8_t *payload, int plen)
++{
++	switch (id) {
++	case R22B_C2H_RA_RPT:
++		r22b_handle_ra_report(sc, payload, plen);
++		break;
++	case R22B_C2H_CCX_TX_RPT:
++	case R22B_C2H_BT_INFO:
++	case R22B_C2H_HW_FEATURE_REPORT:
++	case R22B_C2H_HALMAC:
++	default:
++		RTWN_DPRINTF(sc, RTWN_DEBUG_INTR,
++		    "%s: C2H 0x%02x seq %u len %d isn't handled\n", __func__,
++		    id, seq, plen);
++		break;
++	}
++}
++
++/*
++ * One C2H packet starting at its Rx descriptor (rtw_fw_c2h_cmd_rx_irqsafe():
++ * the event starts after the descriptor, the driver info and the shift).
++ * "len" is what the buffer holds from "buf" on.
++ */
++static void
++r22b_c2h_packet(struct rtwn_softc *sc, const uint8_t *buf, int len)
+ {
+ 	const struct r22b_rx_stat *stat = (const struct r22b_rx_stat *)buf;
+ 	uint32_t rxdw0;
+ 	int infosz, shift, pktlen, off;
+-	uint8_t id, seq;
+ 
+ 	if (len < (int)sizeof(*stat)) {
+ 		device_printf(sc->sc_dev, "C2H report too short (len %d)\n",
+@@ -83,53 +107,119 @@ r22b_handle_c2h_report(struct rtwn_softc *sc, uint8_t *buf, int len)
+ 	shift = MS(rxdw0, RTWN_RXDW0_SHIFT);
+ 	off = sizeof(*stat) + infosz + shift;
+ 
+-	if (pktlen < 2 || len < off + 2) {
++	if (pktlen < 2 || len < off + pktlen) {
+ 		device_printf(sc->sc_dev,
+ 		    "C2H report too short (len %d, pktlen %d)\n", len, pktlen);
+ 		return;
+ 	}
+ 
+-	id = buf[off];
+-	seq = buf[off + 1];
++	r22b_c2h_dispatch(sc, buf[off], buf[off + 1], buf + off + 2,
++	    pktlen - 2);
++}
+ 
+-	switch (id) {
+-	case R22B_C2H_CCX_TX_RPT:
+-	case R22B_C2H_BT_INFO:
+-	case R22B_C2H_RA_RPT:
+-	case R22B_C2H_HW_FEATURE_REPORT:
+-	case R22B_C2H_HALMAC:
+-	default:
+-		RTWN_DPRINTF(sc, RTWN_DEBUG_INTR,
+-		    "%s: C2H id 0x%02x seq %u len %d ignored\n", __func__, id,
+-		    seq, pktlen);
+-		break;
++/*
++ * Walk the packets of an Rx transfer the way rtwn_rxeof() does (8-byte
++ * aligned, rtw_usb_rx_handler()) and hand every C2H packet whose length
++ * satisfies "want" to r22b_c2h_packet():
++ *	R22B_C2H_ALL	all of them
++ *	R22B_C2H_SHORT	only those rtwn_rx_check_pre_alloc() drops before
++ *			sc_check_frame sees them (shorter than an ACK)
++ *	R22B_C2H_COUNT	none
++ * Returns the number of packets and sets *nc2h to the number of C2H
++ * packets among them.
++ */
++int
++r22b_c2h_walk(struct rtwn_softc *sc, uint8_t *buf, int len, int want,
++    int *nc2h)
++{
++	const struct r22b_rx_stat *stat;
++	uint32_t rxdw0;
++	int totlen, pktlen, npkt;
++
++	npkt = 0;
++	*nc2h = 0;
++	while (len >= (int)sizeof(*stat)) {
++		stat = (const struct r22b_rx_stat *)buf;
++		rxdw0 = le32toh(stat->rxdw0);
++		pktlen = MS(rxdw0, RTWN_RXDW0_PKTLEN);
++		if (pktlen == 0)
++			break;
++
++		totlen = sizeof(*stat) + MS(rxdw0, RTWN_RXDW0_INFOSZ) * 8 +
++		    pktlen;
++		if (totlen > len)
++			break;		/* continued in the next transfer */
++
++		npkt++;
++		if (le32toh(stat->rxdw2) & R22B_RXDW2_C2H) {
++			(*nc2h)++;
++			if (want == R22B_C2H_ALL || (want == R22B_C2H_SHORT &&
++			    pktlen < (int)sizeof(struct ieee80211_frame_ack)))
++				r22b_c2h_packet(sc, buf, len);
++		}
++
++		if (totlen < len)
++			totlen = roundup2(totlen, 8);
++		if (totlen > len)
++			totlen = len;
++		buf += totlen;
++		len -= totlen;
+ 	}
++
++	return (npkt);
+ }
+ 
+ /*
+- * sc_check_frame: called for every packet of an Rx transfer.  C2H
+- * events can be aggregated with frames (r22bu_classify_intr() only
+- * routes transfers holding nothing but one C2H event to
+- * r22b_handle_c2h_report()); hand those over here and drop them.
++ * sc_handle_c2h_report: an Rx transfer that holds only C2H packets
++ * (r22bu_classify_intr() returned RTWN_RX_OTHER).
++ */
++void
++r22b_handle_c2h_report(struct rtwn_softc *sc, uint8_t *buf, int len)
++{
++	int nc2h;
++
++	(void)r22b_c2h_walk(sc, buf, len, R22B_C2H_ALL, &nc2h);
++}
++
++/*
++ * sc_check_frame: called for every packet of an Rx transfer that also
++ * holds frames.
++ *
++ * - C2H packets: handled here (those long enough to get here; the short
++ *   ones were handled by r22bu_classify_intr()) and dropped.
++ * - Frames the hardware did not decrypt (SWDEC set; rtw88 rx.c:
++ *   decrypted = !swdec && enc_type != NONE): clear the cipher field so
++ *   that rtwn_rx_common() does not mark them M_WEP (already decrypted)
++ *   and net80211 decrypts them.
+  */
+ int
+ r22b_check_frame(struct rtwn_softc *sc, struct mbuf *m)
+ {
+-	const struct r22b_rx_stat *stat;
++	struct r22b_rx_stat *stat;
+ 	uint32_t rxdw0;
+ 	int totlen;
+ 
+-	stat = mtod(m, const struct r22b_rx_stat *);
+-	if (!(le32toh(stat->rxdw2) & R22B_RXDW2_C2H))
++	if (m->m_len < (int)sizeof(*stat))
+ 		return (0);
+ 
++	stat = mtod(m, struct r22b_rx_stat *);
+ 	rxdw0 = le32toh(stat->rxdw0);
+-	totlen = sizeof(*stat) + MS(rxdw0, RTWN_RXDW0_INFOSZ) * 8 +
+-	    MS(rxdw0, RTWN_RXDW0_SHIFT) + MS(rxdw0, RTWN_RXDW0_PKTLEN);
+-	if (m->m_next == NULL && m->m_len >= totlen)
+-		r22b_handle_c2h_report(sc, mtod(m, uint8_t *), m->m_len);
+ 
+-	return (EAGAIN);
++	if (le32toh(stat->rxdw2) & R22B_RXDW2_C2H) {
++		totlen = sizeof(*stat) + MS(rxdw0, RTWN_RXDW0_INFOSZ) * 8 +
++		    MS(rxdw0, RTWN_RXDW0_SHIFT) + MS(rxdw0, RTWN_RXDW0_PKTLEN);
++		if (m->m_next == NULL && m->m_len >= totlen)
++			r22b_c2h_packet(sc, mtod(m, uint8_t *), m->m_len);
++		return (EAGAIN);
++	}
++
++	/* RX_DESC_ENC_NONE == R92C_CAM_ALGO_NONE == 0 */
++	if ((rxdw0 & RTWN_RXDW0_SWDEC) && MS(rxdw0, RTWN_RXDW0_CIPHER) != 0) {
++		rxdw0 &= ~RTWN_RXDW0_CIPHER_M;
++		stat->rxdw0 = htole32(rxdw0);
++	}
++
++	return (0);
+ }
+ 
+ uint8_t
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_tx.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_tx.c
+index f22869f6e0..4c7896c5b1 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_tx.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_tx.c
+@@ -11,14 +11,15 @@
+ /*
+  * RTL8822B Tx descriptor setup.
+  *
+- * Management and control frames follow rtw_tx_mgmt_pkt_info_update():
+- * QSEL_MGMT, driver rate without fallback, hardware sequence number
+- * (EN_HWSEQ + DISQSELSEQ, HW_SSN_SEL = port).  Data frames follow
+- * rtw_tx_data_pkt_info_update() for QSEL (TID), A-MPDU and RTS fields,
+- * but take the rate from rtwn/net80211 (USE_RATE) because firmware rate
+- * adaptation is not set up yet (TODO phase 2: H2C_CMD_RA_INFO, then
+- * leave USE_RATE clear for unicast data when sc_ratectl is
+- * RTWN_RATECTL_FW).
++ * Management, control and (QoS) Null frames follow
++ * rtw_tx_mgmt_pkt_info_update(): driver rate without fallback, hardware
++ * sequence number (EN_HWSEQ + DISQSELSEQ, HW_SSN_SEL = port).  Unicast
++ * data frames follow rtw_tx_data_pkt_info_update(): QSEL (TID), A-MPDU
++ * and RTS fields, and with firmware rate adaptation (r22b_ra.c) no
++ * USE_RATE, so that the firmware picks the rate, with the station's
++ * rate id, bandwidth, STBC and LDPC.  Frames rtwn sends at a forced rate
++ * (EAPOL at the management rate, multicast, a fixed rate) keep USE_RATE
++ * and DISDATAFB.
+  *
+  * The USB checksum (rtw8822b_fill_txdesc_checksum(): XOR of the first 32
+  * bytes into dword 7) and the packet size/offset are filled in by
+@@ -211,6 +212,24 @@ r22b_tx_set_hwseq(struct r22b_tx_desc *txd, int id)
+ 	txd->txdw3 |= htole32(SM(R22B_TXDW3_HW_SSN_SEL, id));
+ }
+ 
++/* rtw_tx_pkt_info_update_rate(): ridx of the lowest (management) rate */
++static uint8_t
++r22b_mgmt_ridx(struct rtwn_softc *sc, struct ieee80211_node *ni)
++{
++	uint8_t ridx;
++
++	ridx = RTWN_RIDX_UNKNOWN;
++	if (ni->ni_txparms != NULL)
++		ridx = rate2ridx(ni->ni_txparms->mgmtrate);
++	if (ridx == RTWN_RIDX_UNKNOWN || !(RTWN_RATE_IS_CCK(ridx) ||
++	    RTWN_RATE_IS_OFDM(ridx))) {
++		ridx = (r22b_mgmt_rate_id(sc, ni) == R22B_RATEID_G) ?
++		    RTWN_RIDX_OFDM6 : RTWN_RIDX_CCK1;
++	}
++
++	return (ridx);
++}
++
+ void
+ r22b_fill_tx_desc(struct rtwn_softc *sc, struct ieee80211_node *ni,
+     struct mbuf *m, void *buf, uint8_t ridx, bool force_rate, int maxretry)
+@@ -218,16 +237,23 @@ r22b_fill_tx_desc(struct rtwn_softc *sc, struct ieee80211_node *ni,
+ 	struct ieee80211com *ic = &sc->sc_ic;
+ 	struct ieee80211vap *vap = ni->ni_vap;
+ 	struct rtwn_vap *uvp = RTWN_VAP(vap);
++	struct r22b_softc *rs = sc->sc_priv;
++	const struct r22b_sta_info *si;
+ 	struct ieee80211_frame *wh;
+ 	struct r22b_tx_desc *txd;
+ 	uint16_t seqno;
+-	uint8_t type, tid, qsel, rate_id;
+-	int hasqos, ismcast, macid;
++	uint8_t type, subtype, tid, qsel, rate_id;
++	int hasqos, ismcast, isnull, macid, fw_ra;
+ 
+ 	wh = mtod(m, struct ieee80211_frame *);
+ 	type = wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK;
++	subtype = wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK;
+ 	hasqos = IEEE80211_QOS_HAS_SEQ(wh);
+ 	ismcast = IEEE80211_IS_MULTICAST(wh->i_addr1);
++	/* ieee80211_is_nullfunc(): rtw88 treats these like management */
++	isnull = (type == IEEE80211_FC0_TYPE_DATA &&
++	    (subtype == IEEE80211_FC0_SUBTYPE_NODATA ||
++	     subtype == IEEE80211_FC0_SUBTYPE_QOS_NULL));
+ 
+ 	if (hasqos)
+ 		tid = ((const struct ieee80211_qosframe *)wh)->i_qos[0] &
+@@ -240,20 +266,49 @@ r22b_fill_tx_desc(struct rtwn_softc *sc, struct ieee80211_node *ni,
+ 	if (ismcast)
+ 		txd->flags0 |= R22B_FLAGS0_BMC;
+ 
+-	if (!ismcast)
++	/*
++	 * MAC id: the node's; before association (no id yet) rtw88 uses
++	 * the interface's MAC id, which is 0 for the first interface.
++	 */
++	si = NULL;
++	if (!ismcast) {
+ 		macid = RTWN_NODE(ni)->id;
+-	else
++		if (macid == RTWN_MACID_UNDEFINED)
++			macid = 0;
++		else if (macid < R22B_MACID_NUM && rs->sta[macid].valid)
++			si = &rs->sta[macid];
++	} else
+ 		macid = RTWN_MACID_BC;
+ 
+-	if (type == IEEE80211_FC0_TYPE_DATA) {
++	/*
++	 * Firmware rate adaptation (rtw_tx_data_pkt_info_update()): unicast
++	 * data to a station the firmware knows (RA info sent) and no rate
++	 * forced by rtwn (EAPOL, multicast, fixed rate).
++	 */
++	fw_ra = (sc->sc_ratectl == RTWN_RATECTL_FW && !force_rate &&
++	    !isnull && si != NULL && type == IEEE80211_FC0_TYPE_DATA);
++
++	if (type == IEEE80211_FC0_TYPE_DATA && !isnull) {
+ 		/* rtw_tx_data_pkt_info_update() */
+ 		qsel = R22B_TXDW1_QSEL_TID(tid % R22B_MAX_TID);
+ 
+ 		if (ismcast)
+ 			rate_id = R22B_RATEID_BG;	/* rtw88: "default" */
+-		else {
++		else if (fw_ra)
++			rate_id = si->rate_id;
++		else if (force_rate && (RTWN_RATE_IS_CCK(ridx) ||
++		    RTWN_RATE_IS_OFDM(ridx))) {
++			/*
++			 * EAPOL frames (rtwn forces the management rate):
++			 * rate id of rtw_tx_pkt_info_update_rate().
++			 */
++			rate_id = r22b_mgmt_rate_id(sc, ni);
++		} else if (si != NULL)
++			rate_id = si->rate_id;
++		else
+ 			rate_id = r22b_data_rate_id(sc, ni);
+ 
++		if (!ismcast) {
+ 			if (m->m_flags & M_AMPDU_MPDU) {
+ 				txd->txdw2 |= htole32(R22B_TXDW2_AGG_EN);
+ 				txd->txdw2 |= htole32(SM(R22B_TXDW2_AMPDU_DEN,
+@@ -262,13 +317,33 @@ r22b_fill_tx_desc(struct rtwn_softc *sc, struct ieee80211_node *ni,
+ 				    r22b_tx_agg_window(ni, tid)));
+ 			}
+ 
+-			r22b_tx_set_bw(sc, txd, ni, ridx);
+-			if (RTWN_RATE_IS_HT(ridx))
+-				r22b_tx_set_sgi(sc, txd, ni);
+-
+-			if (RTWN_RATE_IS_CCK(ridx) && ridx != RTWN_RIDX_CCK1 &&
+-			    (ic->ic_flags & IEEE80211_F_SHPREAMBLE))
+-				txd->txdw5 |= htole32(R22B_TXDW5_DATA_SHORT);
++			if (fw_ra) {
++				/*
++				 * The firmware picks rate and short GI; the
++				 * descriptor carries the initial rate, the
++				 * bandwidth, STBC and LDPC of the station.
++				 * As in rtw88, the 1-bit LDPC field only
++				 * takes HT_LDPC_EN (le32_encode_bits()).
++				 */
++				ridx = si->init_rate;
++				txd->txdw5 |= htole32(SM(R22B_TXDW5_DATA_BW,
++				    si->bw_mode));
++				txd->txdw5 |= htole32(SM(R22B_TXDW5_DATA_STBC,
++				    si->stbc_en & 0x3));
++				if (si->ldpc_en & 0x1)
++					txd->txdw5 |= htole32(
++					    R22B_TXDW5_DATA_LDPC);
++			} else {
++				r22b_tx_set_bw(sc, txd, ni, ridx);
++				if (RTWN_RATE_IS_HT(ridx))
++					r22b_tx_set_sgi(sc, txd, ni);
++
++				if (RTWN_RATE_IS_CCK(ridx) &&
++				    ridx != RTWN_RIDX_CCK1 &&
++				    (ic->ic_flags & IEEE80211_F_SHPREAMBLE))
++					txd->txdw5 |= htole32(
++					    R22B_TXDW5_DATA_SHORT);
++			}
+ 
+ 			/*
+ 			 * RTS/CTS: rtw88 uses RTS at 24M with short
+@@ -297,13 +372,21 @@ r22b_fill_tx_desc(struct rtwn_softc *sc, struct ieee80211_node *ni,
+ 		    seqno % IEEE80211_SEQ_RANGE));
+ 
+ 		/*
+-		 * TODO (phase 2): ask for a tx report (SPE_RPT + SW_DEFINE)
+-		 * once C2H tx reports are handled.
++		 * Not requested: Tx reports (SPE_RPT + SW_DEFINE); the
++		 * firmware does the rate adaptation.
+ 		 */
+ 	} else {
+-		/* rtw_tx_mgmt_pkt_info_update(); control frames too */
+-		qsel = R22B_TXDW1_QSEL_MGMT;
++		/*
++		 * rtw_tx_mgmt_pkt_info_update(): management, control and
++		 * (QoS) Null frames.  On USB, null frames keep the TID queue
++		 * (rtw_usb_tx_queue_mapping_to_qsel() only maps management
++		 * and control frames to QSEL_MGMT).
++		 */
++		qsel = isnull ? R22B_TXDW1_QSEL_TID(tid % R22B_MAX_TID) :
++		    R22B_TXDW1_QSEL_MGMT;
+ 		rate_id = r22b_mgmt_rate_id(sc, ni);
++		if (isnull)
++			ridx = r22b_mgmt_ridx(sc, ni);
+ 		force_rate = true;
+ 		r22b_tx_set_hwseq(txd, uvp->id);
+ 	}
+@@ -318,7 +401,7 @@ r22b_fill_tx_desc(struct rtwn_softc *sc, struct ieee80211_node *ni,
+ 	if (force_rate)
+ 		txd->txdw3 |= htole32(R22B_TXDW3_USE_RATE |
+ 		    R22B_TXDW3_DISDATAFB);
+-	else if (sc->sc_ratectl != RTWN_RATECTL_FW)
++	else if (!fw_ra)
+ 		txd->txdw3 |= htole32(R22B_TXDW3_USE_RATE);
+ }
+ 
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_var.h b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_var.h
+index b27c168c6e..d0ce00f5d5 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_var.h
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b_var.h
+@@ -60,6 +60,29 @@ struct r22b_txpwr_idx {
+ 	int8_t		vht_bw80_5g[4];		/* 1S .. 4S */
+ };
+ 
++/*
++ * Firmware rate adaptation state of one MAC id (rtw88 main.h, the
++ * struct rtw_sta_info fields rtw_update_sta_info() fills in, plus the
++ * last C2H rate report).  Indexed by rtwn's node id.
++ */
++struct r22b_sta_info {
++	uint8_t		valid;		/* media status "connected" sent */
++	uint8_t		is_5g;		/* band the RA info was built for */
++	uint8_t		rate_id;	/* R22B_RATEID_* */
++	uint8_t		bw_mode;	/* R22B_CHANNEL_WIDTH_* */
++	uint8_t		stbc_en;	/* R22B_HT_STBC_EN / _VHT_STBC_EN */
++	uint8_t		ldpc_en;	/* R22B_HT_LDPC_EN / _VHT_LDPC_EN */
++	uint8_t		sgi_enable;
++	uint8_t		vht_enable;
++	uint8_t		init_ra_lv;
++	uint8_t		rssi_level;
++	uint8_t		init_rate;	/* data rate rtw88 puts in the desc */
++	uint8_t		ra_rate;	/* last C2H_RA_RPT rate (desc index) */
++	uint8_t		ra_sgi;
++	uint8_t		ra_bw;
++	uint64_t	ra_mask;
++};
++
+ struct r22b_softc {
+ 	/* Chip identification (rtw_chip_parameter_setup()). */
+ 	uint32_t	chip_version;		/* REG_SYS_CFG1 */
+@@ -153,6 +176,24 @@ struct r22b_softc {
+ 	uint8_t		coex_bt_disabled:1,
+ 			coex_wl_slot_extend:1;
+ 
++	/* Firmware rate adaptation (r22b_ra.c), per rtwn node id. */
++	struct r22b_sta_info sta[R22B_MACID_NUM];
++	uint8_t		ra_tick;	/* rtwdev->watch_dog_cnt */
++	uint8_t		nsta;		/* connected MAC ids */
++	uint16_t	rrsr_val_init;	/* dm_info->rrsr_val_init */
++
++	/*
++	 * Registers rtwn writes on association that rtw88 leaves alone,
++	 * saved after initialization (r22b_post_init()) and put back by
++	 * r22b_assoc_regs().
++	 */
++	uint16_t	saved_bcn_psr_rpt;
++	uint8_t		saved_inirts_rate_sel;
++	uint32_t	saved_shpre;	/* R22B_BIT_RTWN_SHPRE or 0 */
++
++	/* IQK: channel last calibrated (R22B_IQK_CHAN() or 0). */
++	uint16_t	iqk_chan;
++
+ 	/* net80211 methods wrapped by the chip code. */
+ 	void		(*rs_scan_start)(struct ieee80211com *);
+ 	void		(*rs_scan_end)(struct ieee80211com *);
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_attach.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_attach.c
+index bacda87642..aa5bf8d032 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_attach.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_attach.c
+@@ -14,7 +14,9 @@
+  *
+  * Sources (rtw88 v7.0): rtw8822b.c (rtw8822b_hw_spec), usb.c
+  * (rtw_usb_read, rtw_usb_write, rtw_usb_reg_sec), main.c
+- * (rtw_init_ht_cap, rtw_init_vht_cap, rtw_core_init).
++ * (rtw_init_ht_cap, rtw_init_vht_cap, rtw_core_init), sec.c and
++ * mac80211.c (rtw_sec_get_free_cam, rtw_sec_write_cam,
++ * rtw_sec_enable_sec_engine, rtw_ops_set_key).
+  */
+ 
+ #include <sys/cdefs.h>
+@@ -267,7 +269,7 @@ r22bu_attach(struct rtwn_usb_softc *uc)
+ 	sc->sc_get_rssi_cck		= r22b_get_rssi_cck;
+ 	sc->sc_get_rssi_ofdm		= r22b_get_rssi_ofdm;
+ 	sc->sc_classify_intr		= r22bu_classify_intr;
+-	/* TODO (phase 2): C2H tx reports for net80211 rate control. */
++	/* Firmware rate adaptation (r22b_ra.c); no per-frame Tx reports. */
+ 	sc->sc_handle_tx_report		= rtwn_nop_softc_uint8_int;
+ 	sc->sc_handle_tx_report2	= rtwn_nop_softc_uint8_int;
+ 	sc->sc_handle_c2h_report	= r22b_handle_c2h_report;
+@@ -301,7 +303,7 @@ r22bu_attach(struct rtwn_usb_softc *uc)
+ 	sc->sc_set_media_status		= r22b_set_media_status;
+ 	sc->sc_set_rsvd_page		= r22b_set_rsvd_page;
+ 	sc->sc_set_pwrmode		= r22b_set_pwrmode;
+-	sc->sc_set_rssi			= rtwn_nop_softc;	/* TODO */
++	sc->sc_set_rssi			= r22b_set_rssi;
+ #else
+ 	sc->sc_set_media_status		= rtwn_nop_softc_int;
+ #endif
+@@ -363,7 +365,25 @@ r22bu_attach(struct rtwn_usb_softc *uc)
+ 	sc->macid_limit			= R22B_MACID_MAX;
+ 	sc->cam_entry_limit		= R22B_CAM_ENTRY_COUNT;
+ 	sc->fwsize_limit		= R22B_MAX_FW_SIZE;
+-	sc->temp_delta			= R22B_IQK_THRESHOLD;
++	/*
++	 * rtwn_temp_calib() recalibrates when |delta| > temp_delta,
++	 * rtw_phy_pwrtrack_need_iqk() when delta >= iqk_threshold.
++	 */
++	sc->temp_delta			= R22B_IQK_THRESHOLD - 1;
++
++	/*
++	 * Hardware crypto as rtw88 sets it up (sec.c, mac80211.c
++	 * rtw_ops_set_key()): default key search, i.e. group keys in CAM
++	 * entries 0..3 by key index with BIT(6) set and broadcast address,
++	 * pairwise keys from entry 4 with the peer address, and REG_SECCFG
++	 * = TX/RX_DEC_EN | TX/RX_UNI_USE_DK | TX/RX_BC_USE_DK.  That is
++	 * rtwn's RTWN_CRYPTO_FULL mode (keys and SECCFG 0x00cf), so use it
++	 * instead of rtwn's default (pairwise keys only).  An explicit
++	 * "hwcrypto" setting of 0 (software) is kept.
++	 */
++	if (sc->sc_hwcrypto == RTWN_CRYPTO_PAIR)
++		sc->sc_hwcrypto = RTWN_CRYPTO_FULL;
++	sc->cam_group_bits		= 0x00000040;	/* cam->group << 6 */
+ 
+ 	sc->bcn_status_reg[0]		= R92C_TDECTRL;
+ 	sc->bcn_status_reg[1]		= R92C_TDECTRL;
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_rx.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_rx.c
+index 21b7a78e61..0e800cd450 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_rx.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_rx.c
+@@ -13,10 +13,15 @@
+  *
+  * rtw88 (usb.c rtw_usb_rx_handler()) walks every packet of an Rx
+  * transfer, 8-byte aligned, and routes each one by the C2H bit of its
+- * descriptor (RTW_RX_DESC_W2_C2H).  rtwn classifies a whole transfer by
+- * its first packet, so a transfer is only reported as a C2H event when
+- * that event is all it contains; C2H events aggregated with frames are
+- * caught per packet by r22b_check_frame().
++ * descriptor (RTW_RX_DESC_W2_C2H).  rtwn classifies a whole transfer:
++ *
++ * - only C2H packets: RTWN_RX_OTHER, r22b_handle_c2h_report() handles
++ *   all of them;
++ * - frames and C2H packets mixed: RTWN_RX_DATA; rtwn's Rx path hands
++ *   every packet to sc_check_frame (r22b_check_frame()), except those
++ *   shorter than an ACK frame, which rtwn_rx_check_pre_alloc() drops
++ *   first.  C2H packets that short (a rate report is 9 bytes) are
++ *   handled here before rtwn drops them.
+  */
+ 
+ #include <sys/cdefs.h>
+@@ -52,18 +57,16 @@
+ int
+ r22bu_classify_intr(struct rtwn_softc *sc, void *buf, int len)
+ {
+-	const struct r22b_rx_stat *stat = buf;
+-	uint32_t rxdw0;
+-	int totlen;
++	int npkt, nc2h;
+ 
+-	if (le32toh(stat->rxdw2) & R22B_RXDW2_C2H) {
+-		rxdw0 = le32toh(stat->rxdw0);
+-		totlen = sizeof(*stat) + MS(rxdw0, RTWN_RXDW0_INFOSZ) * 8 +
+-		    MS(rxdw0, RTWN_RXDW0_SHIFT) + MS(rxdw0, RTWN_RXDW0_PKTLEN);
+-		if (roundup2(totlen, 8) >= len)
+-			return (RTWN_RX_OTHER);
+-	}
++	/* Count first; nothing is handled for an all-C2H transfer here. */
++	npkt = r22b_c2h_walk(sc, buf, len, R22B_C2H_COUNT, &nc2h);
++	if (nc2h == 0)
++		return (RTWN_RX_DATA);
++	if (nc2h == npkt)
++		return (RTWN_RX_OTHER);
+ 
++	(void)r22b_c2h_walk(sc, buf, len, R22B_C2H_SHORT, &nc2h);
+ 	return (RTWN_RX_DATA);
+ }
+ 

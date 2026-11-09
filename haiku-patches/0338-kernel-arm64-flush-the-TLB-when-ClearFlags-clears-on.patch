@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 7 Nov 2026 22:04:53 -0500
+Subject: [PATCH 338/342] kernel/arm64: flush the TLB when ClearFlags() clears
+ only the access flag
+
+The other branches flush when the old entry had the flag set; this one
+didn't. A CPU could keep the translation cached while the entry said it
+was never used, so accesses wouldn't fault to set the flag again, and an
+unmap, seeing it clear, wouldn't flush either. No caller in the VM uses
+this case today (vm_clear_map_flags() is called for PAGE_MODIFIED only).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/kernel/arch/arm64/VMSAv8TranslationMap.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/system/kernel/arch/arm64/VMSAv8TranslationMap.cpp b/src/system/kernel/arch/arm64/VMSAv8TranslationMap.cpp
+index f3cae320e2..9d56fc3dc2 100644
+--- a/src/system/kernel/arch/arm64/VMSAv8TranslationMap.cpp
++++ b/src/system/kernel/arch/arm64/VMSAv8TranslationMap.cpp
+@@ -1036,7 +1036,11 @@ VMSAv8TranslationMap::ClearFlags(addr_t va, uint32 flags)
+ 					}
+ 				}
+ 			} else if (clearAF) {
+-				atomic_and64((int64_t*)ptePtr, ~kAttrAF);
++				// The TLB may hold the entry with the flag set: without the
++				// flush, accesses wouldn't fault to set it again, and an
++				// unmap, seeing it clear, wouldn't flush either.
++				uint64_t oldPte = atomic_and64((int64_t*)ptePtr, ~kAttrAF);
++				FlushVAIfAccessed(oldPte, va);
+ 			} else {
+ 				while (true) {
+ 					uint64_t oldPte = atomic_get64((int64_t*)ptePtr);

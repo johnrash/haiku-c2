@@ -1,0 +1,265 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Tue, 27 Oct 2026 23:07:17 -0400
+Subject: [PATCH 004/342] arm64: add Amlogic Meson GX debug UART
+
+Debug UART for "amlogic,meson-gx-uart" (S905 uart_AO on the ODROID-C2),
+used by the EFI loader after ExitBootServices and by the kernel debug
+console. Polled FIFO access only; baud rate and pins stay as the firmware
+set them up.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/arch/arm64/arch_uart_meson.h       |  42 ++++++
+ src/system/boot/arch/arm64/Jamfile            |   1 +
+ src/system/boot/platform/efi/dtb.cpp          |   2 +
+ src/system/kernel/arch/arm64/Jamfile          |   1 +
+ .../kernel/arch/arm64/arch_debug_console.cpp  |   5 +
+ .../kernel/arch/arm64/arch_uart_meson.cpp     | 122 ++++++++++++++++++
+ 6 files changed, 173 insertions(+)
+ create mode 100644 headers/private/kernel/arch/arm64/arch_uart_meson.h
+ create mode 100644 src/system/kernel/arch/arm64/arch_uart_meson.cpp
+
+diff --git a/headers/private/kernel/arch/arm64/arch_uart_meson.h b/headers/private/kernel/arch/arm64/arch_uart_meson.h
+new file mode 100644
+index 0000000000..c2149c3f75
+--- /dev/null
++++ b/headers/private/kernel/arch/arm64/arch_uart_meson.h
+@@ -0,0 +1,42 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef __DEV_UART_MESON_H
++#define __DEV_UART_MESON_H
++
++
++#include <arch/generic/debug_uart.h>
++
++
++#define UART_KIND_MESON "meson"
++
++
++// Amlogic Meson GX UART (S905 uart_AO and the EE UARTs). Baud rate, framing
++// and pin setup are left as the firmware (U-Boot) configured them.
++class ArchUARTMeson : public DebugUART {
++public:
++						ArchUARTMeson(addr_t base, int64 clock);
++						~ArchUARTMeson();
++
++			void		InitPort(uint32 baud);
++
++			void		Enable();
++			void		Disable();
++
++			int			PutChar(char c);
++			int			GetChar(bool wait);
++
++			void		FlushTx();
++			void		FlushRx();
++
++private:
++			void		Out32(int reg, uint32 data);
++			uint32		In32(int reg);
++};
++
++
++ArchUARTMeson* arch_get_uart_meson(addr_t base, int64 clock);
++
++
++#endif
+diff --git a/src/system/boot/arch/arm64/Jamfile b/src/system/boot/arch/arm64/Jamfile
+index 314d77fa1b..d0d4dcc8c9 100644
+--- a/src/system/boot/arch/arm64/Jamfile
++++ b/src/system/boot/arch/arm64/Jamfile
+@@ -5,6 +5,7 @@ local platform ;
+ local kernelArchSources =
+ 	arch_elf.cpp
+ 	arch_uart_linflex.cpp
++	arch_uart_meson.cpp
+ 	arch_uart_samsung.cpp
+ ;
+ 
+diff --git a/src/system/boot/platform/efi/dtb.cpp b/src/system/boot/platform/efi/dtb.cpp
+index ad90255290..01d327e597 100644
+--- a/src/system/boot/platform/efi/dtb.cpp
++++ b/src/system/boot/platform/efi/dtb.cpp
+@@ -20,6 +20,7 @@
+ #elif defined(__aarch64__)
+ #	include <arch/arm/arch_uart_pl011.h>
+ #	include <arch/arm64/arch_uart_linflex.h>
++#	include <arch/arm64/arch_uart_meson.h>
+ #	include <arch/arm64/arch_uart_samsung.h>
+ #endif
+ 
+@@ -85,6 +86,7 @@ const struct supported_uarts {
+ 	{ "fsl,s32-linflexuart", UART_KIND_LINFLEX, &get_uart<ArchUARTlinflex> },
+ 	{ "brcm,bcm2835-aux-uart", UART_KIND_8250, &get_uart<DebugUART8250> },
+ 	{ "apple,s5l-uart", UART_KIND_SAMSUNG, &get_uart<ArchUARTSamsung> },
++	{ "amlogic,meson-gx-uart", UART_KIND_MESON, &get_uart<ArchUARTMeson> },
+ #endif
+ };
+ 
+diff --git a/src/system/kernel/arch/arm64/Jamfile b/src/system/kernel/arch/arm64/Jamfile
+index 4ff8f9fb01..4397a2da2f 100644
+--- a/src/system/kernel/arch/arm64/Jamfile
++++ b/src/system/kernel/arch/arm64/Jamfile
+@@ -40,6 +40,7 @@ KernelMergeObject kernel_arch_arm64.o :
+ #	arch_uart_8250_omap.cpp
+ 	arch_uart_pl011.cpp
+ 	arch_uart_linflex.cpp
++	arch_uart_meson.cpp
+ 	arch_uart_samsung.cpp
+ 
+ 	:
+diff --git a/src/system/kernel/arch/arm64/arch_debug_console.cpp b/src/system/kernel/arch/arm64/arch_debug_console.cpp
+index bdaa106ac3..35b8d889bc 100644
+--- a/src/system/kernel/arch/arm64/arch_debug_console.cpp
++++ b/src/system/kernel/arch/arm64/arch_debug_console.cpp
+@@ -8,6 +8,7 @@
+ // #include <arch/arm/arch_uart_8250_omap.h>
+ #include <arch/arm/arch_uart_pl011.h>
+ #include <arch/arm64/arch_uart_linflex.h>
++#include <arch/arm64/arch_uart_meson.h>
+ #include <arch/arm64/arch_uart_samsung.h>
+ #include <boot/kernel_args.h>
+ #include <kernel.h>
+@@ -113,6 +114,10 @@ arch_debug_console_init(kernel_args *args)
+ 		sizeof(args->arch_args.uart.kind)) == 0) {
+ 		sArchDebugUART = arch_get_uart_samsung(args->arch_args.uart.regs.start,
+ 			args->arch_args.uart.clock);
++	} else if (strncmp(args->arch_args.uart.kind, UART_KIND_MESON,
++		sizeof(args->arch_args.uart.kind)) == 0) {
++		sArchDebugUART = arch_get_uart_meson(args->arch_args.uart.regs.start,
++			args->arch_args.uart.clock);
+ 	}
+ 
+ 	// Oh well.
+diff --git a/src/system/kernel/arch/arm64/arch_uart_meson.cpp b/src/system/kernel/arch/arm64/arch_uart_meson.cpp
+new file mode 100644
+index 0000000000..baede70f5f
+--- /dev/null
++++ b/src/system/kernel/arch/arm64/arch_uart_meson.cpp
+@@ -0,0 +1,122 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++#include <arch/generic/debug_uart.h>
++#include <arch/arm64/arch_uart_meson.h>
++#include <new>
++
++
++#define MESON_WFIFO		0x00	// Transmit FIFO
++#define MESON_RFIFO		0x04	// Receive FIFO
++#define MESON_CONTROL	0x08	// Control
++#define MESON_STATUS	0x0c	// Status
++
++#define STATUS_RX_EMPTY	(1 << 20)	// Receive FIFO empty
++#define STATUS_TX_FULL	(1 << 21)	// Transmit FIFO full
++#define STATUS_TX_EMPTY	(1 << 22)	// Transmit FIFO empty
++
++
++ArchUARTMeson::ArchUARTMeson(addr_t base, int64 clock)
++	:
++	DebugUART(base, clock)
++{
++}
++
++
++ArchUARTMeson::~ArchUARTMeson()
++{
++}
++
++
++void
++ArchUARTMeson::Out32(int reg, uint32 data)
++{
++	*(volatile uint32*)(Base() + reg) = data;
++}
++
++
++uint32
++ArchUARTMeson::In32(int reg)
++{
++	return *(volatile uint32*)(Base() + reg);
++}
++
++
++void
++ArchUARTMeson::InitPort(uint32 baud)
++{
++	// Keep the firmware's baud rate divider and line settings.
++}
++
++
++void
++ArchUARTMeson::Enable()
++{
++	DebugUART::Enable();
++}
++
++
++void
++ArchUARTMeson::Disable()
++{
++	DebugUART::Disable();
++}
++
++
++int
++ArchUARTMeson::PutChar(char c)
++{
++	if (Enabled()) {
++		while ((In32(MESON_STATUS) & STATUS_TX_FULL) != 0)
++			;
++
++		Out32(MESON_WFIFO, (uint8)c);
++		return 0;
++	}
++
++	return -1;
++}
++
++
++int
++ArchUARTMeson::GetChar(bool wait)
++{
++	if (Enabled()) {
++		while (wait && (In32(MESON_STATUS) & STATUS_RX_EMPTY) != 0)
++			;
++
++		if ((In32(MESON_STATUS) & STATUS_RX_EMPTY) != 0)
++			return -1;
++
++		return In32(MESON_RFIFO) & 0xff;
++	}
++
++	return -1;
++}
++
++
++void
++ArchUARTMeson::FlushTx()
++{
++	while ((In32(MESON_STATUS) & STATUS_TX_EMPTY) == 0)
++		;
++}
++
++
++void
++ArchUARTMeson::FlushRx()
++{
++	while ((In32(MESON_STATUS) & STATUS_RX_EMPTY) == 0)
++		In32(MESON_RFIFO);
++}
++
++
++ArchUARTMeson*
++arch_get_uart_meson(addr_t base, int64 clock)
++{
++	static char buffer[sizeof(ArchUARTMeson)];
++	ArchUARTMeson* uart = new(buffer) ArchUARTMeson(base, clock);
++	return uart;
++}

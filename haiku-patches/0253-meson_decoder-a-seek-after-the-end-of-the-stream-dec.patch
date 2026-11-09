@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Mon, 2 Nov 2026 01:35:59 -0500
+Subject: [PATCH 253/342] meson_decoder: a seek after the end of the stream
+ decodes again
+
+Once the stream had ended, a seek stopped the session but left
+fOutputEnded set, and _NextFrame() returned B_LAST_BUFFER_ERROR before
+starting the next session: no frame after any later seek (H.264, HEVC
+and MPEG-1/2 alike; MediaPlayer playing a file again from its end).
+Found with mediadecode's seeks on 10 s MPEG-2 files, whose first seek
+reaches the end.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
+index a8de22c07b..99bcb54a1f 100644
+--- a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
++++ b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
+@@ -835,6 +835,8 @@ MesonVdecDecoder::SeekedTo(int64 frame, bigtime_t time)
+ 	}
+ 	_ReleaseFrame();
+ 	_StopSession();
++	// a seek after the end of the stream: the next frame starts a session
++	fOutputEnded = false;
+ 	return B_OK;
+ }
+ 

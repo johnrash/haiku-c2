@@ -1,0 +1,250 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 4 Nov 2026 14:27:23 -0500
+Subject: [PATCH 292/342] realtekwifi: USB Tx aggregation and a longer send
+ queue on the RTL8822B
+
+Up to 8 data frames now share a bulk OUT transfer, after rtw88's
+rtw_usb_tx_agg_skb(), and the send queue holds 256 frames instead of 50. Each was
+a limit: USB was busy all the time at one frame or three per transfer, and the
+queue's overflow cost TCP its speed. A drop per 2,000 frames holds a connection at
+about 22 MB/s with this round trip, and that's where it sat with room in the chip
+and CPU to spare.
+
+Upload 12.8 to 26.4 MB/s on channel 64, and 17.3 to 31.7 on channel 136, against a
+laptop, with a 1 MB socket buffer; download the same. No restart in 37.6 GB. At 8
+frames USB is about 94% busy, so it's near its limit of 36 MB/s; 12 frames gave
+no more.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../wlan/realtekwifi/dev/rtwn/if_rtwn.c       |  2 +-
+ .../wlan/realtekwifi/dev/rtwn/if_rtwnreg.h    |  2 +
+ .../wlan/realtekwifi/dev/rtwn/if_rtwnvar.h    |  1 +
+ .../wlan/realtekwifi/dev/rtwn/rtl8822b/r22b.h |  6 +-
+ .../dev/rtwn/rtl8822b/usb/r22bu_attach.c      |  9 ++-
+ .../realtekwifi/dev/rtwn/usb/rtwn_usb_tx.c    | 71 ++++++++++++++++---
+ .../realtekwifi/dev/rtwn/usb/rtwn_usb_var.h   |  4 ++
+ 7 files changed, 83 insertions(+), 12 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn.c
+index 3f9e36e46b..b25e669f2d 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn.c
+@@ -169,7 +169,7 @@ rtwn_attach(struct rtwn_softc *sc)
+ #endif
+ 	callout_init(&sc->sc_calib_to, 0);
+ 	callout_init(&sc->sc_pwrmode_init, 0);
+-	mbufq_init(&sc->sc_snd, ifqmaxlen);
++	mbufq_init(&sc->sc_snd, sc->tx_queue_len != 0 ? sc->tx_queue_len : ifqmaxlen);
+ 
+ 	RTWN_LOCK(sc);
+ 	error = rtwn_read_chipid(sc);
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwnreg.h b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwnreg.h
+index f1c0a7a6ff..972031c4e6 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwnreg.h
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwnreg.h
+@@ -47,6 +47,8 @@ struct rtwn_tx_desc_common {
+ 		uint16_t	usb_checksum;
+ 		uint16_t	pci_txbufsize;
+ 	} txdw7;
++	uint8_t		txdw7_reserved;
++	uint8_t		usb_agg_num;	/* RTL8822B: frames in this transfer */
+ } __packed __attribute__((aligned(4)));
+ 
+ /* Common part of Rx descriptor. */
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwnvar.h b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwnvar.h
+index bc934d13e7..8d500bf99a 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwnvar.h
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwnvar.h
+@@ -229,6 +229,7 @@ struct rtwn_softc {
+ 	int			sc_rx_silence;		/* seconds */
+ 	int			sc_rx_flowing;
+ 	int			rx_silence_limit;	/* seconds; 0: not watched */
++	int			tx_queue_len;		/* frames; 0: ifqmaxlen */
+ #endif
+ 
+ 	struct mtx		sc_mtx;
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b.h b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b.h
+index d545006102..0c39cf3a92 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b.h
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/r22b.h
+@@ -27,7 +27,11 @@
+ #define R22B_RSVD_PG_CPU_INSTRUCTION_NUM 0
+ #define R22B_RSVD_PG_FW_TXBUF_NUM	4
+ #define R22B_CSI_BUF_PG_NUM		0
+-#define R22B_USB_TX_AGG_DESC_NUM	3	/* usb_tx_agg_desc_num */
++/*
++ * Frames in a USB transfer. rtw88's usb_tx_agg_desc_num is 3, but those are
++ * mac80211's A-MSDUs, 9-20 KB in all; rtwn's frames are one MSDU each.
++ */
++#define R22B_USB_TX_AGG_DESC_NUM	8
+ #define R22B_PHY_STATUS_SIZE		4	/* in 8-byte units */
+ #define R22B_SYS_FUNC_EN_VAL		0xdc	/* sys_func_en */
+ 
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_attach.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_attach.c
+index 7683b5c3d3..7fe89e07bc 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_attach.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/rtl8822b/usb/r22bu_attach.c
+@@ -251,10 +251,17 @@ r22bu_attach(struct rtwn_usb_softc *uc)
+ 	 * comes every 100 ms, so 4 s without a frame means that.
+ 	 */
+ 	sc->rx_silence_limit		= 4;
++	/*
++	 * At a 3 ms round trip a TCP sender loses a third of its speed to a
++	 * drop in every 2,000 frames, and 50 frames overflow that often (rtw88
++	 * reaches 200 under mac80211).
++	 */
++	sc->tx_queue_len		= 256;
+ 
+ 	/* USB part. */
+ 	uc->uc_align_rx			= r22bu_align_rx;
+-	uc->tx_agg_desc_num		= 1;	/* TODO: Tx aggregation */
++	uc->tx_agg_desc_num		= 1;	/* not used: see r22b_init */
++	uc->tx_agg_frames		= R22B_USB_TX_AGG_DESC_NUM;
+ 	sc->ampdu_density		= IEEE80211_HTCAP_MPDUDENSITY_2;
+ 	uc->tx_no_own			= 1;	/* W0 bit 31 is DISQSELSEQ */
+ 	uc->uc_setup_ep_map		= r22bu_setup_ep_map;
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/usb/rtwn_usb_tx.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/usb/rtwn_usb_tx.c
+index b1540e4389..92a0cef465 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/usb/rtwn_usb_tx.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/usb/rtwn_usb_tx.c
+@@ -62,6 +62,7 @@
+ 
+ static struct rtwn_data * _rtwn_usb_getbuf(struct rtwn_usb_softc *);
+ static struct rtwn_data * rtwn_usb_getbuf(struct rtwn_usb_softc *);
++static void		rtwn_usb_tx_checksum(struct rtwn_tx_desc_common *);
+ static void		rtwn_usb_txeof(struct rtwn_usb_softc *,
+ 			    struct rtwn_data *, int);
+ 
+@@ -132,6 +133,58 @@ rtwn_usb_txeof(struct rtwn_usb_softc *uc, struct rtwn_data *data, int status)
+ #endif
+ }
+ 
++/* The frames of the transfer that has ended, all of them with one status. */
++static void
++rtwn_usb_tx_done(struct rtwn_usb_softc *uc, int qid, int status)
++{
++	struct rtwn_data *data;
++	int count;
++
++	data = STAILQ_FIRST(&uc->uc_tx_active[qid]);
++	for (count = data->agg_num; count > 0 && data != NULL; count--) {
++		STAILQ_REMOVE_HEAD(&uc->uc_tx_active[qid], next);
++		rtwn_usb_txeof(uc, data, status);
++		data = STAILQ_FIRST(&uc->uc_tx_active[qid]);
++	}
++}
++
++/*
++ * USB Tx aggregation (rtw_usb_tx_agg_skb()): the data frames waiting behind
++ * this one go into its transfer, each at the next multiple of 8 bytes, and the
++ * first descriptor gives their number.
++ */
++static void
++rtwn_usb_tx_agg(struct rtwn_usb_softc *uc, struct rtwn_data *head, int qid)
++{
++	struct rtwn_tx_desc_common *txd;
++	struct rtwn_data *data;
++	int offset;
++
++	head->agg_num = 1;
++	if (!head->agg_ok)
++		return;
++
++	while (head->agg_num < uc->tx_agg_frames) {
++		data = STAILQ_FIRST(&uc->uc_tx_pending[qid]);
++		if (data == NULL || !data->agg_ok)
++			break;
++		offset = roundup2(head->buflen, 8);
++		if (offset + data->buflen > RTWN_USB_TXBUFSZ)
++			break;
++		memcpy(head->buf + offset, data->buf, data->buflen);
++		head->buflen = offset + data->buflen;
++		head->agg_num++;
++		STAILQ_REMOVE_HEAD(&uc->uc_tx_pending[qid], next);
++		STAILQ_INSERT_TAIL(&uc->uc_tx_active[qid], data, next);
++	}
++
++	if (head->agg_num > 1) {
++		txd = (struct rtwn_tx_desc_common *)head->buf;
++		txd->usb_agg_num = head->agg_num;
++		rtwn_usb_tx_checksum(txd);
++	}
++}
++
+ static void
+ rtwn_bulk_tx_callback_qid(struct usb_xfer *xfer, usb_error_t error, int qid)
+ {
+@@ -148,11 +201,9 @@ rtwn_bulk_tx_callback_qid(struct usb_xfer *xfer, usb_error_t error, int qid)
+ 
+ 	switch (USB_GET_STATE(xfer)){
+ 	case USB_ST_TRANSFERRED:
+-		data = STAILQ_FIRST(&uc->uc_tx_active[qid]);
+-		if (data == NULL)
++		if (STAILQ_EMPTY(&uc->uc_tx_active[qid]))
+ 			goto tr_setup;
+-		STAILQ_REMOVE_HEAD(&uc->uc_tx_active[qid], next);
+-		rtwn_usb_txeof(uc, data, 0);
++		rtwn_usb_tx_done(uc, qid, 0);
+ 		/* FALLTHROUGH */
+ 	case USB_ST_SETUP:
+ tr_setup:
+@@ -165,6 +216,7 @@ tr_setup:
+ 		}
+ 		STAILQ_REMOVE_HEAD(&uc->uc_tx_pending[qid], next);
+ 		STAILQ_INSERT_TAIL(&uc->uc_tx_active[qid], data, next);
++		rtwn_usb_tx_agg(uc, data, qid);
+ 
+ 		/*
+ 		 * Note: if this is a beacon frame, ensure that it will go
+@@ -175,14 +227,12 @@ tr_setup:
+ 		usbd_xfer_set_frame_data(xfer, 0, data->buf, data->buflen);
+ 		usbd_transfer_submit(xfer);
+ 		if (sc->sc_ratectl != RTWN_RATECTL_NET80211)
+-			sc->sc_tx_n_active++;
++			sc->sc_tx_n_active += data->agg_num;
+ 		break;
+ 	default:
+-		data = STAILQ_FIRST(&uc->uc_tx_active[qid]);
+-		if (data == NULL)
++		if (STAILQ_EMPTY(&uc->uc_tx_active[qid]))
+ 			goto tr_setup;
+-		STAILQ_REMOVE_HEAD(&uc->uc_tx_active[qid], next);
+-		rtwn_usb_txeof(uc, data, 1);
++		rtwn_usb_tx_done(uc, qid, 1);
+ 		if (error != 0)
+ 			device_printf(sc->sc_dev,
+ 			    "%s: called; txeof qid=%d, error=%s\n",
+@@ -329,6 +379,9 @@ rtwn_usb_tx_start(struct rtwn_softc *sc, struct ieee80211_node *ni,
+ 	data->id = id;
+ 	data->ni = ni;
+ 	data->qid = qid;
++	data->agg_ok = uc->tx_agg_frames > 1 && ni != NULL &&
++	    type == IEEE80211_FC0_TYPE_DATA;
++	data->agg_num = 1;
+ 	if (data->ni != NULL) {
+ 		data->m = m;
+ #ifndef D4054
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/usb/rtwn_usb_var.h b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/usb/rtwn_usb_var.h
+index 814c351f13..d4aa4e09b1 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/usb/rtwn_usb_var.h
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/usb/rtwn_usb_var.h
+@@ -41,6 +41,8 @@ struct rtwn_data {
+ 	int				id;
+ 	int				qid;
+ 	uint16_t			buflen;
++	uint8_t				agg_ok;		/* can share a transfer */
++	uint8_t				agg_num;	/* frames in its transfer */
+ 	struct mbuf			*m;
+ 	struct ieee80211_node		*ni;
+ 	STAILQ_ENTRY(rtwn_data)	next;
+@@ -82,6 +84,8 @@ struct rtwn_usb_softc {
+ 
+ 	int			ntx;
+ 	int			tx_agg_desc_num;
++	/* Data frames a bulk OUT transfer can carry; 0: one frame each. */
++	int			tx_agg_frames;
+ 	/*
+ 	 * Set by chips whose Tx descriptor has no OWN bit; rtwn_usb_tx_start()
+ 	 * then leaves dword 0 bit 31 to the chip code (RTL8822B: DISQSELSEQ).

@@ -1,0 +1,232 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 18:57:44 -0500
+Subject: [PATCH 241/342] meson_hdmi: 4K at up to 30 Hz
+
+3840x2160 and 4096x2160 at 24, 25 and 30 Hz (CEA video codes 93 to 95
+and 98 to 100), at 297 MHz:
+- the PHY gets its setting for 2.97 Gbit/s from 297 MHz on (U-Boot's
+  values for GXBB), and its usual one below; the boot state keeps the
+  PHY's too;
+- the PLL makes it from U-Boot's 5940 MHz VCO through /2, as the clock
+  chain is (VID_PLL /5, VCLK /2);
+- modes up to 4096x2160, and a frame buffer for that (35 MB);
+- 4K modes many displays list only as HDMI 1.4's HDMI VICs, in the
+  EDID's HDMI vendor block, count as listed; a display's highest TMDS
+  clock from that block limits the modes;
+- the mode list holds 48 (the capture stick's EDID gives 31 now).
+
+Without scrambling, so not 4K at 50 or 60 Hz (HDMI 2.0's 594 MHz).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../graphics/meson_hdmi/meson_hdmi_info.h     |   2 +-
+ .../graphics/meson_hdmi/meson_hdmi.cpp        | 103 +++++++++++++++++-
+ 2 files changed, 100 insertions(+), 5 deletions(-)
+
+diff --git a/headers/private/graphics/meson_hdmi/meson_hdmi_info.h b/headers/private/graphics/meson_hdmi/meson_hdmi_info.h
+index 21801d53c8..f51a161e3f 100644
+--- a/headers/private/graphics/meson_hdmi/meson_hdmi_info.h
++++ b/headers/private/graphics/meson_hdmi/meson_hdmi_info.h
+@@ -11,7 +11,7 @@
+ 
+ 
+ #define MESON_HDMI_ACCELERANT_NAME	"meson_hdmi.accelerant"
+-#define MESON_HDMI_MAX_MODES		32
++#define MESON_HDMI_MAX_MODES		48
+ #define MESON_HDMI_EDID_SIZE		256
+ 
+ 
+diff --git a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+index 9712255a77..1954c94ccf 100644
+--- a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
++++ b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+@@ -75,10 +75,13 @@ static const phys_addr_t kHhiBase = 0xc883c000;
+ static const phys_addr_t kHdmiTxBase = 0xc883a000;
+ static const phys_addr_t kDmcBase = 0xc8838000;
+ 
+-static const uint32 kMaxWidth = 1920;
+-static const uint32 kMaxHeight = 1200;
++static const uint32 kMaxWidth = 4096;
++static const uint32 kMaxHeight = 2160;
+ static const uint32 kMinPixelClock = 25000;		// kHz, the HDMI minimum
+-static const uint32 kMaxPixelClock = 297000;	// the PHY band U-Boot set
++static const uint32 kMaxPixelClock = 297000;
++	// 4K at 30 Hz; HDMI 1.4's TMDS clock, without scrambling
++static const uint32 kPhyHighBand = 297000;
++	// the PHY's setting for 2.97 Gbit/s from here on
+ static const uint32 kOsdCanvas = 0x4e;		// U-Boot's OSD1 canvas
+ 
+ // VPU registers (word numbers; byte offset = word * 4)
+@@ -345,7 +348,15 @@ static const meson_mode kModes[] = {
+ 	{ 27000, 720, 16, 62, 60, 480, 9, 6, 30, false, false, 3 },
+ 	{ 27000, 720, 12, 64, 68, 576, 5, 5, 39, false, false, 17 },		// 576p
+ 	{ 27000, 720, 12, 64, 68, 576, 5, 5, 39, false, false, 18 },
++	{ 297000, 3840, 176, 88, 296, 2160, 8, 10, 72, true, true, 95 },	// 4K30
++	{ 297000, 3840, 1056, 88, 296, 2160, 8, 10, 72, true, true, 94 },	// 4K25
++	{ 297000, 3840, 1276, 88, 296, 2160, 8, 10, 72, true, true, 93 },	// 4K24
++	{ 297000, 4096, 88, 88, 128, 2160, 8, 10, 72, true, true, 100 },
++	{ 297000, 4096, 968, 88, 128, 2160, 8, 10, 72, true, true, 99 },
++	{ 297000, 4096, 1020, 88, 296, 2160, 8, 10, 72, true, true, 98 },
+ };
++// HDMI 1.4's "HDMI VICs" (the vendor block of the EDID) as CEA video codes
++static const uint8 kHdmiVics[] = { 0, 95, 94, 93, 98 };
+ static const uint8 kPreferredVic = 16;
+ 
+ /*!	VESA DMT modes, for the EDID's established and standard timings. */
+@@ -425,7 +436,7 @@ static bool
+ mode_is_valid(const meson_mode& mode)
+ {
+ 	return mode.pixelClock >= kMinPixelClock
+-		&& mode.pixelClock < kMaxPixelClock
++		&& mode.pixelClock <= kMaxPixelClock
+ 		&& mode.hActive >= 320 && mode.hActive <= kMaxWidth
+ 		&& mode.vActive >= 200 && mode.vActive <= kMaxHeight
+ 		&& mode.hFront > 0 && mode.hSync > 0 && mode.hBack > 0
+@@ -648,6 +659,8 @@ private:
+ 			status_t			_ReadEdidBlock(uint32 block, uint8* data);
+ 			status_t			_ReadEdid();
+ 			const uint8*		_CtaExtension();
++			uint32				_HdmiVendorBlock(const uint8** _payload);
++			uint32				_MaxTmdsClock();
+ 			uint32				_DetailedTimings(const uint8** timings,
+ 									uint32 maxCount);
+ 			bool				_EdidLists(const meson_mode& mode);
+@@ -721,6 +734,8 @@ private:
+ 			uint32				fBootVpuCount;
+ 			uint32				fBootPllCntl;
+ 			uint32				fBootPllCntl2;
++			uint32				fBootPhyCntl0;
++			uint32				fBootPhyCntl3;
+ 			uint8				fBootComposer[14];
+ 			bool				fBootStateSaved;
+ 			meson_mode			fModes[MESON_HDMI_MAX_MODES];
+@@ -814,6 +829,8 @@ MesonHdmi::MesonHdmi(device_node* node)
+ 	fBootVpuCount(0),
+ 	fBootPllCntl(0),
+ 	fBootPllCntl2(0),
++	fBootPhyCntl0(0),
++	fBootPhyCntl3(0),
+ 	fBootStateSaved(false),
+ 	fModeCount(0),
+ 	fModeSet(false),
+@@ -1116,6 +1133,9 @@ MesonHdmi::_AddMode(const meson_mode& mode)
+ 	hdmi_pll pll;
+ 	if (!mode_is_valid(mode) || !compute_hdmi_pll(mode.pixelClock, pll))
+ 		return;
++	uint32 maxTmdsClock = fEdidSize > 0 ? _MaxTmdsClock() : 0;
++	if (maxTmdsClock != 0 && mode.pixelClock > maxTmdsClock)
++		return;
+ 	for (uint32 i = 0; i < fModeCount; i++) {
+ 		if (same_timing(fModes[i], mode))
+ 			return;
+@@ -1262,6 +1282,43 @@ MesonHdmi::_DetailedTimings(const uint8** timings, uint32 maxCount)
+ }
+ 
+ 
++/*!	The HDMI vendor-specific data block of the CTA-861 extension (IEEE OUI
++	00-0C-03): its payload after the header, and its length; 0 if none.
++*/
++uint32
++MesonHdmi::_HdmiVendorBlock(const uint8** _payload)
++{
++	const uint8* cta = _CtaExtension();
++	if (cta == NULL)
++		return 0;
++	uint32 dtdOffset = cta[2];
++	for (uint32 i = 4; i < dtdOffset;) {
++		uint8 header = cta[i];
++		uint32 length = header & 0x1f;
++		if ((header >> 5) == 3 && length >= 5 && i + length < dtdOffset
++			&& cta[i + 1] == 0x03 && cta[i + 2] == 0x0c
++			&& cta[i + 3] == 0x00) {
++			*_payload = cta + i + 1;
++			return length;
++		}
++		i += length + 1;
++	}
++	return 0;
++}
++
++
++/*!	The display's highest TMDS clock in kHz, from its HDMI vendor block (in
++	5 MHz steps); 0 if it doesn't say.
++*/
++uint32
++MesonHdmi::_MaxTmdsClock()
++{
++	const uint8* hdmi;
++	uint32 length = _HdmiVendorBlock(&hdmi);
++	return length >= 7 ? hdmi[6] * 5000 : 0;
++}
++
++
+ bool
+ MesonHdmi::_EdidLists(const meson_mode& mode)
+ {
+@@ -1284,6 +1341,30 @@ MesonHdmi::_EdidLists(const meson_mode& mode)
+ 		}
+ 	}
+ 
++	// HDMI 1.4's 4K modes, which many displays list only as HDMI VICs in
++	// the vendor block: after the latencies, if any, when the "HDMI video
++	// present" flag is set
++	const uint8* hdmi;
++	uint32 hdmiLength = _HdmiVendorBlock(&hdmi);
++	if (hdmiLength >= 8 && (hdmi[7] & 0x20) != 0) {
++		uint32 index = 8;
++		if ((hdmi[7] & 0x80) != 0)
++			index += 2;
++		if ((hdmi[7] & 0x40) != 0)
++			index += 2;
++		if (index + 1 < hdmiLength) {
++			uint32 vicCount = hdmi[index + 1] >> 5;
++			for (uint32 j = 0; j < vicCount && index + 2 + j < hdmiLength;
++					j++) {
++				uint8 hdmiVic = hdmi[index + 2 + j];
++				if (hdmiVic < B_COUNT_OF(kHdmiVics)
++					&& kHdmiVics[hdmiVic] == mode.vic && mode.vic != 0) {
++					return true;
++				}
++			}
++		}
++	}
++
+ 	const uint8* timings[16];
+ 	uint32 count = _DetailedTimings(timings, B_COUNT_OF(timings));
+ 	for (uint32 i = 0; i < count; i++) {
+@@ -1306,6 +1387,8 @@ MesonHdmi::_SaveBootState()
+ 	}
+ 	fBootPllCntl = _Hhi(HHI_HDMI_PLL_CNTL);
+ 	fBootPllCntl2 = _Hhi(HHI_HDMI_PLL_CNTL2);
++	fBootPhyCntl0 = _Hhi(HHI_HDMI_PHY_CNTL0);
++	fBootPhyCntl3 = _Hhi(HHI_HDMI_PHY_CNTL3);
+ 	for (size_t i = 0; i < B_COUNT_OF(kSavedComposer); i++)
+ 		fBootComposer[i] = _DwRead(kSavedComposer[i]);
+ 	fBootStateSaved = true;
+@@ -1655,6 +1738,14 @@ MesonHdmi::_ProgramMode(const meson_mode& mode, phys_addr_t frameBuffer,
+ 	for (int32 i = 0; i < 4; i++)
+ 		_DwWrite(DW_FC_INVIDCONF, videoConfig);
+ 
++	// the PHY's band for the TMDS rate (U-Boot's values for GXBB)
++	if (mode.pixelClock >= kPhyHighBand) {
++		_SetHhi(HHI_HDMI_PHY_CNTL0, 0x33634283);
++		_SetHhi(HHI_HDMI_PHY_CNTL3, 0xb000115b);
++	} else {
++		_SetHhi(HHI_HDMI_PHY_CNTL0, 0x33632122);
++		_SetHhi(HHI_HDMI_PHY_CNTL3, 0x2000115b);
++	}
+ 	_ResetPhy();
+ 	_SetVpu(ENCP_VIDEO_EN, 1);
+ 
+@@ -1814,6 +1905,10 @@ MesonHdmi::RestoreBootMode()
+ 	_DwWrite(DW_MC_SWRSTZ, (uint8)~MC_SWRSTZ_TMDS);
+ 	for (int32 i = 0; i < 4; i++)
+ 		_DwWrite(DW_FC_INVIDCONF, fBootComposer[0]);
++	if (fBootPhyCntl0 != 0) {
++		_SetHhi(HHI_HDMI_PHY_CNTL0, fBootPhyCntl0);
++		_SetHhi(HHI_HDMI_PHY_CNTL3, fBootPhyCntl3);
++	}
+ 	_ResetPhy();
+ 	_SetVpu(ENCP_VIDEO_EN, 1);
+ 	_SetCanvas(fBootFrameBuffer, fBootBytesPerRow, fBootHeight);

@@ -1,0 +1,768 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 09:38:59 -0500
+Subject: [PATCH 206/342] CodyCam: record video files (M45)
+
+A "Record video" button under the picture records what the camera sends
+into ~/Videos/CodyCam <date> <time>.mkv: Matroska with MPEG-4 video, the
+size and frame rate of the connection (320x240 at 30), through the
+Media Kit's writer and the FFmpeg plugin's encoder. The button turns
+into "Stop recording"; the status line says where the file goes and,
+when stopped, its length.
+
+VideoRecorder copies each frame the consumer gets (also one too late to
+be shown) and encodes in a thread of its own. The encoder counts
+frames, so the recorder places them by their time: a frame is written
+again for the frames it stands for, one that came early is left out,
+and the video plays at the speed it was taken also when the camera
+lowers its rate in low light (15 fps here). Quitting CodyCam while it
+records finishes the file.
+
+Tested with the C920: 12.3 s recorded as 371 frames at 30 fps (the
+camera at 15), MediaPlayer plays it; quitting during a recording left a
+whole file (8.5 s); the encoder takes about a quarter of a core.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apps/codycam/CodyCam.cpp       |  95 ++++++++++-
+ src/apps/codycam/CodyCam.h         |   8 +-
+ src/apps/codycam/Jamfile           |   1 +
+ src/apps/codycam/VideoConsumer.cpp |  77 ++++++++-
+ src/apps/codycam/VideoConsumer.h   |  13 ++
+ src/apps/codycam/VideoRecorder.cpp | 261 +++++++++++++++++++++++++++++
+ src/apps/codycam/VideoRecorder.h   |  68 ++++++++
+ 7 files changed, 520 insertions(+), 3 deletions(-)
+ create mode 100644 src/apps/codycam/VideoRecorder.cpp
+ create mode 100644 src/apps/codycam/VideoRecorder.h
+
+diff --git a/src/apps/codycam/CodyCam.cpp b/src/apps/codycam/CodyCam.cpp
+index a57de9d329..2be2d42ea0 100644
+--- a/src/apps/codycam/CodyCam.cpp
++++ b/src/apps/codycam/CodyCam.cpp
+@@ -9,11 +9,13 @@
+ 
+ #include <stdio.h>
+ #include <string.h>
++#include <time.h>
+ #include <unistd.h>
+ 
+ #include <Alert.h>
+ #include <Button.h>
+ #include <Catalog.h>
++#include <Directory.h>
+ #include <FindDirectory.h>
+ #include <LayoutBuilder.h>
+ #include <MediaDefs.h>
+@@ -147,6 +149,9 @@ CodyCam::ReadyToRun()
+ bool
+ CodyCam::QuitRequested()
+ {
++	// a recording's file is finished before the nodes go
++	if (fVideoConsumer != NULL)
++		fVideoConsumer->StopRecording(NULL, NULL);
+ 	_TearDownNodes();
+ 	snooze(100000);
+ 
+@@ -202,6 +207,10 @@ CodyCam::MessageReceived(BMessage* message)
+ 			fVideoControlWindow = NULL;
+ 			break;
+ 
++		case msg_record:
++			_ToggleRecording();
++			break;
++
+ 		default:
+ 			BApplication::MessageReceived(message);
+ 			break;
+@@ -404,6 +413,65 @@ CodyCam::_TearDownNodes()
+ }
+ 
+ 
++/*!	Starts or ends recording the video into a Matroska file (MPEG-4) in
++	the Videos folder in the home folder, named for the time it began.
++*/
++void
++CodyCam::_ToggleRecording()
++{
++	if (fVideoConsumer == NULL || fWindow == NULL)
++		return;
++
++	if (fVideoConsumer->IsRecording()) {
++		BString path;
++		bigtime_t duration = 0;
++		status_t status = fVideoConsumer->StopRecording(&path, &duration);
++		BString text;
++		if (status == B_OK) {
++			int32 seconds = (int32)(duration / 1000000);
++			text = B_TRANSLATE("Saved %path% (%minutes%:%seconds%)");
++			text.ReplaceFirst("%path%", path);
++			BString minutes;
++			minutes << seconds / 60;
++			BString secondsText;
++			secondsText.SetToFormat("%02" B_PRId32, seconds % 60);
++			text.ReplaceFirst("%minutes%", minutes);
++			text.ReplaceFirst("%seconds%", secondsText);
++		} else {
++			text = B_TRANSLATE("Error recording the video: %error%");
++			text.ReplaceFirst("%error%", strerror(status));
++		}
++		fWindow->RecordingChanged(false, text.String());
++		return;
++	}
++
++	BPath path;
++	status_t status = find_directory(B_USER_DIRECTORY, &path);
++	if (status == B_OK)
++		status = path.Append("Videos");
++	if (status == B_OK) {
++		create_directory(path.Path(), 0755);
++		char name[64];
++		time_t now = time(NULL);
++		strftime(name, sizeof(name), "CodyCam %Y-%m-%d %H-%M-%S.mkv",
++			localtime(&now));
++		status = path.Append(name);
++	}
++	if (status == B_OK)
++		status = fVideoConsumer->StartRecording(path.Path());
++
++	BString text;
++	if (status == B_OK) {
++		text = B_TRANSLATE("Recording to %path%");
++		text.ReplaceFirst("%path%", path.Path());
++	} else {
++		text = B_TRANSLATE("Cannot record the video: %error%");
++		text.ReplaceFirst("%error%", strerror(status));
++	}
++	fWindow->RecordingChanged(status == B_OK, text.String());
++}
++
++
+ //	#pragma mark - Video Window Class
+ 
+ 
+@@ -412,7 +480,8 @@ VideoWindow::VideoWindow(const char* title, window_type type,
+ 	:
+ 	BWindow(BRect(50, 50, 50, 50), title, type, flags),
+ 	fPortPtr(consumerPort),
+-	fVideoView(NULL)
++	fVideoView(NULL),
++	fRecordButton(NULL)
+ {
+ 	fFtpInfo.port = 0;
+ 	fFtpInfo.rate = 0x7fffffff;
+@@ -469,6 +538,10 @@ VideoWindow::VideoWindow(const char* title, window_type type,
+ 	box->AddChild(fVideoView);
+ 	box->AddChild(fErrorView);
+ 
++	fRecordButton = new BButton("record", B_TRANSLATE("Record video"),
++		new BMessage(msg_record));
++	fRecordButton->SetTarget(be_app);
++
+ 	BLayoutBuilder::Group<>(this, B_VERTICAL, 0)
+ 		.Add(menuBar)
+ 		.AddGroup(B_VERTICAL)
+@@ -478,6 +551,11 @@ VideoWindow::VideoWindow(const char* title, window_type type,
+ 				.Add(box)
+ 				.AddGlue()
+ 			.End()
++			.AddGroup(B_HORIZONTAL)
++				.AddGlue()
++				.Add(fRecordButton)
++				.AddGlue()
++			.End()
+ 			.AddGroup(B_HORIZONTAL, B_USE_DEFAULT_SPACING)
+ 				.Add(fCaptureSetupBox)
+ 				.Add(fFtpSetupBox)
+@@ -784,12 +862,27 @@ VideoWindow::ErrorAlert(const char* message, status_t err)
+ 	fErrorView->SetExplicitMaxSize(BSize(VIDEO_SIZE_X, VIDEO_SIZE_Y));
+ 	fErrorView->Show();
+ 	fVideoView->Hide();
++	if (fRecordButton != NULL)
++		fRecordButton->SetEnabled(false);
+ 	Unlock();
+ 
+ 	printf("%s\n%s [%" B_PRIx32 "]", message, strerror(err), err);
+ }
+ 
+ 
++void
++VideoWindow::RecordingChanged(bool recording, const char* status)
++{
++	if (!Lock())
++		return;
++	fRecordButton->SetLabel(recording
++		? B_TRANSLATE("Stop recording") : B_TRANSLATE("Record video"));
++	if (status != NULL)
++		fStatusLine->SetText(status);
++	Unlock();
++}
++
++
+ void
+ VideoWindow::_SetUpSettings(const char* filename, const char* dirname)
+ {
+diff --git a/src/apps/codycam/CodyCam.h b/src/apps/codycam/CodyCam.h
+index 742d9d51ad..fd9a16e0fa 100644
+--- a/src/apps/codycam/CodyCam.h
++++ b/src/apps/codycam/CodyCam.h
+@@ -24,6 +24,7 @@
+ #include "VideoConsumer.h"
+ 
+ 
++class BButton;
+ class BMediaRoster;
+ 
+ 
+@@ -48,7 +49,8 @@ enum {
+ 	msg_setup		= 'setp',
+ 	msg_video		= 'vdeo',
+ 
+-	msg_control_win = 'ctlw'
++	msg_control_win = 'ctlw',
++	msg_record		= 'recd'
+ };
+ 
+ 
+@@ -104,6 +106,7 @@ public:
+ private:
+ 			status_t		_SetUpNodes();
+ 			void			_TearDownNodes();
++			void			_ToggleRecording();
+ 
+ 			BMediaRoster*	fMediaRoster;
+ 			media_node		fTimeSourceNode;
+@@ -134,6 +137,8 @@ public:
+ 			void			ToggleMenuOnOff();
+ 
+ 			void			ErrorAlert(const char*, status_t);
++			void			RecordingChanged(bool recording,
++								const char* status);
+ 
+ private:
+ 			void			_BuildCaptureControls();
+@@ -149,6 +154,7 @@ private:
+ 
+ 			BView*			fVideoView;
+ 			BTextView*		fErrorView;
++			BButton*		fRecordButton;
+ 
+ 			BTextControl*	fFileName;
+ 			BBox*			fCaptureSetupBox;
+diff --git a/src/apps/codycam/Jamfile b/src/apps/codycam/Jamfile
+index 3d54f25b68..b1d2673a90 100644
+--- a/src/apps/codycam/Jamfile
++++ b/src/apps/codycam/Jamfile
+@@ -10,6 +10,7 @@ Application CodyCam :
+ 	SftpClient.cpp
+ 	Settings.cpp
+ 	VideoConsumer.cpp
++	VideoRecorder.cpp
+ 	: be localestub media shared translation $(TARGET_NETAPI_LIB)
+ 		[ TargetLibstdc++ ]
+ 	: CodyCam.rdef
+diff --git a/src/apps/codycam/VideoConsumer.cpp b/src/apps/codycam/VideoConsumer.cpp
+index 114a3b00fc..7d0a0fd272 100644
+--- a/src/apps/codycam/VideoConsumer.cpp
++++ b/src/apps/codycam/VideoConsumer.cpp
+@@ -13,6 +13,7 @@
+ #include <unistd.h>
+ 
+ #include <Application.h>
++#include <Autolock.h>
+ #include <BitmapStream.h>
+ #include <Buffer.h>
+ #include <BufferGroup.h>
+@@ -30,6 +31,7 @@
+ #include <View.h>
+ 
+ #include "FileUploadClient.h"
++#include "VideoRecorder.h"
+ #include "FtpClient.h"
+ #include "SftpClient.h"
+ 
+@@ -75,7 +77,9 @@ VideoConsumer::VideoConsumer(const char* name, BView* view,
+ 	fImageFormat(0),
+ 	fTranslator(0),
+ 	fUploadClient(0),
+-	fPassiveFtp(true)
++	fPassiveFtp(true),
++	fRecorderLock("video recording"),
++	fRecorder(NULL)
+ {
+ 	FUNCTION("VideoConsumer::VideoConsumer\n");
+ 
+@@ -104,6 +108,9 @@ VideoConsumer::~VideoConsumer()
+ 
+ 	Quit();
+ 
++	// a recording ends with the node: its file is closed properly
++	StopRecording(NULL, NULL);
++
+ 	if (fWindow) {
+ 		puts(B_TRANSLATE("Locking the window"));
+ 		if (fWindow->Lock()) {
+@@ -579,6 +586,16 @@ VideoConsumer::HandleEvent(const media_timed_event* event, bigtime_t lateness,
+ 					index = 0;
+ 				}
+ 
++				// every frame that arrives goes into a recording, also one
++				// too late to be shown
++				if (fRecorderLock.Lock()) {
++					if (fRecorder != NULL) {
++						fRecorder->AddFrame(buffer->Data(),
++							buffer->Header()->start_time);
++					}
++					fRecorderLock.Unlock();
++				}
++
+ 				if (fFtpComplete && fTimeToFtp) {
+ 					PROGRESS("VidConsumer::HandleEvent - "
+ 							 "SPAWNING FTP THREAD\n");
+@@ -844,3 +861,61 @@ SetFileType(BFile* file, int32 translator, uint32 type)
+ 	BNodeInfo ninfo(file);
+ 	return ninfo.SetType(mime);
+ }
++
++
++/*!	Starts recording what arrives into a video file at \a path (Matroska,
++	MPEG-4), in the size and frame rate of the connection.
++*/
++status_t
++VideoConsumer::StartRecording(const char* path)
++{
++	BAutolock locker(fRecorderLock);
++	if (fRecorder != NULL)
++		return EALREADY;
++	if (!fConnectionActive || fFtpBitmap == NULL)
++		return B_NO_INIT;
++	if (fFtpBitmap->ColorSpace() != B_RGB32)
++		return B_MEDIA_BAD_FORMAT;
++
++	float frameRate = fIn.format.u.raw_video.field_rate;
++	BRect bounds = fFtpBitmap->Bounds();
++	VideoRecorder* recorder = new VideoRecorder;
++	status_t status = recorder->Start(path, bounds.IntegerWidth() + 1,
++		bounds.IntegerHeight() + 1, fFtpBitmap->BytesPerRow(),
++		frameRate > 0 ? frameRate : 30);
++	if (status != B_OK) {
++		delete recorder;
++		return status;
++	}
++	fRecorder = recorder;
++	return B_OK;
++}
++
++
++/*!	Ends a recording and closes its file. */
++status_t
++VideoConsumer::StopRecording(BString* _path, bigtime_t* _duration)
++{
++	fRecorderLock.Lock();
++	VideoRecorder* recorder = fRecorder;
++	fRecorder = NULL;
++	fRecorderLock.Unlock();
++	if (recorder == NULL)
++		return B_NO_INIT;
++
++	status_t status = recorder->Stop();
++	if (_path != NULL)
++		*_path = recorder->Path();
++	if (_duration != NULL)
++		*_duration = recorder->Duration();
++	delete recorder;
++	return status;
++}
++
++
++bool
++VideoConsumer::IsRecording()
++{
++	BAutolock locker(fRecorderLock);
++	return fRecorder != NULL;
++}
+diff --git a/src/apps/codycam/VideoConsumer.h b/src/apps/codycam/VideoConsumer.h
+index d78c4da436..34f052cbaf 100644
+--- a/src/apps/codycam/VideoConsumer.h
++++ b/src/apps/codycam/VideoConsumer.h
+@@ -9,6 +9,7 @@
+ 
+ #include <Bitmap.h>
+ #include <BufferConsumer.h>
++#include <Locker.h>
+ #include <MediaEventLooper.h>
+ #include <MediaNode.h>
+ #include <TimedEventQueue.h>
+@@ -34,6 +35,8 @@ typedef struct {
+ #define FTP_INFO 0x60000001
+ 
+ class BStringView;
++class BString;
++class VideoRecorder;
+ 
+ 
+ 
+@@ -123,6 +126,12 @@ public:
+ 
+ 			status_t 			FtpSave(char* filename);
+ 
++			// recording a video file of what arrives (VideoRecorder)
++			status_t			StartRecording(const char* path);
++			status_t			StopRecording(BString* _path,
++									bigtime_t* _duration);
++			bool				IsRecording();
++
+ private:
+ 			BStringView*		fStatusLine;
+ 			int32				fInternalID;
+@@ -156,6 +165,10 @@ private:
+ 			char				fLoginText[64];
+ 			char				fPasswordText[64];
+ 			char				fDirectoryText[64];
++
++			BLocker				fRecorderLock;
++			VideoRecorder*		fRecorder;
++				// under fRecorderLock: the node's thread feeds it
+ };
+ 
+ #endif	// VIDEO_CONSUMER_H
+diff --git a/src/apps/codycam/VideoRecorder.cpp b/src/apps/codycam/VideoRecorder.cpp
+new file mode 100644
+index 0000000000..70bbfd7476
+--- /dev/null
++++ b/src/apps/codycam/VideoRecorder.cpp
+@@ -0,0 +1,261 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "VideoRecorder.h"
++
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <Autolock.h>
++#include <Entry.h>
++#include <MediaFile.h>
++#include <MediaFormats.h>
++#include <MediaTrack.h>
++#include <NodeInfo.h>
++
++
++static const char* kFileType = "video/x-matroska";
++static const char* kCodecName = "mpeg4";
++
++
++VideoRecorder::VideoRecorder()
++	:
++	fFile(NULL),
++	fTrack(NULL),
++	fFrameSize(0),
++	fFrameRate(30),
++	fLock("video recorder"),
++	fFrameSem(-1),
++	fThread(-1),
++	fQuit(false),
++	fPending(NULL),
++	fPendingTime(0),
++	fHasPending(false),
++	fWorking(NULL),
++	fFirstTime(-1),
++	fFramesWritten(0),
++	fError(B_OK)
++{
++}
++
++
++VideoRecorder::~VideoRecorder()
++{
++	Stop();
++}
++
++
++status_t
++VideoRecorder::Start(const char* path, uint32 width, uint32 height,
++	uint32 bytesPerRow, float frameRate)
++{
++	if (fFile != NULL)
++		return EALREADY;
++	if (frameRate <= 0)
++		frameRate = 30;
++
++	media_file_format fileFormat;
++	int32 cookie = 0;
++	bool found = false;
++	while (get_next_file_format(&cookie, &fileFormat) == B_OK) {
++		if ((fileFormat.capabilities & media_file_format::B_WRITABLE) != 0
++			&& strcmp(fileFormat.mime_type, kFileType) == 0) {
++			found = true;
++			break;
++		}
++	}
++	if (!found)
++		return B_MEDIA_NO_HANDLER;
++
++	media_format inFormat;
++	inFormat.type = B_MEDIA_RAW_VIDEO;
++	inFormat.u.raw_video = media_raw_video_format::wildcard;
++	inFormat.u.raw_video.field_rate = frameRate;
++	inFormat.u.raw_video.interlace = 1;
++	inFormat.u.raw_video.pixel_width_aspect = 1;
++	inFormat.u.raw_video.pixel_height_aspect = 1;
++	inFormat.u.raw_video.display.format = B_RGB32;
++	inFormat.u.raw_video.display.line_width = width;
++	inFormat.u.raw_video.display.line_count = height;
++	inFormat.u.raw_video.display.bytes_per_row = bytesPerRow;
++
++	media_format outFormat;
++	media_codec_info codec;
++	cookie = 0;
++	found = false;
++	while (get_next_encoder(&cookie, &fileFormat, &inFormat, &outFormat,
++			&codec) == B_OK) {
++		if (strcmp(codec.short_name, kCodecName) == 0) {
++			found = true;
++			break;
++		}
++	}
++	if (!found)
++		return B_MEDIA_BAD_FORMAT;
++
++	entry_ref ref;
++	status_t status = get_ref_for_path(path, &ref);
++	if (status != B_OK)
++		return status;
++
++	fFile = new BMediaFile(&ref, &fileFormat);
++	status = fFile->InitCheck();
++	if (status == B_OK) {
++		fTrack = fFile->CreateTrack(&inFormat, &codec);
++		if (fTrack == NULL)
++			status = B_MEDIA_BAD_FORMAT;
++	}
++	if (status == B_OK)
++		status = fFile->CommitHeader();
++
++	fFrameSize = (size_t)bytesPerRow * height;
++	fPending = (uint8*)malloc(fFrameSize);
++	fWorking = (uint8*)malloc(fFrameSize);
++	if (status == B_OK && (fPending == NULL || fWorking == NULL))
++		status = B_NO_MEMORY;
++	if (status == B_OK) {
++		fFrameSem = create_sem(0, "recorder frame");
++		if (fFrameSem < 0)
++			status = fFrameSem;
++	}
++	if (status != B_OK) {
++		_Cleanup();
++		return status;
++	}
++
++	BNode node(&ref);
++	BNodeInfo(&node).SetType(kFileType);
++
++	fPath = path;
++	fFrameRate = frameRate;
++	fHasPending = false;
++	fFirstTime = -1;
++	fFramesWritten = 0;
++	fError = B_OK;
++	fQuit = false;
++	fThread = spawn_thread(_ThreadEntry, "video recorder", B_NORMAL_PRIORITY,
++		this);
++	if (fThread < 0) {
++		status = fThread;
++		_Cleanup();
++		return status;
++	}
++	resume_thread(fThread);
++	return B_OK;
++}
++
++
++void
++VideoRecorder::AddFrame(const void* bits, bigtime_t when)
++{
++	if (fFile == NULL)
++		return;
++
++	fLock.Lock();
++	memcpy(fPending, bits, fFrameSize);
++	fPendingTime = when;
++	bool wake = !fHasPending;
++	fHasPending = true;
++	fLock.Unlock();
++
++	if (wake)
++		release_sem(fFrameSem);
++}
++
++
++/*!	Writes what is left and closes the file. */
++status_t
++VideoRecorder::Stop()
++{
++	if (fFile == NULL)
++		return B_OK;
++
++	fQuit = true;
++	release_sem(fFrameSem);
++	status_t result;
++	wait_for_thread(fThread, &result);
++	fThread = -1;
++
++	fTrack->Flush();
++	status_t status = fError;
++	_Cleanup();
++	return status;
++}
++
++
++bigtime_t
++VideoRecorder::Duration() const
++{
++	return (bigtime_t)(fFramesWritten * 1000000.0 / fFrameRate);
++}
++
++
++status_t
++VideoRecorder::_ThreadEntry(void* data)
++{
++	((VideoRecorder*)data)->_Thread();
++	return B_OK;
++}
++
++
++void
++VideoRecorder::_Thread()
++{
++	// at most this many copies of one frame (a camera that stopped)
++	const int64 kMaxRepeat = (int64)(fFrameRate * 10);
++
++	while (acquire_sem(fFrameSem) == B_OK) {
++		fLock.Lock();
++		bool hasFrame = fHasPending;
++		bigtime_t when = fPendingTime;
++		if (hasFrame) {
++			uint8* swap = fPending;
++			fPending = fWorking;
++			fWorking = swap;
++			fHasPending = false;
++		}
++		fLock.Unlock();
++
++		if (hasFrame && fError == B_OK) {
++			if (fFirstTime < 0)
++				fFirstTime = when;
++			// the frame stands for the time from its own until the next
++			int64 target = llround((when - fFirstTime) * fFrameRate
++				/ 1000000.0) + 1;
++			if (target - fFramesWritten > kMaxRepeat)
++				target = fFramesWritten + kMaxRepeat;
++			while (fFramesWritten < target && fError == B_OK) {
++				fError = fTrack->WriteFrames(fWorking, 1,
++					fFramesWritten == 0 ? B_MEDIA_KEY_FRAME : 0);
++				fFramesWritten++;
++			}
++		}
++
++		if (fQuit)
++			break;
++	}
++}
++
++
++void
++VideoRecorder::_Cleanup()
++{
++	if (fFile != NULL) {
++		fFile->CloseFile();
++		delete fFile;
++		fFile = NULL;
++	}
++	fTrack = NULL;
++	if (fFrameSem >= 0) {
++		delete_sem(fFrameSem);
++		fFrameSem = -1;
++	}
++	free(fPending);
++	fPending = NULL;
++	free(fWorking);
++	fWorking = NULL;
++}
+diff --git a/src/apps/codycam/VideoRecorder.h b/src/apps/codycam/VideoRecorder.h
+new file mode 100644
+index 0000000000..07f3724ba5
+--- /dev/null
++++ b/src/apps/codycam/VideoRecorder.h
+@@ -0,0 +1,68 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef VIDEO_RECORDER_H
++#define VIDEO_RECORDER_H
++
++
++#include <Locker.h>
++#include <OS.h>
++#include <String.h>
++
++
++class BMediaFile;
++class BMediaTrack;
++
++
++/*!	Writes the frames it is given (B_RGB32) into a Matroska file as MPEG-4
++	video at a constant frame rate: a frame that came late is written again
++	for the frames it missed, one that came early is left out, so that the
++	video plays at the speed it was taken, also when the camera lowers its
++	rate in low light. Encoding runs in a thread of its own; AddFrame() only
++	copies the frame.
++*/
++class VideoRecorder {
++public:
++								VideoRecorder();
++								~VideoRecorder();
++
++			status_t			Start(const char* path, uint32 width,
++									uint32 height, uint32 bytesPerRow,
++									float frameRate);
++			void				AddFrame(const void* bits, bigtime_t when);
++			status_t			Stop();
++
++			bool				IsRecording() const { return fFile != NULL; }
++			const char*			Path() const { return fPath.String(); }
++			bigtime_t			Duration() const;
++
++private:
++	static	status_t			_ThreadEntry(void* data);
++			void				_Thread();
++			void				_Cleanup();
++
++			BMediaFile*			fFile;
++			BMediaTrack*		fTrack;
++			BString				fPath;
++			size_t				fFrameSize;
++			float				fFrameRate;
++
++			BLocker				fLock;
++			sem_id				fFrameSem;
++			thread_id			fThread;
++			volatile bool		fQuit;
++			uint8*				fPending;
++				// the newest frame, under fLock
++			bigtime_t			fPendingTime;
++			bool				fHasPending;
++			uint8*				fWorking;
++				// the one being encoded
++
++			bigtime_t			fFirstTime;
++			int64				fFramesWritten;
++			status_t			fError;
++};
++
++
++#endif	// VIDEO_RECORDER_H

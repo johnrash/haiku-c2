@@ -1,0 +1,163 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 15:36:02 -0400
+Subject: [PATCH 032/342] build: regular images for architectures with only
+ bootstrap packages
+
+Building the regular image type for arm64, whose HaikuPorts repository
+has only bootstrap packages, failed in several places:
+
+- libmidi is built only with the fluidlite build feature, but the regular
+  image lists it, MidiPlayer, PatchBay and the Media preferences (all
+  linking it) unconditionally: they now need fluidlite too.
+- WonderBrushTranslator compiles sources from its support folder but did
+  not have it in the header search path.
+- The haiku package requires noto_sans_cjk_jp, the wifi firmwares and
+  cmd:bunzip2/gunzip/tar/unzip in regular builds; none exist for arm64,
+  so these requirements are left out there.
+- HaikuDepot, SoftwareUpdater and the Repositories preferences need
+  package repositories arm64 does not have: left out on arm64.
+- Deskbar "Applications" and "Desktop applets" links are made only for
+  applications that are in the image, so items dropped by build features
+  leave no dangling links.
+
+Tested on the ODROID-C2 with a regular-type profile: the image builds,
+boots to the desktop, Pulse, Clock, ActivityMonitor and Mandelbrot run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/jam/images/definitions/regular        | 14 +++++++-------
+ build/jam/packages/Haiku                    | 13 +++++++++----
+ src/add-ons/translators/wonderbrush/Jamfile |  1 +
+ src/data/package_infos/generic/haiku        |  6 +++---
+ 4 files changed, 20 insertions(+), 14 deletions(-)
+
+diff --git a/build/jam/images/definitions/regular b/build/jam/images/definitions/regular
+index b0e5f5deef..4c46a86ee3 100644
+--- a/build/jam/images/definitions/regular
++++ b/build/jam/images/definitions/regular
+@@ -35,7 +35,7 @@ SYSTEM_APPS += [ FFilterByBuildFeatures
+ 	AutoRaise
+ 	CodyCam
+ 	GLInfo@mesa
+-	HaikuDepot
++	HaikuDepot@!arm64
+ 	Icon-O-Matic@expat
+ 	LaunchBox
+ 	LegacyPackageInstaller
+@@ -43,14 +43,14 @@ SYSTEM_APPS += [ FFilterByBuildFeatures
+ 	Mail
+ 	MediaConverter
+ 	MediaPlayer
+-	MidiPlayer
++	MidiPlayer@fluidlite
+ 	People
+ 	PoorMan
+ 	PowerStatus
+ 	RemoteDesktop
+ 	Screenshot
+ 	SerialConnect
+-	SoftwareUpdater
++	SoftwareUpdater@!arm64
+ 	SoundRecorder
+ ] ;
+ 
+@@ -81,9 +81,9 @@ SYSTEM_PREFERENCES += [ FFilterByBuildFeatures
+ 	Bluetooth
+ 	DataTranslations
+ 	E-mail
+-	Media
++	Media@fluidlite
+ 	Printers
+-	Repositories
++	Repositories@!arm64
+ 	ScreenSaver
+ 	Sounds
+ ] ;
+@@ -98,7 +98,7 @@ SYSTEM_DEMOS += [ FFilterByBuildFeatures
+ 	Mandelbrot
+ 	OverlayImage
+ 	Pairs
+-	PatchBay
++	PatchBay@fluidlite
+ 	Playground
+ 	Pulse
+ 	Sudoku
+@@ -126,7 +126,7 @@ rule HaikuImageGetSystemLibs
+ 			libgnu.so
+ 			libmail.so
+ 			libmedia.so
+-			libmidi.so
++			libmidi.so@fluidlite
+ 			libmidi2.so
+ 			libnetwork.so
+ 			libnvmm.so@x86_64
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index 53368fdc1f..cb639d06cf 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -484,16 +484,21 @@ local linkTarget ;
+ AddDirectoryToPackage data deskbar menu Applications
+ 	: deskbar-applications.rdef ;
+ for linkTarget in $(DESKBAR_APPLICATIONS) {
+-	AddSymlinkToPackage data deskbar menu Applications
+-		: ../../../../apps/$(linkTarget) : $(linkTarget) ;
++	# only for applications built for this image (build features)
++	if $(linkTarget) in $(SYSTEM_APPS) {
++		AddSymlinkToPackage data deskbar menu Applications
++			: ../../../../apps/$(linkTarget) : $(linkTarget) ;
++	}
+ }
+ 
+ # "Desktop applets" links
+ AddDirectoryToPackage data deskbar menu Desktop\ applets
+ 	: deskbar-applets.rdef ;
+ for linkTarget in $(DESKBAR_DESKTOP_APPLETS) {
+-	AddSymlinkToPackage data deskbar menu Desktop\ applets
+-		: ../../../../apps/$(linkTarget) : $(linkTarget) ;
++	if $(linkTarget) in $(SYSTEM_APPS) {
++		AddSymlinkToPackage data deskbar menu Desktop\ applets
++			: ../../../../apps/$(linkTarget) : $(linkTarget) ;
++	}
+ }
+ 
+ # "Preferences" links
+diff --git a/src/add-ons/translators/wonderbrush/Jamfile b/src/add-ons/translators/wonderbrush/Jamfile
+index 45bc59b438..14b1a0dded 100644
+--- a/src/add-ons/translators/wonderbrush/Jamfile
++++ b/src/add-ons/translators/wonderbrush/Jamfile
+@@ -1,6 +1,7 @@
+ SubDir HAIKU_TOP src add-ons translators wonderbrush ;
+ 
+ SubDirHdrs [ FDirName $(SUBDIR) $(DOTDOT) shared ] ;
++SubDirHdrs [ FDirName $(SUBDIR) support ] ;
+ 
+ AddResources WonderBrushTranslator : WonderBrushTranslator.rdef ;
+ 
+diff --git a/src/data/package_infos/generic/haiku b/src/data/package_infos/generic/haiku
+index c6eced0c65..23b86678cf 100644
+--- a/src/data/package_infos/generic/haiku
++++ b/src/data/package_infos/generic/haiku
+@@ -58,11 +58,11 @@ provides {
+ 
+ requires {
+ 	noto >= 2.7
+-#ifdef HAIKU_REGULAR_BUILD
++#if defined(HAIKU_REGULAR_BUILD) && !defined(HAIKU_PACKAGING_ARCH_arm64)
+ 	noto_sans_cjk_jp
+ #endif
+ 
+-#ifdef HAIKU_REGULAR_BUILD
++#if defined(HAIKU_REGULAR_BUILD) && !defined(HAIKU_PACKAGING_ARCH_arm64)
+ 	intel_wifi_firmwares
+ 	ralink_wifi_firmwares
+ 	realtek_wifi_firmwares
+@@ -70,7 +70,7 @@ requires {
+ 
+ 	coreutils
+ 	cmd:sh
+-#ifdef HAIKU_REGULAR_BUILD
++#if defined(HAIKU_REGULAR_BUILD) && !defined(HAIKU_PACKAGING_ARCH_arm64)
+ 	cmd:bunzip2
+ 	cmd:gunzip
+ 	cmd:tar

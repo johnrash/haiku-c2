@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 08:55:29 -0400
+Subject: [PATCH 085/342] ffmpeg plugin: packet times in microseconds for the
+ decoder
+
+Since 45bd581b70 the reader passes each packet's pts, dts and duration
+to AVCodecDecoder, which takes a video frame's start_time from FFmpeg's
+best_effort_timestamp; but they were in the stream's own time base, so
+a 30 frames/s MP4 (1/15360) came out at 0.5 ms a frame, and audio
+mixed those units with microseconds when a packet held several frames.
+MediaPlayer counts frames itself, but presented frames irregularly
+around the times it got: on the ODROID-C2, 1280x720 HEVC showed 28 of
+330 frames a refresh early or late in 11 s, a heavy 1080x1920 H.264
+clip 24 and dropped frames.
+
+The reader now converts them to microseconds, as the media_header's
+times are, and the decoder sets pkt_timebase accordingly. Frame times
+are right (frame 60 of a 30 frames/s clip at 2.000 s instead of 0.031
+s) for H.264, HEVC, VP9 and AV1; the cadence on HDMI is regular (720p
+HEVC and H.264: all 329 gaps two refreshes; the heavy clip: 3 pairs, no
+drops); A/V sync unchanged (-9 to +10 ms).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../media/plugins/ffmpeg/AVCodecDecoder.cpp       |  4 ++++
+ .../media/plugins/ffmpeg/AVFormatReader.cpp       | 15 ++++++++++++---
+ 2 files changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.cpp b/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.cpp
+index e15abb38b3..af9dd2da68 100644
+--- a/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.cpp
++++ b/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.cpp
+@@ -390,6 +390,8 @@ AVCodecDecoder::_NegotiateAudioOutputFormat(media_format* inOutFormat)
+ 		// to _DecodeNextAudioFrameChunk() will update the essential audio
+ 		// format properties accordingly regardless of the settings here.
+ 
++	// the packets' times are in microseconds (StreamBase::GetNextChunk())
++	fCodecContext->pkt_timebase = AVRational{1, 1000000};
+ 	if (avcodec_open2(fCodecContext, fCodec, NULL) < 0) {
+ 		TRACE("avcodec_open() failed to init codec!\n");
+ 		return B_ERROR;
+@@ -490,6 +492,8 @@ AVCodecDecoder::_NegotiateVideoOutputFormat(media_format* inOutFormat)
+ 		// to _DecodeNextVideoFrame() will update the essential video format
+ 		// properties accordingly regardless of the settings here.
+ 
++	// the packets' times are in microseconds (StreamBase::GetNextChunk())
++	fCodecContext->pkt_timebase = AVRational{1, 1000000};
+ 	if (avcodec_open2(fCodecContext, fCodec, NULL) < 0) {
+ 		TRACE("avcodec_open() failed to init codec!\n");
+ 		return B_ERROR;
+diff --git a/src/add-ons/media/plugins/ffmpeg/AVFormatReader.cpp b/src/add-ons/media/plugins/ffmpeg/AVFormatReader.cpp
+index 9d528bb549..69e0cfcf7e 100644
+--- a/src/add-ons/media/plugins/ffmpeg/AVFormatReader.cpp
++++ b/src/add-ons/media/plugins/ffmpeg/AVFormatReader.cpp
+@@ -699,11 +699,20 @@ StreamBase::GetNextChunk(const void** chunkBuffer,
+ #endif
+ 		mediaHeader->user_data_type = AVPACKET_USER_DATA_TYPE;
+ 		avpacket_user_data* data = (avpacket_user_data*)mediaHeader->user_data;
+-		data->pts = fPacket.pts;
+-		data->dts = fPacket.dts;
++		// In microseconds, as the media_header's times: AVCodecDecoder takes
++		// its frames' start times from these (best_effort_timestamp), and
++		// tells FFmpeg so (pkt_timebase). In the stream's own time base, a
++		// 30 frames/s MP4 video (1/15360) came out at 0.5 ms a frame.
++		data->pts = fPacket.pts != AV_NOPTS_VALUE
++			? _ConvertFromStreamTimeBase(fPacket.pts) : AV_NOPTS_VALUE;
++		data->dts = fPacket.dts != AV_NOPTS_VALUE
++			? _ConvertFromStreamTimeBase(fPacket.dts) : AV_NOPTS_VALUE;
+ 		data->stream_index = fPacket.stream_index;
+ 		data->flags = fPacket.flags;
+-		data->duration = fPacket.duration;
++		data->duration = fPacket.duration > 0 && fStream->time_base.den != 0
++			? av_rescale_q(fPacket.duration, fStream->time_base,
++				AVRational{1, 1000000})
++			: fPacket.duration;
+ 		data->pos = fPacket.pos;
+ 
+ 		mediaHeader->type = fFormat.type;

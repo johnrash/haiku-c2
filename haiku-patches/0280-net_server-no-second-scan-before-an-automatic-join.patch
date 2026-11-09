@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Tue, 3 Nov 2026 19:18:40 -0500
+Subject: [PATCH 280/342] net_server: no second scan before an automatic join
+
+It didn't help: three more cold boots joined on 2.4 GHz, only 6 s later. Why the
+supplicant chooses 2.4 GHz there, when it chooses 5 GHz after a reboot or a lost
+link, isn't known yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/servers/net/AutoconfigLooper.cpp | 15 ++-------------
+ src/servers/net/AutoconfigLooper.h   |  1 -
+ 2 files changed, 2 insertions(+), 14 deletions(-)
+
+diff --git a/src/servers/net/AutoconfigLooper.cpp b/src/servers/net/AutoconfigLooper.cpp
+index 76817fbaf6..9b2a1f1961 100644
+--- a/src/servers/net/AutoconfigLooper.cpp
++++ b/src/servers/net/AutoconfigLooper.cpp
+@@ -47,8 +47,7 @@ AutoconfigLooper::AutoconfigLooper(BMessenger target, const char* device)
+ 	fRescanRunner(NULL),
+ 	fNextAutoJoin(0),
+ 	fNextRescan(0),
+-	fAutoJoinAttempts(0),
+-	fScanned(false)
++	fAutoJoinAttempts(0)
+ {
+ 	BMessage ready(kMsgReadyToRun);
+ 	PostMessage(&ready);
+@@ -239,17 +238,7 @@ AutoconfigLooper::_NetworkMonitorNotification(BMessage* message)
+ 		}
+ 
+ 		case B_NETWORK_WLAN_SCANNED:
+-			// any scan while there is no link may join a saved network, but
+-			// not the first one: it often misses access points on channels
+-			// that are only listened to (much of 5 GHz), and then the
+-			// supplicant settles on 2.4 GHz
+-			if (!fScanned && (fLastMediaStatus & IFM_ACTIVE) == 0
+-				&& (BNetworkInterface(fDevice.String()).Flags() & IFF_UP)
+-					!= 0) {
+-				fScanned = true;
+-				BNetworkDevice(fDevice.String()).Scan(false, false);
+-				break;
+-			}
++			// any scan while there is no link may join a saved network
+ 			_AutoJoin();
+ 			break;
+ 	}
+diff --git a/src/servers/net/AutoconfigLooper.h b/src/servers/net/AutoconfigLooper.h
+index c609f36273..335a485463 100644
+--- a/src/servers/net/AutoconfigLooper.h
++++ b/src/servers/net/AutoconfigLooper.h
+@@ -43,7 +43,6 @@ private:
+ 			bigtime_t			fNextAutoJoin;
+ 			bigtime_t			fNextRescan;
+ 			int32				fAutoJoinAttempts;
+-			bool				fScanned;
+ };
+ 
+ #endif	// AUTOCONFIG_LOOPER_H

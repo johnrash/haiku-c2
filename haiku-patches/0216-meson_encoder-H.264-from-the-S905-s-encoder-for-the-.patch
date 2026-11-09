@@ -1,0 +1,530 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 12:58:19 -0500
+Subject: [PATCH 216/342] meson_encoder: H.264 from the S905's encoder for the
+ Media Kit
+
+"H.264 (hardware)", short name "h264": B_RGB32 pictures straight into
+meson_venc's input area (the hardware converts them), an IDR picture
+every two seconds with the SPS and PPS in front, one QP a picture from
+the quality (0.75, the default, is QP 26). The microcode comes from
+meson_venc_firmware's data. meson_venc logs a command's interrupts only
+when it fails.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/jam/images/definitions/regular          |   2 +-
+ src/add-ons/media/plugins/Jamfile             |   1 +
+ .../media/plugins/meson_encoder/Jamfile       |  31 ++
+ .../plugins/meson_encoder/MesonEncoder.cpp    | 283 ++++++++++++++++++
+ .../plugins/meson_encoder/MesonEncoder.h      |  63 ++++
+ .../meson_encoder/MesonEncoderPlugin.cpp      |  78 +++++
+ 6 files changed, 457 insertions(+), 1 deletion(-)
+ create mode 100644 src/add-ons/media/plugins/meson_encoder/Jamfile
+ create mode 100644 src/add-ons/media/plugins/meson_encoder/MesonEncoder.cpp
+ create mode 100644 src/add-ons/media/plugins/meson_encoder/MesonEncoder.h
+ create mode 100644 src/add-ons/media/plugins/meson_encoder/MesonEncoderPlugin.cpp
+
+diff --git a/build/jam/images/definitions/regular b/build/jam/images/definitions/regular
+index 7386258530..e1db601b05 100644
+--- a/build/jam/images/definitions/regular
++++ b/build/jam/images/definitions/regular
+@@ -239,7 +239,7 @@ SYSTEM_ADD_ONS_MEDIA_PLUGINS += [ FFilterByBuildFeatures
+ 	ape_reader@x86
+ 	ffmpeg@ffmpeg
+ 	http_streamer
+-	arm64 @{ meson_decoder@ffmpeg }@
++	arm64 @{ meson_decoder@ffmpeg meson_encoder@ffmpeg }@
+ 	raw_decoder
+ ] ;
+ 
+diff --git a/src/add-ons/media/plugins/Jamfile b/src/add-ons/media/plugins/Jamfile
+index d5fd07a117..efc5b43d75 100644
+--- a/src/add-ons/media/plugins/Jamfile
++++ b/src/add-ons/media/plugins/Jamfile
+@@ -6,5 +6,6 @@ SubInclude HAIKU_TOP src add-ons media plugins ffmpeg ;
+ SubInclude HAIKU_TOP src add-ons media plugins dvd_streamer ;
+ SubInclude HAIKU_TOP src add-ons media plugins http_streamer ;
+ SubInclude HAIKU_TOP src add-ons media plugins meson_decoder ;
++SubInclude HAIKU_TOP src add-ons media plugins meson_encoder ;
+ SubInclude HAIKU_TOP src add-ons media plugins raw_decoder ;
+ SubInclude HAIKU_TOP src add-ons media plugins rtsp_streamer ;
+diff --git a/src/add-ons/media/plugins/meson_encoder/Jamfile b/src/add-ons/media/plugins/meson_encoder/Jamfile
+new file mode 100644
+index 0000000000..9a5c5553ec
+--- /dev/null
++++ b/src/add-ons/media/plugins/meson_encoder/Jamfile
+@@ -0,0 +1,31 @@
++SubDir HAIKU_TOP src add-ons media plugins meson_encoder ;
++
++UsePrivateHeaders media drivers ;
++
++SubDirC++Flags -D__STDC_CONSTANT_MACROS ;
++
++local sources =
++	MesonEncoder.cpp
++	MesonEncoderPlugin.cpp
++	;
++
++if $(TARGET_ARCH) = arm64 {
++	local architectureObject ;
++	for architectureObject in [ MultiArchSubDirSetup ] {
++		on $(architectureObject) {
++			# for FFmpeg's codec ids only
++			UseBuildFeatureHeaders ffmpeg ;
++			Includes [ FGristFiles $(sources) ]
++				: [ BuildFeatureAttribute ffmpeg : headers ] ;
++			UseHeaders [ BuildFeatureAttribute ffmpeg : headers : path ] ;
++
++			Addon [ MultiArchDefaultGristFiles meson_encoder ] :
++				$(sources)
++				:
++				be
++				media
++				[ TargetLibsupc++ ]
++			;
++		}
++	}
++}
+diff --git a/src/add-ons/media/plugins/meson_encoder/MesonEncoder.cpp b/src/add-ons/media/plugins/meson_encoder/MesonEncoder.cpp
+new file mode 100644
+index 0000000000..cf2e231dc9
+--- /dev/null
++++ b/src/add-ons/media/plugins/meson_encoder/MesonEncoder.cpp
+@@ -0,0 +1,283 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "MesonEncoder.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <math.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <File.h>
++#include <PathFinder.h>
++#include <StringList.h>
++
++#include <meson_venc.h>
++
++
++static const char* kMicrocodePath = "firmware/meson/venc/h264_enc_mc_gx.bin";
++static const size_t kChunkSize = 1024 * 1024 + 256;
++	// the driver's bitstream buffer, and the headers in front
++static const uint32 kDefaultQp = 26;
++
++
++MesonEncoder::MesonEncoder()
++	:
++	fDevice(-1),
++	fMicrocode(NULL),
++	fInputArea(-1),
++	fInput(NULL),
++	fInputBytesPerRow(0),
++	fWidth(0),
++	fHeight(0),
++	fSourceBytesPerRow(0),
++	fFrameRate(30),
++	fChunk(NULL),
++	fChunkSize(0),
++	fHeadersSize(0),
++	fQuality(-1),
++	fQp(kDefaultQp),
++	fFramesWritten(0),
++	fKeyInterval(60),
++	fEncodeTime(0)
++{
++}
++
++
++MesonEncoder::~MesonEncoder()
++{
++	_Close();
++	free(fMicrocode);
++	free(fChunk);
++}
++
++
++status_t
++MesonEncoder::AcceptedFormat(const media_format* proposedInputFormat,
++	media_format* _acceptedInputFormat)
++{
++	if (proposedInputFormat->type != B_MEDIA_RAW_VIDEO)
++		return B_MEDIA_BAD_FORMAT;
++
++	media_format format = *proposedInputFormat;
++	media_raw_video_format& video = format.u.raw_video;
++	if (video.display.format == media_raw_video_format::wildcard.display.format)
++		video.display.format = B_RGB32;
++	if (video.display.format != B_RGB32)
++		return B_MEDIA_BAD_FORMAT;
++	if (video.display.line_width > MESON_VENC_MAX_WIDTH
++		|| video.display.line_count > MESON_VENC_MAX_HEIGHT
++		|| (video.display.line_width != 0 && video.display.line_width < 16)
++		|| (video.display.line_count != 0 && video.display.line_count < 16)) {
++		return B_MEDIA_BAD_FORMAT;
++	}
++
++	if (_acceptedInputFormat != NULL)
++		*_acceptedInputFormat = format;
++	return B_OK;
++}
++
++
++status_t
++MesonEncoder::SetUp(const media_format* inputFormat)
++{
++	if (AcceptedFormat(inputFormat) != B_OK)
++		return B_MEDIA_BAD_FORMAT;
++	const media_raw_video_format& video = inputFormat->u.raw_video;
++	if (video.display.line_width == 0 || video.display.line_count == 0)
++		return B_MEDIA_BAD_FORMAT;
++
++	_Close();
++	status_t status = _LoadMicrocode();
++	if (status != B_OK)
++		return status;
++
++	fDevice = open(MESON_VENC_DEVICE, O_RDWR);
++	if (fDevice < 0)
++		return errno;
++
++	meson_venc_start start = {};
++	start.firmware = fMicrocode;
++	start.firmware_size = MESON_VENC_FIRMWARE_SIZE;
++	start.width = video.display.line_width;
++	start.height = video.display.line_count;
++	start.format = MESON_VENC_RGB32;
++	if (ioctl(fDevice, MESON_VENC_START, &start, sizeof(start)) != 0) {
++		status = errno;
++		_Close();
++		return status;
++	}
++	fInputArea = clone_area("meson_encoder input", (void**)&fInput,
++		B_ANY_ADDRESS, B_READ_AREA | B_WRITE_AREA, start.input);
++	if (fInputArea < 0) {
++		status = fInputArea;
++		_Close();
++		return status;
++	}
++	fInputBytesPerRow = start.bytes_per_row;
++	fWidth = start.width;
++	fHeight = start.height;
++	fSourceBytesPerRow = video.display.bytes_per_row != 0
++		? video.display.bytes_per_row : fWidth * 4;
++	fFrameRate = video.field_rate > 0 ? video.field_rate : 30;
++	// an IDR picture every two seconds
++	fKeyInterval = max_c((int64)lroundf(fFrameRate * 2), 1);
++
++	if (fChunk == NULL) {
++		fChunk = (uint8*)malloc(kChunkSize);
++		if (fChunk == NULL) {
++			_Close();
++			return B_NO_MEMORY;
++		}
++	}
++
++	// the parameter sets, for every IDR picture
++	meson_venc_output headers = {};
++	headers.buffer = fHeaders;
++	headers.buffer_size = sizeof(fHeaders);
++	if (ioctl(fDevice, MESON_VENC_HEADERS, &headers, sizeof(headers)) != 0) {
++		status = errno;
++		_Close();
++		return status;
++	}
++	fHeadersSize = headers.size;
++	fFramesWritten = 0;
++	return B_OK;
++}
++
++
++status_t
++MesonEncoder::GetEncodeParameters(encode_parameters* parameters) const
++{
++	memset(parameters, 0, sizeof(*parameters));
++	parameters->quality = fQuality >= 0 ? fQuality : 0.75f;
++	return B_OK;
++}
++
++
++/*!	The quality (0 to 1) as the QP of every picture: 1 is 22, 0.75 (and the
++	default) 26, 0 is 38.
++*/
++status_t
++MesonEncoder::SetEncodeParameters(encode_parameters* parameters)
++{
++	fQuality = parameters->quality;
++	if (fQuality < 0)
++		fQuality = 0;
++	if (fQuality > 1)
++		fQuality = 1;
++	fQp = (uint32)lroundf(38 - fQuality * 16);
++	return B_OK;
++}
++
++
++status_t
++MesonEncoder::Encode(const void* buffer, int64 frameCount,
++	media_encode_info* info)
++{
++	if (fDevice < 0)
++		return B_NO_INIT;
++
++	const uint8* source = (const uint8*)buffer;
++	size_t sourceSize = (size_t)fSourceBytesPerRow * fHeight;
++	for (int64 i = 0; i < frameCount; i++) {
++		// into the driver's input area, row by row where the rows differ
++		if (fSourceBytesPerRow == fInputBytesPerRow)
++			memcpy(fInput, source, sourceSize);
++		else {
++			size_t rowSize = min_c(fSourceBytesPerRow, fInputBytesPerRow);
++			for (uint32 y = 0; y < fHeight; y++) {
++				memcpy(fInput + (size_t)y * fInputBytesPerRow,
++					source + (size_t)y * fSourceBytesPerRow, rowSize);
++			}
++		}
++
++		bool keyFrame = fFramesWritten % fKeyInterval == 0
++			|| (info->flags & B_MEDIA_KEY_FRAME) != 0;
++		meson_venc_encode encode = {};
++		encode.flags = keyFrame ? MESON_VENC_IDR : 0;
++		encode.qp = fQp;
++		encode.timeout = 1000000;
++		encode.output.buffer = fChunk + fHeadersSize;
++		encode.output.buffer_size = kChunkSize - fHeadersSize;
++		if (ioctl(fDevice, MESON_VENC_ENCODE, &encode, sizeof(encode)) != 0)
++			return errno;
++		fEncodeTime += encode.encode_time;
++
++		// an IDR picture starts with the parameter sets
++		uint8* chunk = fChunk + fHeadersSize;
++		size_t chunkSize = encode.output.size;
++		if (encode.idr) {
++			chunk = fChunk;
++			memcpy(chunk, fHeaders, fHeadersSize);
++			chunkSize += fHeadersSize;
++		}
++
++		info->start_time = (bigtime_t)(fFramesWritten * 1000000.0
++			/ fFrameRate);
++		info->flags = encode.idr ? B_MEDIA_KEY_FRAME : 0;
++		status_t status = WriteChunk(chunk, chunkSize, info);
++		if (status != B_OK)
++			return status;
++
++		fFramesWritten++;
++		source += sourceSize;
++	}
++	return B_OK;
++}
++
++
++/*!	The microcode, from meson_venc_firmware's data (the first of the data
++	directories that has it).
++*/
++status_t
++MesonEncoder::_LoadMicrocode()
++{
++	if (fMicrocode != NULL)
++		return B_OK;
++
++	BStringList paths;
++	status_t status = BPathFinder::FindPaths(B_FIND_PATH_DATA_DIRECTORY,
++		kMicrocodePath, B_FIND_PATH_EXISTING_ONLY, paths);
++	if (status != B_OK || paths.IsEmpty())
++		return B_ENTRY_NOT_FOUND;
++
++	BFile file(paths.StringAt(0), B_READ_ONLY);
++	off_t size;
++	if (file.InitCheck() != B_OK || file.GetSize(&size) != B_OK
++		|| size != MESON_VENC_FIRMWARE_SIZE) {
++		return B_BAD_DATA;
++	}
++	uint8* microcode = (uint8*)malloc(MESON_VENC_FIRMWARE_SIZE);
++	if (microcode == NULL)
++		return B_NO_MEMORY;
++	if (file.Read(microcode, MESON_VENC_FIRMWARE_SIZE)
++			!= (ssize_t)MESON_VENC_FIRMWARE_SIZE) {
++		free(microcode);
++		return B_IO_ERROR;
++	}
++	fMicrocode = microcode;
++	return B_OK;
++}
++
++
++void
++MesonEncoder::_Close()
++{
++	if (fInputArea >= 0) {
++		delete_area(fInputArea);
++		fInputArea = -1;
++		fInput = NULL;
++	}
++	if (fDevice >= 0) {
++		ioctl(fDevice, MESON_VENC_STOP, NULL, 0);
++		close(fDevice);
++		fDevice = -1;
++	}
++}
+diff --git a/src/add-ons/media/plugins/meson_encoder/MesonEncoder.h b/src/add-ons/media/plugins/meson_encoder/MesonEncoder.h
+new file mode 100644
+index 0000000000..d7f749c426
+--- /dev/null
++++ b/src/add-ons/media/plugins/meson_encoder/MesonEncoder.h
+@@ -0,0 +1,63 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef MESON_ENCODER_H
++#define MESON_ENCODER_H
++
++
++#include <MediaFormats.h>
++
++#include "EncoderPlugin.h"
++
++
++/*!	H.264 from the S905's encoder (meson_venc): B_RGB32 pictures go into the
++	driver's input area as they are (the hardware converts them), each comes
++	back as one chunk, an IDR picture with the stream's SPS and PPS in front
++	of it. Annex B form, one QP a picture (from the quality asked for).
++*/
++class MesonEncoder : public Encoder {
++public:
++								MesonEncoder();
++	virtual						~MesonEncoder();
++
++	virtual	status_t			AcceptedFormat(
++									const media_format* proposedInputFormat,
++									media_format* _acceptedInputFormat
++										= NULL);
++	virtual	status_t			SetUp(const media_format* inputFormat);
++
++	virtual	status_t			GetEncodeParameters(
++									encode_parameters* parameters) const;
++	virtual	status_t			SetEncodeParameters(
++									encode_parameters* parameters);
++
++	virtual	status_t			Encode(const void* buffer, int64 frameCount,
++									media_encode_info* info);
++
++private:
++			status_t			_LoadMicrocode();
++			void				_Close();
++
++			int					fDevice;
++			uint8*				fMicrocode;
++			area_id				fInputArea;
++			uint8*				fInput;
++			uint32				fInputBytesPerRow;
++			uint32				fWidth;
++			uint32				fHeight;
++			uint32				fSourceBytesPerRow;
++			float				fFrameRate;
++			uint8*				fChunk;
++			size_t				fChunkSize;
++			uint8				fHeaders[256];
++			size_t				fHeadersSize;
++			float				fQuality;
++			uint32				fQp;
++			int64				fFramesWritten;
++			int64				fKeyInterval;
++			bigtime_t			fEncodeTime;
++};
++
++
++#endif	// MESON_ENCODER_H
+diff --git a/src/add-ons/media/plugins/meson_encoder/MesonEncoderPlugin.cpp b/src/add-ons/media/plugins/meson_encoder/MesonEncoderPlugin.cpp
+new file mode 100644
+index 0000000000..1087d91de9
+--- /dev/null
++++ b/src/add-ons/media/plugins/meson_encoder/MesonEncoderPlugin.cpp
+@@ -0,0 +1,78 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * meson_encoder: an encoder plugin for the S905's H.264 encoder (PLAN.md
++ * M48), "H.264 (hardware)", short name "h264". Its codec's sub_id is
++ * FFmpeg's id for H.264, which FFmpeg's writer (Matroska, MP4...) takes as
++ * the stream's codec.
++ */
++
++
++#include <new>
++
++extern "C" {
++#include "libavcodec/codec_id.h"
++}
++
++#include "EncoderPlugin.h"
++#include "MesonEncoder.h"
++
++
++class MesonEncoderPlugin : public EncoderPlugin {
++public:
++	virtual	Encoder*			NewEncoder(const media_codec_info& codecInfo);
++	virtual	Encoder*			NewEncoder(const media_format& format);
++	virtual	status_t			RegisterNextEncoder(int32* cookie,
++									media_codec_info* codecInfo,
++									media_format_family* formatFamily,
++									media_format* inputFormat,
++									media_format* outputFormat);
++};
++
++
++Encoder*
++MesonEncoderPlugin::NewEncoder(const media_codec_info& codecInfo)
++{
++	if (codecInfo.sub_id != AV_CODEC_ID_H264)
++		return NULL;
++	return new(std::nothrow) MesonEncoder();
++}
++
++
++Encoder*
++MesonEncoderPlugin::NewEncoder(const media_format& format)
++{
++	if (format.type != B_MEDIA_ENCODED_VIDEO)
++		return NULL;
++	return new(std::nothrow) MesonEncoder();
++}
++
++
++status_t
++MesonEncoderPlugin::RegisterNextEncoder(int32* cookie,
++	media_codec_info* codecInfo, media_format_family* formatFamily,
++	media_format* inputFormat, media_format* outputFormat)
++{
++	if (*cookie != 0)
++		return B_BAD_INDEX;
++
++	memset(codecInfo, 0, sizeof(*codecInfo));
++	strlcpy(codecInfo->pretty_name, "H.264 (hardware)",
++		sizeof(codecInfo->pretty_name));
++	strlcpy(codecInfo->short_name, "h264", sizeof(codecInfo->short_name));
++	codecInfo->sub_id = AV_CODEC_ID_H264;
++	*formatFamily = B_ANY_FORMAT_FAMILY;
++	inputFormat->type = B_MEDIA_RAW_VIDEO;
++	outputFormat->type = B_MEDIA_ENCODED_VIDEO;
++
++	(*cookie)++;
++	return B_OK;
++}
++
++
++MediaPlugin*
++instantiate_plugin()
++{
++	return new(std::nothrow) MesonEncoderPlugin;
++}

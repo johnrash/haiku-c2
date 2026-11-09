@@ -1,0 +1,1147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 01:45:41 -0400
+Subject: [PATCH 156/342] libdevice: BDigitalPin, BPWM and BGeekPort, the rest
+ of the header
+
+Be-style classes for the ODROID-C2's 40-pin header beyond the BeBox
+ones, through meson_gpio:
+
+- BDigitalPin: one GPIO pin, "Pin7" or "GPIOX_21": direction, pull,
+  level, and edges, waited for (WaitForEdge(), with the level and the
+  time) or sent to a BMessenger (B_DIGITAL_PIN_CHANGED).
+- BPWM: "PWM1" (pin 11) and "PWM2" (pin 19) with a period and pulse
+  width in nanoseconds, or a frequency and duty cycle; 0.33 us steps at
+  50 Hz, for servos. Closing stops it, the pin low.
+- BGeekPort: all 40 pins, what each can do, what it does now, and who
+  has it.
+
+One owner per pin, whatever class asks. 3.3 V pins.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/os/device/DigitalPin.h | 109 +++++++++
+ headers/os/device/GeekPort.h   |  56 +++++
+ headers/os/device/PWM.h        |  67 +++++
+ src/kits/device/DigitalPin.cpp | 430 +++++++++++++++++++++++++++++++++
+ src/kits/device/GeekPort.cpp   | 116 +++++++++
+ src/kits/device/Jamfile        |   3 +
+ src/kits/device/PWM.cpp        | 279 +++++++++++++++++++++
+ 7 files changed, 1060 insertions(+)
+ create mode 100644 headers/os/device/DigitalPin.h
+ create mode 100644 headers/os/device/GeekPort.h
+ create mode 100644 headers/os/device/PWM.h
+ create mode 100644 src/kits/device/DigitalPin.cpp
+ create mode 100644 src/kits/device/GeekPort.cpp
+ create mode 100644 src/kits/device/PWM.cpp
+
+diff --git a/headers/os/device/DigitalPin.h b/headers/os/device/DigitalPin.h
+new file mode 100644
+index 0000000000..c99d6e267f
+--- /dev/null
++++ b/headers/os/device/DigitalPin.h
+@@ -0,0 +1,109 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef	_DIGITAL_PIN_H
++#define	_DIGITAL_PIN_H
++
++
++#include <BeBuild.h>
++#include <OS.h>
++#include <SupportDefs.h>
++
++
++class BMessenger;
++
++
++/*!	One GPIO pin of the ODROID-C2's 40-pin header, in the manner of the
++	BeBox GeekPort's BDigitalPort: "Pin7" (the header's numbering) or the
++	SoC's name ("GPIOX_21"). The pins are 3.3 V, and not 5 V tolerant.
++
++	Edges: from the first WaitForEdge() (or StartWatching()) on, the pin's
++	edges of that kind are recorded, so a loop of waits misses none (up to
++	32 wait; older ones are lost, and "missed" says how many). They are
++	interrupts: 8 hardware channels for the whole header, an edge kind of a
++	pin takes one (B_ANY_EDGE two), B_BUSY when they are taken. An output
++	sees its own edges.
++*/
++
++
++enum pin_pull {
++	B_PIN_PULL_NONE = 0,
++	B_PIN_PULL_DOWN,
++	B_PIN_PULL_UP
++};
++
++enum pin_edge {
++	B_PIN_RISING_EDGE = 1,
++	B_PIN_FALLING_EDGE = 2,
++	B_PIN_ANY_EDGE = 3
++};
++
++enum {
++	B_DIGITAL_PIN_CHANGED = 'DPch'
++		// StartWatching()'s messages: "pin" (int32, the header's number),
++		// "edge" (int32, B_PIN_RISING_EDGE or B_PIN_FALLING_EDGE), "level"
++		// (bool, just after it), "when" (int64, system_time()), and
++		// "missed" (int32) when edges were lost before this one
++};
++
++
++class BDigitalPin {
++public:
++							BDigitalPin();
++	virtual					~BDigitalPin();
++
++			status_t		Open(const char* name);
++								// as an input, its pull as it was
++			void			Close();
++								// the pin becomes an input
++			bool			IsOpen() const;
++
++			status_t		SetAsInput();
++			status_t		SetAsOutput(bool level);
++								// the level first: no glitch
++			bool			IsInput() const;
++			bool			IsOutput() const;
++			status_t		SetPull(pin_pull pull);
++
++			status_t		Read(bool* level);
++								// inputs and outputs
++			status_t		Write(bool level);
++								// B_NOT_ALLOWED on an input
++
++			status_t		WaitForEdge(pin_edge edge,
++								bigtime_t timeout = B_INFINITE_TIMEOUT,
++								bool* _level = NULL,
++								bigtime_t* _when = NULL);
++								// B_TIMED_OUT; B_INTERRUPTED (a
++								// signal); B_BUSY while watching
++			status_t		StartWatching(BMessenger target,
++								pin_edge edge = B_PIN_ANY_EDGE);
++								// B_DIGITAL_PIN_CHANGED for each edge,
++								// from a thread of its own
++			status_t		StopWatching();
++
++			int32			CountDevices();
++			status_t		GetDeviceName(int32 index, char* name,
++								size_t bufSize = B_OS_NAME_LENGTH);
++
++private:
++			status_t		_RecordEdges(pin_edge edge);
++	static	status_t		_Watch(void* data);
++
++	virtual	void			_ReservedDigitalPin1();
++	virtual	void			_ReservedDigitalPin2();
++	virtual	void			_ReservedDigitalPin3();
++
++			int				fFd;
++			bool			fIsInput;
++			int32			fPin;
++			thread_id		fWatcher;
++			BMessenger*		fTarget;
++			uint32			fRecordedEdges;
++	volatile bool			fStopWatching;
++			uint32			_reserved[4];
++};
++
++
++#endif // _DIGITAL_PIN_H
+diff --git a/headers/os/device/GeekPort.h b/headers/os/device/GeekPort.h
+new file mode 100644
+index 0000000000..2cc35ed525
+--- /dev/null
++++ b/headers/os/device/GeekPort.h
+@@ -0,0 +1,56 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef	_GEEK_PORT_H
++#define	_GEEK_PORT_H
++
++
++#include <BeBuild.h>
++#include <OS.h>
++#include <SupportDefs.h>
++
++
++/*!	The ODROID-C2's 40-pin header, this port's GeekPort: what each pin is,
++	what it can do, and what it is doing. The pins are used through
++	BDigitalPort, BDigitalPin, BA2D, BD2A, BPWM, BSerialPort ("header") and
++	BI2CDevice.
++*/
++
++
++enum geekport_pin_capability {
++	B_GEEKPORT_GPIO		= 0x01,
++	B_GEEKPORT_PWM		= 0x02,
++	B_GEEKPORT_UART		= 0x04,
++	B_GEEKPORT_I2C		= 0x08,
++	B_GEEKPORT_ANALOG	= 0x10,		// an A/D input, 0 to 1.8 V
++	B_GEEKPORT_POWER	= 0x20,		// 5 V, 3.3 V or the 1.8 V reference
++	B_GEEKPORT_GROUND	= 0x40
++};
++
++
++struct geekport_pin_info {
++	int32			pin;			// 1 to 40
++	char			name[16];		// "GPIOX_21", "3.3V", "GND", "ADC.AIN0"
++	uint32			capabilities;	// geekport_pin_capability
++	char			function[16];	// now: "input", "output", "PWM",
++									// "I2C A", "UART A", "analog", "power",
++									// "ground"
++	char			user[32];		// who has it: "" (free), "program",
++									// "I2C A" (the kernel), ...
++	team_id			team;			// a program's team, or -1
++	uint32			_reserved[4];
++};
++
++
++class BGeekPort {
++public:
++	static	int32			CountPins();
++	static	status_t		GetPinInfo(int32 pin, geekport_pin_info* info);
++
++private:
++							BGeekPort();
++};
++
++
++#endif // _GEEK_PORT_H
+diff --git a/headers/os/device/PWM.h b/headers/os/device/PWM.h
+new file mode 100644
+index 0000000000..e0fcb000ee
+--- /dev/null
++++ b/headers/os/device/PWM.h
+@@ -0,0 +1,67 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef	_PWM_H
++#define	_PWM_H
++
++
++#include <BeBuild.h>
++#include <OS.h>
++#include <SupportDefs.h>
++
++
++/*!	A PWM output of the ODROID-C2's 40-pin header, with a period and pulse
++	width of your choosing (BD2A drives the same outputs as D/A channels):
++	"PWM1" on pin 11, "PWM2" on pin 19, 3.3 V. Periods from about 84 ns to
++	0.35 s (3 Hz); at 50 Hz (servos) the pulse width moves in steps of
++	about 0.33 us. Closing stops the output, the pin low: a motor or servo
++	shouldn't run on after its program.
++*/
++class BPWM {
++public:
++							BPWM();
++	virtual					~BPWM();
++
++			status_t		Open(const char* name);
++								// stopped, the pin low
++			void			Close();
++			bool			IsOpen() const;
++
++			status_t		SetPeriod(uint32 nanoseconds);
++			status_t		SetFrequency(float hertz);
++			status_t		SetPulseWidth(uint32 nanoseconds);
++			status_t		SetDutyCycle(float fraction);
++								// 0 to 1, kept when the period changes
++			uint32			Period() const;
++			uint32			PulseWidth() const;
++								// what the hardware makes of them
++			float			DutyCycle() const;
++
++			status_t		Start();
++			status_t		Stop();
++								// the pin low
++			bool			IsRunning() const;
++
++			int32			CountDevices();
++			status_t		GetDeviceName(int32 index, char* name,
++								size_t bufSize = B_OS_NAME_LENGTH);
++
++private:
++			status_t		_Apply();
++
++	virtual	void			_ReservedPWM1();
++	virtual	void			_ReservedPWM2();
++	virtual	void			_ReservedPWM3();
++
++			int				fFd;
++			uint32			fPeriod;
++			uint32			fPulseWidth;
++			float			fDutyCycle;
++			bool			fKeepDutyCycle;
++			bool			fRunning;
++			uint32			_reserved[4];
++};
++
++
++#endif // _PWM_H
+diff --git a/src/kits/device/DigitalPin.cpp b/src/kits/device/DigitalPin.cpp
+new file mode 100644
+index 0000000000..75fc026d9c
+--- /dev/null
++++ b/src/kits/device/DigitalPin.cpp
+@@ -0,0 +1,430 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * One GPIO pin of the ODROID-C2's 40-pin header, through meson_gpio
++ * (headers/private/drivers/meson_gpio.h): "Pin7" or "GPIOX_21". Elsewhere
++ * Open() fails.
++ */
++
++
++#include <DigitalPin.h>
++
++#include <new>
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++#include <unistd.h>
++
++#include <Message.h>
++#include <Messenger.h>
++
++#include <meson_gpio.h>
++
++
++namespace {
++
++/*!	The header pin \a name ("Pin7", "7", "GPIOX_21") is, or 0. */
++int32
++find_pin(int fd, const char* name)
++{
++	if (name == NULL)
++		return 0;
++	const char* number = strncasecmp(name, "pin", 3) == 0 ? name + 3 : name;
++	char* end;
++	long value = strtol(number, &end, 10);
++	bool isNumber = *number != '\0' && *end == '\0';
++	meson_gpio_pin_info info;
++	for (info.index = 0; ioctl(fd, MESON_GPIO_GET_PIN_INFO, &info,
++			sizeof(info)) == 0; info.index++) {
++		if ((info.flags & MESON_GPIO_PIN_GPIO) == 0)
++			continue;
++		if ((isNumber && (long)info.pin == value)
++			|| strcasecmp(info.pad, name) == 0) {
++			return info.pin;
++		}
++	}
++	return 0;
++}
++
++}	// namespace
++
++
++BDigitalPin::BDigitalPin()
++	:
++	fFd(-1),
++	fIsInput(true),
++	fPin(0),
++	fWatcher(-1),
++	fTarget(NULL),
++	fRecordedEdges(0),
++	fStopWatching(false)
++{
++}
++
++
++BDigitalPin::~BDigitalPin()
++{
++	Close();
++}
++
++
++/*!	Opens a pin as an input, its pull as it was. Returns B_OK, or an error
++	(B_BUSY: someone else has the pin).
++*/
++status_t
++BDigitalPin::Open(const char* name)
++{
++	Close();
++	int fd = open(MESON_GPIO_DEVICE, O_RDWR | O_CLOEXEC);
++	if (fd < 0)
++		return B_ERROR;
++	int32 pin = find_pin(fd, name);
++	if (pin == 0) {
++		close(fd);
++		return B_ENTRY_NOT_FOUND;
++	}
++	meson_gpio_pins pins;
++	pins.count = 1;
++	pins.pins[0] = pin;
++	if (ioctl(fd, MESON_GPIO_CLAIM, &pins, sizeof(pins)) != 0) {
++		status_t status = errno;
++		close(fd);
++		return status;
++	}
++	uint32 outputs = 0;
++	if (ioctl(fd, MESON_GPIO_SET_OUTPUTS, &outputs, sizeof(outputs)) != 0) {
++		close(fd);
++		return B_ERROR;
++	}
++	fFd = fd;
++	fPin = pin;
++	fIsInput = true;
++	return B_OK;
++}
++
++
++/*!	Closes the pin; it becomes an input. */
++void
++BDigitalPin::Close()
++{
++	StopWatching();
++	if (fFd >= 0)
++		close(fFd);
++	fFd = -1;
++	fPin = 0;
++	fIsInput = true;
++	fRecordedEdges = 0;
++}
++
++
++bool
++BDigitalPin::IsOpen() const
++{
++	return fFd >= 0;
++}
++
++
++status_t
++BDigitalPin::SetAsInput()
++{
++	uint32 outputs = 0;
++	if (fFd < 0)
++		return B_NO_INIT;
++	if (ioctl(fFd, MESON_GPIO_SET_OUTPUTS, &outputs, sizeof(outputs)) != 0)
++		return errno;
++	fIsInput = true;
++	return B_OK;
++}
++
++
++/*!	The pin as an output at \a level: the level is set first. */
++status_t
++BDigitalPin::SetAsOutput(bool level)
++{
++	uint32 levels = level ? 1 : 0;
++	uint32 outputs = 1;
++	if (fFd < 0)
++		return B_NO_INIT;
++	if (ioctl(fFd, MESON_GPIO_WRITE, &levels, sizeof(levels)) != 0
++		|| ioctl(fFd, MESON_GPIO_SET_OUTPUTS, &outputs, sizeof(outputs))
++			!= 0) {
++		return errno;
++	}
++	fIsInput = false;
++	return B_OK;
++}
++
++
++bool
++BDigitalPin::IsInput() const
++{
++	return fFd >= 0 && fIsInput;
++}
++
++
++bool
++BDigitalPin::IsOutput() const
++{
++	return fFd >= 0 && !fIsInput;
++}
++
++
++status_t
++BDigitalPin::SetPull(pin_pull pull)
++{
++	if (fFd < 0)
++		return B_NO_INIT;
++	meson_gpio_pull request;
++	request.bits = 1;
++	switch (pull) {
++		case B_PIN_PULL_NONE:
++			request.pull = MESON_GPIO_PULL_NONE;
++			break;
++		case B_PIN_PULL_DOWN:
++			request.pull = MESON_GPIO_PULL_DOWN;
++			break;
++		case B_PIN_PULL_UP:
++			request.pull = MESON_GPIO_PULL_UP;
++			break;
++		default:
++			return B_BAD_VALUE;
++	}
++	if (ioctl(fFd, MESON_GPIO_SET_PULL, &request, sizeof(request)) != 0)
++		return errno;
++	return B_OK;
++}
++
++
++/*!	The level on the pin, input or output. */
++status_t
++BDigitalPin::Read(bool* level)
++{
++	uint32 levels;
++	if (fFd < 0)
++		return B_NO_INIT;
++	if (level == NULL)
++		return B_BAD_VALUE;
++	if (ioctl(fFd, MESON_GPIO_READ, &levels, sizeof(levels)) != 0)
++		return errno;
++	*level = (levels & 1) != 0;
++	return B_OK;
++}
++
++
++/*!	Drives \a level on an output; B_NOT_ALLOWED on an input. */
++status_t
++BDigitalPin::Write(bool level)
++{
++	uint32 levels = level ? 1 : 0;
++	if (fFd < 0)
++		return B_NO_INIT;
++	if (fIsInput)
++		return B_NOT_ALLOWED;
++	if (ioctl(fFd, MESON_GPIO_WRITE, &levels, sizeof(levels)) != 0)
++		return errno;
++	return B_OK;
++}
++
++
++/*!	The oldest edge of that kind recorded since the first wait for it
++	(another kind starts again): its level just after it, and when it came.
++*/
++status_t
++BDigitalPin::WaitForEdge(pin_edge edge, bigtime_t timeout, bool* _level,
++	bigtime_t* _when)
++{
++	if (fFd < 0)
++		return B_NO_INIT;
++	if (fWatcher >= 0)
++		return B_BUSY;
++	status_t status = _RecordEdges(edge);
++	if (status != B_OK)
++		return status;
++	meson_gpio_edge event;
++	event.bit = 0;
++	event.timeout = timeout;
++	if (ioctl(fFd, MESON_GPIO_WAIT_EDGE, &event, sizeof(event)) != 0)
++		return errno;
++	if (_level != NULL)
++		*_level = event.level != 0;
++	if (_when != NULL)
++		*_when = event.when;
++	return B_OK;
++}
++
++
++/*!	Sends \a target a B_DIGITAL_PIN_CHANGED message for each edge of that
++	kind, until StopWatching() or Close().
++*/
++status_t
++BDigitalPin::StartWatching(BMessenger target, pin_edge edge)
++{
++	if (fFd < 0)
++		return B_NO_INIT;
++	if (!target.IsValid())
++		return B_BAD_VALUE;
++	StopWatching();
++	status_t status = _RecordEdges(edge);
++	if (status != B_OK)
++		return status;
++	fTarget = new(std::nothrow) BMessenger(target);
++	if (fTarget == NULL)
++		return B_NO_MEMORY;
++	fStopWatching = false;
++	char name[B_OS_NAME_LENGTH];
++	snprintf(name, sizeof(name), "pin %" B_PRId32 " watcher", fPin);
++	fWatcher = spawn_thread(&_Watch, name, B_DISPLAY_PRIORITY, this);
++	if (fWatcher < 0) {
++		status = fWatcher;
++		fWatcher = -1;
++		delete fTarget;
++		fTarget = NULL;
++		return status;
++	}
++	resume_thread(fWatcher);
++	return B_OK;
++}
++
++
++status_t
++BDigitalPin::StopWatching()
++{
++	if (fWatcher < 0)
++		return B_OK;
++	fStopWatching = true;
++	// the end of the recording ends the thread's wait
++	meson_gpio_edges edges;
++	edges.bit = 0;
++	edges.edges = 0;
++	ioctl(fFd, MESON_GPIO_SET_EDGES, &edges, sizeof(edges));
++	fRecordedEdges = 0;
++	status_t result;
++	wait_for_thread(fWatcher, &result);
++	fWatcher = -1;
++	delete fTarget;
++	fTarget = NULL;
++	return B_OK;
++}
++
++
++/*!	The pins this class can open (whether free or not). */
++int32
++BDigitalPin::CountDevices()
++{
++	int fd = open(MESON_GPIO_DEVICE, O_RDONLY | O_CLOEXEC);
++	if (fd < 0)
++		return 0;
++	int32 count = 0;
++	meson_gpio_pin_info info;
++	for (info.index = 0; ioctl(fd, MESON_GPIO_GET_PIN_INFO, &info,
++			sizeof(info)) == 0; info.index++) {
++		if ((info.flags & MESON_GPIO_PIN_GPIO) != 0)
++			count++;
++	}
++	close(fd);
++	return count;
++}
++
++
++/*!	The name of a pin this class can open: "Pin7". */
++status_t
++BDigitalPin::GetDeviceName(int32 index, char* name, size_t bufSize)
++{
++	if (name == NULL || index < 0)
++		return B_BAD_VALUE;
++	int fd = open(MESON_GPIO_DEVICE, O_RDONLY | O_CLOEXEC);
++	if (fd < 0)
++		return B_ERROR;
++	status_t status = B_BAD_INDEX;
++	meson_gpio_pin_info info;
++	for (info.index = 0; ioctl(fd, MESON_GPIO_GET_PIN_INFO, &info,
++			sizeof(info)) == 0; info.index++) {
++		if ((info.flags & MESON_GPIO_PIN_GPIO) == 0 || index-- > 0)
++			continue;
++		snprintf(name, bufSize, "Pin%" B_PRIu32, info.pin);
++		status = B_OK;
++		break;
++	}
++	close(fd);
++	return status;
++}
++
++
++/*!	The driver records \a edge from now on, unless it does already: the
++	pin_edge values are its MESON_GPIO_EDGE_* bits.
++*/
++status_t
++BDigitalPin::_RecordEdges(pin_edge edge)
++{
++	if (edge < B_PIN_RISING_EDGE || edge > B_PIN_ANY_EDGE)
++		return B_BAD_VALUE;
++	if (fRecordedEdges == (uint32)edge)
++		return B_OK;
++	meson_gpio_edges edges;
++	edges.bit = 0;
++	edges.edges = edge;
++	fRecordedEdges = 0;
++	if (ioctl(fFd, MESON_GPIO_SET_EDGES, &edges, sizeof(edges)) != 0)
++		return errno;
++	fRecordedEdges = edge;
++	return B_OK;
++}
++
++
++/*static*/ status_t
++BDigitalPin::_Watch(void* data)
++{
++	BDigitalPin* pin = (BDigitalPin*)data;
++	while (!pin->fStopWatching) {
++		meson_gpio_edge event;
++		event.bit = 0;
++		event.timeout = B_INFINITE_TIMEOUT;
++		if (ioctl(pin->fFd, MESON_GPIO_WAIT_EDGE, &event, sizeof(event))
++				!= 0) {
++			if (errno == B_INTERRUPTED)
++				continue;
++			break;
++		}
++		BMessage message(B_DIGITAL_PIN_CHANGED);
++		message.AddInt32("pin", pin->fPin);
++		message.AddInt32("edge", event.edge == MESON_GPIO_EDGE_RISING
++			? B_PIN_RISING_EDGE : B_PIN_FALLING_EDGE);
++		message.AddBool("level", event.level != 0);
++		message.AddInt64("when", event.when);
++		if (event.missed > 0)
++			message.AddInt32("missed", event.missed);
++		// in steps, so that a target that waits in StopWatching() with a
++		// full port doesn't wait for good
++		status_t status;
++		do {
++			status = pin->fTarget->SendMessage(&message, (BHandler*)NULL,
++				100000);
++		} while (status == B_TIMED_OUT && !pin->fStopWatching);
++		if (status == B_BAD_PORT_ID)
++			break;
++	}
++	return B_OK;
++}
++
++
++void
++BDigitalPin::_ReservedDigitalPin1()
++{
++}
++
++
++void
++BDigitalPin::_ReservedDigitalPin2()
++{
++}
++
++
++void
++BDigitalPin::_ReservedDigitalPin3()
++{
++}
+diff --git a/src/kits/device/GeekPort.cpp b/src/kits/device/GeekPort.cpp
+new file mode 100644
+index 0000000000..521fe5a924
+--- /dev/null
++++ b/src/kits/device/GeekPort.cpp
+@@ -0,0 +1,116 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * The ODROID-C2's 40-pin header (J2, board revision 0.2, as Hardkernel's
++ * wiki lists it): the fixed pins here, the SoC's pins from meson_gpio
++ * (headers/private/drivers/meson_gpio.h). Elsewhere there are no pins.
++ */
++
++
++#include <GeekPort.h>
++
++#include <fcntl.h>
++#include <stdio.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <meson_gpio.h>
++
++
++namespace {
++
++struct fixed_pin {
++	int32		pin;
++	const char*	name;
++	uint32		capabilities;
++	const char*	function;
++};
++
++const fixed_pin kFixedPins[] = {
++	{ 1, "3.3V", B_GEEKPORT_POWER, "power" },
++	{ 2, "5V", B_GEEKPORT_POWER, "power" },
++	{ 4, "5V", B_GEEKPORT_POWER, "power" },
++	{ 6, "GND", B_GEEKPORT_GROUND, "ground" },
++	{ 9, "GND", B_GEEKPORT_GROUND, "ground" },
++	{ 14, "GND", B_GEEKPORT_GROUND, "ground" },
++	{ 17, "3.3V", B_GEEKPORT_POWER, "power" },
++	{ 20, "GND", B_GEEKPORT_GROUND, "ground" },
++	{ 25, "GND", B_GEEKPORT_GROUND, "ground" },
++	{ 30, "GND", B_GEEKPORT_GROUND, "ground" },
++	{ 34, "GND", B_GEEKPORT_GROUND, "ground" },
++	{ 37, "ADC.AIN1", B_GEEKPORT_ANALOG, "analog" },
++	{ 38, "1.8V REF", B_GEEKPORT_POWER, "power" },
++	{ 39, "GND", B_GEEKPORT_GROUND, "ground" },
++	{ 40, "ADC.AIN0", B_GEEKPORT_ANALOG, "analog" },
++};
++
++const int32 kPinCount = 40;
++
++}	// namespace
++
++
++int32
++BGeekPort::CountPins()
++{
++	return access(MESON_GPIO_DEVICE, F_OK) == 0 ? kPinCount : 0;
++}
++
++
++status_t
++BGeekPort::GetPinInfo(int32 pin, geekport_pin_info* info)
++{
++	if (info == NULL)
++		return B_BAD_VALUE;
++	if (pin < 1 || pin > kPinCount || CountPins() == 0)
++		return B_BAD_INDEX;
++	memset(info, 0, sizeof(*info));
++	info->pin = pin;
++	info->team = -1;
++
++	for (size_t i = 0; i < B_COUNT_OF(kFixedPins); i++) {
++		if (kFixedPins[i].pin != pin)
++			continue;
++		strlcpy(info->name, kFixedPins[i].name, sizeof(info->name));
++		info->capabilities = kFixedPins[i].capabilities;
++		strlcpy(info->function, kFixedPins[i].function,
++			sizeof(info->function));
++		return B_OK;
++	}
++
++	int fd = open(MESON_GPIO_DEVICE, O_RDONLY | O_CLOEXEC);
++	if (fd < 0)
++		return B_ERROR;
++	status_t status = B_BAD_INDEX;
++	meson_gpio_pin_info pinInfo;
++	for (pinInfo.index = 0; ioctl(fd, MESON_GPIO_GET_PIN_INFO, &pinInfo,
++			sizeof(pinInfo)) == 0; pinInfo.index++) {
++		if ((int32)pinInfo.pin != pin)
++			continue;
++		strlcpy(info->name, pinInfo.pad, sizeof(info->name));
++		if ((pinInfo.flags & MESON_GPIO_PIN_GPIO) != 0)
++			info->capabilities |= B_GEEKPORT_GPIO;
++		if ((pinInfo.flags & MESON_GPIO_PIN_PWM) != 0)
++			info->capabilities |= B_GEEKPORT_PWM;
++		if ((pinInfo.flags & MESON_GPIO_PIN_UART) != 0)
++			info->capabilities |= B_GEEKPORT_UART;
++		if ((pinInfo.flags & MESON_GPIO_PIN_I2C) != 0)
++			info->capabilities |= B_GEEKPORT_I2C;
++		if (strcmp(pinInfo.function, "GPIO") == 0) {
++			strlcpy(info->function,
++				(pinInfo.flags & MESON_GPIO_PIN_OUTPUT) != 0
++					? "output" : "input", sizeof(info->function));
++		} else if (strncmp(pinInfo.function, "PWM", 3) == 0)
++			strlcpy(info->function, "PWM", sizeof(info->function));
++		else {
++			strlcpy(info->function, pinInfo.function,
++				sizeof(info->function));
++		}
++		strlcpy(info->user, pinInfo.use, sizeof(info->user));
++		info->team = pinInfo.team;
++		status = B_OK;
++		break;
++	}
++	close(fd);
++	return status;
++}
+diff --git a/src/kits/device/Jamfile b/src/kits/device/Jamfile
+index 9aeb2752c9..cd372b04bf 100644
+--- a/src/kits/device/Jamfile
++++ b/src/kits/device/Jamfile
+@@ -11,9 +11,12 @@ for architectureObject in [ MultiArchSubDirSetup ] {
+ 		SharedLibrary [ MultiArchDefaultGristFiles libdevice.so ] :
+ 			A2D.cpp
+ 			D2A.cpp
++			DigitalPin.cpp
+ 			DigitalPort.cpp
++			GeekPort.cpp
+ 			Joystick.cpp
+ 			JoystickTweaker.cpp
++			PWM.cpp
+ 			SerialPort.cpp
+ 			USBConfiguration.cpp
+ 			USBDevice.cpp
+diff --git a/src/kits/device/PWM.cpp b/src/kits/device/PWM.cpp
+new file mode 100644
+index 0000000000..7927488a30
+--- /dev/null
++++ b/src/kits/device/PWM.cpp
+@@ -0,0 +1,279 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * A PWM output of the ODROID-C2's 40-pin header, through meson_gpio
++ * (headers/private/drivers/meson_gpio.h): "PWM1" on pin 11, "PWM2" on pin
++ * 19. Elsewhere Open() fails.
++ */
++
++
++#include <PWM.h>
++
++#include <errno.h>
++#include <fcntl.h>
++#include <string.h>
++#include <strings.h>
++#include <unistd.h>
++
++#include <meson_gpio.h>
++
++
++namespace {
++
++struct pwm_channel {
++	const char*	name;
++	uint8		pin;
++};
++
++const pwm_channel kChannels[] = {
++	{ "PWM1", 11 },
++	{ "PWM2", 19 },
++};
++
++const uint32 kDefaultPeriod = 1000000;		// 1 kHz
++
++}	// namespace
++
++
++BPWM::BPWM()
++	:
++	fFd(-1),
++	fPeriod(kDefaultPeriod),
++	fPulseWidth(0),
++	fDutyCycle(0),
++	fKeepDutyCycle(true),
++	fRunning(false)
++{
++}
++
++
++BPWM::~BPWM()
++{
++	Close();
++}
++
++
++/*!	Opens "PWM1" or "PWM2", stopped (the pin low), with a period of 1 ms.
++	Returns B_OK, or an error (B_BUSY: someone else has the pin).
++*/
++status_t
++BPWM::Open(const char* name)
++{
++	Close();
++	if (name == NULL)
++		return B_BAD_VALUE;
++	for (size_t i = 0; i < B_COUNT_OF(kChannels); i++) {
++		if (strcasecmp(name, kChannels[i].name) != 0)
++			continue;
++		int fd = open(MESON_GPIO_DEVICE, O_RDWR | O_CLOEXEC);
++		if (fd < 0)
++			return B_ERROR;
++		meson_gpio_pins pins;
++		pins.count = 1;
++		pins.pins[0] = kChannels[i].pin;
++		if (ioctl(fd, MESON_GPIO_CLAIM, &pins, sizeof(pins)) != 0) {
++			status_t status = errno;
++			close(fd);
++			return status;
++		}
++		fFd = fd;
++		fPeriod = kDefaultPeriod;
++		fPulseWidth = 0;
++		fDutyCycle = 0;
++		fKeepDutyCycle = true;
++		fRunning = false;
++		return Stop();
++	}
++	return B_ENTRY_NOT_FOUND;
++}
++
++
++/*!	Stops the output (the pin low) and closes the channel. */
++void
++BPWM::Close()
++{
++	if (fFd < 0)
++		return;
++	Stop();
++	close(fFd);
++	fFd = -1;
++}
++
++
++bool
++BPWM::IsOpen() const
++{
++	return fFd >= 0;
++}
++
++
++/*!	The hardware's period and pulse width for what was asked, while the
++	output runs; else the pin low.
++*/
++status_t
++BPWM::_Apply()
++{
++	if (fFd < 0)
++		return B_NO_INIT;
++	meson_gpio_pwm_period period;
++	period.bit = 0;
++	period.period = fPeriod;
++	period.high = fRunning ? fPulseWidth : 0;
++	if (ioctl(fFd, MESON_GPIO_SET_PWM_PERIOD, &period, sizeof(period)) != 0)
++		return errno;
++	fPeriod = period.period;
++	if (fRunning)
++		fPulseWidth = period.high;
++	return B_OK;
++}
++
++
++status_t
++BPWM::SetPeriod(uint32 nanoseconds)
++{
++	if (fFd < 0)
++		return B_NO_INIT;
++	if (nanoseconds == 0)
++		return B_BAD_VALUE;
++	uint32 oldPeriod = fPeriod;
++	uint32 oldPulseWidth = fPulseWidth;
++	fPeriod = nanoseconds;
++	if (fKeepDutyCycle)
++		fPulseWidth = (uint32)(fDutyCycle * fPeriod + 0.5f);
++	else if (fPulseWidth > fPeriod)
++		fPulseWidth = fPeriod;
++	status_t status = _Apply();
++	if (status != B_OK) {
++		fPeriod = oldPeriod;
++		fPulseWidth = oldPulseWidth;
++		_Apply();
++	}
++	return status;
++}
++
++
++status_t
++BPWM::SetFrequency(float hertz)
++{
++	if (hertz <= 0)
++		return B_BAD_VALUE;
++	return SetPeriod((uint32)(1000000000.0f / hertz + 0.5f));
++}
++
++
++status_t
++BPWM::SetPulseWidth(uint32 nanoseconds)
++{
++	if (fFd < 0)
++		return B_NO_INIT;
++	if (nanoseconds > fPeriod)
++		return B_BAD_VALUE;
++	fPulseWidth = nanoseconds;
++	fDutyCycle = (float)nanoseconds / fPeriod;
++	fKeepDutyCycle = false;
++	return _Apply();
++}
++
++
++status_t
++BPWM::SetDutyCycle(float fraction)
++{
++	if (fFd < 0)
++		return B_NO_INIT;
++	if (fraction < 0 || fraction > 1)
++		return B_BAD_VALUE;
++	fDutyCycle = fraction;
++	fKeepDutyCycle = true;
++	fPulseWidth = (uint32)(fraction * fPeriod + 0.5f);
++	return _Apply();
++}
++
++
++uint32
++BPWM::Period() const
++{
++	return fPeriod;
++}
++
++
++uint32
++BPWM::PulseWidth() const
++{
++	return fPulseWidth;
++}
++
++
++float
++BPWM::DutyCycle() const
++{
++	return fPeriod > 0 ? (float)fPulseWidth / fPeriod : 0;
++}
++
++
++status_t
++BPWM::Start()
++{
++	if (fFd < 0)
++		return B_NO_INIT;
++	fRunning = true;
++	status_t status = _Apply();
++	if (status != B_OK)
++		fRunning = false;
++	return status;
++}
++
++
++/*!	Stops the output: the pin low. */
++status_t
++BPWM::Stop()
++{
++	if (fFd < 0)
++		return B_NO_INIT;
++	fRunning = false;
++	return _Apply();
++}
++
++
++bool
++BPWM::IsRunning() const
++{
++	return fFd >= 0 && fRunning;
++}
++
++
++int32
++BPWM::CountDevices()
++{
++	return B_COUNT_OF(kChannels);
++}
++
++
++status_t
++BPWM::GetDeviceName(int32 index, char* name, size_t bufSize)
++{
++	if (name == NULL || index < 0)
++		return B_BAD_VALUE;
++	if (index >= (int32)B_COUNT_OF(kChannels))
++		return B_BAD_INDEX;
++	strlcpy(name, kChannels[index].name, bufSize);
++	return B_OK;
++}
++
++
++void
++BPWM::_ReservedPWM1()
++{
++}
++
++
++void
++BPWM::_ReservedPWM2()
++{
++}
++
++
++void
++BPWM::_ReservedPWM3()
++{
++}

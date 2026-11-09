@@ -1,0 +1,496 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 20:30:58 -0400
+Subject: [PATCH 183/342] Remote Control: profiles for one application
+
+A profile can be for one application ("Use while: <application> is
+active"): its buttons count while that application is active, before those
+of the profiles for any application. So the same remote does MediaPlayer's
+keys in MediaPlayer and a music player's in that player, without
+choosing a profile.
+Profile files are version 3 (an "application" field); earlier ones are for
+any application. The add-on asks the roster for the active application at
+each new press; a held button repeats by its code, as it started. The
+MediaPlayer and music player keystroke templates make an empty profile one for
+their application; the Test button presses as if the profile's
+application were active.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../remote_control/RemoteControlDevice.cpp    | 54 +++++++-----
+ .../remote_control/RemoteControlDevice.h      |  4 +-
+ .../devices/remote_control/RemoteProfile.cpp  | 19 +++-
+ .../devices/remote_control/RemoteProfile.h    | 14 ++-
+ .../remotecontrol/RemoteWindow.cpp            | 86 ++++++++++++++++---
+ src/preferences/remotecontrol/RemoteWindow.h  |  1 +
+ src/preferences/remotecontrol/Templates.cpp   |  6 +-
+ src/preferences/remotecontrol/Templates.h     |  3 +
+ 8 files changed, 147 insertions(+), 40 deletions(-)
+
+diff --git a/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.cpp b/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.cpp
+index 6ff42b889d..4b3e9e514d 100644
+--- a/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.cpp
++++ b/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.cpp
+@@ -374,6 +374,8 @@ RemoteControlDevice::Control(const char* name, void* cookie, uint32 command,
+ 			event.command = (uint32)message->GetInt32("command", 0);
+ 			event.flags = 0;
+ 			event.when = system_time();
++			// as if the profile's application were active
++			BString application = message->GetString("application", "");
+ 			// the device asked: the receiver it is
+ 			RemoteReceiver* receiver = (RemoteReceiver*)cookie;
+ 			if (receiver == NULL) {
+@@ -382,7 +384,8 @@ RemoteControlDevice::Control(const char* name, void* cookie, uint32 command,
+ 			}
+ 			if (receiver == NULL)
+ 				return B_DEV_NOT_READY;
+-			HandleEvent(receiver, event, true);
++			HandleEvent(receiver, event, true,
++				application.IsEmpty() ? NULL : application.String());
+ 			return B_OK;
+ 		}
+ 	}
+@@ -392,7 +395,7 @@ RemoteControlDevice::Control(const char* name, void* cookie, uint32 command,
+ 
+ void
+ RemoteControlDevice::HandleEvent(RemoteReceiver* receiver,
+-	const ir_remote_event& event, bool test)
++	const ir_remote_event& event, bool test, const char* application)
+ {
+ 	BAutolock locker(fLock);
+ 
+@@ -411,18 +414,14 @@ RemoteControlDevice::HandleEvent(RemoteReceiver* receiver,
+ 			return;
+ 	}
+ 
+-	const Profile* profile = NULL;
+-	const Button* button = _FindButton(event, &profile);
+-
+ 	bigtime_t now = system_time();
+ 	bool repeat = (event.flags & IR_REMOTE_REPEAT) != 0;
+-	if (repeat && receiver->fHeld && button != NULL
+-		&& button->command == receiver->fHeldButton.command
+-		&& button->key == receiver->fHeldButton.key
+-		&& button->script == receiver->fHeldButton.script) {
+-		// still held
++	if (repeat && receiver->fHeld
++		&& event.command == receiver->fHeldButton.command) {
++		// still held: it goes on as it started, whatever is active now
+ 		receiver->fReleaseAt = now + kRelease;
+-		if (button->repeat && now - receiver->fPressed >= kRepeatDelay
++		if (receiver->fHeldButton.repeat
++			&& now - receiver->fPressed >= kRepeatDelay
+ 			&& now - receiver->fRepeated >= kRepeatInterval) {
+ 			receiver->fRepeated = now;
+ 			RepeatKey(receiver);
+@@ -430,7 +429,13 @@ RemoteControlDevice::HandleEvent(RemoteReceiver* receiver,
+ 		return;
+ 	}
+ 
+-	// a new press (a repeat without its first frame counts as one)
++	// a new press (a repeat without its first frame counts as one): the
++	// active application's profiles first
++	app_info active;
++	if (application == NULL && be_roster->GetActiveAppInfo(&active) == B_OK)
++		application = active.signature;
++	const Profile* profile = NULL;
++	const Button* button = _FindButton(event, application, &profile);
+ 	ReleaseKey(receiver);
+ 	if (button == NULL || (button->key == 0 && button->script.IsEmpty()))
+ 		return;
+@@ -467,21 +472,28 @@ RemoteControlDevice::RepeatKey(RemoteReceiver* receiver)
+ }
+ 
+ 
+-/*!	The first button of the enabled profiles for the event, and its
++/*!	The first button for the event of the enabled profiles for \a
++	application (the active one), else of those for any application; and its
+ 	profile.
+ */
+ const Button*
+ RemoteControlDevice::_FindButton(const ir_remote_event& event,
+-	const Profile** _profile) const
++	const char* application, const Profile** _profile) const
+ {
+-	for (int32 i = 0; i < fProfiles.CountItems(); i++) {
+-		const Profile* profile = fProfiles.ItemAt(i);
+-		if (!profile->Matches(event.protocol, event.address))
++	for (int32 pass = 0; pass < 2; pass++) {
++		if (pass == 0 && application == NULL)
+ 			continue;
+-		const Button* button = profile->FindButton(event.command);
+-		if (button != NULL) {
+-			*_profile = profile;
+-			return button;
++		for (int32 i = 0; i < fProfiles.CountItems(); i++) {
++			const Profile* profile = fProfiles.ItemAt(i);
++			if (!profile->Matches(event.protocol, event.address)
++				|| !profile->IsFor(pass == 0 ? application : NULL)) {
++				continue;
++			}
++			const Button* button = profile->FindButton(event.command);
++			if (button != NULL) {
++				*_profile = profile;
++				return button;
++			}
+ 		}
+ 	}
+ 	return NULL;
+diff --git a/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.h b/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.h
+index e49fc278a7..8bccc2b844 100644
+--- a/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.h
++++ b/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.h
+@@ -34,7 +34,8 @@ public:
+ 	// for the receivers' threads
+ 			void				HandleEvent(RemoteReceiver* receiver,
+ 									const ir_remote_event& event,
+-									bool test = false);
++									bool test = false,
++									const char* application = NULL);
+ 			void				ReleaseKey(RemoteReceiver* receiver);
+ 			void				RepeatKey(RemoteReceiver* receiver);
+ 
+@@ -46,6 +47,7 @@ private:
+ 			status_t			_AddDevice(const char* path);
+ 			const RemoteControl::Button* _FindButton(
+ 									const ir_remote_event& event,
++									const char* application,
+ 									const RemoteControl::Profile** profile)
+ 									const;
+ 			void				_Press(RemoteReceiver* receiver,
+diff --git a/src/add-ons/input_server/devices/remote_control/RemoteProfile.cpp b/src/add-ons/input_server/devices/remote_control/RemoteProfile.cpp
+index 3bb905fd5f..69ee712b34 100644
+--- a/src/add-ons/input_server/devices/remote_control/RemoteProfile.cpp
++++ b/src/add-ons/input_server/devices/remote_control/RemoteProfile.cpp
+@@ -24,7 +24,8 @@ namespace RemoteControl {
+ static const uint32 kProfileMessage = 'rcPF';
+ // 2: the target application and the buttons' scripting commands; version
+ // 1 files are read as profiles following the active application
+-static const int32 kProfileVersion = 2;
++// 3: the application the profile is for; earlier files are for any
++static const int32 kProfileVersion = 3;
+ static const char* const kDirectoryName = "Remote Control";
+ 
+ 
+@@ -65,6 +66,7 @@ Profile::operator=(const Profile& other)
+ 	fAddress = other.fAddress;
+ 	fTarget = other.fTarget;
+ 	fStartTarget = other.fStartTarget;
++	fApplication = other.fApplication;
+ 	fButtons.MakeEmpty();
+ 	for (int32 i = 0; i < other.CountButtons(); i++)
+ 		AddButton(*other.ButtonAt(i));
+@@ -86,6 +88,8 @@ Profile::Archive(BMessage* archive) const
+ 		archive->AddString("target", fTarget);
+ 		archive->AddBool("start target", fStartTarget);
+ 	}
++	if (HasApplication())
++		archive->AddString("application", fApplication);
+ 	for (int32 i = 0; i < CountButtons(); i++) {
+ 		const Button* button = ButtonAt(i);
+ 		BMessage buttonArchive;
+@@ -115,6 +119,7 @@ Profile::Unarchive(const BMessage& archive)
+ 	fAddress = (uint32)archive.GetInt32("address", 0);
+ 	fTarget = archive.GetString("target", "");
+ 	fStartTarget = archive.GetBool("start target", false);
++	fApplication = archive.GetString("application", "");
+ 	fButtons.MakeEmpty();
+ 	BMessage buttonArchive;
+ 	for (int32 i = 0; archive.FindMessage("button", i, &buttonArchive) == B_OK;
+@@ -201,6 +206,18 @@ Profile::Matches(uint32 protocol, uint32 address) const
+ }
+ 
+ 
++/*!	Whether the profile counts while the application with \a signature is
++	active, being for it (or for any, NULL: whether it is for any).
++*/
++bool
++Profile::IsFor(const char* signature) const
++{
++	if (!HasApplication())
++		return signature == NULL;
++	return signature != NULL && fApplication.ICompare(signature) == 0;
++}
++
++
+ Button*
+ Profile::FindButton(uint32 command) const
+ {
+diff --git a/src/add-ons/input_server/devices/remote_control/RemoteProfile.h b/src/add-ons/input_server/devices/remote_control/RemoteProfile.h
+index 14b26c8bd1..7fa3f3f517 100644
+--- a/src/add-ons/input_server/devices/remote_control/RemoteProfile.h
++++ b/src/add-ons/input_server/devices/remote_control/RemoteProfile.h
+@@ -11,7 +11,9 @@
+ 	hey writes them, ScriptCommand.h). A profile follows the active
+ 	application, or sends to one application whether it is active or not
+ 	(its target): commands go to it, and keystrokes straight to its window
+-	instead of through the input stream. One file per profile in
++	instead of through the input stream. A profile can be for one
++	application: its buttons count while that application is active, before
++	those of the profiles for any application. One file per profile in
+ 	~/config/settings/Remote Control/, a flattened BMessage; shared by the
+ 	input_server add-on and the Remote Control preferences.
+ */
+@@ -94,6 +96,15 @@ public:
+ 			void				SetStartsTarget(bool start)
+ 									{ fStartTarget = start; }
+ 
++	// the application the profile is for, by signature: it counts while
++	// that one is active; empty: while any is
++			const BString&		Application() const { return fApplication; }
++			void				SetApplication(const char* signature)
++									{ fApplication = signature; }
++			bool				HasApplication() const
++									{ return !fApplication.IsEmpty(); }
++			bool				IsFor(const char* signature) const;
++
+ 	// whether an event of this protocol and address is from this remote
+ 			bool				Matches(uint32 protocol,
+ 									uint32 address) const;
+@@ -121,6 +132,7 @@ private:
+ 			uint32				fAddress;
+ 			BString				fTarget;
+ 			bool				fStartTarget;
++			BString				fApplication;
+ 			BObjectList<Button, true> fButtons;
+ };
+ 
+diff --git a/src/preferences/remotecontrol/RemoteWindow.cpp b/src/preferences/remotecontrol/RemoteWindow.cpp
+index eec53a7f53..357c8370f4 100644
+--- a/src/preferences/remotecontrol/RemoteWindow.cpp
++++ b/src/preferences/remotecontrol/RemoteWindow.cpp
+@@ -81,6 +81,7 @@ enum {
+ 	kMsgLearn				= 'lrn ',
+ 	kMsgTemplate			= 'tmpl',
+ 	kMsgTarget				= 'pTgt',
++	kMsgApplication			= 'pApp',
+ 	kMsgStartTarget			= 'pStT',
+ 	kMsgScriptChanged		= 'bScr',
+ 	kMsgTest				= 'bTst'
+@@ -95,17 +96,15 @@ enum {
+ };
+ 
+ 
+-// the applications the "Send to" menu offers when they are installed, if
+-// they aren't running
++// the applications the "Use while" and "Send to" menus offer when they are
++// installed, if they aren't running
+ static const char* const kKnownTargets[] = {
+ 	"application/x-vnd.BeTunes",
+ 	"application/x-vnd.Haiku-MediaPlayer"
+ };
+ 
+ 
+-/*!	An application's name for the "Send to" menu: its file's, else the
+-	signature.
+-*/
++/*!	An application's name for the menus: its file's, else the signature. */
+ static BString
+ application_name(const char* signature)
+ {
+@@ -302,6 +301,12 @@ RemoteWindow::RemoteWindow()
+ 	fRemoteView = new BStringView("remote", "");
+ 	fForgetRemoteButton = new BButton("Forget remote",
+ 		new BMessage(kMsgForgetRemote));
++	fApplicationField = new BMenuField("application", "Use while:",
++		new BPopUpMenu("application"));
++	fApplicationField->SetToolTip("A profile for one application counts "
++		"while that application is active, before the profiles for any "
++		"application: the same buttons can do something else in each "
++		"application.");
+ 	fTargetField = new BMenuField("target", "Send to:",
+ 		new BPopUpMenu("target"));
+ 	fTargetField->SetToolTip("The active application gets keystrokes and "
+@@ -431,10 +436,11 @@ RemoteWindow::RemoteWindow()
+ 					.AddGlue()
+ 					.Add(fForgetRemoteButton)
+ 				.End()
+-				.AddGroup(B_HORIZONTAL)
+-					.Add(fTargetField)
+-					.Add(fStartTargetBox)
+-					.AddGlue()
++				.AddGrid(B_USE_SMALL_SPACING, B_USE_SMALL_SPACING)
++					.AddMenuField(fApplicationField, 0, 0)
++					.AddMenuField(fTargetField, 0, 1)
++					.Add(fStartTargetBox, 2, 1)
++					.Add(BSpaceLayoutItem::CreateGlue(), 3, 0)
+ 				.End()
+ 				.Add(fButtonList)
+ 				.AddGrid(B_USE_SMALL_SPACING, B_USE_SMALL_SPACING)
+@@ -695,6 +701,18 @@ RemoteWindow::MessageReceived(BMessage* message)
+ 			break;
+ 		}
+ 
++		case kMsgApplication:
++		{
++			Profile* profile = _CurrentProfile();
++			if (profile == NULL)
++				break;
++			profile->SetApplication(message->GetString("signature", ""));
++			_Changed(profile);
++			_UpdateTarget();
++			_UpdateProfileList(fProfiles.IndexOf(profile));
++			break;
++		}
++
+ 		case kMsgStartTarget:
+ 		{
+ 			Profile* profile = _CurrentProfile();
+@@ -717,6 +735,7 @@ RemoteWindow::MessageReceived(BMessage* message)
+ 			press.AddInt32("protocol", profile->Protocol());
+ 			press.AddInt32("address", profile->Address());
+ 			press.AddInt32("command", button->command);
++			press.AddString("application", profile->Application());
+ 			status_t status = control_add_on(RemoteControl::kMsgTestButton,
+ 				&press);
+ 			BString text;
+@@ -818,6 +837,8 @@ RemoteWindow::_UpdateProfileList(int32 select)
+ 	for (int32 i = 0; i < fProfiles.CountItems(); i++) {
+ 		const Profile* profile = fProfiles.ItemAt(i);
+ 		BString text = profile->Name();
++		if (profile->HasApplication())
++			text << " (in " << application_name(profile->Application()) << ")";
+ 		if (!profile->IsEnabled())
+ 			text << " (off)";
+ 		fProfileList->AddItem(new BStringItem(text));
+@@ -863,14 +884,17 @@ RemoteWindow::_UpdateProfile()
+ }
+ 
+ 
+-/*!	The "Send to" menu: the active application, the applications running
+-	(but background ones), the known ones installed, and the profile's.
++/*!	The "Use while" and "Send to" menus: any or the active application, the
++	applications running (but background ones), the known ones installed,
++	and the profile's.
+ */
+ void
+ RemoteWindow::_UpdateTarget()
+ {
+ 	Profile* profile = _CurrentProfile();
+ 	BString current = profile != NULL ? profile->Target() : BString();
++	BString application = profile != NULL
++		? profile->Application() : BString();
+ 
+ 	std::vector<BString> signatures;
+ 	BList teams;
+@@ -891,6 +915,8 @@ RemoteWindow::_UpdateTarget()
+ 	}
+ 	if (!current.IsEmpty())
+ 		signatures.push_back(current);
++	if (!application.IsEmpty())
++		signatures.push_back(application);
+ 
+ 	// by name, each once
+ 	std::vector<std::pair<BString, BString> > targets;
+@@ -909,12 +935,33 @@ RemoteWindow::_UpdateTarget()
+ 			return a.first.ICompare(b.first) < 0;
+ 		});
+ 
+-	BMenu* menu = fTargetField->Menu();
++	BMenu* menu = fApplicationField->Menu();
++	while (BMenuItem* item = menu->RemoveItem((int32)0))
++		delete item;
++	BMessage* message = new BMessage(kMsgApplication);
++	message->AddString("signature", "");
++	BMenuItem* item = new BMenuItem("Any application is active", message);
++	item->SetMarked(application.IsEmpty());
++	menu->AddItem(item);
++	menu->AddSeparatorItem();
++	for (size_t i = 0; i < targets.size(); i++) {
++		message = new BMessage(kMsgApplication);
++		message->AddString("signature", targets[i].second);
++		BString label = targets[i].first;
++		label << " is active";
++		item = new BMenuItem(label, message);
++		item->SetMarked(targets[i].second.ICompare(application) == 0);
++		menu->AddItem(item);
++	}
++	menu->SetTargetForItems(this);
++	fApplicationField->SetEnabled(profile != NULL);
++
++	menu = fTargetField->Menu();
+ 	while (BMenuItem* item = menu->RemoveItem((int32)0))
+ 		delete item;
+-	BMessage* message = new BMessage(kMsgTarget);
++	message = new BMessage(kMsgTarget);
+ 	message->AddString("signature", "");
+-	BMenuItem* item = new BMenuItem("The active application", message);
++	item = new BMenuItem("The active application", message);
+ 	item->SetMarked(current.IsEmpty());
+ 	menu->AddItem(item);
+ 	menu->AddSeparatorItem();
+@@ -1218,6 +1265,12 @@ RemoteWindow::_AddTemplate(int32 index)
+ 	if (profile == NULL || index < 0 || index >= kTemplateCount)
+ 		return;
+ 	const Template& added = kTemplates[index];
++	// an empty profile becomes one for the application the keystrokes are
++	// for
++	bool forApplication = added.application != NULL
++		&& profile->CountButtons() == 0 && !profile->HasApplication();
++	if (forApplication)
++		profile->SetApplication(added.application);
+ 	int32 first = -1;
+ 	for (int32 i = 0; i < added.count; i++) {
+ 		Button button;
+@@ -1237,6 +1290,8 @@ RemoteWindow::_AddTemplate(int32 index)
+ 		profile->SetTarget(added.target);
+ 	_Changed(profile);
+ 	_UpdateTarget();
++	if (forApplication)
++		_UpdateProfileList(fProfiles.IndexOf(profile));
+ 	_UpdateButtons(first);
+ 	if (added.target != NULL
+ 		&& profile->Target().ICompare(added.target) != 0) {
+@@ -1249,6 +1304,9 @@ RemoteWindow::_AddTemplate(int32 index)
+ 		if (added.target != NULL) {
+ 			text << "The buttons go to " << application_name(added.target)
+ 				<< ", active or not. ";
++		} else if (forApplication) {
++			text << "The buttons count while "
++				<< application_name(added.application) << " is active. ";
+ 		}
+ 		text << "Now press Learn, then each button the list asks for.";
+ 		_SetStatus(text);
+diff --git a/src/preferences/remotecontrol/RemoteWindow.h b/src/preferences/remotecontrol/RemoteWindow.h
+index 486884d78b..1c80f45ca0 100644
+--- a/src/preferences/remotecontrol/RemoteWindow.h
++++ b/src/preferences/remotecontrol/RemoteWindow.h
+@@ -74,6 +74,7 @@ private:
+ 			BCheckBox*			fEnabledBox;
+ 			BStringView*		fRemoteView;
+ 			BButton*			fForgetRemoteButton;
++			BMenuField*			fApplicationField;
+ 			BMenuField*			fTargetField;
+ 			BCheckBox*			fStartTargetBox;
+ 			BColumnListView*	fButtonList;
+diff --git a/src/preferences/remotecontrol/Templates.cpp b/src/preferences/remotecontrol/Templates.cpp
+index 565b8a25bc..eb42ee423b 100644
+--- a/src/preferences/remotecontrol/Templates.cpp
++++ b/src/preferences/remotecontrol/Templates.cpp
+@@ -104,8 +104,10 @@ static const TemplateButton kVolume[] = {
+ 
+ 
+ const Template kTemplates[] = {
+-	{ "MediaPlayer", kMediaPlayer, B_COUNT_OF(kMediaPlayer) },
+-	{ "BeTunes", kBeTunes, B_COUNT_OF(kBeTunes) },
++	{ "MediaPlayer", kMediaPlayer, B_COUNT_OF(kMediaPlayer), NULL,
++		"application/x-vnd.Haiku-MediaPlayer" },
++	{ "BeTunes", kBeTunes, B_COUNT_OF(kBeTunes), NULL,
++		"application/x-vnd.BeTunes" },
+ 	{ "Desktop navigation", kDesktop, B_COUNT_OF(kDesktop) },
+ 	{ "System volume", kVolume, B_COUNT_OF(kVolume) },
+ 	{ "MediaPlayer, active or not", kMediaPlayerCommands,
+diff --git a/src/preferences/remotecontrol/Templates.h b/src/preferences/remotecontrol/Templates.h
+index f3b92b63c6..7397643ec4 100644
+--- a/src/preferences/remotecontrol/Templates.h
++++ b/src/preferences/remotecontrol/Templates.h
+@@ -24,6 +24,9 @@ struct Template {
+ 	const char*				target;
+ 		// the application the profile is to send to (by signature), for
+ 		// templates with commands; NULL: the active one
++	const char*				application;
++		// the application the keystrokes are for: an empty profile becomes
++		// one for it (while it is active); NULL: any
+ };
+ 
+ // buttons named for what they do in an application, with its keystrokes

@@ -1,0 +1,249 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 14:26:54 -0500
+Subject: [PATCH 225/342] multi_audio: sound devices published after the add-on
+ started
+
+The add-on scanned /dev/audio/hmulti once, when the media add-on server
+loaded it, so a USB microphone whose driver published its device later
+(plugged in, or found after the media services started, as a webcam's
+often is) never got a node. A looper now watches the device directory and
+the ones in it; a device that appears is added after the others, which
+keep their flavor indexes, and the add-on server is asked to scan the
+flavors again, which makes the new device's node and the defaults.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../multi_audio/MultiAudioAddOn.cpp           | 99 ++++++++++++++++++-
+ .../multi_audio/MultiAudioAddOn.h             |  8 ++
+ .../multi_audio/MultiAudioDevice.h            |  1 +
+ 3 files changed, 106 insertions(+), 2 deletions(-)
+
+diff --git a/src/add-ons/media/media-add-ons/multi_audio/MultiAudioAddOn.cpp b/src/add-ons/media/media-add-ons/multi_audio/MultiAudioAddOn.cpp
+index 7ec5f86428..8ee1a81054 100644
+--- a/src/add-ons/media/media-add-ons/multi_audio/MultiAudioAddOn.cpp
++++ b/src/add-ons/media/media-add-ons/multi_audio/MultiAudioAddOn.cpp
+@@ -10,10 +10,13 @@
+ #include <stdio.h>
+ #include <string.h>
+ 
++#include <Autolock.h>
+ #include <Directory.h>
+ #include <Entry.h>
+ #include <FindDirectory.h>
+ #include <File.h>
++#include <Looper.h>
++#include <NodeMonitor.h>
+ #include <Path.h>
+ 
+ #include "debug.h"
+@@ -24,6 +27,40 @@
+ #define MULTI_SAVE
+ 
+ const char* kSettingsName = "Media/multi_audio_settings";
++static const char* kDevicePath = "/dev/audio/hmulti/";
++
++
++/*!	Watches the device directory and the directories in it: a device that a
++	driver publishes later (a USB sound device plugged in, or one published
++	after the media services started) becomes a new flavor, and the add-on
++	server makes its node.
++*/
++class MultiAudioAddOn::DeviceWatcher : public BLooper {
++public:
++	DeviceWatcher(MultiAudioAddOn* addOn)
++		:
++		BLooper("multi_audio devices", B_LOW_PRIORITY),
++		fAddOn(addOn)
++	{
++	}
++
++	virtual void MessageReceived(BMessage* message)
++	{
++		if (message->what != B_NODE_MONITOR) {
++			BLooper::MessageReceived(message);
++			return;
++		}
++
++		int32 opcode;
++		if (message->FindInt32("opcode", &opcode) == B_OK
++			&& opcode == B_ENTRY_CREATED) {
++			fAddOn->_DevicesChanged();
++		}
++	}
++
++private:
++	MultiAudioAddOn* fAddOn;
++};
+ 
+ 
+ //! instantiation function
+@@ -40,10 +77,19 @@ make_media_addon(image_id image)
+ 
+ MultiAudioAddOn::MultiAudioAddOn(image_id image)
+ 	: BMediaAddOn(image),
+-	fDevices()
++	fLock("multi_audio devices"),
++	fDevices(),
++	fWatcher(NULL)
+ {
+ 	CALLED();
+-	fInitStatus = _RecursiveScan("/dev/audio/hmulti/");
++	// watching first: the scan watches each directory before reading it
++	fWatcher = new(std::nothrow) DeviceWatcher(this);
++	if (fWatcher != NULL)
++		fWatcher->Run();
++
++	fLock.Lock();
++	fInitStatus = _RecursiveScan(kDevicePath);
++	fLock.Unlock();
+ 	if (fInitStatus != B_OK)
+ 		return;
+ 
+@@ -56,6 +102,12 @@ MultiAudioAddOn::~MultiAudioAddOn()
+ {
+ 	CALLED();
+ 
++	if (fWatcher != NULL) {
++		stop_watching(fWatcher);
++		if (fWatcher->Lock())
++			fWatcher->Quit();
++	}
++
+ 	void *device = NULL;
+ 	for (int32 i = 0; (device = fDevices.ItemAt(i)); i++)
+ 		delete (MultiAudioDevice*)device;
+@@ -76,6 +128,7 @@ int32
+ MultiAudioAddOn::CountFlavors()
+ {
+ 	CALLED();
++	BAutolock _(fLock);
+ 	return fDevices.CountItems();
+ }
+ 
+@@ -85,7 +138,9 @@ MultiAudioAddOn::GetFlavorAt(int32 index, const flavor_info** _info)
+ {
+ 	CALLED();
+ 
++	fLock.Lock();
+ 	MultiAudioDevice* device = (MultiAudioDevice*)fDevices.ItemAt(index);
++	fLock.Unlock();
+ 	if (device == NULL)
+ 		return B_BAD_INDEX;
+ 
+@@ -107,8 +162,10 @@ MultiAudioAddOn::InstantiateNodeFor(const flavor_info* info, BMessage* config,
+ {
+ 	CALLED();
+ 
++	fLock.Lock();
+ 	MultiAudioDevice* device = (MultiAudioDevice*)fDevices.ItemAt(
+ 		info->internal_id);
++	fLock.Unlock();
+ 	if (device == NULL) {
+ 		*_error = B_ERROR;
+ 		return NULL;
+@@ -190,6 +247,10 @@ MultiAudioAddOn::_RecursiveScan(const char* rootPath, BEntry* rootEntry, uint32
+ 		return B_ERROR;
+ 	}
+ 
++	node_ref nodeRef;
++	if (fWatcher != NULL && root.GetNodeRef(&nodeRef) == B_OK)
++		watch_node(&nodeRef, B_WATCH_DIRECTORY, fWatcher);
++
+ 	BEntry entry;
+ 	while (root.GetNextEntry(&entry) == B_OK) {
+ 		if (entry.IsDirectory()) {
+@@ -197,6 +258,8 @@ MultiAudioAddOn::_RecursiveScan(const char* rootPath, BEntry* rootEntry, uint32
+ 		} else {
+ 			BPath path;
+ 			entry.GetPath(&path);
++			if (_HasDevice(path.Path()))
++				continue;
+ 			MultiAudioDevice *device = 
+ 				new(std::nothrow) MultiAudioDevice(path.Path()
+ 					+ strlen(rootPath), path.Path());
+@@ -213,6 +276,38 @@ MultiAudioAddOn::_RecursiveScan(const char* rootPath, BEntry* rootEntry, uint32
+ }
+ 
+ 
++//!	Whether a device of that path is known (with the lock held).
++bool
++MultiAudioAddOn::_HasDevice(const char* path) const
++{
++	for (int32 i = 0; i < fDevices.CountItems(); i++) {
++		const MultiAudioDevice* device
++			= (const MultiAudioDevice*)fDevices.ItemAt(i);
++		if (strcmp(device->Path(), path) == 0)
++			return true;
++	}
++	return false;
++}
++
++
++/*!	Something was published in a watched directory: the devices that are new
++	are added, after the ones there are (which keep their indexes), and the
++	add-on server is asked to scan the flavors again.
++*/
++void
++MultiAudioAddOn::_DevicesChanged()
++{
++	fLock.Lock();
++	int32 count = fDevices.CountItems();
++	_RecursiveScan(kDevicePath);
++	bool added = fDevices.CountItems() != count;
++	fLock.Unlock();
++
++	if (added)
++		NotifyFlavorChange();
++}
++
++
+ void
+ MultiAudioAddOn::_SaveSettings()
+ {
+diff --git a/src/add-ons/media/media-add-ons/multi_audio/MultiAudioAddOn.h b/src/add-ons/media/media-add-ons/multi_audio/MultiAudioAddOn.h
+index d0711e031a..0925675d0f 100644
+--- a/src/add-ons/media/media-add-ons/multi_audio/MultiAudioAddOn.h
++++ b/src/add-ons/media/media-add-ons/multi_audio/MultiAudioAddOn.h
+@@ -6,6 +6,7 @@
+ #define MULTI_AUDIO_ADDON_H
+ 
+ 
++#include <Locker.h>
+ #include <MediaDefs.h>
+ #include <MediaAddOn.h>
+ #include <Message.h>
+@@ -30,14 +31,21 @@ public:
+ 							int32* _internalID, bool* _hasMore);
+ 
+ private:
++			class DeviceWatcher;
++
+ 			status_t	_RecursiveScan(const char* path, BEntry* rootEntry = NULL,
+ 							uint32 depth = 0);
++			bool		_HasDevice(const char* path) const;
++			void		_DevicesChanged();
+ 			void		_SaveSettings();
+ 			void		_LoadSettings();
+ 
+ private:
+ 	status_t 		fInitStatus;
++	BLocker			fLock;
+ 	BList			fDevices;
++		// only added to, so that a flavor's index stays its device's
++	DeviceWatcher*	fWatcher;
+ 
+ 	BMessage		fSettings;
+ 		// loaded from settings directory
+diff --git a/src/add-ons/media/media-add-ons/multi_audio/MultiAudioDevice.h b/src/add-ons/media/media-add-ons/multi_audio/MultiAudioDevice.h
+index bde5537607..f00c233242 100644
+--- a/src/add-ons/media/media-add-ons/multi_audio/MultiAudioDevice.h
++++ b/src/add-ons/media/media-add-ons/multi_audio/MultiAudioDevice.h
+@@ -20,6 +20,7 @@ public:
+ 						~MultiAudioDevice();
+ 
+ 	status_t			InitCheck() const;
++	const char*			Path() const { return fPath; }
+ 
+ 	const multi_description& Description() const { return fDescription; }
+ 	const multi_format_info& FormatInfo() const { return fFormatInfo; }

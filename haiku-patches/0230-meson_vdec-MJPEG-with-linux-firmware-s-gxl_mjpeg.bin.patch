@@ -1,0 +1,393 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 15:25:51 -0500
+Subject: [PATCH 230/342] meson_vdec: MJPEG, with linux-firmware's
+ gxl_mjpeg.bin
+
+Baseline JPEG pictures written one after the other, as Amlogic's driver
+starts its MJPEG firmware (docs/m51-mjpeg-facts.md): four frames, its
+list of free frames, the picture's height, the picture scaler at one to
+one; reports in AV_SCRATCH_9 and _A, frames given back through _8.
+
+The firmware writes three planes whatever MDEC_PIC_DC_NV12 says, so the
+frames are planar 4:2:0 (meson_vdec_frame's new cr_offset); a 4:2:2
+picture comes out 4:2:0 too, its chroma filtered. It decodes a picture
+once more data follows: each picture is written with 4 KB of zeros after
+it, and its frame comes right away.
+
+On a C920's pictures: Y within 1 of libjpeg-turbo's, the chroma within
+0.25 on average (the 2x2 mean of its 4:2:2); 10.8 ms a 1280x720 picture,
+21.4 ms a 1920x1080 one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/drivers/meson_vdec.h          |  14 +-
+ .../drivers/video/meson_vdec/meson_vdec.cpp   | 161 ++++++++++++++++--
+ .../video/meson_vdec/meson_vdec_private.h     |  13 ++
+ 3 files changed, 171 insertions(+), 17 deletions(-)
+
+diff --git a/headers/private/drivers/meson_vdec.h b/headers/private/drivers/meson_vdec.h
+index ef9e5b7536..845dffbef7 100644
+--- a/headers/private/drivers/meson_vdec.h
++++ b/headers/private/drivers/meson_vdec.h
+@@ -11,8 +11,9 @@
+ 
+ /*!	The Amlogic S905's (Meson GXBB) video decoder, /dev/video/meson_vdec/0.
+ 	One session at a time: start it with the codec's firmware, write the
+-	compressed stream (an elementary stream: MPEG-1/2, or H.264 in Annex B
+-	form), take the decoded frames in display order and give each back when
++	compressed stream (an elementary stream: MPEG-1/2, H.264 in Annex B
++	form, or MJPEG: baseline JPEG pictures one after the other, each written
++	whole), take the decoded frames in display order and give each back when
+ 	done with it. The frames are NV12 (a Y plane, then interleaved Cb and Cr
+ 	at half the height) in an area the caller clones; their contents are
+ 	valid from GET_FRAME until RECYCLE_FRAME. For H.264, the firmware asks
+@@ -43,6 +44,11 @@ enum {
+ 	MESON_VDEC_HEVC = 3,
+ 		// Main and Main 10, 4:2:0, to 8-bit NV12; linux-firmware's
+ 		// gxl_hevc.bin
++	MESON_VDEC_MJPEG = 4,
++		// baseline JPEG to planar 4:2:0 (cr_offset; 4:2:2 pictures too);
++		// linux-firmware's gxl_mjpeg.bin; the size from the first picture's
++		// SOF, the same for all; a picture's frame comes once the next
++		// picture (or the end of the stream) is written
+ };
+ 
+ struct meson_vdec_start {
+@@ -83,6 +89,10 @@ struct meson_vdec_frame {
+ 	size_t			offset;			// out: the frame's start in it
+ 	uint32			stream_offset;	// out: H.264: where in the stream its
+ 									// picture is (as WRITE's offset)
++	uint32			cr_offset;		// out: MJPEG: the frame is planar, Cb
++									// at chroma_offset and Cr here, each
++									// half the width and height, with
++									// bytes_per_row / 2 a row; 0: NV12
+ };
+ 
+ 
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+index 2f7619fc80..28b6b243cf 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+@@ -280,7 +280,11 @@ MesonVdec::_CheckDecoder()
+ 	if (!fRunning || _IsHevc())
+ 		return false;
+ 	_SetDos(ASSIST_MBOX1_CLR_REG, 1);
+-	return fCodec == MESON_VDEC_H264 ? _CheckH264() : _CheckMpeg12();
++	if (fCodec == MESON_VDEC_H264)
++		return _CheckH264();
++	if (fCodec == MESON_VDEC_MJPEG)
++		return _CheckMjpeg();
++	return _CheckMpeg12();
+ }
+ 
+ 
+@@ -367,6 +371,27 @@ MesonVdec::_CheckMpeg12()
+ }
+ 
+ 
++/*!	The MJPEG firmware's report: the frame (1-based) in AV_SCRATCH_9, the
++	picture's stream offset in AV_SCRATCH_A. It reports no errors: a damaged
++	picture is decoded as far as it goes, or not at all.
++*/
++bool
++MesonVdec::_CheckMjpeg()
++{
++	uint32 report = _Dos(AV_SCRATCH_9);
++	if ((report & MJPEG_REPORT_INDEX_MASK) == 0)
++		return false;
++	fLastReport = system_time();
++	uint32 offset = _Dos(AV_SCRATCH_A);
++	_Trace('R', report, offset, _StreamLevel());
++	uint32 index = ((report & MJPEG_REPORT_INDEX_MASK) - 1)
++		& (kMjpegFrameCount - 1);
++	_QueueFrame(index, report, offset);
++	_SetDos(AV_SCRATCH_9, 0);
++	return true;
++}
++
++
+ /*!	The H.264 firmware's command in AV_SCRATCH_0: its wish for frames
+ 	(left for the setup thread, which answers in the same register), decoded
+ 	frames (up to six, each with its status in AV_SCRATCH_1-6 and its
+@@ -718,6 +743,74 @@ MesonVdec::_StartCodec()
+ }
+ 
+ 
++/*!	The MJPEG firmware's registers (docs/m51-mjpeg-facts.md §4.2, §6.3),
++	after the firmware is loaded: its four frames' canvases (three planes:
++	it writes Cb and Cr apart whatever MDEC_PIC_DC_NV12 says), the frames it
++	may use (all), the picture's height (it reads the width from the
++	pictures), and the picture scaler the pictures go through.
++*/
++void
++MesonVdec::_StartMjpeg()
++{
++	_SetDos(DOS_SW_RESET0, (1 << 7) | (1 << 6));
++	_SetDos(DOS_SW_RESET0, 0);
++
++	// the free frames: four 3-bit fields (frames 2, 3, 4, 1, 1-based) and
++	// their length in bits
++	_SetDos(AV_SCRATCH_0, 12);
++	_SetDos(AV_SCRATCH_1, 0x31a);
++	for (uint32 i = 0; i < kMjpegFrameCount; i++) {
++		uint32 luma = kFirstCanvas + 3 * i;
++		_SetDos(AV_SCRATCH_4 + 4 * i,
++			luma | ((luma + 1) << 8) | ((luma + 2) << 16));
++	}
++	_SetupPictureScaler();
++	_SetDos(AV_SCRATCH_8, 0);
++	_SetDos(AV_SCRATCH_9, 0);
++	_SetDos(MCPU_INTR_MSK, 0xffff);
++	_SetDos(AV_SCRATCH_2, (fHeight << 4) | 0x8000);
++	_SetDos(AV_SCRATCH_3, 0);
++	_SetDos(VDEC_ASSIST_AMR1_INT8, 8);
++}
++
++
++/*!	The picture scaler at one to one, as Amlogic's driver sets it for MJPEG
++	(docs/m51-mjpeg-facts.md §6.2): a 4-tap triangle filter in 17 phases,
++	the initial states and the phase steps (1.0) of luma and chroma, each
++	way. Its memory takes 64-bit entries as two words, the high one first.
++*/
++void
++MesonVdec::_SetupPictureScaler()
++{
++	_SetDos(PSCALE_CTRL, 0xc000);
++	_SetDos(PSCALE_BMEM_ADDR, 0);
++	for (uint32 i = 0; i <= 32; i++) {
++		uint32 phase = i / 2;
++		_SetDos(PSCALE_BMEM_DAT, 0);
++		_SetDos(PSCALE_BMEM_DAT, ((32 - phase) << 24) | ((64 - phase) << 16)
++			| ((32 + phase) << 8) | phase);
++	}
++	// luma horizontal, chroma horizontal, luma vertical, chroma vertical
++	static const uint32 kInitialStates[] = { 74, 82, 78, 86 };
++	for (size_t i = 0; i < B_COUNT_OF(kInitialStates); i++) {
++		_SetDos(PSCALE_BMEM_ADDR, kInitialStates[i]);
++		_SetDos(PSCALE_BMEM_DAT, 0x00000008);
++		_SetDos(PSCALE_BMEM_DAT, 0x60000000);
++	}
++	static const uint32 kPhaseSteps[] = { 73, 81, 77, 85 };
++	for (size_t i = 0; i < B_COUNT_OF(kPhaseSteps); i++) {
++		_SetDos(PSCALE_BMEM_ADDR, kPhaseSteps[i]);
++		_SetDos(PSCALE_BMEM_DAT, 0x00010000);
++	}
++	_SetDos(DOS_SW_RESET0, 1 << 10);
++	_SetDos(DOS_SW_RESET0, 0);
++	for (int i = 0; i < 3; i++)
++		(void)fReset[RESET2 / 4];
++	_SetDos(PSCALE_RST, 7);
++	_SetDos(PSCALE_RST, 0);
++}
++
++
+ void
+ MesonVdec::_InitParser()
+ {
+@@ -798,8 +891,10 @@ MesonVdec::_StartSession(meson_vdec_start& start, const void* userFirmware)
+ 	if (start.codec == MESON_VDEC_HEVC)
+ 		return _StartHevc(start, userFirmware);
+ 	bool h264 = start.codec == MESON_VDEC_H264;
+-	if (start.codec != MESON_VDEC_MPEG12 && !h264)
++	bool mjpeg = start.codec == MESON_VDEC_MJPEG;
++	if (start.codec != MESON_VDEC_MPEG12 && !h264 && !mjpeg)
+ 		return B_BAD_VALUE;
++	const uint32 frameCount = mjpeg ? kMjpegFrameCount : kFrameCount;
+ 	if (start.firmware_size
+ 			!= (h264 ? kFirmwareSize + kH264ExtensionSize : kFirmwareSize)
+ 		|| !IS_USER_ADDRESS(userFirmware)) {
+@@ -813,13 +908,14 @@ MesonVdec::_StartSession(meson_vdec_start& start, const void* userFirmware)
+ 	fCodec = start.codec;
+ 	fWidth = h264 ? 0 : start.width;
+ 	fHeight = h264 ? 0 : start.height;
+-	fBytesPerRow = align_up(fWidth, 32);
++	// MJPEG's chroma planes are half as wide, their rows 32-byte aligned too
++	fBytesPerRow = align_up(fWidth, mjpeg ? 64 : 32);
+ 	fLumaSize = align_up(fBytesPerRow * align_up(fHeight, 32), 64 * 1024);
+ 	fFrameSize = ROUNDUP(fLumaSize + fLumaSize / 2, B_PAGE_SIZE);
+ 
+-	// MPEG-1/2's frames are as large as the picture
++	// MPEG-1/2's and MJPEG's frames are as large as the picture
+ 	if (!h264 && fFrames.area >= 0
+-		&& fFrames.size != ROUNDUP(kFrameCount * fFrameSize, B_PAGE_SIZE)) {
++		&& fFrames.size != ROUNDUP(frameCount * fFrameSize, B_PAGE_SIZE)) {
+ 		_FreeBuffer(fFrames);
+ 	}
+ 	status_t status;
+@@ -834,7 +930,7 @@ MesonVdec::_StartSession(meson_vdec_start& start, const void* userFirmware)
+ 			kInputSize + kMinimumFetch + kMarkerSize, fInput, false, false))
+ 				!= B_OK
+ 		|| (!h264 && (status = _KeepBuffer("meson_vdec frames",
+-			kFrameCount * fFrameSize, fFrames, true, false)) != B_OK)
++			frameCount * fFrameSize, fFrames, true, false)) != B_OK)
+ 		|| (h264 && (status = _KeepBuffer("meson_vdec extension",
+ 			kH264ExtensionSize, fExtension, false, false)) != B_OK)
+ 		|| (h264 && (status = _KeepBuffer("meson_vdec sei", kH264SeiSize,
+@@ -862,7 +958,7 @@ MesonVdec::_StartSession(meson_vdec_start& start, const void* userFirmware)
+ 		fEndOfStream = false;
+ 		fStreamBytes = 0;
+ 		fEndOffset = 0;
+-		fFrameCount = h264 ? 0 : kFrameCount;
++		fFrameCount = h264 ? 0 : frameCount;
+ 		fSetupPending = false;
+ 		fWaitingForFrames = false;
+ 		fEndReached = false;
+@@ -882,12 +978,21 @@ MesonVdec::_StartSession(meson_vdec_start& start, const void* userFirmware)
+ 	// mostly land where the previous session's were, didn't), as if the
+ 	// decoder kept the canvases it saw when it came out of reset. (H.264's
+ 	// come later, when the firmware asks for frames.)
+-	for (uint32 i = 0; !h264 && i < kFrameCount; i++) {
++	for (uint32 i = 0; !h264 && i < frameCount; i++) {
+ 		phys_addr_t frame = fFrames.physical + i * fFrameSize;
++		uint32 lines = align_up(fHeight, 32);
++		if (mjpeg) {
++			uint32 luma = kFirstCanvas + 3 * i;
++			_WriteCanvas(luma, frame, fBytesPerRow, lines);
++			_WriteCanvas(luma + 1, frame + fLumaSize, fBytesPerRow / 2,
++				lines / 2);
++			_WriteCanvas(luma + 2, frame + fLumaSize + fLumaSize / 4,
++				fBytesPerRow / 2, lines / 2);
++			continue;
++		}
+ 		uint32 luma = kFirstCanvas + 2 * i;
+-		_WriteCanvas(luma, frame, fBytesPerRow, align_up(fHeight, 32));
+-		_WriteCanvas(luma + 1, frame + fLumaSize, fBytesPerRow,
+-			align_up(fHeight, 32) / 2);
++		_WriteCanvas(luma, frame, fBytesPerRow, lines);
++		_WriteCanvas(luma + 1, frame + fLumaSize, fBytesPerRow, lines / 2);
+ 	}
+ 	_PowerUp();
+ 	_SetupVififo();
+@@ -899,11 +1004,16 @@ MesonVdec::_StartSession(meson_vdec_start& start, const void* userFirmware)
+ 		_Stop();
+ 		return status;
+ 	}
+-	if (!h264)
++	if (mjpeg)
++		_StartMjpeg();
++	else if (!h264)
+ 		_StartCodec();
+ 	_SetDos(ASSIST_MBOX1_CLR_REG, 1);
+ 	_SetDos(ASSIST_MBOX1_MASK, 1);
+-	_SetDos(MDEC_PIC_DC_CTRL, _Dos(MDEC_PIC_DC_CTRL) | MDEC_PIC_DC_NV12);
++	if (mjpeg)
++		_SetDos(MDEC_PIC_DC_CTRL, _Dos(MDEC_PIC_DC_CTRL) & ~MDEC_PIC_DC_NV12);
++	else
++		_SetDos(MDEC_PIC_DC_CTRL, _Dos(MDEC_PIC_DC_CTRL) | MDEC_PIC_DC_NV12);
+ 	fRunning = true;
+ 	if (h264) {
+ 		fSetupThread = spawn_kernel_thread(&_SetupThread, "meson_vdec setup",
+@@ -915,7 +1025,7 @@ MesonVdec::_StartSession(meson_vdec_start& start, const void* userFirmware)
+ 	spin(20);
+ 	_InitParser();
+ 
+-	start.frame_count = h264 ? 0 : kFrameCount;
++	start.frame_count = h264 ? 0 : frameCount;
+ 	start.frame_size = h264 ? 0 : fFrameSize;
+ 	start.frames = h264 ? -1 : fFrames.area;
+ 	// (Nothing logged per session: the serial debug output takes about a
+@@ -1288,7 +1398,14 @@ MesonVdec::_Write(const uint8* userData, size_t size, uint32* _offset)
+ 
+ 		if (user_memcpy(fInput.address, userData, piece) != B_OK)
+ 			return B_BAD_ADDRESS;
+-		status_t status = _Submit(piece, true);
++		size_t length = piece;
++		if (fCodec == MESON_VDEC_MJPEG && piece == size) {
++			// the firmware decodes a picture once more follows it: zeros,
++			// for this one's frame to come now
++			memset(fInput.address + piece, 0, kMinimumFetch);
++			length += kMinimumFetch;
++		}
++		status_t status = _Submit(length, true);
+ 		if (status != B_OK)
+ 			return status;
+ 		userData += piece;
+@@ -1330,6 +1447,18 @@ MesonVdec::_EndOfStream()
+ 		_Submit(kMinimumFetch, false);
+ 		return B_OK;
+ 	}
++	if (fCodec == MESON_VDEC_MJPEG) {
++		// no end code: zeros behind the last picture, in case the firmware
++		// waits for more before it decodes a picture
++		{
++			InterruptsSpinLocker locker(fStateLock);
++			fEndOfStream = true;
++			fLastReport = system_time();
++		}
++		memset(fInput.address, 0, kMinimumFetch);
++		_Submit(kMinimumFetch, true);
++		return B_OK;
++	}
+ 	bigtime_t timeout = system_time() + 3000000;
+ 	while (system_time() < timeout) {
+ 		InterruptsSpinLocker locker(fStateLock);
+@@ -1463,6 +1592,8 @@ MesonVdec::_GetFrame(meson_vdec_frame& frame)
+ 		flush_cache_range(fFrames.physical + index * fFrameSize, fFrameSize);
+ 		frame.frames = fFrames.area;
+ 		frame.offset = (size_t)index * fFrameSize;
++		if (fCodec == MESON_VDEC_MJPEG)
++			frame.cr_offset = fLumaSize + fLumaSize / 4;
+ 	}
+ 	return B_OK;
+ }
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
+index c9b5c2a732..d6277df4a6 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
+@@ -70,6 +70,7 @@ enum {
+ // reset controller (byte offsets)
+ enum {
+ 	RESET1						= 0x408,
++	RESET2						= 0x40c,
+ };
+ #define RESET1_PARSER				(1 << 8)	// a pulse
+ 
+@@ -78,14 +79,19 @@ static const uint32 kFirstCanvas = 0x80;
+ 
+ // DOS (byte offsets)
+ enum {
++	VDEC_ASSIST_AMR1_INT8		= 0x00b4,
+ 	ASSIST_MBOX1_CLR_REG		= 0x01d4,
+ 	ASSIST_MBOX1_MASK			= 0x01d8,
+ 	MPSR						= 0x0c04,
++	MCPU_INTR_MSK				= 0x0c10,
+ 	CPSR						= 0x0c84,
+ 	IMEM_DMA_CTRL				= 0x0d00,
+ 	IMEM_DMA_ADR				= 0x0d04,
+ 	IMEM_DMA_COUNT				= 0x0d08,
++	PSCALE_RST					= 0x2440,
+ 	PSCALE_CTRL					= 0x2444,
++	PSCALE_BMEM_ADDR			= 0x247c,
++	PSCALE_BMEM_DAT				= 0x2480,
+ 	GCLK_EN						= 0x260c,
+ 	MDEC_PIC_DC_CTRL			= 0x2638,
+ 	ANC0_CANVAS_ADDR			= 0x2640,	// H.264: to 23, the frames
+@@ -178,6 +184,10 @@ static const size_t kVififoMargin = 6 * 1024;
+ 	// the parser's own FIFO
+ static const uint32 kFrameCount = 8;
+ 	// MPEG-1/2's
++static const uint32 kMjpegFrameCount = 4;
++	// MJPEG's: the firmware's protocol has room for no more
++#define MJPEG_REPORT_INDEX_MASK		0x7		// the frame + 1
++#define MJPEG_REPORT_INTERLACED		(1 << 5)
+ static const uint32 kMaxFrames = 24;
+ 	// H.264's at most (and the queue's)
+ static const uint32 kMaxWidth = 1920;
+@@ -294,6 +304,7 @@ private:
+ 			bool				_CheckDecoder();
+ 			bool				_CheckMpeg12();
+ 			bool				_CheckH264();
++			bool				_CheckMjpeg();
+ 			bool				_CheckParser();
+ 			void				_QueueFrame(uint32 index, uint32 info,
+ 									uint32 offset);
+@@ -323,6 +334,8 @@ private:
+ 			void				_SetupVififo();
+ 			status_t			_LoadFirmware(const void* userFirmware);
+ 			void				_StartCodec();
++			void				_StartMjpeg();
++			void				_SetupPictureScaler();
+ 			status_t			_StartH264(const void* userFirmware);
+ 	static	status_t			_SetupThread(void* data);
+ 			status_t			_SetupH264Frames(const uint32* info);

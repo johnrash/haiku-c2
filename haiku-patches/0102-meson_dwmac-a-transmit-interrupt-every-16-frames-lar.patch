@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 14:12:53 -0400
+Subject: [PATCH 102/342] meson_dwmac: a transmit interrupt every 16 frames,
+ larger rings
+
+Every transmitted frame raised an interrupt. When a burst filled the
+64-slot ring, the writer was woken once per finished frame, wrote one
+frame and slept again; the profile of a TCP send showed 6% of its time
+in the condition variable wait and 2% adding to it, which every write
+did even with a free slot. Now a frame interrupts only every 16th slot,
+a writer arms a wait only when the ring is full, and the rings hold 256
+frames to send and 128 received.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../network/ether/meson_dwmac/meson_dwmac.cpp | 28 +++++++++++++------
+ 1 file changed, 19 insertions(+), 9 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp b/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
+index 84de96406d..8bac153f7a 100644
+--- a/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
++++ b/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
+@@ -19,7 +19,9 @@
+  *   a 64-byte cache line, with 2 KB copy buffers: the DMA engine does not
+  *   snoop the CPU caches, so every hand-over is a cache clean or invalidate;
+  * - read()/write() hooks copy one frame each; DMA interrupts wake readers
+- *   and writers;
++ *   and writers. A transmitted frame raises one only every kTxInterruptEvery
++ *   frames: a writer waits only when the ring is full, and is then woken
++ *   once for that many free slots instead of once per frame;
+  * - the link is polled over MDIO once a second.
+  */
+ 
+@@ -155,8 +157,9 @@ enum {
+ #define RTL8211F_PHYSR_DUPLEX	(1 << 3)
+ #define RTL8211F_PHYSR_SPEED_SHIFT 4
+ 
+-static const uint32 kRxCount = 64;
+-static const uint32 kTxCount = 64;
++static const uint32 kRxCount = 128;
++static const uint32 kTxCount = 256;
++static const uint32 kTxInterruptEvery = 16;
+ static const uint32 kDescriptorStride = 64;		// one per cache line
+ static const uint32 kBufferSize = 2048;
+ static const uint32 kRxBufferLength = 1536;
+@@ -653,24 +656,29 @@ MesonDwmac::Write(const void* buffer, size_t* _length)
+ 
+ 	uint32 slot = fTxHead;
+ 	volatile descriptor* desc = _TxDescriptor(slot);
+-	while (true) {
++	_SyncDescriptor(kRxCount + slot, true);
++	while ((desc->status & DESC_OWN) != 0) {
++		// the ring is full: wait for the DMA engine (the timeout also covers
++		// a lost interrupt)
+ 		if (!fOpen)
+ 			return B_FILE_ERROR;
+-
++		if (fNonBlocking)
++			return B_WOULD_BLOCK;
+ 		ConditionVariableEntry entry;
+ 		fTxCondition.Add(&entry);
+ 		_SyncDescriptor(kRxCount + slot, true);
+ 		if ((desc->status & DESC_OWN) == 0)
+ 			break;
+-		if (fNonBlocking)
+-			return B_WOULD_BLOCK;
+ 		locker.Unlock();
+ 		status_t waitStatus = entry.Wait(B_CAN_INTERRUPT | B_RELATIVE_TIMEOUT,
+ 			100000);
+ 		locker.Lock();
+ 		if (waitStatus != B_OK && waitStatus != B_TIMED_OUT)
+ 			return waitStatus;
++		_SyncDescriptor(kRxCount + slot, true);
+ 	}
++	if (!fOpen)
++		return B_FILE_ERROR;
+ 
+ 	status_t status = user_memcpy(_Buffer(kRxCount + slot), buffer, length);
+ 	if (status != B_OK)
+@@ -678,8 +686,10 @@ MesonDwmac::Write(const void* buffer, size_t* _length)
+ 	dcache_maintain(_BufferPhysical(kRxCount + slot), length, false);
+ 
+ 	desc->buffer = (uint32)_BufferPhysical(kRxCount + slot);
+-	desc->control = TX_CONTROL_INTERRUPT | TX_CONTROL_LAST | TX_CONTROL_FIRST
+-		| TX_CONTROL_CHAINED | (length & DESC_BUFFER_SIZE_MASK);
++	// any kTxInterruptEvery frames in a row hold one that interrupts
++	desc->control = TX_CONTROL_LAST | TX_CONTROL_FIRST | TX_CONTROL_CHAINED
++		| (length & DESC_BUFFER_SIZE_MASK)
++		| (slot % kTxInterruptEvery == 0 ? TX_CONTROL_INTERRUPT : 0);
+ 	asm volatile("dmb sy" : : : "memory");
+ 	desc->status = DESC_OWN;
+ 	_SyncDescriptor(kRxCount + slot, false);

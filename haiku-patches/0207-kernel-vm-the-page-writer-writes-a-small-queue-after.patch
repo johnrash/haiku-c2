@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 10:33:30 -0500
+Subject: [PATCH 207/342] kernel/vm: the page writer writes a small queue after
+ its idle wait
+
+Since the per-device page writers (3bfaa91290), a timed-out wait went
+back to waiting, so fewer than 256 modified pages were only written by
+a sync, a quota or an unmount. Data written minutes before a power loss
+was lost, while BFS's journal kept the inodes pointing at blocks that
+held whatever was there before (found on a C2's eMMC: test programs
+holding pages of deleted package uploads). Write the queue after each
+idle wait again, as before the rewrite.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/kernel/vm/vm_page_writer.cpp | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/src/system/kernel/vm/vm_page_writer.cpp b/src/system/kernel/vm/vm_page_writer.cpp
+index 82116500dc..c15e0c0f4c 100644
+--- a/src/system/kernel/vm/vm_page_writer.cpp
++++ b/src/system/kernel/vm/vm_page_writer.cpp
+@@ -565,9 +565,12 @@ ModifiedPageQueue::_PageWriter()
+ 
+ 	while (fWriterThread >= 0) {
+ 		if (queue.Count() < kNumPages) {
+-			// wait the full amount when no one triggers us
+-			if (!fPageWriterCondition.Wait(PAGES_FLUSH_DURATION_LOCAL_QUOTA, true))
+-				continue;
++			// Wait the full amount when no one triggers us, then write what
++			// is queued anyway: otherwise fewer than kNumPages modified pages
++			// stay in memory until a sync, and a power loss loses data that
++			// was written long before it (while the journal kept the
++			// metadata pointing at blocks that were never written).
++			fPageWriterCondition.Wait(PAGES_FLUSH_DURATION_LOCAL_QUOTA, true);
+ 		}
+ 
+ 		page_num_t modifiedPages = queue.Count();

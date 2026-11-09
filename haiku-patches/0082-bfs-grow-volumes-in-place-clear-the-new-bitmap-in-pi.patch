@@ -1,0 +1,262 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 02:12:26 -0400
+Subject: [PATCH 082/342] bfs: grow volumes in place; clear the new bitmap in
+ pieces
+
+Initialize takes "grow_limit <bytes>" (k/m/g suffixes): the log goes
+behind a block bitmap large enough for a volume of that size and gets
+that volume's log size, the blocks in between reserved like the log.
+Growing such a volume up to the limit then moves nothing: no inode walk,
+no log move, only the new bitmap blocks and the superblock. That makes
+it safe for a mounted boot volume (a first-boot grow on the ODROID-C2).
+With 2 KB blocks the limit can be up to about 384 GB, which still fits
+the first allocation group with the default group size; 256 GB costs
+24 MB of a 300 MB image.
+
+Growing also cleared all new bitmap blocks in one transaction, which
+failed for more than the log could hold: 300 MB to 256 GB adds 8192
+blocks for a 4096 block log ("transaction too large"). They are now
+cleared in transactions of half the log; the superblock keeps the old
+size until all are done.
+
+Tested in bfs_shell: 300 MB to 8, 64 and 256 GB in place (0.01-0.14 s),
+then to 300 GB the old way, checkfs clean and file contents intact after
+each step; a volume without a limit grows as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/file_systems/bfs/ResizeVisitor.cpp | 64 +++++++++++++++----
+ .../kernel/file_systems/bfs/ResizeVisitor.h   |  2 +
+ .../kernel/file_systems/bfs/Volume.cpp        | 22 ++++++-
+ src/add-ons/kernel/file_systems/bfs/Volume.h  |  3 +-
+ .../file_systems/bfs/bfs_disk_system.cpp      | 20 ++++++
+ .../kernel/file_systems/bfs/bfs_disk_system.h |  2 +
+ .../file_systems/bfs/kernel_interface.cpp     |  2 +-
+ 7 files changed, 99 insertions(+), 16 deletions(-)
+
+diff --git a/src/add-ons/kernel/file_systems/bfs/ResizeVisitor.cpp b/src/add-ons/kernel/file_systems/bfs/ResizeVisitor.cpp
+index 25255f8114..7d555dd9dc 100644
+--- a/src/add-ons/kernel/file_systems/bfs/ResizeVisitor.cpp
++++ b/src/add-ons/kernel/file_systems/bfs/ResizeVisitor.cpp
+@@ -59,6 +59,21 @@ ResizeVisitor::Resize(off_t size, bool dryRun, disk_job_id job)
+ 
+ 	update_disk_device_job_progress(job, 0.0);
+ 
++	if (fInPlace) {
++		INFORM(("Resize: growing in place, the log stays where it is\n"));
++		if (fDryRun)
++			return B_OK;
++
++		status = _ResizeVolume();
++		if (status != B_OK) {
++			FATAL(("Resize: Failed to update file system size!\n"));
++			return status;
++		}
++
++		update_disk_device_job_progress(job, 1.0);
++		return B_OK;
++	}
++
+ 	Start(VISIT_REGULAR | VISIT_INDICES | VISIT_REMOVED
+ 		| VISIT_ATTRIBUTE_DIRECTORIES);
+ 
+@@ -249,6 +264,20 @@ ResizeVisitor::_CalculateNewSizes(off_t size)
+ 	fNewLog.SetTo(0, 1 + fBitmapBlocks, logLength);
+ 	fReservedLength = 1 + fBitmapBlocks + logLength;
+ 
++	// A volume laid out to grow (a grow limit when it was initialized) may
++	// already have its log behind a block bitmap large enough for the new
++	// size, and as large as the new size needs: then it stays there, and
++	// nothing has to move.
++	off_t currentLogStart = GetVolume()->ToBlock(GetVolume()->Log());
++	off_t currentLogLength = GetVolume()->Log().Length();
++	fInPlace = fNumBlocks > GetVolume()->NumBlocks()
++		&& currentLogStart >= 1 + fBitmapBlocks
++		&& currentLogLength >= logLength;
++	if (fInPlace) {
++		fNewLog = GetVolume()->Log();
++		fReservedLength = currentLogStart + currentLogLength;
++	}
++
+ 	fBeginBlock = fReservedLength;
+ 
+ 	if (fNumBlocks < GetVolume()->NumBlocks()) {
+@@ -335,24 +364,33 @@ ResizeVisitor::_ResizeVolume()
+ 	if (1 + fBitmapBlocks > GetVolume()->Log().Start())
+ 		return B_ERROR;
+ 
+-	// clear bitmap blocks - TODO maybe not use a transaction?
+-	Transaction transaction(GetVolume(), 0);
++	// Clear the new bitmap blocks, in transactions the log can hold: growing
++	// to 256 GB adds 8192 of them with 2 KB blocks, twice a 4096 block log.
++	// The superblock still has the old size until they are all done, and
++	// nothing else uses these blocks, so stopping half way does no harm.
++	off_t chunk = GetVolume()->Log().Length() / 2;
++	off_t block = 1 + GetVolume()->NumBitmapBlocks();
++	while (block < 1 + fBitmapBlocks) {
++		Transaction transaction(GetVolume(), 0);
++		off_t end = min_c(1 + fBitmapBlocks, block + chunk);
++
++		CachedBlock cached(GetVolume());
++		for (; block < end; block++) {
++			status_t status = cached.SetToWritable(transaction, block);
++			if (status != B_OK)
++				return status;
++			uint8* buffer = cached.WritableBlock();
++
++			memset(buffer, 0, GetVolume()->BlockSize());
++		}
++		cached.Unset();
+ 
+-	CachedBlock cached(GetVolume());
+-	for (off_t block = 1 + GetVolume()->NumBitmapBlocks();
+-		block < 1 + fBitmapBlocks; block++) {
+-		status_t status = cached.SetToWritable(transaction, block);
++		status_t status = transaction.Done();
+ 		if (status != B_OK)
+ 			return status;
+-		uint8* buffer = cached.WritableBlock();
+-
+-		memset(buffer, 0, GetVolume()->BlockSize());
+ 	}
+-	cached.Unset();
+ 
+-	status_t status = transaction.Done();
+-	if (status != B_OK)
+-		return status;
++	status_t status;
+ 
+ 	// change size of block cache
+ 	status = GetVolume()->ResizeBlockCache(fNumBlocks);
+diff --git a/src/add-ons/kernel/file_systems/bfs/ResizeVisitor.h b/src/add-ons/kernel/file_systems/bfs/ResizeVisitor.h
+index 4d7635e7bd..4ede4ffc25 100644
+--- a/src/add-ons/kernel/file_systems/bfs/ResizeVisitor.h
++++ b/src/add-ons/kernel/file_systems/bfs/ResizeVisitor.h
+@@ -74,6 +74,8 @@ private:
+ 			off_t				fEndBlock;
+ 
+ 			bool				fShrinking;
++			bool				fInPlace;
++				// growing without moving data or the log
+ };
+ 
+ 
+diff --git a/src/add-ons/kernel/file_systems/bfs/Volume.cpp b/src/add-ons/kernel/file_systems/bfs/Volume.cpp
+index 5ae0309f66..c405a13f6c 100644
+--- a/src/add-ons/kernel/file_systems/bfs/Volume.cpp
++++ b/src/add-ons/kernel/file_systems/bfs/Volume.cpp
+@@ -599,7 +599,7 @@ Volume::CalculateLogSize(off_t numBlocks, off_t deviceSize)
+ 
+ status_t
+ Volume::Initialize(int fd, const char* name, uint32 blockSize,
+-	uint32 flags)
++	uint32 flags, off_t growLimit)
+ {
+ 	// although there is no really good reason for it, we won't
+ 	// accept '/' in disk names (mkbfs does this, too - and since
+@@ -642,6 +642,26 @@ Volume::Initialize(int fd, const char* name, uint32 blockSize,
+ 	// cannot use BlockAllocator::BitmapSize() here
+ 	off_t bitmapBlocks = (numBlocks + blockSize * 8 - 1) / (blockSize * 8);
+ 
++	// With a grow limit, the log goes behind a block bitmap large enough for
++	// a volume of that size, and gets that volume's log size. The volume can
++	// then grow up to the limit without moving anything (ResizeVisitor); the
++	// blocks between bitmap and log stay reserved like the log itself.
++	if (growLimit > deviceSize) {
++		off_t limitBlocks = growLimit / blockSize;
++		off_t limitBitmapBlocks
++			= (limitBlocks + blockSize * 8 - 1) / (blockSize * 8);
++		off_t limitLogSize = CalculateLogSize(limitBlocks, growLimit);
++		off_t reserved = 1 + limitBitmapBlocks + limitLogSize;
++		if (reserved > (1LL << fAllocationGroupShift)
++			|| reserved > numBlocks / 4) {
++			// it would not fit into the first allocation group, which a
++			// resize cannot change, or take too much of this volume
++			return B_BAD_VALUE;
++		}
++		bitmapBlocks = limitBitmapBlocks;
++		logSize = limitLogSize;
++	}
++
+ 	fSuperBlock.log_blocks = ToBlockRun(bitmapBlocks + 1);
+ 	fSuperBlock.log_blocks.length = HOST_ENDIAN_TO_BFS_INT16(logSize);
+ 	fSuperBlock.log_start = fSuperBlock.log_end = HOST_ENDIAN_TO_BFS_INT64(
+diff --git a/src/add-ons/kernel/file_systems/bfs/Volume.h b/src/add-ons/kernel/file_systems/bfs/Volume.h
+index 80aca486cf..0da620a113 100644
+--- a/src/add-ons/kernel/file_systems/bfs/Volume.h
++++ b/src/add-ons/kernel/file_systems/bfs/Volume.h
+@@ -38,7 +38,8 @@ public:
+ 			status_t		Mount(const char* device, uint32 flags);
+ 			status_t		Unmount();
+ 			status_t		Initialize(int fd, const char* name,
+-								uint32 blockSize, uint32 flags);
++								uint32 blockSize, uint32 flags,
++								off_t growLimit = 0);
+ 
+ 			bool			IsInitializing() const { return fVolume == NULL; }
+ 
+diff --git a/src/add-ons/kernel/file_systems/bfs/bfs_disk_system.cpp b/src/add-ons/kernel/file_systems/bfs/bfs_disk_system.cpp
+index 4948049038..e926322597 100644
+--- a/src/add-ons/kernel/file_systems/bfs/bfs_disk_system.cpp
++++ b/src/add-ons/kernel/file_systems/bfs/bfs_disk_system.cpp
+@@ -15,6 +15,7 @@ parse_initialize_parameters(const char* parameterString,
+ {
+ 	parameters.flags = 0;
+ 	parameters.verbose = false;
++	parameters.growLimit = 0;
+ 
+ 	void *handle = parse_driver_settings_string(parameterString);
+ 	if (handle == NULL)
+@@ -31,6 +32,25 @@ parse_initialize_parameters(const char* parameterString,
+ 	if (string != NULL)
+ 		blockSize = strtoul(string, NULL, 0);
+ 
++	// "grow_limit <bytes>" (k, m, g suffixes): lay the volume out to grow
++	// up to that size in place (Volume::Initialize())
++	string = get_driver_parameter(handle, "grow_limit", NULL, NULL);
++	if (string != NULL) {
++		char* end;
++		parameters.growLimit = strtoll(string, &end, 0);
++		switch (*end) {
++			case 'g':
++			case 'G':
++				parameters.growLimit <<= 10;
++			case 'm':
++			case 'M':
++				parameters.growLimit <<= 10;
++			case 'k':
++			case 'K':
++				parameters.growLimit <<= 10;
++		}
++	}
++
+ 	unload_driver_settings(handle);
+ 
+ 	if (blockSize != 1024 && blockSize != 2048 && blockSize != 4096
+diff --git a/src/add-ons/kernel/file_systems/bfs/bfs_disk_system.h b/src/add-ons/kernel/file_systems/bfs/bfs_disk_system.h
+index d12abc2a94..d265dc4f5f 100644
+--- a/src/add-ons/kernel/file_systems/bfs/bfs_disk_system.h
++++ b/src/add-ons/kernel/file_systems/bfs/bfs_disk_system.h
+@@ -12,6 +12,8 @@ struct initialize_parameters {
+ 	uint32	blockSize;
+ 	uint32	flags;
+ 	bool	verbose;
++	off_t	growLimit;
++		// bytes the volume can grow to without moving anything, or 0
+ };
+ 
+ status_t parse_initialize_parameters(const char* parameterString,
+diff --git a/src/add-ons/kernel/file_systems/bfs/kernel_interface.cpp b/src/add-ons/kernel/file_systems/bfs/kernel_interface.cpp
+index 853d597014..50f90bd728 100644
+--- a/src/add-ons/kernel/file_systems/bfs/kernel_interface.cpp
++++ b/src/add-ons/kernel/file_systems/bfs/kernel_interface.cpp
+@@ -2394,7 +2394,7 @@ bfs_initialize(int fd, partition_id partitionID, const char* name,
+ 	// initialize the volume
+ 	Volume volume(NULL);
+ 	status = volume.Initialize(fd, name, parameters.blockSize,
+-		parameters.flags);
++		parameters.flags, parameters.growLimit);
+ 	if (status < B_OK) {
+ 		INFORM(("Initializing volume failed: %s\n", strerror(status)));
+ 		return status;

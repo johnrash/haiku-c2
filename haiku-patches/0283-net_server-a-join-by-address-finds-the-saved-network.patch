@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 4 Nov 2026 00:22:28 -0500
+Subject: [PATCH 283/342] net_server: a join by address finds the saved network
+
+Without a name in the request the settings weren't searched, so no password went
+to the supplicant, which then asked for it in a dialog: `ifconfig join <address>`
+did nothing on a saved network, whatever access point it named.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/servers/net/NetServer.cpp | 20 ++++++++++++++++----
+ 1 file changed, 16 insertions(+), 4 deletions(-)
+
+diff --git a/src/servers/net/NetServer.cpp b/src/servers/net/NetServer.cpp
+index 955f3db1c2..49881de044 100644
+--- a/src/servers/net/NetServer.cpp
++++ b/src/servers/net/NetServer.cpp
+@@ -1072,14 +1072,26 @@ NetServer::_JoinNetwork(const BMessage& message, const BNetworkAddress* address,
+ 			}
+ 		}
+ 	}
+-	if (!found && name != NULL) {
++	if (!found) {
+ 		// The network was saved with another of its access points (or
+-		// bands): its settings, the password among them, still apply.
++		// bands): its settings, the password among them, still apply. Asked
++		// for by address alone, the scan has its name.
++		const char* savedName = name;
++		wireless_network scanned;
++		char scannedName[sizeof(scanned.name) + 1];
++		if (savedName == NULL && BNetworkDevice(deviceName).GetNetwork(*address,
++				scanned) == B_OK) {
++			memcpy(scannedName, scanned.name, sizeof(scanned.name));
++			scannedName[sizeof(scanned.name)] = '\0';
++			savedName = scannedName;
++		}
++
+ 		cookie = 0;
+-		while (fSettings.GetNextNetwork(cookie, networkMessage) == B_OK) {
++		while (savedName != NULL
++			&& fSettings.GetNextNetwork(cookie, networkMessage) == B_OK) {
+ 			const char* networkName;
+ 			if (networkMessage.FindString("name", &networkName) == B_OK
+-				&& !strcmp(name, networkName)) {
++				&& !strcmp(savedName, networkName)) {
+ 				found = true;
+ 				break;
+ 			}

@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 13:44:20 -0400
+Subject: [PATCH 173/342] Remote Control preferences: a duplicate's changes go
+ to the duplicate
+
+_UpdateProfileList() emptied the list with BListView::RemoveItems(),
+which leaves the selection's first and last index behind: after New,
+Duplicate or Import, CurrentSelection() still named the profile that
+was selected before, so the new profile was shown highlighted while
+the window showed, and changed, the old one. The items are now removed
+one by one with RemoveItem(), which keeps the selection right, and
+deleted (they leaked).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/preferences/remotecontrol/RemoteWindow.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/preferences/remotecontrol/RemoteWindow.cpp b/src/preferences/remotecontrol/RemoteWindow.cpp
+index 98ffc2367c..eec53a7f53 100644
+--- a/src/preferences/remotecontrol/RemoteWindow.cpp
++++ b/src/preferences/remotecontrol/RemoteWindow.cpp
+@@ -810,7 +810,11 @@ RemoteWindow::_CurrentButton() const
+ void
+ RemoteWindow::_UpdateProfileList(int32 select)
+ {
+-	fProfileList->RemoveItems(0, fProfileList->CountItems());
++	// one by one: BListView::RemoveItems() keeps the selection's first and
++	// last index, so CurrentSelection() went on naming the profile that
++	// was selected (a duplicate's changes went to its original)
++	while (BListItem* item = fProfileList->RemoveItem((int32)0))
++		delete item;
+ 	for (int32 i = 0; i < fProfiles.CountItems(); i++) {
+ 		const Profile* profile = fProfiles.ItemAt(i);
+ 		BString text = profile->Name();

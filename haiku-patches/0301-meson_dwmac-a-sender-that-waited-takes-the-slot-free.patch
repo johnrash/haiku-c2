@@ -1,0 +1,120 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 4 Nov 2026 21:32:18 -0500
+Subject: [PATCH 301/342] meson_dwmac: a sender that waited takes the slot free
+ by then
+
+Write() chose its slot once, before waiting for room in the ring without the lock,
+and used it afterwards. Two senders waiting together both had the same slot: the
+second overwrote it and moved the position on past the next slot, which was never
+filled, and the transmit engine rightly stopped there for good. That's the ring seen
+at the stalls: the slot behind the engine still owned, the one at the engine not,
+with the length of its last frame still there. My reading of that as a frame status
+closing the wrong descriptor was wrong. Found by a review of this code with Codex.
+
+Three TCP streams and pings both ways before this, without operate on second frame:
+25 stalls in two rounds of 24 s, and the link gone in the second.
+
+The count of senders overtaken this way is shown with the other state.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../network/ether/meson_dwmac/meson_dwmac.cpp | 46 +++++++++++--------
+ 1 file changed, 27 insertions(+), 19 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp b/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
+index 2f53bcad29..e263475580 100644
+--- a/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
++++ b/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
+@@ -323,6 +323,7 @@ private:
+ 			sem_id				fLinkStateSemaphore;
+ 
+ 			int32				fTxStuckSeconds;
++			int32				fTxSendersOvertaken;
+ 			bool				fSecondFrame;
+ };
+ 
+@@ -357,6 +358,7 @@ MesonDwmac::MesonDwmac(device_node* node)
+ 	fSpeed(0),
+ 	fLinkStateSemaphore(-1),
+ 	fTxStuckSeconds(0),
++	fTxSendersOvertaken(0),
+ 	fSecondFrame(true)
+ {
+ 	memset(fMacAddress, 0, sizeof(fMacAddress));
+@@ -694,14 +696,21 @@ MesonDwmac::Write(const void* buffer, size_t* _length)
+ 
+ 	MutexLocker locker(fTxLock);
+ 
+-	uint32 slot = fTxHead;
+-	volatile descriptor* desc = _TxDescriptor(slot);
+-	_SyncDescriptor(kRxCount + slot, true);
+-	while ((desc->status & DESC_OWN) != 0) {
+-		// the ring is full: wait for the DMA engine (the timeout also covers
+-		// a lost interrupt)
++	// The slot is the one at the driver's position when there's room: another
++	// sender can move that on while this one waits without the lock.
++	uint32 slot;
++	volatile descriptor* desc;
++	while (true) {
+ 		if (!fOpen)
+ 			return B_FILE_ERROR;
++		slot = fTxHead;
++		desc = _TxDescriptor(slot);
++		_SyncDescriptor(kRxCount + slot, true);
++		if ((desc->status & DESC_OWN) == 0)
++			break;
++
++		// the ring is full: wait for the DMA engine (the timeout also covers
++		// a lost interrupt)
+ 		if (fNonBlocking)
+ 			return B_WOULD_BLOCK;
+ 		ConditionVariableEntry entry;
+@@ -715,10 +724,10 @@ MesonDwmac::Write(const void* buffer, size_t* _length)
+ 		locker.Lock();
+ 		if (waitStatus != B_OK && waitStatus != B_TIMED_OUT)
+ 			return waitStatus;
+-		_SyncDescriptor(kRxCount + slot, true);
++
++		if (fTxHead != slot)
++			atomic_add(&fTxSendersOvertaken, 1);
+ 	}
+-	if (!fOpen)
+-		return B_FILE_ERROR;
+ 
+ 	status_t status = user_memcpy(_Buffer(kRxCount + slot), buffer, length);
+ 	if (status != B_OK)
+@@ -899,15 +908,13 @@ MesonDwmac::_ConfigureEee()
+ }
+ 
+ 
+-/*!	The transmit engine can stay suspended with frames waiting, whatever the
+-	poll demands say: the slot behind its position is still its own, the one at
+-	its position has lost OWN with its length intact, as if a frame's status had
+-	closed the next descriptor. It happened within a few GB without OPERATION_OSF,
+-	and with it once in about 110 GB.
++/*!	A safety net: the transmit engine suspended for 2 s with frames waiting,
++	which no poll demand will change if a slot among them isn't its own. Write()
++	used to leave such a hole, when two senders had waited for the same slot.
+ 
+-	After 2 s of that, gives the ring back to the engine in order, from the
+-	oldest frame. A frame that had gone out may go out again, which TCP copes
+-	with, and which nothing else on a LAN minds much.
++	Gives the ring back to the engine in order, from the oldest frame. A frame
++	that had gone out may go out again, which TCP copes with, and which nothing
++	else on a LAN minds much.
+ */
+ void
+ MesonDwmac::_CheckTransmit()
+@@ -1005,8 +1012,9 @@ MesonDwmac::DumpState(void (*print)(const char*, ...))
+ 		}
+ 	}
+ 	print("meson_dwmac: received %" B_PRIu32 " frames, %" B_PRIu32
+-		" CRC errors, missed %#" B_PRIx32 "\n", _Read(kMmcRxFrames),
+-		_Read(kMmcRxCrcErrors), _Read(kDmaMissedFrames));
++		" CRC errors, missed %#" B_PRIx32 "; senders overtaken while waiting: %"
++		B_PRId32 "\n", _Read(kMmcRxFrames), _Read(kMmcRxCrcErrors),
++		_Read(kDmaMissedFrames), fTxSendersOvertaken);
+ }
+ 
+ 

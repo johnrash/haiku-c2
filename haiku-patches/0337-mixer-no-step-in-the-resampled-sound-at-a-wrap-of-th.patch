@@ -1,0 +1,221 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 7 Nov 2026 11:36:20 -0500
+Subject: [PATCH 337/342] mixer: no step in the resampled sound at a wrap of
+ the input ring
+
+With the output at 48 kHz, 44.1 kHz material crackled on a C2 on Wi-Fi,
+and played clean at 44.1 kHz. A 1 kHz tone through MediaPlayer at 48 kHz
+showed 6-8 small clicks a second, 120 ms apart; at 44.1 kHz (nothing to
+resample) under one. MixerInput resampled a buffer that wrapped around
+the end of its ring (three output buffers, 126 ms) in two parts, the
+input split in proportion and rounded down, so the time base stepped at
+every wrap. It now resamples such a buffer in one piece into a second
+buffer from the same pool and copies the two parts.
+
+Interpolate (the default linear resampler) also summed its position in
+a float: for some buffer sizes it ended a sample short, and the next
+buffer began a sample early. Each output sample's position now comes
+from its index, the last input sample is always the one kept, and a call
+with no input holds the last sample.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../media/media-add-ons/mixer/Interpolate.cpp | 54 +++++++++++++------
+ .../media/media-add-ons/mixer/MixerInput.cpp  | 43 ++++++++++++++-
+ .../media/media-add-ons/mixer/MixerInput.h    |  3 ++
+ 3 files changed, 81 insertions(+), 19 deletions(-)
+
+diff --git a/src/add-ons/media/media-add-ons/mixer/Interpolate.cpp b/src/add-ons/media/media-add-ons/mixer/Interpolate.cpp
+index 0fb48f995d..7c3d58cbe2 100644
+--- a/src/add-ons/media/media-add-ons/mixer/Interpolate.cpp
++++ b/src/add-ons/media/media-add-ons/mixer/Interpolate.cpp
+@@ -30,8 +30,23 @@ kernel(Resampler* object, const void *_src, int32 srcSampleOffset,
+ 	int32 count = destSampleCount;
+ 	float gain = _gain * gnum / gden;
+ 
++	if (srcSampleCount <= 0) {
++		// nothing to read: the last sample is held
++		float tmp = (((Interpolate*)object)->fOldSample - inMiddle) * gain
++			+ outMiddle;
++		while (count--) {
++			if (tmp <= min)
++				*(outType *)dest = min;
++			else if (tmp >= max)
++				*(outType *)dest = max;
++			else
++				*(outType *)dest = (outType)tmp;
++			dest += destSampleOffset;
++		}
++		return;
++	}
++
+ 	if (srcSampleCount == destSampleCount) {
+-		// optimized case for no resampling
+ 		while (count--) {
+ 			float tmp = ((*(const inType*)src) - inMiddle) * gain + outMiddle;
+ 			if (tmp <= min)
+@@ -43,36 +58,41 @@ kernel(Resampler* object, const void *_src, int32 srcSampleOffset,
+ 			src += srcSampleOffset;
+ 			dest += destSampleOffset;
+ 		}
++		((Interpolate*)object)->fOldSample
++			= *(const inType*)(src - srcSampleOffset);
+ 		return;
+ 	}
+ 
+-	float delta = float(srcSampleCount) / float(destSampleCount);
+-	float current = 0.0f;
++	// Output sample k lies k * delta input samples after the last sample of
++	// the call before (oldSample): between samples i - 1 and i of this one.
++	// The position comes from k each time. Summed up in a float, it ended a
++	// sample short now and then, and the next call began a sample early: a
++	// click at every such buffer when 44.1 kHz material played at 48 kHz.
++	double delta = double(srcSampleCount) / double(destSampleCount);
+ 	float oldSample = ((Interpolate*)object)->fOldSample;
+ 
+-	#define SRC *(const inType*)(src)
+-
+-	while (count--) {
+-		float tmp = (gain * (oldSample + (SRC - oldSample) * current - inMiddle)
+-			+ outMiddle);
++	for (int32 k = 0; k < destSampleCount; k++) {
++		double position = k * delta;
++		int32 i = (int32)position;
++		if (i >= srcSampleCount)
++			i = srcSampleCount - 1;
++		float fraction = float(position - i);
++		float before = i == 0 ? oldSample
++			: float(*(const inType*)(src + (i - 1) * srcSampleOffset));
++		float after = float(*(const inType*)(src + i * srcSampleOffset));
++		float tmp = gain * (before + (after - before) * fraction - inMiddle)
++			+ outMiddle;
+ 		if (tmp <= min)
+ 			*(outType *)dest = min;
+ 		else if (tmp >= max)
+ 			*(outType *)dest = max;
+ 		else
+ 			*(outType *)dest = (outType)tmp;
+-
+ 		dest += destSampleOffset;
+-		current += delta;
+-		if (current >= 1.0f) {
+-			double ipart;
+-			current = modf(current, &ipart);
+-			oldSample = SRC;
+-			src += srcSampleOffset * (int)ipart;
+-		}
+ 	}
+ 
+-	((Interpolate*)object)->fOldSample = oldSample;
++	((Interpolate*)object)->fOldSample
++		= float(*(const inType*)(src + (srcSampleCount - 1) * srcSampleOffset));
+ }
+ 
+ 
+diff --git a/src/add-ons/media/media-add-ons/mixer/MixerInput.cpp b/src/add-ons/media/media-add-ons/mixer/MixerInput.cpp
+index d15f649dd9..6d4e9e274b 100644
+--- a/src/add-ons/media/media-add-ons/mixer/MixerInput.cpp
++++ b/src/add-ons/media/media-add-ons/mixer/MixerInput.cpp
+@@ -34,6 +34,7 @@ MixerInput::MixerInput(MixerCore* core, const media_input& input,
+ 	fMixerChannelInfo(0),
+ 	fMixerChannelCount(0),
+ 	fMixBuffer(NULL),
++	fResampleBuffer(NULL),
+ 	fMixBufferFrameRate(0),
+ 	fMixBufferFrameCount(0),
+ 	fLastDataFrameWritten(-1),
+@@ -91,6 +92,8 @@ MixerInput::~MixerInput()
+ {
+ 	if (fMixBuffer)
+ 		rtm_free(fMixBuffer);
++	if (fResampleBuffer)
++		rtm_free(fResampleBuffer);
+ 	if (fRtmPool)
+ 		rtm_delete_pool(fRtmPool);
+ 	delete[] fInputChannelInfo;
+@@ -234,7 +237,32 @@ MixerInput::BufferReceived(BBuffer* buffer, bigtime_t lateness)
+ //		start + duration_for_frames(fInput.format.u.raw_audio.frame_rate,
+ //		frames_per_buffer(fInput.format.u.raw_audio)), offset,
+ //		offset + out_frames);
+-	if (offset + out_frames > fMixBufferFrameCount) {
++	if (offset + out_frames > fMixBufferFrameCount && fResampleBuffer != NULL
++		&& out_frames <= fMixBufferFrameCount) {
++		// Resampled in one piece, then copied to the end and the start of
++		// the mix buffer. Resampling the two parts separately (the input
++		// split in proportion, rounded down) put a step in the time base at
++		// every wrap: a click about every 126 ms when 44.1 kHz material
++		// played at 48 kHz (three 2016-frame output buffers).
++		int out_frames1 = fMixBufferFrameCount - offset;
++		int out_frames2 = out_frames - out_frames1;
++		fLastDataFrameWritten = out_frames2 - 1;
++
++		size_t frameSize = sizeof(float) * fInputChannelCount;
++		for (int i = 0; i < fInputChannelCount; i++) {
++			fResampler[i]->Resample(
++				reinterpret_cast<char*>(data)
++					+ i * bytes_per_sample(fInput.format.u.raw_audio),
++				bytes_per_frame(fInput.format.u.raw_audio), in_frames,
++				reinterpret_cast<char*>(fResampleBuffer) + i * sizeof(float),
++				frameSize, out_frames, fInputChannelInfo[i].gain);
++		}
++		memcpy(reinterpret_cast<char*>(fMixBuffer) + offset * frameSize,
++			fResampleBuffer, out_frames1 * frameSize);
++		memcpy(fMixBuffer,
++			reinterpret_cast<char*>(fResampleBuffer) + out_frames1 * frameSize,
++			out_frames2 * frameSize);
++	} else if (offset + out_frames > fMixBufferFrameCount) {
+ 		int out_frames1 = fMixBufferFrameCount - offset;
+ 		int out_frames2 = out_frames - out_frames1;
+ 		int in_frames1 = (out_frames1 * in_frames) / out_frames;
+@@ -697,6 +725,10 @@ MixerInput::SetMixBufferFormat(int32 framerate, int32 frames)
+ 			rtm_free(fMixBuffer);
+ 			fMixBuffer = NULL;
+ 		}
++		if (fResampleBuffer != NULL) {
++			rtm_free(fResampleBuffer);
++			fResampleBuffer = NULL;
++		}
+ 		for (int i = 0; i < fInputChannelCount; i++)
+ 			fInputChannelInfo[i].buffer_base = 0;
+ 		fMixBufferFrameCount = 0;
+@@ -729,10 +761,12 @@ MixerInput::SetMixBufferFormat(int32 framerate, int32 frames)
+ 	fFractionalFrames = 0.0;
+ 
+ 	rtm_free(fMixBuffer);
++	rtm_free(fResampleBuffer);
++	fResampleBuffer = NULL;
+ 	rtm_delete_pool(fRtmPool);
+ 
+ 	int size = sizeof(float) * fInputChannelCount * fMixBufferFrameCount;
+-	if (rtm_create_pool(&fRtmPool, size) != B_OK)
++	if (rtm_create_pool(&fRtmPool, 2 * size + B_PAGE_SIZE) != B_OK)
+ 		fRtmPool = NULL;
+ 
+ 	fMixBuffer = (float*)rtm_alloc(fRtmPool, size);
+@@ -741,6 +775,11 @@ MixerInput::SetMixBufferFormat(int32 framerate, int32 frames)
+ 
+ 	memset(fMixBuffer, 0, size);
+ 
++	// without it, a wrapping buffer is resampled in two parts as before
++	fResampleBuffer = (float*)rtm_alloc(fRtmPool, size);
++	if (fResampleBuffer != NULL)
++		memset(fResampleBuffer, 0, size);
++
+ 	for (int i = 0; i < fInputChannelCount; i++)
+ 		fInputChannelInfo[i].buffer_base = &fMixBuffer[i];
+ 
+diff --git a/src/add-ons/media/media-add-ons/mixer/MixerInput.h b/src/add-ons/media/media-add-ons/mixer/MixerInput.h
+index 7617eba2a9..882be0543d 100644
+--- a/src/add-ons/media/media-add-ons/mixer/MixerInput.h
++++ b/src/add-ons/media/media-add-ons/mixer/MixerInput.h
+@@ -104,6 +104,9 @@ private:
+ 			mixer_chan_info*	fMixerChannelInfo; // array
+ 			int					fMixerChannelCount;
+ 			float*				fMixBuffer;
++			float*				fResampleBuffer;
++				// a buffer that wraps around the end of fMixBuffer is
++				// resampled here in one piece, then copied in two
+ 			int32				fMixBufferFrameRate;
+ 			int					fMixBufferFrameCount;
+ 			int32				fLastDataFrameWritten;

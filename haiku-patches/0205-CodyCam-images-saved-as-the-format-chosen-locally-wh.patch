@@ -1,0 +1,174 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 09:30:48 -0500
+Subject: [PATCH 205/342] CodyCam: images saved as the format chosen, locally
+ where asked (M45)
+
+Found with a USB microscope on a C2:
+- The format menu's items sent B_TRANSLATION_MENU (AddTranslationItems()
+  without a model), but the window takes msg_translate: the format
+  chosen never arrived, and every capture was saved, and uploaded, as a
+  raw bitmap ('bits') named codycam.jpg. The items now send
+  msg_translate.
+- Saving locally went to the Directory field, which was greyed out in
+  that mode and kept the FTP default "web/images", relative to the
+  folder CodyCam was started in: "Error creating output file". The field
+  stays enabled, a relative directory is in the home folder, a missing
+  one is made, and the status line says where the image went.
+- A failed translation now fails the save (it was uploaded anyway).
+- The error view, shown instead of the video only for an error, was
+  visible and empty below the video, so the video's box had a strip at
+  the bottom. It starts hidden.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apps/codycam/CodyCam.cpp       | 13 +++++++--
+ src/apps/codycam/VideoConsumer.cpp | 45 ++++++++++++++++++++++++------
+ src/apps/codycam/VideoConsumer.h   |  3 +-
+ 3 files changed, 49 insertions(+), 12 deletions(-)
+
+diff --git a/src/apps/codycam/CodyCam.cpp b/src/apps/codycam/CodyCam.cpp
+index 81dcc33adb..a57de9d329 100644
+--- a/src/apps/codycam/CodyCam.cpp
++++ b/src/apps/codycam/CodyCam.cpp
+@@ -618,6 +618,9 @@ VideoWindow::_BuildCaptureControls()
+ 
+ 	fErrorView = new BTextView("error");
+ 	fErrorView->SetViewColor(ui_color(B_PANEL_BACKGROUND_COLOR));
++	// shown instead of the video only for an error (ErrorAlert()): visible
++	// and empty, it added a strip below the video inside its box
++	fErrorView->Hide();
+ 
+ 	// Capture controls
+ 	BGridLayout* controlsLayout = new BGridLayout(B_USE_DEFAULT_SPACING,
+@@ -638,8 +641,12 @@ VideoWindow::_BuildCaptureControls()
+ 
+ 	// format menu
+ 	fImageFormatMenu = new BPopUpMenu(B_TRANSLATE("Image Format Menu"));
++	// the items' message is the one MessageReceived() takes (without a
++	// model they sent B_TRANSLATION_MENU, and the format chosen never
++	// arrived: every capture was saved as a raw bitmap)
++	BMessage translateModel(msg_translate);
+ 	BTranslationUtils::AddTranslationItems(fImageFormatMenu,
+-		B_TRANSLATOR_BITMAP);
++		B_TRANSLATOR_BITMAP, &translateModel);
+ 	fImageFormatMenu->SetTargetForItems(this);
+ 
+ 	if (fImageFormatSettings->Value()
+@@ -839,8 +846,10 @@ VideoWindow::_UploadClientChanged()
+ 	fServerName->SetEnabled(enableServerControls);
+ 	fLoginId->SetEnabled(enableServerControls);
+ 	fPassword->SetEnabled(enableServerControls);
+-	fDirectory->SetEnabled(enableServerControls);
+ 	fPassiveFtp->SetEnabled(enableServerControls);
++	// the directory stays: saving locally puts the image there (relative to
++	// the home folder), and was greyed out while it did
++
+ }
+ 
+ 
+diff --git a/src/apps/codycam/VideoConsumer.cpp b/src/apps/codycam/VideoConsumer.cpp
+index 5c56f60d0b..114a3b00fc 100644
+--- a/src/apps/codycam/VideoConsumer.cpp
++++ b/src/apps/codycam/VideoConsumer.cpp
+@@ -17,9 +17,13 @@
+ #include <Buffer.h>
+ #include <BufferGroup.h>
+ #include <Catalog.h>
++#include <Directory.h>
++#include <FindDirectory.h>
+ #include <Locale.h>
+ #include <MediaRoster.h>
+ #include <NodeInfo.h>
++#include <Path.h>
++#include <String.h>
+ #include <scheduler.h>
+ #include <StringView.h>
+ #include <TimeSource.h>
+@@ -645,13 +649,31 @@ VideoConsumer::FtpRun(void* data)
+ void
+ VideoConsumer::FtpThread()
+ {
+-	char fullPath[B_PATH_NAME_LENGTH];
+ 	FUNCTION("VideoConsumer::FtpThread\n");
+ 	if (fUploadClient == 2) {
+-		// 64 + 64 = 128 max
+-		snprintf(fullPath, B_PATH_NAME_LENGTH, "%s/%s", fDirectoryText,
+-			fFileNameText);
+-		LocalSave(fullPath, fFtpBitmap);
++		// Saving locally: a directory without a leading slash is in the
++		// home folder (else it depended on the folder CodyCam was started
++		// in, and the default, "web/images", is one for the FTP server
++		// that rarely exists locally); one that doesn't exist yet is made
++		BPath path;
++		if (fDirectoryText[0] == '/')
++			path.SetTo(fDirectoryText);
++		else if (find_directory(B_USER_DIRECTORY, &path) == B_OK
++			&& fDirectoryText[0] != '\0') {
++			path.Append(fDirectoryText);
++		}
++		if (path.InitCheck() == B_OK) {
++			create_directory(path.Path(), 0755);
++			path.Append(fFileNameText);
++		}
++		bool typeSet = false;
++		if (path.InitCheck() == B_OK
++			&& LocalSave(path.Path(), fFtpBitmap, &typeSet) == B_OK
++			&& typeSet) {
++			BString status(B_TRANSLATE("Saved %path%"));
++			status.ReplaceFirst("%path%", path.Path());
++			UpdateFtpStatus(status.String());
++		}
+ 	} else if (LocalSave(fFileNameText, fFtpBitmap) == B_OK)
+ 		FtpSave(fFileNameText);
+ 
+@@ -688,7 +710,7 @@ VideoConsumer::UpdateFtpStatus(const char* status)
+ 
+ 
+ status_t
+-VideoConsumer::LocalSave(char* filename, BBitmap* bitmap)
++VideoConsumer::LocalSave(const char* filename, BBitmap* bitmap, bool* _typeSet)
+ {
+ 	BFile* output;
+ 
+@@ -702,10 +724,14 @@ VideoConsumer::LocalSave(char* filename, BBitmap* bitmap)
+ 		status_t err = BTranslatorRoster::Default()->Translate(&input, NULL,
+ 			NULL, output, fImageFormat);
+ 		if (err == B_OK) {
+-			err = SetFileType(output, fTranslator, fImageFormat);
+-			if (err != B_OK)
++			// a file without its type is still the image
++			status_t typeStatus = SetFileType(output, fTranslator,
++				fImageFormat);
++			if (typeStatus != B_OK)
+ 				UpdateFtpStatus(
+ 					B_TRANSLATE("Error setting type of output file"));
++			if (_typeSet != NULL)
++				*_typeSet = typeStatus == B_OK;
+ 		}
+ 		else
+ 			UpdateFtpStatus(B_TRANSLATE("Error writing output file"));
+@@ -714,7 +740,8 @@ VideoConsumer::LocalSave(char* filename, BBitmap* bitmap)
+ 		output->Unset();
+ 		delete output;
+ 
+-		return B_OK;
++		// a file that isn't the image is not to be uploaded either
++		return err;
+ 	}
+ 
+ 	UpdateFtpStatus(B_TRANSLATE("Error creating output file"));
+diff --git a/src/apps/codycam/VideoConsumer.h b/src/apps/codycam/VideoConsumer.h
+index 0416e1cd4e..d78c4da436 100644
+--- a/src/apps/codycam/VideoConsumer.h
++++ b/src/apps/codycam/VideoConsumer.h
+@@ -118,7 +118,8 @@ public:
+ 
+ 			void 				UpdateFtpStatus(const char* status);
+ 
+-			status_t 			LocalSave(char* filename, BBitmap* bitmap);
++			status_t 			LocalSave(const char* filename, BBitmap* bitmap,
++									bool* _typeSet = NULL);
+ 
+ 			status_t 			FtpSave(char* filename);
+ 

@@ -1,0 +1,1379 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 13:58:50 -0400
+Subject: [PATCH 059/342] meson_hdmi: HDMI audio, 48 kHz 16-bit stereo, as a
+ multi_audio device
+
+The display driver publishes audio/hmulti/meson_hdmi/1 next to the
+display. The path: a ring of two 1024-frame buffers, read by the AIU's
+I2S DMA, the AIU's I2S encoder, the HDMI TX's I2S input, the DesignWare
+controller's audio sampler; MPLL2 at 294.912 MHz gives cts_amclk =
+12.288 MHz (256 fs) and a 64 fs bit clock, which is also the controller's
+master clock. N is 6144; the controller measures CTS.
+
+The client (the media_server's multi_audio node) writes the ring
+directly through a write combining mapping in its team. A 2 ms timer
+watches the DMA's read pointer and ends buffer exchanges (all SPIs are
+level in the GIC driver, the AIU's interrupt is an edge); a buffer's
+start time is back-dated by how far the DMA is into it.
+
+Found on the board with an HDMI capture stick:
+* the I2S core encodes 24-bit samples: a 16-bit one goes to the top
+  ("MSB position" 2) with 16-bit words MSB first, else the controller
+  got its upper byte as the lower one;
+* the DMA's end pointer is the start of the last 256-byte block, else it
+  ran on past the ring;
+* the LRCLK divider (64 bit clocks), both clocks inverted, skew 1;
+* the encoder is released and reset once the DMA has filled its FIFO,
+  else the channel order is undefined (they also need swapping back);
+* the controller's I2S part is reset once the I2S clock runs, and CTS is
+  then checked against the pixel clock (for N 6144 at 48 kHz, CTS is the
+  pixel clock in kHz), again after every mode set: it measures once, and
+  a wrong CTS makes the sink play at a wrong rate. The audio clocks are
+  set up at attach.
+
+Kernel debugger: "meson_hdmi audio [tone | stop | aiu <word> [<value>]]",
+"meson_hdmi dw|top|hhi <register> [<value>]".
+
+Tested: a test tone and the multi_audio path (a buffer-aligned tone, 10 s
+without a discontinuity), MediaPlayer through the media_server (440 Hz
+left, 660 Hz right, complete channel separation, no gaps in 15 s), mode
+changes between 1080p60 and 720p60 while playing (CTS 148501 and 74251).
+
+Sources: S905 datasheet (AIU, audio clocks), S905X datasheet (HDMITX
+top), NetBSD dw_hdmi.c (BSD-2); facts only from Linux (cts_amclk mux
+values, the AIU sequence and register values named above).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../drivers/graphics/meson_hdmi/Jamfile       |   6 +
+ .../graphics/meson_hdmi/meson_hdmi.cpp        | 170 +++-
+ .../graphics/meson_hdmi/meson_hdmi_audio.cpp  | 900 ++++++++++++++++++
+ .../graphics/meson_hdmi/meson_hdmi_audio.h    | 100 ++
+ 4 files changed, 1172 insertions(+), 4 deletions(-)
+ create mode 100644 src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi_audio.cpp
+ create mode 100644 src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi_audio.h
+
+diff --git a/src/add-ons/kernel/drivers/graphics/meson_hdmi/Jamfile b/src/add-ons/kernel/drivers/graphics/meson_hdmi/Jamfile
+index 87f50ce744..2fe35011d7 100644
+--- a/src/add-ons/kernel/drivers/graphics/meson_hdmi/Jamfile
++++ b/src/add-ons/kernel/drivers/graphics/meson_hdmi/Jamfile
+@@ -2,9 +2,15 @@ SubDir HAIKU_TOP src add-ons kernel drivers graphics meson_hdmi ;
+ 
+ UsePrivateKernelHeaders ;
+ UsePrivateHeaders [ FDirName graphics meson_hdmi ] ;
++UsePrivateHeaders audio ;
++
++# the multi_audio drivers' generic ioctl dispatcher
++SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src add-ons kernel drivers audio
++	generic ] ;
+ 
+ if $(TARGET_ARCH) = arm64 {
+ 	KernelAddon meson_hdmi :
+ 		meson_hdmi.cpp
++		meson_hdmi_audio.cpp
+ 	;
+ }
+diff --git a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+index 6ee7de3429..efd8147fd5 100644
+--- a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
++++ b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+@@ -27,6 +27,9 @@
+ 	the frame buffer's alpha is 0, which is where app_server draws the
+ 	overlay's key colour.
+ 
++	HDMI audio (meson_hdmi_audio.cpp) is a multi_audio device the driver
++	publishes as well; it shares the HDMI TX ports.
++
+ 	Sources: the S905 and S905X datasheets (VPU, ENCP, HHI, HDMI TX top),
+ 	NetBSD's dw_hdmi (BSD-2) for the DesignWare controller, and register
+ 	facts listed in docs/m6-hdmi-design.md of the port's project folder.
+@@ -50,11 +53,13 @@
+ #include <vm/vm.h>
+ #include <arch/arm64/arch_kernel.h>
+ 
++#include "meson_hdmi_audio.h"
+ #include "meson_hdmi_info.h"
+ 
+ 
+ #define DRIVER_MODULE_NAME	"drivers/graphics/meson_hdmi/driver_v1"
+ #define DEVICE_MODULE_NAME	"drivers/graphics/meson_hdmi/device_v1"
++#define AUDIO_DEVICE_MODULE_NAME "drivers/graphics/meson_hdmi/audio_device_v1"
+ 
+ #define INFO(x...)			dprintf("meson_hdmi: " x)
+ 
+@@ -372,7 +377,7 @@ compute_encp(const meson_mode& mode, encp_timing& timing)
+ device_manager_info* gDeviceManager;
+ 
+ 
+-class MesonHdmi {
++class MesonHdmi : public MesonHdmiRegisters {
+ public:
+ 								MesonHdmi(device_node* node);
+ 								~MesonHdmi();
+@@ -380,6 +385,23 @@ public:
+ 			status_t			Init();
+ 			device_node*		Node() const { return fNode; }
+ 			bool				Publish() const { return fPublish; }
++			MesonHdmiAudio*		Audio() const { return fAudio; }
++
++	// MesonHdmiRegisters, for the audio part
++	virtual	uint32				TopRead(uint32 reg) { return _TopRead(reg); }
++	virtual	void				TopWrite(uint32 reg, uint32 value)
++									{ _TopWrite(reg, value); }
++	virtual	uint8				DwRead(uint32 reg) { return _DwRead(reg); }
++	virtual	void				DwWrite(uint32 reg, uint8 value)
++									{ _DwWrite(reg, value); }
++	virtual	uint32				HhiRead(uint32 offset)
++									{ return _Hhi(offset); }
++	virtual	void				HhiWrite(uint32 offset, uint32 value)
++									{ _SetHhi(offset, value); }
++	virtual	uint32				PixelClock()
++									{ return fShared != NULL
++										? fShared->current_mode.timing
++											.pixel_clock : 0; }
+ 
+ 			area_id				SharedArea() const { return fSharedArea; }
+ 			area_id				FrameBufferArea() const
+@@ -409,6 +431,7 @@ private:
+ 			void				_SetHhi(uint32 offset, uint32 value)
+ 									{ fHhi[offset / 4] = value; }
+ 			uint32				_TopRead(uint32 reg);
++			void				_TopWrite(uint32 reg, uint32 value);
+ 			uint8				_DwRead(uint32 reg);
+ 			uint32				_DwRead16(uint32 lowReg)
+ 									{ return _DwRead(lowReg)
+@@ -452,6 +475,7 @@ private:
+ 			spinlock			fPortLock;
+ 			mutex				fModeLock;
+ 			bool				fPublish;
++			MesonHdmiAudio*		fAudio;
+ 
+ 			area_id				fFrameBufferArea;		// the pages
+ 			area_id				fFrameBufferMapArea;	// write combining
+@@ -530,6 +554,7 @@ MesonHdmi::MesonHdmi(device_node* node)
+ 	fDmcArea(-1),
+ 	fDmc(NULL),
+ 	fPublish(true),
++	fAudio(NULL),
+ 	fFrameBufferArea(-1),
+ 	fFrameBufferMapArea(-1),
+ 	fFrameBuffer(NULL),
+@@ -560,6 +585,7 @@ MesonHdmi::MesonHdmi(device_node* node)
+ 
+ MesonHdmi::~MesonHdmi()
+ {
++	delete fAudio;
+ 	if (fVpuArea >= 0)
+ 		delete_area(fVpuArea);
+ 	if (fHhiArea >= 0)
+@@ -628,6 +654,14 @@ MesonHdmi::Init()
+ 
+ 	_CheckBootMode();
+ 	_ReadEdid();
++
++	fAudio = new(std::nothrow) MesonHdmiAudio(this);
++	if (fAudio != NULL && fAudio->Init() != B_OK) {
++		INFO("no HDMI audio\n");
++		delete fAudio;
++		fAudio = NULL;
++	}
++
+ 	if (!fPublish) {
+ 		INFO("mode setting off in the driver settings\n");
+ 		return B_OK;
+@@ -973,6 +1007,11 @@ MesonHdmi::SetDisplayMode(const display_mode& displayMode)
+ 		32, bytesPerRow);
+ 	INFO("mode %ux%u, %" B_PRIu32 " kHz\n", mode->hActive, mode->vActive,
+ 		mode->pixelClock);
++	locker.Unlock();
++
++	// the audio sampler measured CTS against the old pixel clock
++	if (fAudio != NULL)
++		fAudio->ModeChanged();
+ 	return B_OK;
+ }
+ 
+@@ -1349,6 +1388,16 @@ MesonHdmi::_TopRead(uint32 reg)
+ }
+ 
+ 
++void
++MesonHdmi::_TopWrite(uint32 reg, uint32 value)
++{
++	InterruptsSpinLocker locker(fPortLock);
++	fHdmiTx[HDMITX_TOP_ADDR / 4] = reg;
++	fHdmiTx[HDMITX_TOP_ADDR / 4] = reg;
++	fHdmiTx[HDMITX_TOP_DATA / 4] = value;
++}
++
++
+ uint8
+ MesonHdmi::_DwRead(uint32 reg)
+ {
+@@ -1604,6 +1653,54 @@ dump_meson_hdmi(int argc, char** argv)
+ 		sDevice->SetOverlayEndian(parse_expression(argv[2]));
+ 		return 0;
+ 	}
++	if (argc > 1 && strcmp(argv[1], "audio") == 0) {
++		MesonHdmiAudio* audio = sDevice->Audio();
++		if (audio == NULL) {
++			kprintf("meson_hdmi: no audio\n");
++			return 0;
++		}
++		if (argc > 2 && strcmp(argv[2], "tone") == 0)
++			audio->StartTone();
++		else if (argc > 2 && strcmp(argv[2], "stop") == 0)
++			audio->StopTone();
++		else if (argc > 3 && strcmp(argv[2], "aiu") == 0) {
++			uint32 word = parse_expression(argv[3]);
++			if (word >= 0x300 / 4) {
++				kprintf("meson_hdmi: AIU word out of range\n");
++				return 0;
++			}
++			if (argc > 4)
++				audio->WriteAiu(word, parse_expression(argv[4]));
++			kprintf("AIU %#" B_PRIx32 ": %#" B_PRIx32 "\n", word,
++				audio->ReadAiu(word));
++		} else
++			audio->Dump();
++		return 0;
++	}
++	if (argc > 2 && (strcmp(argv[1], "dw") == 0
++			|| strcmp(argv[1], "top") == 0 || strcmp(argv[1], "hhi") == 0)) {
++		uint32 reg = parse_expression(argv[2]);
++		bool dw = strcmp(argv[1], "dw") == 0;
++		bool top = strcmp(argv[1], "top") == 0;
++		if ((dw && reg > 0x7fff) || (top && reg > 0xff)
++			|| (!dw && !top && (reg >= B_PAGE_SIZE || (reg & 3) != 0))) {
++			kprintf("meson_hdmi: register out of range\n");
++			return 0;
++		}
++		if (argc > 3) {
++			uint32 value = parse_expression(argv[3]);
++			if (dw)
++				sDevice->DwWrite(reg, value);
++			else if (top)
++				sDevice->TopWrite(reg, value);
++			else
++				sDevice->HhiWrite(reg, value);
++		}
++		kprintf("%s %#" B_PRIx32 ": %#" B_PRIx32 "\n", argv[1], reg,
++			dw ? sDevice->DwRead(reg) : top ? sDevice->TopRead(reg)
++				: sDevice->HhiRead(reg));
++		return 0;
++	}
+ 	if (argc > 2 && strcmp(argv[1], "vpu") == 0) {
+ 		uint32 word = parse_expression(argv[2]);
+ 		if (word >= kVpuSize / 4) {
+@@ -1669,10 +1766,14 @@ init_driver(device_node* node, void** _cookie)
+ 	sDevice = device;
+ 	add_debugger_command_etc("meson_hdmi", &dump_meson_hdmi,
+ 		"Show the Meson HDMI display state",
+-		"[restore | overlay | endian <n> | vpu <word> [<value>]]\n"
++		"[restore | overlay | endian <n> | vpu <word> [<value>]\n"
++		"  | dw|top|hhi <register> [<value>]\n"
++		"  | audio [tone | stop | aiu <word> [<value>]]]\n"
+ 		"Shows the display state; or puts U-Boot's mode back, shows the\n"
+-		"video overlay, sets its canvas byte order (0-15), or reads or\n"
+-		"writes a VPU register.\n", 0);
++		"video overlay, sets its canvas byte order (0-15), reads or writes\n"
++		"a VPU, DesignWare, HDMI TX top or HHI register; or shows HDMI\n"
++		"audio, plays a test tone, stops it, reads or writes an AIU\n"
++		"register.\n", 0);
+ 	*_cookie = device;
+ 	return B_OK;
+ }
+@@ -1691,6 +1792,10 @@ static status_t
+ register_child_devices(void* cookie)
+ {
+ 	MesonHdmi* device = (MesonHdmi*)cookie;
++	if (device->Audio() != NULL) {
++		gDeviceManager->publish_device(device->Node(),
++			"audio/hmulti/meson_hdmi/1", AUDIO_DEVICE_MODULE_NAME);
++	}
+ 	if (!device->Publish())
+ 		return B_OK;
+ 	return gDeviceManager->publish_device(device->Node(),
+@@ -1838,6 +1943,62 @@ module_dependency module_dependencies[] = {
+ };
+ 
+ 
++//	#pragma mark - audio device module
++
++
++static status_t
++audio_open(void* deviceCookie, const char* path, int openMode,
++	void** _cookie)
++{
++	MesonHdmiAudio* audio = ((MesonHdmi*)deviceCookie)->Audio();
++	if (audio == NULL)
++		return B_ERROR;
++	status_t status = audio->Open();
++	if (status != B_OK)
++		return status;
++	*_cookie = audio;
++	return B_OK;
++}
++
++
++static status_t
++audio_close(void* cookie)
++{
++	return ((MesonHdmiAudio*)cookie)->Close();
++}
++
++
++static status_t
++audio_control(void* cookie, uint32 op, void* buffer, size_t length)
++{
++	return ((MesonHdmiAudio*)cookie)->Control(op, buffer, length);
++}
++
++
++static struct device_module_info sMesonHdmiAudioDevice = {
++	{
++		AUDIO_DEVICE_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	device_init,
++	device_uninit,
++	NULL,	// device_removed
++
++	audio_open,
++	audio_close,
++	device_free,
++	device_read,
++	device_write,
++	NULL,	// io
++	audio_control,
++
++	NULL,	// select
++	NULL,	// deselect
++};
++
++
+ static struct driver_module_info sMesonHdmiDriver = {
+ 	{
+ 		DRIVER_MODULE_NAME,
+@@ -1882,5 +2043,6 @@ static struct device_module_info sMesonHdmiDevice = {
+ module_info* modules[] = {
+ 	(module_info*)&sMesonHdmiDriver,
+ 	(module_info*)&sMesonHdmiDevice,
++	(module_info*)&sMesonHdmiAudioDevice,
+ 	NULL
+ };
+diff --git a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi_audio.cpp b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi_audio.cpp
+new file mode 100644
+index 0000000000..b868304c9e
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi_audio.cpp
+@@ -0,0 +1,900 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++/*!	HDMI audio on the Amlogic Meson GXBB (S905, ODROID-C2): 48 kHz, 16-bit
++	stereo PCM, published as a multi_audio device next to the display.
++
++	The path: a ring buffer in memory, read by the AIU's I2S DMA
++	(AIU_MEM_I2S_*), the AIU's I2S encoder, the HDMI TX's I2S input
++	(AIU_HDMI_CLK_DATA_CTRL), the DesignWare controller's audio sampler and
++	frame composer, which send the samples in audio sample packets.
++
++	Clocks: MPLL2, fed by the 2 GHz fixed PLL, runs at 294.912 MHz;
++	cts_amclk is that /24, 12.288 MHz (256 fs); the I2S bit clock aoclk is
++	cts_amclk /4 (64 fs, 32 bits per channel), which the controller also
++	gets as its audio master clock (it measured CTS 148501 for 148.5 MHz
++	with "64 fs", twice that with "128 fs"). The controller measures CTS
++	itself against the TMDS clock; N is 6144, as for every 48 kHz mode with
++	a whole kHz pixel clock (CEA-861: 74.25 and 148.5 MHz).
++
++	Found on the board with an HDMI capture stick (tools/hdmi-audio-check.py
++	in the port's project folder): the I2S core encodes 24-bit samples, and
++	a 16-bit one has to be moved to the top (source descriptor "MSB
++	position" 2), else the controller got its upper byte as the lower one;
++	the channels come out swapped unless the encoder swaps them back. The
++	encoder has to be released and reset while the DMA has filled its FIFO
++	(else the channel order changes), and the controller's I2S part reset
++	once the I2S clock runs steadily: reset too early it measures a wrong
++	CTS, and the sink plays at a wrong rate.
++
++	The ring holds two buffers the client writes directly, through a write
++	combining mapping (the DMA does not snoop the CPU caches). A periodic
++	timer watches the DMA's read pointer and ends a buffer exchange when it
++	passes into the other buffer (the GIC driver sets all SPIs to level,
++	and the AIU's interrupt is an edge).
++
++	Sources: the S905 datasheet (AIU registers, ch. 31.4; HHI_AUD_CLK_CNTL
++	and the MPLL, ch. 22), the S905X datasheet (HDMITX TOP, ch. 27.4),
++	NetBSD's dw_hdmi.c (BSD-2) for the controller's audio registers. Facts
++	only, from Linux: cts_amclk's mux values (1-3: MPLL0-2), the I2S source
++	descriptor's split mode bit and the irq block unit (256 bytes).
++*/
++
++
++#include "meson_hdmi_audio.h"
++
++#include <new>
++#include <stdio.h>
++#include <string.h>
++
++#include <team.h>
++#include <util/AutoLock.h>
++#include <vm/vm.h>
++#include <arch/arm64/arch_kernel.h>
++
++
++#define INFO(x...)				dprintf("meson_hdmi: audio: " x)
++
++
++static const phys_addr_t kAiuPage = 0xc1105000;
++static const uint32 kAiuOffset = 0x400;		// AIU at 0xc1105400
++
++// AIU registers (word numbers)
++enum {
++	AIU_I2S_MUTE_SWAP			= 0x0c,
++	AIU_I2S_SOURCE_DESC			= 0x0d,
++	AIU_I2S_DAC_CFG				= 0x10,
++	AIU_I2S_SYNC				= 0x11,
++	AIU_I2S_MISC				= 0x12,
++	AIU_I2S_OUT_CFG				= 0x13,
++	AIU_RST_SOFT				= 0x15,
++	AIU_CLK_CTRL				= 0x16,
++	AIU_CLK_CTRL_MORE			= 0x19,
++	AIU_CODEC_DAC_LRCLK_CTRL	= 0x28,
++	AIU_HDMI_CLK_DATA_CTRL		= 0x2a,
++	AIU_MEM_I2S_START_PTR		= 0x60,
++	AIU_MEM_I2S_RD_PTR			= 0x61,
++	AIU_MEM_I2S_END_PTR			= 0x62,
++	AIU_MEM_I2S_MASKS			= 0x63,
++	AIU_MEM_I2S_CONTROL			= 0x64,
++	AIU_MEM_I2S_LEVEL			= 0x75,
++	AIU_MEM_I2S_BUF_CNTL		= 0x76,
++};
++
++#define I2S_SOURCE_DESC_SPLIT		(1 << 11)
++#define I2S_SOURCE_DESC_MSB_POSITION(n)	((n) << 3)
++#define I2S_DAC_CFG_MSB_FIRST		(1 << 2)	// size 0: 16-bit words
++#define I2S_MUTE_SWAP_CH01			(3 << 0)	// right, left
++#define I2S_MISC_HOLD				(1 << 2)
++#define I2S_MISC_FORCE_LEFT_RIGHT	(1 << 4)
++#define RST_SOFT_I2S_FAST			(1 << 0)
++#define CLK_CTRL_I2S_DIV_EN			(1 << 0)
++#define CLK_CTRL_AOCLK_INVERT		(1 << 6)
++#define CLK_CTRL_ALRCLK_INVERT		(1 << 7)
++#define CLK_CTRL_ALRCLK_SKEW_I2S	(1 << 8)	// changes before the msb
++#define CLK_CTRL_PLL_SOURCE			(1 << 10)
++#define CLK_CTRL_MORE_HDMI_AOCLKX2	(1 << 6)
++#define CLK_CTRL_MORE_I2S_DIV(n)	((n) - 1)
++#define HDMI_DATA_AIU_I2S			(2 << 4)
++#define HDMI_CLK_AIU				(2 << 0)
++#define MEM_CONTROL_INIT			(1 << 0)
++#define MEM_CONTROL_FILL_EN			(1 << 1)
++#define MEM_CONTROL_EMPTY_EN		(1 << 2)
++#define MEM_CONTROL_ENDIAN(n)		((n) << 3)
++#define MEM_CONTROL_16BIT			(1 << 6)
++#define MEM_CONTROL_BUSY			(1 << 7)
++#define MEM_MASKS_IRQ_BLOCK(n)		((n) << 16)	// 256 byte units
++#define MEM_BUF_CNTL_INIT			(1 << 0)
++static const uint32 kDmaBlock = 256;
++	// the DMA's end pointer is the start of the last block
++
++// HHI (byte offsets)
++enum {
++	HHI_AUD_CLK_CNTL			= 0x178,
++	HHI_MPLL_CNTL9				= 0x2a0,	// MP2
++};
++
++#define AUD_CLK_DIV(n)				((n) - 1)
++#define AUD_CLK_EN					(1 << 8)
++#define AUD_CLK_SRC_MPLL2			(3 << 9)
++#define MPLL_SDM(n)					(n)
++#define MPLL_EN_DDS					(1 << 14)
++#define MPLL_SDM_EN					(1 << 15)
++#define MPLL_N(n)					((n) << 16)
++
++// HDMI TX top
++enum {
++	HDMITX_TOP_CLK_CNTL			= 0x01,
++};
++#define TOP_CLK_I2S_EN				(1 << 3)
++
++// DesignWare HDMI TX (8 bit registers)
++enum {
++	DW_FC_AUDICONF0				= 0x1025,
++	DW_FC_AUDICONF1				= 0x1026,
++	DW_FC_AUDICONF2				= 0x1027,
++	DW_FC_AUDICONF3				= 0x1028,
++	DW_FC_AUDSCONF				= 0x1063,
++	DW_AUD_CONF0				= 0x3100,
++	DW_AUD_CONF1				= 0x3101,
++	DW_AUD_N1					= 0x3200,
++	DW_AUD_N2					= 0x3201,
++	DW_AUD_N3					= 0x3202,
++	DW_AUD_CTS1					= 0x3203,
++	DW_AUD_CTS2					= 0x3204,
++	DW_AUD_CTS3					= 0x3205,
++	DW_AUD_INPUTCLKFS			= 0x3206,
++	DW_MC_CLKDIS				= 0x4001,
++	DW_MC_SWRSTZ				= 0x4002,
++	DW_FC_INVIDCONF				= 0x1000,
++};
++
++#define AUD_CONF0_FIFO_RESET		(1 << 7)
++#define AUD_CONF0_I2S_SELECT		(1 << 5)
++#define AUD_CONF0_I2S_IN0			(1 << 0)
++#define AUD_INPUTCLKFS_64FS			4
++#define FC_AUDICONF0_2CH			(1 << 4)
++#define MC_CLKDIS_AUDCLK			(1 << 3)
++#define MC_SWRSTZ_I2S				(1 << 3)	// active low
++
++static const uint32 kN = 6144;
++
++static const uint32 kRate = 48000;
++static const uint32 kFrameSize = 4;			// 16-bit stereo
++static const uint32 kBufferFrames = 1024;
++static const uint32 kBufferCount = 2;
++static const uint32 kBufferSize = kBufferFrames * kFrameSize;
++static const uint32 kRingSize = kBufferSize * kBufferCount;
++static const bigtime_t kPollInterval = 2000;
++static const uint32 kDmaEndian = 0;
++
++static multi_channel_info sChannels[] = {
++	{ 0, B_MULTI_OUTPUT_CHANNEL, B_CHANNEL_LEFT | B_CHANNEL_STEREO_BUS, 0 },
++	{ 1, B_MULTI_OUTPUT_CHANNEL, B_CHANNEL_RIGHT | B_CHANNEL_STEREO_BUS, 0 },
++	{ 2, B_MULTI_OUTPUT_BUS, B_CHANNEL_LEFT | B_CHANNEL_STEREO_BUS,
++		B_CHANNEL_MINI_JACK_STEREO },
++	{ 3, B_MULTI_OUTPUT_BUS, B_CHANNEL_RIGHT | B_CHANNEL_STEREO_BUS,
++		B_CHANNEL_MINI_JACK_STEREO },
++};
++
++
++static void
++dcache_flush(phys_addr_t physical, size_t length)
++{
++	// all RAM is mapped at KERNEL_PMAP_BASE as normal write-back memory
++	uint64 ctr;
++	asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
++	const addr_t lineSize = 4 << ((ctr >> 16) & 0xf);
++	addr_t end = KERNEL_PMAP_BASE + physical + length;
++	for (addr_t address = (KERNEL_PMAP_BASE + physical) & ~(lineSize - 1);
++			address < end; address += lineSize) {
++		asm volatile("dc civac, %0" : : "r"(address) : "memory");
++	}
++	asm volatile("dsb sy" : : : "memory");
++}
++
++
++MesonHdmiAudio::MesonHdmiAudio(MesonHdmiRegisters* registers)
++	:
++	fRegisters(registers),
++	fAiuArea(-1),
++	fAiu(NULL),
++	fRingArea(-1),
++	fRingMapArea(-1),
++	fRing(NULL),
++	fRingPhysical(0),
++	fClientArea(-1),
++	fClientRing(NULL),
++	fBufferSem(-1),
++	fOpen(false),
++	fRunning(false),
++	fPlaying(0),
++	fFramesPlayed(0),
++	fBufferTime(0)
++{
++	mutex_init(&fLock, "meson_hdmi audio");
++	B_INITIALIZE_SPINLOCK(&fStateLock);
++	memset(&fTimer, 0, sizeof(fTimer));
++	fTimer.user_data = this;
++}
++
++
++MesonHdmiAudio::~MesonHdmiAudio()
++{
++	if (fRunning)
++		_Stop();
++	_DeleteClientArea();
++	if (fBufferSem >= 0)
++		delete_sem(fBufferSem);
++	if (fRingMapArea >= 0)
++		delete_area(fRingMapArea);
++	if (fRingArea >= 0)
++		delete_area(fRingArea);
++	if (fAiuArea >= 0)
++		delete_area(fAiuArea);
++	mutex_destroy(&fLock);
++}
++
++
++status_t
++MesonHdmiAudio::Init()
++{
++	void* address;
++	fAiuArea = map_physical_memory("meson_hdmi aiu", kAiuPage, B_PAGE_SIZE,
++		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++		&address);
++	if (fAiuArea < 0)
++		return fAiuArea;
++	fAiu = (volatile uint32*)((uint8*)address + kAiuOffset);
++
++	// the ring: contiguous pages below 4 GiB (the DMA pointers are 32 bits),
++	// used only through a write combining mapping
++	void* pages;
++	fRingArea = create_area("meson_hdmi audio pages", &pages,
++		B_ANY_KERNEL_ADDRESS, kRingSize, B_32_BIT_CONTIGUOUS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
++	if (fRingArea < 0)
++		return fRingArea;
++	physical_entry entry;
++	get_memory_map(pages, B_PAGE_SIZE, &entry, 1);
++	fRingPhysical = entry.address;
++	dcache_flush(fRingPhysical, kRingSize);
++
++	fRingMapArea = map_physical_memory("meson_hdmi audio ring", fRingPhysical,
++		kRingSize, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&fRing);
++	if (fRingMapArea < 0)
++		return fRingMapArea;
++	vm_set_area_memory_type(fRingMapArea, fRingPhysical,
++		B_WRITE_COMBINING_MEMORY);
++	memset(fRing, 0, kRingSize);
++
++	fBufferSem = create_sem(0, "meson_hdmi audio buffer");
++	if (fBufferSem < 0)
++		return fBufferSem;
++
++	_SetupClocks();
++
++	INFO("ring at %#" B_PRIxPHYSADDR ", AIU_HDMI_CLK_DATA_CTRL %#" B_PRIx32
++		", HHI_AUD_CLK_CNTL %#" B_PRIx32 ", MPLL2 %#" B_PRIx32 "\n",
++		fRingPhysical, fAiu[AIU_HDMI_CLK_DATA_CTRL],
++		fRegisters->HhiRead(HHI_AUD_CLK_CNTL),
++		fRegisters->HhiRead(HHI_MPLL_CNTL9));
++	return B_OK;
++}
++
++
++//	#pragma mark - hardware
++
++
++/*!	MPLL2 at 294.912 MHz (2000 / (6 + 12807 / 16384), 0.8 ppm high), then
++	cts_amclk = MPLL2 / 24 = 12.288 MHz. MPLL2 is unused otherwise; the
++	clock is gated while it changes (S905 datasheet, HHI_AUD_CLK_CNTL).
++	Set up once, at attach: right after it changes, the controller measures
++	a wrong CTS for a while.
++*/
++void
++MesonHdmiAudio::_SetupClocks()
++{
++	const uint32 mpll = MPLL_N(6) | MPLL_SDM_EN | MPLL_EN_DDS | MPLL_SDM(12807);
++	uint32 audio = fRegisters->HhiRead(HHI_AUD_CLK_CNTL);
++	uint32 wanted = (audio & ~0x7ffu) | AUD_CLK_SRC_MPLL2 | AUD_CLK_DIV(24)
++		| AUD_CLK_EN;
++	if (fRegisters->HhiRead(HHI_MPLL_CNTL9) == mpll && audio == wanted)
++		return;
++
++	fRegisters->HhiWrite(HHI_AUD_CLK_CNTL, audio & ~AUD_CLK_EN);
++	fRegisters->HhiWrite(HHI_MPLL_CNTL9, mpll);
++	spin(1000);
++	fRegisters->HhiWrite(HHI_AUD_CLK_CNTL, wanted & ~AUD_CLK_EN);
++	fRegisters->HhiWrite(HHI_AUD_CLK_CNTL, wanted);
++}
++
++
++/*!	The I2S encoder: 2 channels of 16 bits from memory (split mode), sent
++	as standard I2S (64 bit clocks per frame, 16-bit words MSB first; the
++	SoC changes data on the rising edge, so both clocks are inverted);
++	aoclk = cts_amclk / 4. Its clock and data go to the HDMI TX. The encoder
++	stays on hold until the DMA starts.
++*/
++void
++MesonHdmiAudio::_SetupAiu()
++{
++	fAiu[AIU_I2S_MISC] = I2S_MISC_HOLD;
++	fAiu[AIU_CLK_CTRL] &= ~CLK_CTRL_I2S_DIV_EN;
++
++	fAiu[AIU_I2S_SOURCE_DESC] = I2S_SOURCE_DESC_SPLIT
++		| I2S_SOURCE_DESC_MSB_POSITION(2);
++	fAiu[AIU_I2S_DAC_CFG] = I2S_DAC_CFG_MSB_FIRST;
++	fAiu[AIU_I2S_MUTE_SWAP] = I2S_MUTE_SWAP_CH01;
++	fAiu[AIU_I2S_OUT_CFG] = 0;
++	fAiu[AIU_CODEC_DAC_LRCLK_CTRL] = 64 - 1;
++
++	fAiu[AIU_CLK_CTRL_MORE] = (fAiu[AIU_CLK_CTRL_MORE] & ~0x7fu)
++		| CLK_CTRL_MORE_HDMI_AOCLKX2 | CLK_CTRL_MORE_I2S_DIV(4);
++	fAiu[AIU_CLK_CTRL] = (fAiu[AIU_CLK_CTRL] & ~0x7ffu) | CLK_CTRL_PLL_SOURCE
++		| CLK_CTRL_AOCLK_INVERT | CLK_CTRL_ALRCLK_INVERT
++		| CLK_CTRL_ALRCLK_SKEW_I2S;
++	fAiu[AIU_CLK_CTRL] |= CLK_CTRL_I2S_DIV_EN;
++
++	fAiu[AIU_HDMI_CLK_DATA_CTRL] = HDMI_DATA_AIU_I2S | HDMI_CLK_AIU;
++}
++
++
++/*!	The controller's audio sampler: I2S input 0, 16 bits, master clock
++	64 fs; N = 6144 with CTS measured; the audio infoframe says 2 channels.
++	The I2S part is reset after the I2S clock has run for a while (50 ms;
++	about 130 ms worked when tried by hand, the first 40 did not), and again
++	if the CTS it then measures does not match the pixel clock (for N = 6144
++	at 48 kHz, CTS is the pixel clock in kHz).
++*/
++void
++MesonHdmiAudio::_SetupHdmi(bool debugger)
++{
++	fRegisters->TopWrite(HDMITX_TOP_CLK_CNTL,
++		fRegisters->TopRead(HDMITX_TOP_CLK_CNTL) | TOP_CLK_I2S_EN);
++
++	fRegisters->DwWrite(DW_MC_CLKDIS,
++		fRegisters->DwRead(DW_MC_CLKDIS) & ~MC_CLKDIS_AUDCLK);
++
++	fRegisters->DwWrite(DW_AUD_CONF0, AUD_CONF0_I2S_SELECT | AUD_CONF0_I2S_IN0);
++	fRegisters->DwWrite(DW_AUD_CONF1, 16);
++	fRegisters->DwWrite(DW_AUD_INPUTCLKFS, AUD_INPUTCLKFS_64FS);
++
++	fRegisters->DwWrite(DW_AUD_CTS1, 0);
++	fRegisters->DwWrite(DW_AUD_CTS2, 0);
++	fRegisters->DwWrite(DW_AUD_CTS3, 0);
++	fRegisters->DwWrite(DW_AUD_N1, kN & 0xff);
++	fRegisters->DwWrite(DW_AUD_N2, (kN >> 8) & 0xff);
++	fRegisters->DwWrite(DW_AUD_N3, (kN >> 16) & 0xff);
++
++	fRegisters->DwWrite(DW_FC_AUDSCONF, 0);		// layout 0: 2 channels
++	fRegisters->DwWrite(DW_FC_AUDICONF0, FC_AUDICONF0_2CH);
++	fRegisters->DwWrite(DW_FC_AUDICONF1, 0);
++	fRegisters->DwWrite(DW_FC_AUDICONF2, 0);
++	fRegisters->DwWrite(DW_FC_AUDICONF3, 0);
++
++	// the measurement takes a while to settle after a reset; an unknown
++	// pixel clock (no mode set yet) accepts the second one
++	uint32 expected = fRegisters->PixelClock();
++	uint32 cts = 0;
++	int32 resets = 0;
++	if (debugger)
++		spin(50000);
++	else
++		snooze(50000);
++	while (resets < 10) {
++		fRegisters->DwWrite(DW_AUD_CONF0, AUD_CONF0_FIFO_RESET
++			| AUD_CONF0_I2S_SELECT | AUD_CONF0_I2S_IN0);
++		fRegisters->DwWrite(DW_MC_SWRSTZ, (uint8)~MC_SWRSTZ_I2S);
++		resets++;
++		if (debugger)
++			spin(50000);
++		else
++			snooze(50000);
++		cts = _Cts();
++		if (expected != 0 ? cts > expected * 99 / 100
++				&& cts < expected * 101 / 100
++			: resets > 1 && cts != 0x10000) {
++			break;
++		}
++	}
++	if (debugger) {
++		kprintf("meson_hdmi: audio: CTS %" B_PRIu32 " for a %" B_PRIu32
++			" kHz pixel clock (%" B_PRId32 " sampler reset(s))\n", cts,
++			expected, resets);
++	} else {
++		INFO("started: CTS %" B_PRIu32 " for a %" B_PRIu32 " kHz pixel clock"
++			" (%" B_PRId32 " sampler reset(s))\n", cts, expected, resets);
++	}
++}
++
++
++uint32
++MesonHdmiAudio::_Cts()
++{
++	return fRegisters->DwRead(DW_AUD_CTS1)
++		| (fRegisters->DwRead(DW_AUD_CTS2) << 8)
++		| ((fRegisters->DwRead(DW_AUD_CTS3) & 0xf) << 16);
++}
++
++
++/*!	The DMA reads the ring over and over: 64-bit words, 16-bit samples.
++	The order: pointers, then the init pulses (as the vendor driver does,
++	per Linux), then the DMA on with the encoder on hold.
++*/
++void
++MesonHdmiAudio::_StartDma()
++{
++	fAiu[AIU_MEM_I2S_CONTROL] = 0;
++	for (int32 i = 0; i < 1000 && (fAiu[AIU_MEM_I2S_CONTROL]
++			& MEM_CONTROL_BUSY) != 0; i++) {
++		spin(10);
++	}
++	fAiu[AIU_I2S_MISC] = I2S_MISC_HOLD;
++
++	fAiu[AIU_MEM_I2S_START_PTR] = (uint32)fRingPhysical;
++	fAiu[AIU_MEM_I2S_RD_PTR] = (uint32)fRingPhysical;
++	fAiu[AIU_MEM_I2S_END_PTR] = (uint32)fRingPhysical + kRingSize - kDmaBlock;
++	fAiu[AIU_MEM_I2S_MASKS] = MEM_MASKS_IRQ_BLOCK(kBufferSize / kDmaBlock)
++		| 0xffff;
++
++	uint32 control = MEM_CONTROL_16BIT | MEM_CONTROL_ENDIAN(kDmaEndian);
++	fAiu[AIU_MEM_I2S_CONTROL] = control | MEM_CONTROL_INIT;
++	fAiu[AIU_MEM_I2S_CONTROL] = control;
++	fAiu[AIU_MEM_I2S_BUF_CNTL] = MEM_BUF_CNTL_INIT;
++	fAiu[AIU_MEM_I2S_BUF_CNTL] = 0;
++
++	// the DMA fills the encoder's FIFO while it is on hold; then the encoder
++	// starts from the first sample
++	fAiu[AIU_I2S_MISC] = I2S_MISC_FORCE_LEFT_RIGHT | I2S_MISC_HOLD;
++	fAiu[AIU_MEM_I2S_CONTROL] = control | MEM_CONTROL_FILL_EN
++		| MEM_CONTROL_EMPTY_EN;
++	spin(2000);
++	fAiu[AIU_I2S_MISC] = I2S_MISC_FORCE_LEFT_RIGHT;
++	fAiu[AIU_RST_SOFT] = RST_SOFT_I2S_FAST;
++	(void)fAiu[AIU_I2S_SYNC];
++}
++
++
++void
++MesonHdmiAudio::_StopDma()
++{
++	fAiu[AIU_MEM_I2S_CONTROL] &= ~(MEM_CONTROL_FILL_EN | MEM_CONTROL_EMPTY_EN);
++}
++
++
++void
++MesonHdmiAudio::_Start()
++{
++	_SetupClocks();
++	_SetupAiu();
++
++	// the poll timer does not run yet: no lock needed around the start
++	fPlaying = 0;
++	fFramesPlayed = 0;
++	fBufferTime = system_time();
++	_StartDma();
++	_SetupHdmi(false);
++
++	InterruptsSpinLocker locker(fStateLock);
++	fRunning = true;
++	locker.Unlock();
++
++	add_timer(&fTimer, &_Poll, kPollInterval, B_PERIODIC_TIMER);
++}
++
++
++void
++MesonHdmiAudio::_Stop()
++{
++	cancel_timer(&fTimer);
++	InterruptsSpinLocker locker(fStateLock);
++	_StopDma();
++	fRunning = false;
++	locker.Unlock();
++	// a waiting exchange returns
++	release_sem_etc(fBufferSem, 1, B_DO_NOT_RESCHEDULE);
++}
++
++
++/*!	Every 2 ms while playing: has the DMA moved on to the other buffer?
++	The buffer's start time is estimated from how far into it the DMA is
++	(it reads ahead of the output by its FIFO, a steady offset).
++*/
++/*static*/ int32
++MesonHdmiAudio::_Poll(timer* timer)
++{
++	MesonHdmiAudio* self = (MesonHdmiAudio*)timer->user_data;
++	SpinLocker locker(self->fStateLock);
++	if (!self->fRunning)
++		return B_HANDLED_INTERRUPT;
++
++	uint32 offset = self->fAiu[AIU_MEM_I2S_RD_PTR] - (uint32)self->fRingPhysical;
++	if (offset >= kRingSize)
++		return B_HANDLED_INTERRUPT;
++	uint32 playing = offset / kBufferSize;
++	if (playing == self->fPlaying)
++		return B_HANDLED_INTERRUPT;
++
++	self->fPlaying = playing;
++	self->fFramesPlayed += kBufferFrames;
++	self->fBufferTime = system_time()
++		- (bigtime_t)(offset % kBufferSize) / kFrameSize * 1000000 / kRate;
++	locker.Unlock();
++	release_sem_etc(self->fBufferSem, 1, B_DO_NOT_RESCHEDULE);
++	return B_INVOKE_SCHEDULER;
++}
++
++
++/*!	The controller measures CTS when its I2S part is reset, against the
++	pixel clock of that moment: after a mode set, playing audio needs a new
++	measurement.
++*/
++void
++MesonHdmiAudio::ModeChanged()
++{
++	MutexLocker locker(fLock);
++	if (fRunning)
++		_SetupHdmi(false);
++}
++
++
++//	#pragma mark - device
++
++
++status_t
++MesonHdmiAudio::Open()
++{
++	MutexLocker locker(fLock);
++	if (fOpen)
++		return B_BUSY;
++	fOpen = true;
++	return B_OK;
++}
++
++
++status_t
++MesonHdmiAudio::Close()
++{
++	MutexLocker locker(fLock);
++	if (fRunning)
++		_Stop();
++	_DeleteClientArea();
++	fOpen = false;
++	return B_OK;
++}
++
++
++void
++MesonHdmiAudio::_DeleteClientArea()
++{
++	if (fClientArea >= 0) {
++		delete_area(fClientArea);
++		fClientArea = -1;
++		fClientRing = NULL;
++	}
++}
++
++
++//	#pragma mark - multi_audio
++
++
++status_t
++MesonHdmiAudio::GetDescription(multi_description* data)
++{
++	data->interface_version = B_CURRENT_INTERFACE_VERSION;
++	data->interface_minimum = B_CURRENT_INTERFACE_VERSION;
++	strlcpy(data->friendly_name, "HDMI", sizeof(data->friendly_name));
++	strlcpy(data->vendor_info, "Amlogic", sizeof(data->vendor_info));
++
++	data->output_channel_count = 2;
++	data->output_bus_channel_count = 2;
++	data->input_channel_count = 0;
++	data->input_bus_channel_count = 0;
++	data->aux_bus_channel_count = 0;
++	if (data->request_channel_count >= (int32)B_COUNT_OF(sChannels))
++		memcpy(data->channels, sChannels, sizeof(sChannels));
++
++	data->output_rates = B_SR_48000;
++	data->input_rates = B_SR_48000;
++	data->max_cvsr_rate = 0;
++	data->min_cvsr_rate = 0;
++	data->output_formats = B_FMT_16BIT;
++	data->input_formats = B_FMT_16BIT;
++	data->lock_sources = B_MULTI_LOCK_INTERNAL;
++	data->timecode_sources = 0;
++	data->interface_flags = B_MULTI_INTERFACE_PLAYBACK;
++	data->start_latency = 30000;
++	strlcpy(data->control_panel, "", sizeof(data->control_panel));
++	return B_OK;
++}
++
++
++status_t
++MesonHdmiAudio::GetEnabledChannels(multi_channel_enable* data)
++{
++	B_SET_CHANNEL(data->enable_bits, 0, true);
++	B_SET_CHANNEL(data->enable_bits, 1, true);
++	data->lock_source = B_MULTI_LOCK_INTERNAL;
++	return B_OK;
++}
++
++
++status_t
++MesonHdmiAudio::GetGlobalFormat(multi_format_info* data)
++{
++	data->output_latency = 0;
++	data->input_latency = 0;
++	data->timecode_kind = 0;
++	data->output.rate = B_SR_48000;
++	data->output.cvsr = kRate;
++	data->output.format = B_FMT_16BIT;
++	data->input.rate = B_SR_48000;
++	data->input.cvsr = kRate;
++	data->input.format = B_FMT_16BIT;
++	return B_OK;
++}
++
++
++/*!	The buffers are the ring itself, mapped into the caller (the opener). */
++status_t
++MesonHdmiAudio::GetBuffers(multi_buffer_list* data)
++{
++	MutexLocker locker(fLock);
++	if (fClientArea < 0) {
++		fClientArea = vm_map_physical_memory(team_get_current_team_id(),
++			"meson_hdmi audio buffers", (void**)&fClientRing, B_ANY_ADDRESS,
++			kRingSize, B_READ_AREA | B_WRITE_AREA, fRingPhysical, false);
++		if (fClientArea < 0)
++			return fClientArea;
++		vm_set_area_memory_type(fClientArea, fRingPhysical,
++			B_WRITE_COMBINING_MEMORY);
++	}
++
++	data->flags = B_MULTI_BUFFER_PLAYBACK;
++	data->return_playback_buffers = kBufferCount;
++	data->return_playback_channels = 2;
++	data->return_playback_buffer_size = kBufferFrames;
++	data->return_record_buffers = 0;
++	data->return_record_channels = 0;
++	data->return_record_buffer_size = 0;
++
++	for (uint32 i = 0; i < kBufferCount; i++) {
++		buffer_desc descs[2];
++		for (uint32 channel = 0; channel < 2; channel++) {
++			descs[channel].base = (char*)fClientRing + i * kBufferSize
++				+ channel * 2;
++			descs[channel].stride = kFrameSize;
++		}
++		if (!IS_USER_ADDRESS(data->playback_buffers[i])
++			|| user_memcpy(data->playback_buffers[i], descs, sizeof(descs))
++				!= B_OK) {
++			return B_BAD_ADDRESS;
++		}
++	}
++	return B_OK;
++}
++
++
++/*!	Waits until the DMA has finished a buffer; the client then fills the
++	one before the cycle reported (MultiAudioNode), which is that one.
++*/
++status_t
++MesonHdmiAudio::BufferExchange(multi_buffer_info* userData)
++{
++	multi_buffer_info data;
++	if (!IS_USER_ADDRESS(userData)
++		|| user_memcpy(&data, userData, sizeof(data)) != B_OK) {
++		return B_BAD_ADDRESS;
++	}
++
++	// the buffers are the client's: what it wrote before plays first
++	MutexLocker locker(fLock);
++	if (!fRunning)
++		_Start();
++	locker.Unlock();
++
++	status_t status = acquire_sem_etc(fBufferSem, 1,
++		B_CAN_INTERRUPT | B_RELATIVE_TIMEOUT, 1000000);
++	if (status == B_TIMED_OUT)
++		INFO("no buffer done in 1 s, DMA at %#" B_PRIx32 "\n",
++			fAiu[AIU_MEM_I2S_RD_PTR]);
++	if (status != B_OK)
++		return status;
++
++	InterruptsSpinLocker stateLocker(fStateLock);
++	data.played_real_time = fBufferTime;
++	data.played_frames_count = fFramesPlayed;
++	data.playback_buffer_cycle = fPlaying;
++	stateLocker.Unlock();
++
++	if (user_memcpy(userData, &data, sizeof(data)) != B_OK)
++		return B_BAD_ADDRESS;
++	return B_OK;
++}
++
++
++status_t
++MesonHdmiAudio::ForceStop()
++{
++	MutexLocker locker(fLock);
++	if (fRunning)
++		_Stop();
++	return B_OK;
++}
++
++
++//	#pragma mark - the generic dispatcher's hooks
++
++
++static status_t
++get_description(MesonHdmiAudio* audio, multi_description* data)
++{
++	return audio->GetDescription(data);
++}
++
++
++static status_t
++get_enabled_channels(MesonHdmiAudio* audio, multi_channel_enable* data)
++{
++	return audio->GetEnabledChannels(data);
++}
++
++
++static status_t
++get_global_format(MesonHdmiAudio* audio, multi_format_info* data)
++{
++	return audio->GetGlobalFormat(data);
++}
++
++
++static status_t
++set_global_format(MesonHdmiAudio* audio, multi_format_info* data)
++{
++	// 48 kHz 16-bit stereo only
++	return B_OK;
++}
++
++
++static status_t
++list_mix_channels(MesonHdmiAudio* audio, multi_mix_channel_info* data)
++{
++	return B_OK;
++}
++
++
++static status_t
++list_mix_controls(MesonHdmiAudio* audio, multi_mix_control_info* data)
++{
++	data->control_count = 0;
++	return B_OK;
++}
++
++
++static status_t
++list_mix_connections(MesonHdmiAudio* audio, multi_mix_connection_info* data)
++{
++	return B_OK;
++}
++
++
++static status_t
++get_mix(MesonHdmiAudio* audio, multi_mix_value_info* data)
++{
++	return B_OK;
++}
++
++
++static status_t
++set_mix(MesonHdmiAudio* audio, multi_mix_value_info* data)
++{
++	return B_OK;
++}
++
++
++static status_t
++get_buffers(MesonHdmiAudio* audio, multi_buffer_list* data)
++{
++	return audio->GetBuffers(data);
++}
++
++
++static status_t
++buffer_exchange(MesonHdmiAudio* audio, multi_buffer_info* data)
++{
++	return audio->BufferExchange(data);
++}
++
++
++static status_t
++buffer_force_stop(MesonHdmiAudio* audio)
++{
++	return audio->ForceStop();
++}
++
++
++#define cookie_type MesonHdmiAudio
++#include "multi.c"
++
++
++status_t
++MesonHdmiAudio::Control(uint32 op, void* arg, size_t length)
++{
++	return multi_audio_control_generic(this, op, arg, length);
++}
++
++
++//	#pragma mark - kernel debugger
++
++
++/*!	Fills the ring with two tones that repeat seamlessly in it (19 and 43
++	periods per ring: 445.3 Hz left, 1007.8 Hz right, at -12 dBFS) and
++	starts playing it, for checking the output without a client.
++*/
++void
++MesonHdmiAudio::StartTone()
++{
++	int16* samples = (int16*)fRing;
++	uint32 frames = kRingSize / kFrameSize;
++	for (uint32 i = 0; i < frames; i++) {
++		// a sine from a parabola, good enough for a test tone
++		int32 phases[2] = { (int32)(i * 19 % frames), (int32)(i * 43 % frames) };
++		for (int c = 0; c < 2; c++) {
++			// x in [-1, 1) over one period
++			int64 x = (int64)phases[c] * 2 * 32768 / frames - 32768;
++			int64 y = 4 * x * (32768 - (x < 0 ? -x : x)) / 32768;
++				// -32768..32768, a sine shaped arch per half period
++			samples[i * 2 + c] = (int16)(-y / 4);
++		}
++	}
++	if (fRunning) {
++		kprintf("meson_hdmi: a client is playing\n");
++		return;
++	}
++	// no timer: nothing waits for buffers
++	_SetupClocks();
++	_SetupAiu();
++	_StartDma();
++	_SetupHdmi(true);
++	kprintf("meson_hdmi: test tone playing (445.3 Hz left, 1007.8 Hz"
++		" right)\n");
++}
++
++
++void
++MesonHdmiAudio::StopTone()
++{
++	if (!fRunning)
++		_StopDma();
++}
++
++
++void
++MesonHdmiAudio::Dump()
++{
++	kprintf("meson_hdmi audio: %s, ring %#" B_PRIxPHYSADDR ", DMA read %#"
++		B_PRIx32 " level %#" B_PRIx32 " control %#" B_PRIx32 ", %" B_PRId64
++		" frames played\n", fRunning ? "running" : "stopped", fRingPhysical,
++		fAiu[AIU_MEM_I2S_RD_PTR], fAiu[AIU_MEM_I2S_LEVEL],
++		fAiu[AIU_MEM_I2S_CONTROL], fFramesPlayed);
++	kprintf("  HHI_AUD_CLK_CNTL %#" B_PRIx32 ", MPLL2 %#" B_PRIx32 "\n",
++		fRegisters->HhiRead(HHI_AUD_CLK_CNTL),
++		fRegisters->HhiRead(HHI_MPLL_CNTL9));
++	kprintf("  AIU: clk_ctrl %#" B_PRIx32 " more %#" B_PRIx32 ", source_desc %#"
++		B_PRIx32 ", dac_cfg %#" B_PRIx32 ", misc %#" B_PRIx32 ", hdmi %#"
++		B_PRIx32 "\n", fAiu[AIU_CLK_CTRL], fAiu[AIU_CLK_CTRL_MORE],
++		fAiu[AIU_I2S_SOURCE_DESC], fAiu[AIU_I2S_DAC_CFG], fAiu[AIU_I2S_MISC],
++		fAiu[AIU_HDMI_CLK_DATA_CTRL]);
++	kprintf("  TOP_CLK_CNTL %#" B_PRIx32 "; DW: FC_INVIDCONF %#x, MC_CLKDIS"
++		" %#x, AUD_CONF0 %#x CONF1 %#x INPUTCLKFS %#x, N %#x%02x%02x, CTS"
++		" %#x%02x%02x\n", fRegisters->TopRead(HDMITX_TOP_CLK_CNTL),
++		fRegisters->DwRead(DW_FC_INVIDCONF), fRegisters->DwRead(DW_MC_CLKDIS),
++		fRegisters->DwRead(DW_AUD_CONF0), fRegisters->DwRead(DW_AUD_CONF1),
++		fRegisters->DwRead(DW_AUD_INPUTCLKFS), fRegisters->DwRead(DW_AUD_N3),
++		fRegisters->DwRead(DW_AUD_N2), fRegisters->DwRead(DW_AUD_N1),
++		fRegisters->DwRead(DW_AUD_CTS3), fRegisters->DwRead(DW_AUD_CTS2),
++		fRegisters->DwRead(DW_AUD_CTS1));
++}
+diff --git a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi_audio.h b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi_audio.h
+new file mode 100644
+index 0000000000..3ff62882c3
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi_audio.h
+@@ -0,0 +1,100 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef MESON_HDMI_AUDIO_H
++#define MESON_HDMI_AUDIO_H
++
++
++#include <KernelExport.h>
++#include <lock.h>
++
++#include <hmulti_audio.h>
++
++
++/*!	What the audio part needs from the display driver: the HDMI TX ports
++	(one lock covers them) and the HHI clock registers.
++*/
++class MesonHdmiRegisters {
++public:
++	virtual						~MesonHdmiRegisters() {}
++
++	virtual	uint32				TopRead(uint32 reg) = 0;
++	virtual	void				TopWrite(uint32 reg, uint32 value) = 0;
++	virtual	uint8				DwRead(uint32 reg) = 0;
++	virtual	void				DwWrite(uint32 reg, uint8 value) = 0;
++	virtual	uint32				HhiRead(uint32 offset) = 0;
++	virtual	void				HhiWrite(uint32 offset, uint32 value) = 0;
++	virtual	uint32				PixelClock() = 0;	// kHz, 0: unknown
++};
++
++
++class MesonHdmiAudio {
++public:
++								MesonHdmiAudio(MesonHdmiRegisters* registers);
++								~MesonHdmiAudio();
++
++			status_t			Init();
++
++			// the published device (one opener at a time)
++			status_t			Open();
++			status_t			Close();
++			status_t			Control(uint32 op, void* arg, size_t length);
++
++			// the display driver: a new mode, a new pixel clock
++			void				ModeChanged();
++
++			// the kernel debugger: a test tone, register access
++			void				Dump();
++			void				StartTone();
++			void				StopTone();
++			uint32				ReadAiu(uint32 word)
++									{ return fAiu[word]; }
++			void				WriteAiu(uint32 word, uint32 value)
++									{ fAiu[word] = value; }
++
++			// multi_audio, through the drivers' generic dispatcher
++			status_t			GetDescription(multi_description* data);
++			status_t			GetEnabledChannels(multi_channel_enable* data);
++			status_t			GetGlobalFormat(multi_format_info* data);
++			status_t			GetBuffers(multi_buffer_list* data);
++			status_t			BufferExchange(multi_buffer_info* data);
++			status_t			ForceStop();
++
++private:
++			void				_SetupClocks();
++			void				_SetupAiu();
++			void				_SetupHdmi(bool debugger);
++			uint32				_Cts();
++			void				_StartDma();
++			void				_StopDma();
++			void				_Start();
++			void				_Stop();
++			void				_DeleteClientArea();
++	static	int32				_Poll(timer* timer);
++
++private:
++			MesonHdmiRegisters*	fRegisters;
++			area_id				fAiuArea;
++			volatile uint32*	fAiu;
++
++			area_id				fRingArea;		// the pages
++			area_id				fRingMapArea;	// kernel, write combining
++			uint8*				fRing;
++			phys_addr_t			fRingPhysical;
++			area_id				fClientArea;	// the opener's mapping
++			uint8*				fClientRing;
++
++			mutex				fLock;			// open, start, stop
++			spinlock			fStateLock;		// the poll timer's state
++			timer				fTimer;
++			sem_id				fBufferSem;
++			bool				fOpen;
++			bool				fRunning;
++			uint32				fPlaying;		// buffer the DMA reads
++			int64				fFramesPlayed;
++			bigtime_t			fBufferTime;	// when it began
++};
++
++
++#endif	// MESON_HDMI_AUDIO_H

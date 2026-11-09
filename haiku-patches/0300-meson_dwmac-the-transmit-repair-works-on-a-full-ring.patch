@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 4 Nov 2026 20:20:58 -0500
+Subject: [PATCH 300/342] meson_dwmac: the transmit repair works on a full ring
+
+After a stall the ring is full by the time it's seen, with the oldest frame at the
+driver's position, and the walk from there to there ended at once. So no lost OWN
+bit was put back, and the engine stopped at the same one again: 15 s of that, in the
+one stall in about 110 GB with operate on second frame. So OSF makes the stall rarer,
+it doesn't cure it.
+
+"second_frame false" in the settings brings back the frequent stall, for testing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../network/ether/meson_dwmac/meson_dwmac.cpp | 37 +++++++++++--------
+ 1 file changed, 22 insertions(+), 15 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp b/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
+index 58967a562e..2f53bcad29 100644
+--- a/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
++++ b/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
+@@ -75,8 +75,6 @@ enum {
+ 	kMmcTxInterrupt		= 0x0108,
+ 	kMmcRxInterruptMask	= 0x010c,
+ 	kMmcTxInterruptMask	= 0x0110,
+-	kMmcTxOctets		= 0x0114,
+-	kMmcTxFrames		= 0x0118,
+ 	kMmcRxFrames		= 0x0180,
+ 	kMmcRxCrcErrors		= 0x0194,
+ 	kMmcIpcRxInterruptMask = 0x0200,
+@@ -325,6 +323,7 @@ private:
+ 			sem_id				fLinkStateSemaphore;
+ 
+ 			int32				fTxStuckSeconds;
++			bool				fSecondFrame;
+ };
+ 
+ 
+@@ -357,7 +356,8 @@ MesonDwmac::MesonDwmac(device_node* node)
+ 	fFullDuplex(true),
+ 	fSpeed(0),
+ 	fLinkStateSemaphore(-1),
+-	fTxStuckSeconds(0)
++	fTxStuckSeconds(0),
++	fSecondFrame(true)
+ {
+ 	memset(fMacAddress, 0, sizeof(fMacAddress));
+ 	mutex_init(&fRxLock, "meson_dwmac rx");
+@@ -563,8 +563,8 @@ MesonDwmac::_Start()
+ 	_Write(kDmaStatus, DMA_STATUS_CLEAR_MASK);
+ 	_Write(kDmaInterruptEnable, INTERRUPT_NIE | INTERRUPT_AIE | INTERRUPT_FBE
+ 		| INTERRUPT_RUE | INTERRUPT_RIE | INTERRUPT_TIE);
+-	_Write(kDmaOperationMode, OPERATION_RSF | OPERATION_TSF | OPERATION_OSF
+-		| OPERATION_ST | OPERATION_SR);
++	_Write(kDmaOperationMode, OPERATION_RSF | OPERATION_TSF
++		| (fSecondFrame ? OPERATION_OSF : 0) | OPERATION_ST | OPERATION_SR);
+ }
+ 
+ 
+@@ -875,6 +875,9 @@ MesonDwmac::_ConfigureEee()
+ 	void* settings = load_driver_settings("meson_dwmac");
+ 	if (settings != NULL) {
+ 		keep = get_driver_boolean_parameter(settings, "eee", false, true);
++		// off, the stall _CheckTransmit() repairs comes within a few GB
++		fSecondFrame = get_driver_boolean_parameter(settings, "second_frame",
++			true, true);
+ 		unload_driver_settings(settings);
+ 	}
+ 
+@@ -896,11 +899,11 @@ MesonDwmac::_ConfigureEee()
+ }
+ 
+ 
+-/*!	Without OPERATION_OSF the transmit engine stayed suspended with frames
+-	waiting, whatever the poll demands said: the slot behind its position was
+-	still its own, the one at its position had lost OWN with its length intact,
+-	as if a frame's status had closed the next descriptor. Not seen since OSF is
+-	set; this stays for anything like it.
++/*!	The transmit engine can stay suspended with frames waiting, whatever the
++	poll demands say: the slot behind its position is still its own, the one at
++	its position has lost OWN with its length intact, as if a frame's status had
++	closed the next descriptor. It happened within a few GB without OPERATION_OSF,
++	and with it once in about 110 GB.
+ 
+ 	After 2 s of that, gives the ring back to the engine in order, from the
+ 	oldest frame. A frame that had gone out may go out again, which TCP copes
+@@ -945,8 +948,13 @@ MesonDwmac::_CheckTransmit()
+ 	for (int32 i = 0; i < 100 && ((_Read(kDmaStatus) >> 20) & 7) != 0; i++)
+ 		spin(100);
+ 
++	// from the oldest frame up to the driver's position; a full ring has the
++	// oldest one there
+ 	uint32 holes = 0;
+-	for (uint32 slot = first; slot != fTxHead; slot = (slot + 1) % kTxCount) {
++	for (uint32 i = 0; i < kTxCount; i++) {
++		uint32 slot = (first + i) % kTxCount;
++		if (i > 0 && slot == fTxHead)
++			break;
+ 		_SyncDescriptor(kRxCount + slot, true);
+ 		volatile descriptor* desc = _TxDescriptor(slot);
+ 		if ((desc->status & DESC_OWN) == 0) {
+@@ -996,10 +1004,9 @@ MesonDwmac::DumpState(void (*print)(const char*, ...))
+ 				desc->status, desc->control, desc->next);
+ 		}
+ 	}
+-	print("meson_dwmac: counters: sent %" B_PRIu32 " frames, %" B_PRIu32
+-		" bytes; received %" B_PRIu32 " frames, %" B_PRIu32 " CRC errors; "
+-		"missed %#" B_PRIx32 "\n", _Read(kMmcTxFrames), _Read(kMmcTxOctets),
+-		_Read(kMmcRxFrames), _Read(kMmcRxCrcErrors), _Read(kDmaMissedFrames));
++	print("meson_dwmac: received %" B_PRIu32 " frames, %" B_PRIu32
++		" CRC errors, missed %#" B_PRIx32 "\n", _Read(kMmcRxFrames),
++		_Read(kMmcRxCrcErrors), _Read(kDmaMissedFrames));
+ }
+ 
+ 

@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Tue, 3 Nov 2026 14:54:39 -0500
+Subject: [PATCH 270/342] dwc2: an idle bulk IN holds back while split audio
+ runs
+
+The core repeats a NAKed bulk IN by itself as fast as it can, and that takes the
+bus from the periodic splits: with a wireless adapter just waiting for frames, a
+microphone behind a hub lost 5 to 13 % of its packets and a tone played through
+a cable came back with dropouts, none of it with the interface down. While a
+full speed isochronous stream has transfers, a bulk IN that moves nothing now
+runs for 1 ms in 10. Data that has begun to flow is not held up.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/busses/usb/dwc2.cpp | 36 ++++++++++++++++++++++----
+ src/add-ons/kernel/busses/usb/dwc2.h   |  1 +
+ 2 files changed, 32 insertions(+), 5 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.cpp b/src/add-ons/kernel/busses/usb/dwc2.cpp
+index f4afbfcfa4..67393756ae 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2.cpp
+@@ -101,6 +101,8 @@ static const bigtime_t kInterruptRetryDelay = 10000;
+ // how often a waiting bulk IN looks at the queue: with others in it, and without
+ static const bigtime_t kBulkYieldCheck = 1000;
+ static const bigtime_t kBulkIdleCheck = 20000;
++static const bigtime_t kBulkSplitAudioPause = 9000;
++	// see _IsoSplitsRunning()
+ 
+ 
+ device_manager_info* gDeviceManager;
+@@ -880,8 +882,11 @@ DWC2::_Worker(dwc2_lane* lane)
+ 		}
+ 		if (retry) {
+ 			// a bulk IN that gave way goes on after what is queued
+-			entry->due = lane->channel == kBulkLane
+-				? 0 : system_time() + kInterruptRetryDelay;
++			entry->due = system_time() + kInterruptRetryDelay;
++			if (lane->channel == kBulkLane) {
++				entry->due = _IsoSplitsRunning()
++					? system_time() + kBulkSplitAudioPause : 0;
++			}
+ 			lane->queue.Add(entry);
+ 			lane->idle.NotifyAll();
+ 			continue;
+@@ -1115,7 +1120,8 @@ DWC2::_RunChannel(dwc2_lane* lane, uint32 character, uint32 split,
+ 		bigtime_t wait = 100000;
+ 		if (mayYield) {
+ 			MutexLocker locker(fQueueLock);
+-			wait = lane->queue.IsEmpty() ? kBulkIdleCheck : kBulkYieldCheck;
++			wait = lane->queue.IsEmpty() && !_IsoSplitsRunning()
++				? kBulkIdleCheck : kBulkYieldCheck;
+ 		}
+ 		entry.Wait(B_RELATIVE_TIMEOUT, wait);
+ 		status = atomic_get(&lane->status);
+@@ -1366,14 +1372,34 @@ DWC2::_RetrySplit(uint32 status, int32& errors, const char* phase)
+ }
+ 
+ 
++/*!	Whether a full speed isochronous stream (split transactions) has transfers.
++	The core repeats a NAKed bulk IN by itself, as fast as it can, and with
++	that going on the complete-splits of audio behind a hub come too late: 5 to
++	13 % of a microphone's packets were lost with a wireless adapter just
++	waiting for frames. So meanwhile a bulk IN that moves nothing runs for a
++	millisecond now and then. Data that comes is not held up after that.
++*/
++bool
++DWC2::_IsoSplitsRunning()
++{
++	InterruptsSpinLocker locker(fIsoLock);
++	for (uint32 i = 0; i < kIsoFirstHighSpeedStream; i++) {
++		if (!fIsoStreams[i].queue.IsEmpty())
++			return true;
++	}
++	return false;
++}
++
++
+ /*!	Whether a bulk IN of \a packets packets, which is waiting for its device,
+-	should give way: others wait on the lane, and nothing has come in.
++	should give way: others wait on the lane or split audio is running, and
++	nothing has come in.
+ */
+ bool
+ DWC2::_ShouldYield(dwc2_lane* lane, uint32 packets)
+ {
+ 	MutexLocker locker(fQueueLock);
+-	if (lane->queue.IsEmpty())
++	if (lane->queue.IsEmpty() && !_IsoSplitsRunning())
+ 		return false;
+ 	locker.Unlock();
+ 	return ((_Read(HC_TSIZ(lane->channel)) >> HCTSIZ_PKTCNT_SHIFT) & 0x3ff)
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.h b/src/add-ons/kernel/busses/usb/dwc2.h
+index 3966cf5b2b..0a21dbb8df 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.h
++++ b/src/add-ons/kernel/busses/usb/dwc2.h
+@@ -242,6 +242,7 @@ private:
+ 			void				_CancelIsochronous(Pipe* pipe, bool force);
+ 			dwc2_iso_stream*	_IsoStreamFor(Pipe* pipe, bool create);
+ 			status_t			_IsoPlace(dwc2_iso_stream* stream);
++			bool				_IsoSplitsRunning();
+ 			void				_IsoArm(dwc2_iso_stream* stream);
+ 			void				_IsoStartPart(dwc2_iso_stream* stream,
+ 										bool oddFrame);

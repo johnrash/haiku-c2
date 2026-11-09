@@ -1,0 +1,1593 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 12:54:45 -0500
+Subject: [PATCH 214/342] meson_vdec: the H.264 encoder (HCODEC) as
+ /dev/video/meson_venc/0
+
+Written from docs/m48-venc-facts.md (the facts of Amlogic's vendor
+driver): power and clock (500 MHz), Amlogic's microcode by IMEM DMA
+(the caller gives it: meson_venc_firmware), the reconstruction and
+reference frames, and before each command every unit programmed again
+(the vendor's full mode). Pictures come from an input area the caller
+clones: NV12, NV21, RGB24, or B_RGB32 (the input reader's RGBA mode,
+with its byte lanes turning each pixel around). One QP a picture.
+
+On the board: Baseline H.264 that FFmpeg decodes and the hardware
+decoder decodes bit for bit as FFmpeg; 1920x1080 in 19.4 ms a picture,
+1280x720 in 9.0 ms. GXBB's microcode answers P pictures with IDR_DONE.
+
+The decoder's power code now shares a lock and a counted DOS clock
+with the encoder, and sets only its own bits of DOS_GCLK_EN0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/drivers/meson_canvas.h        |    3 +-
+ headers/private/drivers/meson_venc.h          |   86 ++
+ .../kernel/drivers/video/meson_vdec/Jamfile   |    1 +
+ .../drivers/video/meson_vdec/meson_vdec.cpp   |   91 +-
+ .../video/meson_vdec/meson_vdec_hevc.cpp      |   17 +-
+ .../video/meson_vdec/meson_vdec_private.h     |  119 +-
+ .../drivers/video/meson_vdec/meson_venc.cpp   | 1075 +++++++++++++++++
+ 7 files changed, 1373 insertions(+), 19 deletions(-)
+ create mode 100644 headers/private/drivers/meson_venc.h
+ create mode 100644 src/add-ons/kernel/drivers/video/meson_vdec/meson_venc.cpp
+
+diff --git a/headers/private/drivers/meson_canvas.h b/headers/private/drivers/meson_canvas.h
+index eaec11baa0..313be3c530 100644
+--- a/headers/private/drivers/meson_canvas.h
++++ b/headers/private/drivers/meson_canvas.h
+@@ -16,7 +16,8 @@
+ 	them through this module, which does it under one lock.
+ 
+ 	The indexes in use: 0x4e (the frame buffer, U-Boot's choice) and
+-	0x60-0x63 (the video layer) by meson_hdmi; 0x80-0xbf by meson_vdec.
++	0x60-0x63 (the video layer) by meson_hdmi; 0x80-0xbf by meson_vdec;
++	0xe4-0xec by meson_vdec's encoder.
+ */
+ 
+ #define MESON_CANVAS_MODULE_NAME	"generic/meson_canvas/v1"
+diff --git a/headers/private/drivers/meson_venc.h b/headers/private/drivers/meson_venc.h
+new file mode 100644
+index 0000000000..b65ee4da50
+--- /dev/null
++++ b/headers/private/drivers/meson_venc.h
+@@ -0,0 +1,86 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef _MESON_VENC_H
++#define _MESON_VENC_H
++
++
++#include <Drivers.h>
++
++
++/*!	The Amlogic S905's (Meson GXBB) H.264 encoder (HCODEC), meson_vdec's
++	second device: /dev/video/meson_venc/0. One session at a time, for
++	pictures of one size and format: start it with Amlogic's microcode
++	(meson_venc_firmware's h264_enc_mc_gx.bin), take the stream's parameter
++	sets (HEADERS: the SPS and the PPS), then for each picture write it into
++	the input area START gives (cloned by the caller) and ENCODE it. The
++	output is H.264 in Annex B form, I and P pictures with one reference.
++*/
++
++#define MESON_VENC_DEVICE			"/dev/video/meson_venc/0"
++#define MESON_VENC_FIRMWARE_SIZE	8280
++#define MESON_VENC_MAX_WIDTH		1920
++#define MESON_VENC_MAX_HEIGHT		1088
++
++enum {
++	MESON_VENC_START = B_DEVICE_OP_CODES_END + 0x100,
++		// meson_venc_start
++	MESON_VENC_HEADERS,
++		// meson_venc_output: the SPS and the PPS
++	MESON_VENC_ENCODE,
++		// meson_venc_encode: the picture in the input area
++	MESON_VENC_STOP,
++		// no data: ends the session (closing the device does too)
++};
++
++// the input: the layout in the input area
++enum {
++	MESON_VENC_NV12 = 1,
++		// Y (bytes_per_row as START gives), then CbCr at chroma_offset,
++		// half the height
++	MESON_VENC_NV21 = 2,
++		// as NV12, CrCb
++	MESON_VENC_RGB24 = 3,
++		// packed, 3 bytes a pixel
++	MESON_VENC_RGB32 = 4,
++		// B_RGB32: B, G, R, A in memory (the hardware reads A, R, G, B: the
++		// bytes of each pixel are turned around on the way)
++};
++
++#define MESON_VENC_NOISE_REDUCTION	0x1
++	// the input reader's spatial and temporal noise reduction
++
++struct meson_venc_start {
++	const void*		firmware;		// in: MESON_VENC_FIRMWARE_SIZE bytes
++	size_t			firmware_size;	// in
++	uint32			width;			// in: at most MESON_VENC_MAX_*
++	uint32			height;			// in
++	uint32			format;			// in: MESON_VENC_*
++	uint32			flags;			// in: MESON_VENC_NOISE_REDUCTION
++	area_id			input;			// out: the input picture's area
++	size_t			input_size;		// out: its size
++	uint32			bytes_per_row;	// out: of the picture (and of CbCr)
++	uint32			chroma_offset;	// out: NV12/NV21: CbCr's start
++};
++
++struct meson_venc_output {
++	void*			buffer;			// in: where the bytes go
++	size_t			buffer_size;	// in
++	size_t			size;			// out: the bytes written
++};
++
++#define MESON_VENC_IDR				0x1
++	// an IDR picture (the first one is one anyway)
++
++struct meson_venc_encode {
++	uint32			flags;			// in: MESON_VENC_IDR
++	uint32			qp;				// in: the quantiser, 0-51
++	bigtime_t		timeout;		// in: relative
++	struct meson_venc_output output;
++	uint32			idr;			// out: it is an IDR picture
++	bigtime_t		encode_time;	// out: the hardware's time for it
++};
++
++
++#endif	// _MESON_VENC_H
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/Jamfile b/src/add-ons/kernel/drivers/video/meson_vdec/Jamfile
+index 0ebd8768b0..ff53a12245 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/Jamfile
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/Jamfile
+@@ -7,5 +7,6 @@ if $(TARGET_ARCH) = arm64 {
+ 	KernelAddon meson_vdec :
+ 		meson_vdec.cpp
+ 		meson_vdec_hevc.cpp
++		meson_venc.cpp
+ 	;
+ }
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+index 15907a83d7..2f7619fc80 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+@@ -30,6 +30,28 @@ meson_canvas_module_info* gCanvas;
+ 
+ 
+ static MesonVdec* sDevice;
++static MesonVenc* sEncoder;
++
++spinlock gDosPowerLock = B_SPINLOCK_INITIALIZER;
++static int32 sDosClockUsers;
++
++
++void
++dos_clock_acquire(volatile uint32* hhi)
++{
++	InterruptsSpinLocker locker(gDosPowerLock);
++	if (sDosClockUsers++ == 0)
++		hhi[HHI_GCLK_MPEG0 / 4] |= GCLK_MPEG0_DOS;
++}
++
++
++void
++dos_clock_release(volatile uint32* hhi)
++{
++	InterruptsSpinLocker locker(gDosPowerLock);
++	if (sDosClockUsers > 0 && --sDosClockUsers == 0)
++		hhi[HHI_GCLK_MPEG0 / 4] &= ~GCLK_MPEG0_DOS;
++}
+ 
+ 
+ MesonVdec::MesonVdec(device_node* node)
+@@ -571,7 +593,9 @@ void
+ MesonVdec::_PowerUp()
+ {
+ 	fHhi[HHI_GCLK_MPEG1 / 4] |= GCLK_MPEG1_DOS_PARSER;
+-	fHhi[HHI_GCLK_MPEG0 / 4] |= GCLK_MPEG0_DOS;
++	dos_clock_acquire(fHhi);
++
++	InterruptsSpinLocker locker(gDosPowerLock);
+ 	uint32 clock = fHhi[HHI_VDEC_CLK_CNTL / 4]
+ 		& ~(VDEC_CLK_SOURCE_MASK | VDEC_CLK_DIVIDER_MASK | VDEC_CLK_GATE);
+ 	fHhi[HHI_VDEC_CLK_CNTL / 4]
+@@ -583,9 +607,11 @@ MesonVdec::_PowerUp()
+ 
+ 	_SetDos(DOS_SW_RESET0, 0xfffffffc);
+ 	_SetDos(DOS_SW_RESET0, 0);
+-	_SetDos(DOS_GCLK_EN0, 0x3ff);
++	// VDEC_1's gates only: the encoder's are in the same register
++	_SetDos(DOS_GCLK_EN0, _Dos(DOS_GCLK_EN0) | 0x3ff);
+ 	_SetDos(DOS_MEM_PD_VDEC, 0);
+ 	fAo[AO_RTI_GEN_PWR_ISO0 / 4] &= ~AO_ISO_VDEC1;
++	locker.Unlock();
+ 	_SetDos(DOS_VDEC_MCRCC_STALL_CTRL, 0);
+ 	_SetDos(GCLK_EN, 0x3ff);
+ 	_SetDos(MDEC_PIC_DC_CTRL, _Dos(MDEC_PIC_DC_CTRL) & ~MDEC_PIC_DC_BIT31);
+@@ -601,11 +627,14 @@ MesonVdec::_PowerDown()
+ 	_SetDos(DOS_SW_RESET0, (1 << 12) | (1 << 11));
+ 	_SetDos(DOS_SW_RESET0, 0);
+ 	(void)_Dos(DOS_SW_RESET0);
+-	fAo[AO_RTI_GEN_PWR_ISO0 / 4] |= AO_ISO_VDEC1;
+-	_SetDos(DOS_MEM_PD_VDEC, 0xffffffff);
+-	fAo[AO_RTI_GEN_PWR_SLEEP0 / 4] |= AO_SLEEP_VDEC1;
+-	fHhi[HHI_VDEC_CLK_CNTL / 4] &= ~VDEC_CLK_GATE;
+-	fHhi[HHI_GCLK_MPEG0 / 4] &= ~GCLK_MPEG0_DOS;
++	{
++		InterruptsSpinLocker locker(gDosPowerLock);
++		fAo[AO_RTI_GEN_PWR_ISO0 / 4] |= AO_ISO_VDEC1;
++		_SetDos(DOS_MEM_PD_VDEC, 0xffffffff);
++		fAo[AO_RTI_GEN_PWR_SLEEP0 / 4] |= AO_SLEEP_VDEC1;
++		fHhi[HHI_VDEC_CLK_CNTL / 4] &= ~VDEC_CLK_GATE;
++	}
++	dos_clock_release(fHhi);
+ 	fHhi[HHI_GCLK_MPEG1 / 4] &= ~GCLK_MPEG1_DOS_PARSER;
+ }
+ 
+@@ -1659,6 +1688,17 @@ dump_meson_vdec(int argc, char** argv)
+ }
+ 
+ 
++static int
++dump_meson_venc(int argc, char** argv)
++{
++	if (sEncoder == NULL)
++		kprintf("meson_venc: no device\n");
++	else
++		sEncoder->Dump();
++	return 0;
++}
++
++
+ //	#pragma mark - driver module
+ 
+ 
+@@ -1749,6 +1789,15 @@ init_driver(device_node* node, void** _cookie)
+ 	sDevice = device;
+ 	add_debugger_command("meson_vdec", &dump_meson_vdec,
+ 		"Shows the video decoder's state");
++
++	// the encoder: same block, its own device
++	MesonVenc* encoder = new(std::nothrow) MesonVenc;
++	if (encoder != NULL && encoder->Init(-1) == B_OK) {
++		sEncoder = encoder;
++		add_debugger_command("meson_venc", &dump_meson_venc,
++			"Shows the video encoder's state");
++	} else
++		delete encoder;
+ 	*_cookie = device;
+ 	return B_OK;
+ }
+@@ -1758,6 +1807,11 @@ static void
+ uninit_driver(void* cookie)
+ {
+ 	remove_debugger_command("meson_vdec", &dump_meson_vdec);
++	if (sEncoder != NULL) {
++		remove_debugger_command("meson_venc", &dump_meson_venc);
++		delete sEncoder;
++		sEncoder = NULL;
++	}
+ 	sDevice = NULL;
+ 	delete (MesonVdec*)cookie;
+ }
+@@ -1767,8 +1821,13 @@ static status_t
+ register_child_devices(void* cookie)
+ {
+ 	MesonVdec* device = (MesonVdec*)cookie;
+-	return gDeviceManager->publish_device(device->Node(),
++	status_t status = gDeviceManager->publish_device(device->Node(),
+ 		"video/meson_vdec/0", DEVICE_MODULE_NAME);
++	if (status == B_OK && sEncoder != NULL) {
++		gDeviceManager->publish_device(device->Node(), "video/meson_venc/0",
++			DEVICE_MODULE_NAME);
++	}
++	return status;
+ }
+ 
+ 
+@@ -1793,6 +1852,15 @@ static status_t
+ device_open(void* deviceCookie, const char* path, int openMode,
+ 	void** _cookie)
+ {
++	// the encoder's device, or the decoder's
++	if (sEncoder != NULL && strstr(path, "meson_venc") != NULL) {
++		status_t status = sEncoder->Open();
++		if (status != B_OK)
++			return status;
++		*_cookie = sEncoder;
++		return B_OK;
++	}
++
+ 	MesonVdec* device = (MesonVdec*)deviceCookie;
+ 	status_t status = device->Open();
+ 	if (status != B_OK)
+@@ -1812,7 +1880,10 @@ device_close(void* cookie)
+ static status_t
+ device_free(void* cookie)
+ {
+-	((MesonVdec*)cookie)->Close();
++	if (cookie == sEncoder)
++		sEncoder->Close();
++	else
++		((MesonVdec*)cookie)->Close();
+ 	return B_OK;
+ }
+ 
+@@ -1837,6 +1908,8 @@ device_write(void* cookie, off_t position, const void* buffer,
+ static status_t
+ device_control(void* cookie, uint32 op, void* buffer, size_t length)
+ {
++	if (cookie == sEncoder)
++		return sEncoder->Control(op, buffer, length);
+ 	return ((MesonVdec*)cookie)->Control(op, buffer, length);
+ }
+ 
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp
+index 248162e621..a49dfe3c24 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp
+@@ -256,8 +256,9 @@ void
+ MesonVdec::_PowerUpHevc()
+ {
+ 	fHhi[HHI_GCLK_MPEG1 / 4] |= GCLK_MPEG1_DOS_PARSER;
+-	fHhi[HHI_GCLK_MPEG0 / 4] |= GCLK_MPEG0_DOS;
++	dos_clock_acquire(fHhi);
+ 
++	InterruptsSpinLocker locker(gDosPowerLock);
+ 	// HHI_VDEC2_CLK_CNTL's upper half: fclk/3, 666.7 MHz
+ 	uint32 clock = fHhi[HHI_VDEC2_CLK_CNTL / 4] & ~(0x7fu << 16)
+ 		& ~(3u << 25) & ~(1u << 24);
+@@ -272,6 +273,7 @@ MesonVdec::_PowerUpHevc()
+ 	_SetDos(DOS_GCLK_EN3, 0xffffffff);
+ 	_SetDos(DOS_MEM_PD_HEVC, 0);
+ 	fAo[AO_RTI_GEN_PWR_ISO0 / 4] &= ~AO_ISO_HEVC;
++	locker.Unlock();
+ 	_SetDos(DOS_SW_RESET3, 0xffffffff);
+ 	spin(10);
+ 	_SetDos(DOS_SW_RESET3, 0);
+@@ -334,12 +336,15 @@ MesonVdec::_StopHevcProcessor()
+ void
+ MesonVdec::_PowerDownHevc()
+ {
+-	fAo[AO_RTI_GEN_PWR_ISO0 / 4] |= AO_ISO_HEVC;
+-	_SetDos(DOS_MEM_PD_HEVC, 0xffffffff);
+-	fAo[AO_RTI_GEN_PWR_SLEEP0 / 4] |= AO_SLEEP_HEVC;
+-	fHhi[HHI_VDEC2_CLK_CNTL / 4] &= ~(1u << 24);
++	{
++		InterruptsSpinLocker locker(gDosPowerLock);
++		fAo[AO_RTI_GEN_PWR_ISO0 / 4] |= AO_ISO_HEVC;
++		_SetDos(DOS_MEM_PD_HEVC, 0xffffffff);
++		fAo[AO_RTI_GEN_PWR_SLEEP0 / 4] |= AO_SLEEP_HEVC;
++		fHhi[HHI_VDEC2_CLK_CNTL / 4] &= ~(1u << 24);
++	}
+ 	_SetDos(DOS_GEN_CTRL0, 0);
+-	fHhi[HHI_GCLK_MPEG0 / 4] &= ~GCLK_MPEG0_DOS;
++	dos_clock_release(fHhi);
+ 	fHhi[HHI_GCLK_MPEG1 / 4] &= ~GCLK_MPEG1_DOS_PARSER;
+ }
+ 
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
+index 8126663200..a0565ee3d4 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
+@@ -2,9 +2,9 @@
+  * Copyright 2026, haiku-odroid-c2 port authors.
+  * Distributed under the terms of the MIT License.
+  *
+- * meson_vdec's registers, constants and its class, for its source files:
+- * meson_vdec.cpp (VDEC_1: MPEG-1/2 and H.264) and meson_vdec_hevc.cpp (the
+- * HEVC block).
++ * meson_vdec's registers, constants and its classes, for its source files:
++ * meson_vdec.cpp (VDEC_1: MPEG-1/2 and H.264), meson_vdec_hevc.cpp (the
++ * HEVC block) and meson_venc.cpp (HCODEC, the H.264 encoder).
+  */
+ #ifndef MESON_VDEC_PRIVATE_H
+ #define MESON_VDEC_PRIVATE_H
+@@ -28,6 +28,7 @@
+ 
+ #include <meson_canvas.h>
+ #include <meson_vdec.h>
++#include <meson_venc.h>
+ 
+ 
+ #define DRIVER_MODULE_NAME	"drivers/video/meson_vdec/driver_v1"
+@@ -532,4 +533,116 @@ private:
+ 
+ 
+ 
++/*!	The DOS block's bus clock (HHI_GCLK_MPEG0's DOS bit) and the power and
++	clock registers VDEC_1, HEVC and HCODEC share (the AO domain bits,
++	HHI_VDEC_CLK_CNTL, DOS_GCLK_EN0): their read-modify-writes go under
++	gDosPowerLock, and the bus clock stays on while any of them is powered.
++*/
++extern spinlock gDosPowerLock;
++void dos_clock_acquire(volatile uint32* hhi);
++void dos_clock_release(volatile uint32* hhi);
++
++
++/*!	The H.264 encoder, HCODEC (meson_venc.cpp), published as
++	/dev/video/meson_venc/0. From docs/m48-venc-facts.md.
++*/
++class MesonVenc {
++public:
++								MesonVenc();
++								~MesonVenc();
++
++			status_t			Init(int32 irq);
++
++			status_t			Open();
++			void				Close();
++			status_t			Control(uint32 op, void* buffer,
++									size_t length);
++			void				Dump();
++
++private:
++	static	int32				_Interrupt(void* data);
++
++			status_t			_Start(meson_venc_start& start,
++									const void* userFirmware);
++			void				_Stop();
++			status_t			_Headers(meson_venc_output& output);
++			status_t			_Encode(meson_venc_encode& encode);
++
++			void				_PowerUp();
++			void				_PowerDown();
++			status_t			_LoadMicrocode(const void* userFirmware);
++			void				_StartProcessor();
++			void				_StopProcessor();
++			void				_ResetPulse(uint32 bits);
++			void				_WriteCanvases();
++			void				_SetCanvasWords();
++			void				_FullInit(uint32 frameNumber, uint32 poc);
++			void				_ProtocolInit();
++			void				_SetupInput();
++			void				_SetCommandParameters(uint32 macroblockType);
++			status_t			_Command(uint32 command, uint32 done,
++									bigtime_t timeout);
++			status_t			_CopyOut(meson_venc_output& output,
++									size_t size);
++
++			status_t			_AllocateBuffers();
++			void				_FreeBuffers();
++
++			uint32				_Dos(uint32 offset)
++									{ return fDos[offset / 4]; }
++			void				_SetDos(uint32 offset, uint32 value)
++									{ fDos[offset / 4] = value; }
++
++private:
++			area_id				fDosArea;
++			area_id				fAoArea;
++			area_id				fHhiArea;
++			volatile uint32*	fDos;
++			volatile uint32*	fAo;
++			volatile uint32*	fHhi;
++			int32				fIrq;
++
++			mutex				fLock;
++			sem_id				fDoneSem;
++			bool				fOpen;
++			bool				fRunning;
++			int32				fInterrupts;
++
++			uint32				fWidth;
++			uint32				fHeight;
++			uint32				fFormat;
++			uint32				fFlags;
++			uint32				fBytesPerRow;
++			uint32				fChromaOffset;
++			size_t				fInputSize;
++			uint32				fQp;
++			uint32				fIdrPicId;
++			uint32				fFrameNumber;
++			uint32				fPoc;
++			bool				fNeedIdr;
++			uint32				fReconstruction;
++				// 0 or 1: the buffer the next picture is written to
++
++			dma_buffer			fMicrocode;
++			dma_buffer			fInput;
++			dma_buffer			fFrames[2];
++			dma_buffer			fAssist;
++			dma_buffer			fBitstream;
++			dma_buffer			fDump;
++
++			bigtime_t			fLastEncodeTime;
++			uint32				fLastSize;
++			uint32				fPictures;
++
++			// what the interrupts saw, for the bring-up
++			struct irq_entry {
++				bigtime_t		time;
++				uint32			status;
++				uint32			bytes;
++			};
++			irq_entry			fIrqLog[32];
++			int32				fIrqLogCount;
++};
++
++
+ #endif	// MESON_VDEC_PRIVATE_H
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_venc.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_venc.cpp
+new file mode 100644
+index 0000000000..25784b0bf8
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_venc.cpp
+@@ -0,0 +1,1075 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * meson_venc: the S905's H.264 encoder, HCODEC, written from
++ * docs/m48-venc-facts.md (the facts of Amlogic's vendor driver; section
++ * numbers below are that document's). Amlogic's microcode runs the picture:
++ * the CPU powers the block, loads the microcode, and before each command
++ * programs every unit (the vendor's "full mode" on GXBB), writes the command
++ * into a scratch register and waits for the done value and the interrupt.
++ */
++
++
++#include "meson_vdec_private.h"
++
++
++#define TRACE(x...)			dprintf("meson_venc: " x)
++
++
++// AO (byte offsets)
++enum {
++	AO_RTI_PWR_CNTL_REG0		= 0x10,
++};
++#define AO_PWR_CNTL_HCODEC			(3 << 3)	// cleared at power-up (§2.4)
++#define AO_SLEEP_HCODEC				(3 << 0)
++#define AO_ISO_HCODEC				(3 << 4)
++
++// HHI_VDEC_CLK_CNTL's upper half: HCODEC's clock (§2.3)
++#define HCODEC_CLOCK_MASK			0xffff0000
++#define HCODEC_CLOCK_500MHZ			0x01000000	// fclk/4, gate on
++#define HCODEC_CLOCK_GATE			(1 << 24)
++
++// DOS (byte offsets)
++enum {
++	HCODEC_ASSIST_MMC_CTRL1		= 0x4008,
++	HCODEC_MFDIN_REG1_CTRL		= 0x4024,	// GXBB: 8 words below the
++	HCODEC_MFDIN_REG3_CANV		= 0x402c,	// vendor header's names (§6.1)
++	HCODEC_MFDIN_REG4_LNR0		= 0x4030,
++	HCODEC_MFDIN_REG5_LNR1		= 0x4034,
++	HCODEC_MFDIN_REG8_DMBL		= 0x4040,
++	HCODEC_MFDIN_REG9_ENDN		= 0x4044,
++	HCODEC_MFDIN_REG0D			= 0x4054,	// to REG16 at 0x4078
++	HCODEC_ASSIST_AMR1_INT0		= 0x4094,
++	HCODEC_ASSIST_AMR1_INT1		= 0x4098,
++	HCODEC_ASSIST_AMR1_INT3		= 0x40a0,
++	HCODEC_ASSIST_MBOX2_CLR_REG	= 0x41e4,
++	HCODEC_ASSIST_MBOX2_MASK	= 0x41e8,
++	HCODEC_MPSR					= 0x4c04,
++	HCODEC_CPSR					= 0x4c84,
++	HCODEC_IMEM_DMA_CTRL		= 0x4d00,
++	HCODEC_IMEM_DMA_ADR			= 0x4d04,
++	HCODEC_IMEM_DMA_COUNT		= 0x4d08,
++	HCODEC_HDEC_MC_OMEM_AUTO	= 0x64c0,
++	HCODEC_ANC0_CANVAS_ADDR		= 0x6640,
++	HCODEC_DBKR_CANVAS_ADDR		= 0x66c0,
++	HCODEC_DBKW_CANVAS_ADDR		= 0x66c4,
++	HCODEC_REC_CANVAS_ADDR		= 0x66c8,
++	HCODEC_CURR_CANVAS_CTRL		= 0x66cc,
++	HCODEC_HENC_SCRATCH_0		= 0x6b00,	// to _N, 4 bytes apart
++	HCODEC_IE_DATA_FEED_BUFF_INFO = 0x6b60,
++	HCODEC_VLC_CONFIG			= 0x7404,
++	HCODEC_VLC_VB_START_PTR		= 0x7440,
++	HCODEC_VLC_VB_END_PTR		= 0x7444,
++	HCODEC_VLC_VB_WR_PTR		= 0x7448,
++	HCODEC_VLC_VB_SW_RD_PTR		= 0x7450,
++	HCODEC_VLC_VB_CONTROL		= 0x7458,
++	HCODEC_VLC_VB_MEM_CTL		= 0x745c,
++	HCODEC_VLC_TOTAL_BYTES		= 0x7468,
++	HCODEC_VLC_ADV_CONFIG		= 0x7494,
++	HCODEC_VLC_INT_CONTROL		= 0x74c0,
++	HCODEC_VLC_PIC_SIZE			= 0x74c4,
++	HCODEC_VLC_PIC_POSITION		= 0x74cc,
++	HCODEC_VLC_HCMD_CONFIG		= 0x7550,
++	HCODEC_IGNORE_CONFIG		= 0x7c08,
++	HCODEC_IGNORE_CONFIG_2		= 0x7c0c,
++	HCODEC_QDCT_MB_START_PTR	= 0x7c40,
++	HCODEC_QDCT_MB_END_PTR		= 0x7c44,
++	HCODEC_QDCT_MB_WR_PTR		= 0x7c48,
++	HCODEC_QDCT_MB_RD_PTR		= 0x7c4c,
++	HCODEC_QDCT_MB_CONTROL		= 0x7c54,
++	HCODEC_QDCT_MB_BUFF			= 0x7c5c,
++	HCODEC_QDCT_Q_QUANT_I		= 0x7c70,
++	HCODEC_QDCT_Q_QUANT_P		= 0x7c74,
++	HCODEC_QDCT_ADV_CONFIG		= 0x7cd0,
++	HCODEC_IE_WEIGHT			= 0x7cd4,
++	HCODEC_Q_QUANT_CONTROL		= 0x7cd8,
++	HCODEC_QUANT_TABLE_DATA		= 0x7ce4,
++	HCODEC_SAD_CONTROL_0		= 0x7ce8,
++	HCODEC_SAD_CONTROL_1		= 0x7cec,
++	HCODEC_QDCT_VLC_QUANT_CTL_0	= 0x7cf0,
++	HCODEC_QDCT_VLC_QUANT_CTL_1	= 0x7cf4,
++	HCODEC_IE_CONTROL			= 0x7d00,
++	HCODEC_SAD_CONTROL			= 0x7d0c,
++	HCODEC_IE_RESULT_BUFFER		= 0x7d10,
++	HCODEC_ME_SKIP_LINE			= 0x7d34,
++	HCODEC_ME_SAD_ENOUGH_01		= 0x7d40,
++	HCODEC_ME_SAD_ENOUGH_23		= 0x7d44,
++	HCODEC_ME_STEP0_CLOSE_MV	= 0x7d48,
++	HCODEC_ME_F_SKIP_SAD		= 0x7d4c,
++	HCODEC_ME_F_SKIP_WEIGHT		= 0x7d50,
++	HCODEC_ME_MV_MERGE_CTL		= 0x7d54,
++	HCODEC_ME_MV_WEIGHT_01		= 0x7d58,
++	HCODEC_ME_MV_WEIGHT_23		= 0x7d5c,
++	HCODEC_ME_SAD_RANGE_INC		= 0x7d60,
++	HCODEC_ME_WEIGHT			= 0x7d80,
++	HCODEC_ADV_MV_CTL0			= 0x7da4,
++	HCODEC_ADV_MV_CTL1			= 0x7da8,
++	DOS_SW_RESET1				= 0xfc1c,
++	DOS_MEM_PD_HCODEC			= 0xfcc8,
++};
++
++#define HCODEC_GCLK_MASK			(0x7fff << 12)	// in DOS_GCLK_EN0
++
++// the scratch registers' uses (§7.1)
++#define SCRATCH(n)					(HCODEC_HENC_SCRATCH_0 + 4 * (n))
++enum {
++	ENCODER_STATUS			= 0,	// command and done value
++	MEM_OFFSET				= 1,	// the assist buffer
++	IDR_PIC_ID				= 5,
++	FRAME_NUMBER			= 6,
++	PIC_ORDER_CNT_LSB		= 7,
++	LOG2_MAX_POC_LSB		= 8,
++	LOG2_MAX_FRAME_NUM		= 9,
++	ANC0_BUFFER_ID			= 10,
++	QP_PICTURE				= 11,
++	IE_ME_MB_TYPE			= 13,
++	IE_ME_MODE				= 14,
++	IE_REF_SEL				= 15,
++	INFO_DUMP_START			= 18,
++	FIXED_SLICE_CFG			= 21,
++};
++
++// commands and done values (§7.2)
++enum {
++	ENCODER_IDLE			= 0,
++	ENCODER_SEQUENCE		= 1,
++	ENCODER_PICTURE			= 2,
++	ENCODER_IDR				= 3,
++	ENCODER_NON_IDR			= 4,
++	ENCODER_SEQUENCE_DONE	= 7,
++	ENCODER_PICTURE_DONE	= 8,
++	ENCODER_IDR_DONE		= 9,
++	ENCODER_NON_IDR_DONE	= 10,
++};
++
++// DOS_SW_RESET1 pulses (§2.6)
++static const uint32 kResetAll = 0xffffffff;
++static const uint32 kResetPicture = 0x000341c4;
++	// every unit but the processor
++static const uint32 kResetProcessorStart = 0x00001800;
++static const uint32 kResetProcessorStop = 0x000359c4;
++
++// HCODEC's canvases (§5.4): the two reconstruction buffers (Y, chroma, the
++// chroma again as a third plane) and the input's planes
++static const uint32 kCanvasFrames[2] = { 0xe4, 0xe7 };
++static const uint32 kCanvasInput = 0xea;
++
++// the input reader's byte lanes (§6.7): field i (3 bits) names the source
++// lane of lane i. 7 - i gives the bytes in memory order; 7 - (i ^ 3) turns
++// each 4-byte pixel around (B_RGB32's B, G, R, A to the A, R, G, B the
++// RGBA mode reads, found on the board)
++static const uint32 kByteLanesMemoryOrder = 0x00053977;
++static const uint32 kByteLanesPixelSwapped = 0x00688fac;
++
++static const uint32 kInterruptVector = 77;	// GIC SPI 45, mailbox 2 (§3)
++static const size_t kMicrocodeDmaSize = 16384;	// 0x1000 words (§4.2)
++static const size_t kAssistSize = 0xc0000;
++static const size_t kBitstreamSize = 0x100000;
++static const uint32 kLog2MaxFrameNumber = 4;
++static const uint32 kInitialQp = 26;
++
++
++static status_t
++map_registers(const char* name, phys_addr_t base, size_t size, area_id& area,
++	volatile uint32*& registers)
++{
++	phys_addr_t page = base & ~(phys_addr_t)(B_PAGE_SIZE - 1);
++	size_t mapSize = ROUNDUP(base + size - page, B_PAGE_SIZE);
++	void* address;
++	area = map_physical_memory(name, page, mapSize, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++	if (area < 0)
++		return area;
++	registers = (volatile uint32*)((addr_t)address + (base - page));
++	return B_OK;
++}
++
++
++/*!	Physically contiguous, below 4 GB (every address register has 32 bits),
++	aligned as meson_vdec's buffers (to the size up to 1 MB), cleared.
++*/
++static status_t
++allocate_buffer(const char* name, size_t size, dma_buffer& buffer,
++	bool userAccessible)
++{
++	size = ROUNDUP(size, B_PAGE_SIZE);
++	phys_size_t alignment = B_PAGE_SIZE;
++	while (alignment < size && alignment < 1024 * 1024)
++		alignment *= 2;
++
++	virtual_address_restrictions virtualRestrictions = {};
++	virtualRestrictions.address_specification = B_ANY_KERNEL_ADDRESS;
++	physical_address_restrictions physicalRestrictions = {};
++	physicalRestrictions.high_address = (phys_addr_t)1 << 32;
++	physicalRestrictions.alignment = alignment;
++	void* address;
++	buffer.area = create_area_etc(B_SYSTEM_TEAM, name, size, B_CONTIGUOUS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA
++			| (userAccessible
++				? B_READ_AREA | B_WRITE_AREA | B_CLONEABLE_AREA : 0),
++		0, 0, &virtualRestrictions, &physicalRestrictions, &address);
++	if (buffer.area < 0)
++		return buffer.area;
++	physical_entry entry;
++	get_memory_map(address, B_PAGE_SIZE, &entry, 1);
++	buffer.address = (uint8*)address;
++	buffer.physical = entry.address;
++	buffer.size = size;
++	memset(address, 0, size);
++	flush_cache_range(buffer.physical, size);
++	return B_OK;
++}
++
++
++static void
++free_buffer(dma_buffer& buffer)
++{
++	if (buffer.area >= 0)
++		delete_area(buffer.area);
++	buffer = dma_buffer();
++}
++
++
++/*!	A QP and its chroma QP (H.264's mapping, chroma_qp_index_offset 0) as
++	HCODEC_QDCT_Q_QUANT_I/P take them (§10).
++*/
++static uint32
++quant_word(uint32 qp)
++{
++	static const uint8 kChroma[] = { 29, 30, 31, 32, 32, 33, 34, 34, 35, 35,
++		36, 36, 37, 37, 37, 38, 38, 38, 39, 39, 39, 39 };
++	uint32 chroma = qp < 30 ? qp : kChroma[min_c(qp, 51) - 30];
++	return (chroma << 22) | (qp << 16) | ((chroma % 6) << 12)
++		| ((chroma / 6) << 8) | ((qp % 6) << 4) | (qp / 6);
++}
++
++
++//	#pragma mark -
++
++
++MesonVenc::MesonVenc()
++	:
++	fDosArea(-1),
++	fAoArea(-1),
++	fHhiArea(-1),
++	fDos(NULL),
++	fAo(NULL),
++	fHhi(NULL),
++	fIrq(-1),
++	fDoneSem(-1),
++	fOpen(false),
++	fRunning(false),
++	fInterrupts(0),
++	fWidth(0),
++	fHeight(0),
++	fFormat(0),
++	fFlags(0),
++	fBytesPerRow(0),
++	fChromaOffset(0),
++	fInputSize(0),
++	fQp(kInitialQp),
++	fIdrPicId(0),
++	fFrameNumber(0),
++	fPoc(0),
++	fNeedIdr(true),
++	fReconstruction(0),
++	fLastEncodeTime(0),
++	fLastSize(0),
++	fPictures(0),
++	fIrqLogCount(0)
++{
++	mutex_init(&fLock, "meson_venc");
++}
++
++
++MesonVenc::~MesonVenc()
++{
++	if (fRunning)
++		_Stop();
++	_FreeBuffers();
++	if (fIrq >= 0)
++		remove_io_interrupt_handler(fIrq, &_Interrupt, this);
++	if (fDoneSem >= 0)
++		delete_sem(fDoneSem);
++	if (fDosArea >= 0)
++		delete_area(fDosArea);
++	if (fAoArea >= 0)
++		delete_area(fAoArea);
++	if (fHhiArea >= 0)
++		delete_area(fHhiArea);
++	mutex_destroy(&fLock);
++}
++
++
++status_t
++MesonVenc::Init(int32 irq)
++{
++	status_t status;
++	if ((status = map_registers("meson_venc dos", 0xc8820000, 0x10000,
++			fDosArea, fDos)) != B_OK
++		|| (status = map_registers("meson_venc ao", kAoBase, B_PAGE_SIZE,
++			fAoArea, fAo)) != B_OK
++		|| (status = map_registers("meson_venc hhi", kHhiBase, B_PAGE_SIZE,
++			fHhiArea, fHhi)) != B_OK) {
++		return status;
++	}
++
++	fDoneSem = create_sem(0, "meson_venc done");
++	if (fDoneSem < 0)
++		return fDoneSem;
++
++	// mailbox 2's short pulse: an edge (§3)
++	if (irq < 0)
++		irq = kInterruptVector;
++	arch_int_configure_io_interrupt(irq, B_EDGE_TRIGGERED,
++		B_RISING_EDGE_POLARITY);
++	if (install_io_interrupt_handler(irq, &_Interrupt, this, 0) == B_OK)
++		fIrq = irq;
++	TRACE("interrupt %" B_PRId32 "\n", fIrq);
++	return B_OK;
++}
++
++
++status_t
++MesonVenc::Open()
++{
++	MutexLocker locker(fLock);
++	if (fOpen)
++		return B_BUSY;
++	fOpen = true;
++	return B_OK;
++}
++
++
++void
++MesonVenc::Close()
++{
++	MutexLocker locker(fLock);
++	if (fRunning)
++		_Stop();
++	_FreeBuffers();
++	fOpen = false;
++}
++
++
++status_t
++MesonVenc::Control(uint32 op, void* buffer, size_t length)
++{
++	MutexLocker locker(fLock);
++
++	switch (op) {
++		case MESON_VENC_START:
++		{
++			meson_venc_start start;
++			if (length < sizeof(start) || !IS_USER_ADDRESS(buffer)
++				|| user_memcpy(&start, buffer, sizeof(start)) != B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			status_t status = _Start(start, start.firmware);
++			if (status != B_OK)
++				return status;
++			return user_memcpy(buffer, &start, sizeof(start));
++		}
++
++		case MESON_VENC_HEADERS:
++		{
++			meson_venc_output output;
++			if (length < sizeof(output) || !IS_USER_ADDRESS(buffer)
++				|| user_memcpy(&output, buffer, sizeof(output)) != B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			status_t status = _Headers(output);
++			if (status != B_OK)
++				return status;
++			return user_memcpy(buffer, &output, sizeof(output));
++		}
++
++		case MESON_VENC_ENCODE:
++		{
++			meson_venc_encode encode;
++			if (length < sizeof(encode) || !IS_USER_ADDRESS(buffer)
++				|| user_memcpy(&encode, buffer, sizeof(encode)) != B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			status_t status = _Encode(encode);
++			if (status != B_OK)
++				return status;
++			return user_memcpy(buffer, &encode, sizeof(encode));
++		}
++
++		case MESON_VENC_STOP:
++			if (fRunning)
++				_Stop();
++			return B_OK;
++	}
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++void
++MesonVenc::Dump()
++{
++	kprintf("meson_venc: %s, %" B_PRIu32 "x%" B_PRIu32 " format %" B_PRIu32
++		", %" B_PRIu32 " pictures, %" B_PRId32 " interrupts\n",
++		fRunning ? "running" : "stopped", fWidth, fHeight, fFormat,
++		fPictures, fInterrupts);
++	if (fRunning) {
++		kprintf("  status %" B_PRIu32 ", bytes %" B_PRIu32 ", MPSR %#"
++			B_PRIx32 "\n", _Dos(SCRATCH(ENCODER_STATUS)),
++			_Dos(HCODEC_VLC_TOTAL_BYTES), _Dos(HCODEC_MPSR));
++	}
++}
++
++
++//	#pragma mark - interrupt
++
++
++/*static*/ int32
++MesonVenc::_Interrupt(void* data)
++{
++	MesonVenc* encoder = (MesonVenc*)data;
++	if (!encoder->fRunning)
++		return B_UNHANDLED_INTERRUPT;
++	encoder->_SetDos(HCODEC_ASSIST_MBOX2_CLR_REG, 1);
++	int32 index = atomic_add(&encoder->fIrqLogCount, 1);
++	if (index < 32) {
++		irq_entry& entry = encoder->fIrqLog[index];
++		entry.time = system_time();
++		entry.status = encoder->_Dos(SCRATCH(ENCODER_STATUS));
++		entry.bytes = encoder->_Dos(HCODEC_VLC_TOTAL_BYTES);
++	}
++	atomic_add(&encoder->fInterrupts, 1);
++	release_sem_etc(encoder->fDoneSem, 1, B_DO_NOT_RESCHEDULE);
++	return B_INVOKE_SCHEDULER;
++}
++
++
++//	#pragma mark - session
++
++
++status_t
++MesonVenc::_Start(meson_venc_start& start, const void* userFirmware)
++{
++	if (fRunning)
++		return B_BUSY;
++	if (start.firmware_size != MESON_VENC_FIRMWARE_SIZE
++		|| start.width < 16 || start.height < 16
++		|| start.width > MESON_VENC_MAX_WIDTH
++		|| start.height > MESON_VENC_MAX_HEIGHT) {
++		return B_BAD_VALUE;
++	}
++
++	fWidth = start.width;
++	fHeight = start.height;
++	fFormat = start.format;
++	fFlags = start.flags;
++
++	// the input's layout (§6.4, §6.8): its planes are read PH lines high
++	uint32 paddedWidth = align_up(fWidth, 16);
++	uint32 paddedHeight = align_up(fHeight, 16);
++	switch (fFormat) {
++		case MESON_VENC_NV12:
++		case MESON_VENC_NV21:
++			fBytesPerRow = align_up(fWidth, 32);
++			fChromaOffset = fBytesPerRow * paddedHeight;
++			fInputSize = fChromaOffset + fBytesPerRow * paddedHeight / 2;
++			break;
++		case MESON_VENC_RGB24:
++			fBytesPerRow = align_up(paddedWidth * 3, 32);
++			fChromaOffset = 0;
++			fInputSize = fBytesPerRow * paddedHeight;
++			break;
++		case MESON_VENC_RGB32:
++			fBytesPerRow = paddedWidth * 4;
++			fChromaOffset = 0;
++			fInputSize = fBytesPerRow * paddedHeight;
++			break;
++		default:
++			return B_BAD_VALUE;
++	}
++
++	status_t status = _AllocateBuffers();
++	if (status != B_OK) {
++		_FreeBuffers();
++		return status;
++	}
++
++	fQp = kInitialQp;
++	fIdrPicId = 0;
++	fFrameNumber = 0;
++	fPoc = 0;
++	fNeedIdr = true;
++	fReconstruction = 0;
++	fPictures = 0;
++	while (acquire_sem_etc(fDoneSem, 1, B_RELATIVE_TIMEOUT, 0) == B_OK)
++		;
++
++	// the session start (§11.1)
++	_PowerUp();
++	fRunning = true;
++	_WriteCanvases();
++	status = _LoadMicrocode(userFirmware);
++	if (status != B_OK) {
++		_Stop();
++		return status;
++	}
++	_FullInit(0, 0);
++	_SetCanvasWords();
++	_SetCommandParameters(0);
++	_SetDos(SCRATCH(ENCODER_STATUS), ENCODER_IDLE);
++	_SetDos(SCRATCH(FIXED_SLICE_CFG), 0);
++	_StartProcessor();
++
++	start.input = fInput.area;
++	start.input_size = fInputSize;
++	start.bytes_per_row = fBytesPerRow;
++	start.chroma_offset = fChromaOffset;
++	TRACE("started %" B_PRIu32 "x%" B_PRIu32 ", format %" B_PRIu32
++		", input %zu bytes, %" B_PRIu32 " bytes a row\n", fWidth, fHeight,
++		fFormat, fInputSize, fBytesPerRow);
++	return B_OK;
++}
++
++
++void
++MesonVenc::_Stop()
++{
++	_StopProcessor();
++	_SetDos(HCODEC_ASSIST_MBOX2_MASK, 0);
++	_PowerDown();
++	fRunning = false;
++	TRACE("stopped after %" B_PRIu32 " pictures, %" B_PRId32
++		" interrupts\n", fPictures, fInterrupts);
++}
++
++
++/*!	The SPS and the PPS (§11.2): each a command of its own, the PPS's bytes
++	after the SPS's.
++*/
++status_t
++MesonVenc::_Headers(meson_venc_output& output)
++{
++	if (!fRunning)
++		return B_NO_INIT;
++
++	_FullInit(fFrameNumber, fPoc);
++	_SetCommandParameters(0);
++	status_t status = _Command(ENCODER_SEQUENCE, ENCODER_SEQUENCE_DONE,
++		5000000);
++	if (status != B_OK)
++		return status;
++	uint32 sequenceSize = _Dos(HCODEC_VLC_TOTAL_BYTES);
++
++	_SetCommandParameters(0);
++	status = _Command(ENCODER_PICTURE, ENCODER_PICTURE_DONE, 5000000);
++	if (status != B_OK)
++		return status;
++	uint32 total = _Dos(HCODEC_VLC_TOTAL_BYTES);
++	TRACE("SPS %" B_PRIu32 " bytes, PPS %" B_PRIu32 "\n", sequenceSize,
++		total - sequenceSize);
++	return _CopyOut(output, total);
++}
++
++
++/*!	One picture from the input area (§11.3, §11.4). */
++status_t
++MesonVenc::_Encode(meson_venc_encode& encode)
++{
++	if (!fRunning)
++		return B_NO_INIT;
++	if (encode.qp > 51)
++		return B_BAD_VALUE;
++
++	bool idr = fNeedIdr || (encode.flags & MESON_VENC_IDR) != 0;
++	fQp = encode.qp;
++
++	// what the caller wrote, to memory
++	flush_cache_range(fInput.physical, fInputSize);
++
++	// the counters are written reduced (log2_max 4, §7.5)
++	uint32 mask = (1 << kLog2MaxFrameNumber) - 1;
++	_FullInit(idr ? 0 : fFrameNumber & mask, idr ? 0 : fPoc & mask);
++	_SetCanvasWords();
++	_SetupInput();
++	_SetCommandParameters(idr ? 0x00000009 : 0xffff00ff);
++
++	bigtime_t start = system_time();
++	status_t status = _Command(idr ? ENCODER_IDR : ENCODER_NON_IDR,
++		idr ? ENCODER_IDR_DONE : ENCODER_NON_IDR_DONE,
++		encode.timeout > 0 ? encode.timeout : 1000000);
++	fLastEncodeTime = system_time() - start;
++	if (status != B_OK) {
++		// the reference may be lost: the next picture starts over
++		fNeedIdr = true;
++		return status;
++	}
++	uint32 size = _Dos(HCODEC_VLC_TOTAL_BYTES);
++	fLastSize = size;
++	fPictures++;
++
++	// the counters and the reference for the next picture
++	if (idr) {
++		fIdrPicId = (fIdrPicId + 1) & 0xffff;
++		fFrameNumber = 1;
++		fPoc = 2;
++		fNeedIdr = false;
++	} else {
++		fFrameNumber++;
++		fPoc += 2;
++	}
++	fReconstruction ^= 1;
++
++	encode.idr = idr;
++	encode.encode_time = fLastEncodeTime;
++	return _CopyOut(encode.output, size);
++}
++
++
++//	#pragma mark - hardware sequences
++
++
++/*!	§2.4, under the lock VDEC_1 and HEVC take for the registers they share
++	with HCODEC.
++*/
++void
++MesonVenc::_PowerUp()
++{
++	dos_clock_acquire(fHhi);
++	{
++		InterruptsSpinLocker locker(gDosPowerLock);
++		fAo[AO_RTI_PWR_CNTL_REG0 / 4] &= ~AO_PWR_CNTL_HCODEC;
++		spin(10);
++		fAo[AO_RTI_GEN_PWR_SLEEP0 / 4] &= ~AO_SLEEP_HCODEC;
++		spin(10);
++		_SetDos(DOS_SW_RESET1, kResetAll);
++		_SetDos(DOS_SW_RESET1, 0);
++		fHhi[HHI_VDEC_CLK_CNTL / 4] = (fHhi[HHI_VDEC_CLK_CNTL / 4]
++			& ~HCODEC_CLOCK_MASK) | HCODEC_CLOCK_500MHZ;
++		_SetDos(DOS_GCLK_EN0, _Dos(DOS_GCLK_EN0) | HCODEC_GCLK_MASK);
++		_SetDos(DOS_MEM_PD_HCODEC, 0);
++		fAo[AO_RTI_GEN_PWR_ISO0 / 4] &= ~AO_ISO_HCODEC;
++		spin(10);
++		_SetDos(DOS_GEN_CTRL0, _Dos(DOS_GEN_CTRL0) | 1);
++		_SetDos(DOS_GEN_CTRL0, _Dos(DOS_GEN_CTRL0) & ~1);
++	}
++	snooze(10000);
++}
++
++
++/*!	§2.5. */
++void
++MesonVenc::_PowerDown()
++{
++	{
++		InterruptsSpinLocker locker(gDosPowerLock);
++		fAo[AO_RTI_GEN_PWR_ISO0 / 4] |= AO_ISO_HCODEC;
++		_SetDos(DOS_MEM_PD_HCODEC, 0xffffffff);
++		_SetDos(DOS_GCLK_EN0, _Dos(DOS_GCLK_EN0) & ~HCODEC_GCLK_MASK);
++		fHhi[HHI_VDEC_CLK_CNTL / 4] &= ~HCODEC_CLOCK_GATE;
++		fAo[AO_RTI_GEN_PWR_SLEEP0 / 4] |= AO_SLEEP_HCODEC;
++	}
++	dos_clock_release(fHhi);
++}
++
++
++/*!	§4.3: the image, zero-padded to 16 KB, into the processor's instruction
++	memory by DMA.
++*/
++status_t
++MesonVenc::_LoadMicrocode(const void* userFirmware)
++{
++	if (!IS_USER_ADDRESS(userFirmware)
++		|| user_memcpy(fMicrocode.address, userFirmware,
++			MESON_VENC_FIRMWARE_SIZE) != B_OK) {
++		return B_BAD_ADDRESS;
++	}
++	memset(fMicrocode.address + MESON_VENC_FIRMWARE_SIZE, 0,
++		kMicrocodeDmaSize - MESON_VENC_FIRMWARE_SIZE);
++	flush_cache_range(fMicrocode.physical, kMicrocodeDmaSize);
++
++	_SetDos(HCODEC_ASSIST_MMC_CTRL1, 0x32);
++	_SetDos(HCODEC_MPSR, 0);
++	_SetDos(HCODEC_CPSR, 0);
++	(void)_Dos(HCODEC_MPSR);
++	(void)_Dos(HCODEC_MPSR);
++	_SetDos(HCODEC_IMEM_DMA_ADR, fMicrocode.physical);
++	_SetDos(HCODEC_IMEM_DMA_COUNT, kMicrocodeDmaSize / 4);
++	_SetDos(HCODEC_IMEM_DMA_CTRL, 0x00078000);
++	bigtime_t timeout = system_time() + 1000000;
++	while ((_Dos(HCODEC_IMEM_DMA_CTRL) & (1 << 15)) != 0) {
++		if (system_time() > timeout) {
++			TRACE("the microcode DMA does not finish\n");
++			return B_TIMED_OUT;
++		}
++		snooze(100);
++	}
++	return B_OK;
++}
++
++
++void
++MesonVenc::_ResetPulse(uint32 bits)
++{
++	for (int i = 0; i < 3; i++)
++		(void)_Dos(DOS_SW_RESET1);
++	_SetDos(DOS_SW_RESET1, bits);
++	_SetDos(DOS_SW_RESET1, 0);
++	for (int i = 0; i < 3; i++)
++		(void)_Dos(DOS_SW_RESET1);
++}
++
++
++void
++MesonVenc::_StartProcessor()
++{
++	_ResetPulse(kResetProcessorStart);
++	_SetDos(HCODEC_MPSR, 1);
++}
++
++
++void
++MesonVenc::_StopProcessor()
++{
++	_SetDos(HCODEC_MPSR, 0);
++	_SetDos(HCODEC_CPSR, 0);
++	bigtime_t timeout = system_time() + 1000000;
++	while ((_Dos(HCODEC_IMEM_DMA_CTRL) & (1 << 15)) != 0
++		&& system_time() < timeout) {
++		spin(10);
++	}
++	_ResetPulse(kResetProcessorStop);
++}
++
++
++/*!	The reconstruction buffers' canvases (§5.4): linear, without a byte
++	swap (the input reader swaps by itself, §6.7).
++*/
++void
++MesonVenc::_WriteCanvases()
++{
++	uint32 width = align_up(fWidth, 32);
++	uint32 height = align_up(fHeight, 16);
++	for (int i = 0; i < 2; i++) {
++		phys_addr_t luma = fFrames[i].physical;
++		phys_addr_t chroma = luma + width * height;
++		gCanvas->write(kCanvasFrames[i], luma, width, height, 0);
++		gCanvas->write(kCanvasFrames[i] + 1, chroma, width, height / 2, 0);
++		gCanvas->write(kCanvasFrames[i] + 2, chroma, width, height / 2, 0);
++	}
++}
++
++
++/*!	The picture written next and its reference, the one written before
++	(§7.5).
++*/
++void
++MesonVenc::_SetCanvasWords()
++{
++	uint32 reconstruction = kCanvasFrames[fReconstruction];
++	uint32 reference = kCanvasFrames[fReconstruction ^ 1];
++	uint32 reconstructionWord = reconstruction | ((reconstruction + 1) << 8)
++		| ((reconstruction + 2) << 16);
++	uint32 referenceWord = reference | ((reference + 1) << 8)
++		| ((reference + 2) << 16);
++	_SetDos(HCODEC_REC_CANVAS_ADDR, reconstructionWord);
++	_SetDos(HCODEC_DBKR_CANVAS_ADDR, reconstructionWord);
++	_SetDos(HCODEC_DBKW_CANVAS_ADDR, reconstructionWord);
++	_SetDos(HCODEC_ANC0_CANVAS_ADDR, referenceWord);
++	_SetDos(HCODEC_VLC_HCMD_CONFIG, 0);
++}
++
++
++/*!	What precedes every command but the PPS (§11.3 steps 1-7): every unit
++	reset and programmed again.
++*/
++void
++MesonVenc::_FullInit(uint32 frameNumber, uint32 poc)
++{
++	_ResetPulse(kResetPicture);
++	_WriteCanvases();
++
++	// the encoder (§11.3 step 3)
++	_SetDos(HCODEC_VLC_TOTAL_BYTES, 0);
++	_SetDos(HCODEC_VLC_CONFIG, 0x07);
++	_SetDos(HCODEC_VLC_INT_CONTROL, 0);
++	_SetDos(HCODEC_ASSIST_AMR1_INT0, 0x15);
++	_SetDos(HCODEC_ASSIST_AMR1_INT1, 0x08);
++	_SetDos(HCODEC_ASSIST_AMR1_INT3, 0x14);
++	_SetDos(SCRATCH(IDR_PIC_ID), fIdrPicId);
++	_SetDos(SCRATCH(FRAME_NUMBER), frameNumber);
++	_SetDos(SCRATCH(PIC_ORDER_CNT_LSB), poc);
++	_SetDos(SCRATCH(LOG2_MAX_POC_LSB), kLog2MaxFrameNumber);
++	_SetDos(SCRATCH(LOG2_MAX_FRAME_NUM), kLog2MaxFrameNumber);
++	_SetDos(SCRATCH(ANC0_BUFFER_ID), 0);
++	_SetDos(SCRATCH(QP_PICTURE), kInitialQp);
++
++	// the QDCT's buffer, unused in this mode, on the input (§5.3)
++	uint32 input = fInput.physical;
++	_SetDos(HCODEC_QDCT_MB_START_PTR, input);
++	_SetDos(HCODEC_QDCT_MB_END_PTR, input + fInput.size - 1);
++	_SetDos(HCODEC_QDCT_MB_WR_PTR, input);
++	_SetDos(HCODEC_QDCT_MB_RD_PTR, input);
++	_SetDos(HCODEC_QDCT_MB_BUFF, 0);
++
++	// the bitstream (§11.3 step 5)
++	uint32 bitstream = fBitstream.physical;
++	_SetDos(HCODEC_VLC_VB_MEM_CTL, 0xbf200002);
++	_SetDos(HCODEC_VLC_VB_START_PTR, bitstream);
++	_SetDos(HCODEC_VLC_VB_WR_PTR, bitstream);
++	_SetDos(HCODEC_VLC_VB_SW_RD_PTR, bitstream);
++	_SetDos(HCODEC_VLC_VB_END_PTR, bitstream + kBitstreamSize - 1);
++	_SetDos(HCODEC_VLC_VB_CONTROL, 1);
++	_SetDos(HCODEC_VLC_VB_CONTROL, 0x3a);
++
++	_ProtocolInit();
++	_SetDos(SCRATCH(MEM_OFFSET), fAssist.physical);
++}
++
++
++/*!	§9.2, in the vendor's order, with one QP for the whole picture (§10). */
++void
++MesonVenc::_ProtocolInit()
++{
++	uint32 macroblockColumns = (fWidth + 15) / 16;
++	_SetDos(HCODEC_HDEC_MC_OMEM_AUTO,
++		(1u << 31) | ((macroblockColumns - 1) << 16));
++	_SetDos(HCODEC_VLC_ADV_CONFIG, 0x0000033e);
++	_SetDos(HCODEC_QDCT_ADV_CONFIG, 0x3f6c577f);
++	_SetDos(HCODEC_IE_WEIGHT, 0x33203655);
++	_SetDos(HCODEC_ME_WEIGHT, 0x00003320);
++	_SetDos(HCODEC_SAD_CONTROL_0, 0x33203655);
++	_SetDos(HCODEC_SAD_CONTROL_1, 0x01113320);
++	_SetDos(HCODEC_ADV_MV_CTL0, 0xf0003000);
++	_SetDos(HCODEC_ADV_MV_CTL1, 0x0000a000);
++
++	// the quant tables (I4, I16, ME), all of the one QP
++	for (uint32 table = 0; table < 3; table++) {
++		_SetDos(HCODEC_Q_QUANT_CONTROL, ((table * 8) << 23) | (1 << 22));
++		for (int word = 0; word < 8; word++)
++			_SetDos(HCODEC_QUANT_TABLE_DATA, fQp * 0x01010101);
++	}
++	_SetDos(HCODEC_QDCT_VLC_QUANT_CTL_0, (fQp << 13) | fQp);
++	_SetDos(HCODEC_QDCT_VLC_QUANT_CTL_1, 0x00000699);
++
++	_SetDos(HCODEC_VLC_PIC_SIZE, fWidth | (fHeight << 16));
++	_SetDos(HCODEC_VLC_PIC_POSITION, 0);
++	_SetDos(HCODEC_QDCT_Q_QUANT_I, quant_word(fQp));
++	_SetDos(HCODEC_QDCT_Q_QUANT_P, quant_word(fQp));
++	_SetDos(HCODEC_IGNORE_CONFIG, 0x84228423);
++	_SetDos(HCODEC_IGNORE_CONFIG_2, 0x84250000);
++	_SetDos(HCODEC_QDCT_MB_CONTROL, 0x00000201);
++	_SetDos(HCODEC_QDCT_MB_CONTROL, 0x301e7400);
++	_SetDos(HCODEC_SAD_CONTROL, 0x00000005);
++	_SetDos(HCODEC_IE_RESULT_BUFFER, 0);
++	_SetDos(HCODEC_SAD_CONTROL, 0x0000000a);
++	_SetDos(HCODEC_IE_CONTROL, 0x40000001);
++	_SetDos(HCODEC_IE_CONTROL, 0x40000000);
++	_SetDos(HCODEC_ME_SKIP_LINE, 0x08202000);
++
++	// motion search (§9.1)
++	_SetDos(HCODEC_ME_MV_MERGE_CTL, 0xff4ab080);
++	_SetDos(HCODEC_ME_STEP0_CLOSE_MV, 0x00040042);
++	_SetDos(HCODEC_ME_SAD_ENOUGH_01, 0x00004000);
++	_SetDos(HCODEC_ME_SAD_ENOUGH_23, 0x00020011);
++	_SetDos(HCODEC_ME_F_SKIP_SAD, 0x00203030);
++	_SetDos(HCODEC_ME_F_SKIP_WEIGHT, 0x00040404);
++	_SetDos(HCODEC_ME_MV_WEIGHT_01, 0);
++	_SetDos(HCODEC_ME_MV_WEIGHT_23, 0);
++	_SetDos(HCODEC_ME_SAD_RANGE_INC, 0);
++
++	_SetDos(HCODEC_IE_DATA_FEED_BUFF_INFO, 0);
++	_SetDos(HCODEC_CURR_CANVAS_CTRL, 0);
++	_SetDos(HCODEC_VLC_CONFIG, _Dos(HCODEC_VLC_CONFIG) | 1);
++	_SetDos(SCRATCH(INFO_DUMP_START), fDump.physical);
++	_SetDos(HCODEC_ASSIST_MBOX2_CLR_REG, 1);
++	_SetDos(HCODEC_ASSIST_MBOX2_MASK, 1);
++}
++
++
++/*!	The input reader (§6.4), in the vendor's order: the canvases, the noise
++	reduction, then the format and the size.
++*/
++void
++MesonVenc::_SetupInput()
++{
++	uint32 paddedWidth = align_up(fWidth, 16);
++	uint32 paddedHeight = align_up(fHeight, 16);
++	phys_addr_t input = fInput.physical;
++	bool noiseReduction = (fFlags & MESON_VENC_NOISE_REDUCTION) != 0;
++
++	uint32 format = 0;
++	uint32 canvases = 0;
++	uint32 linear0 = 0;
++	uint32 linear1 = 0;
++	uint32 byteLanes = kByteLanesMemoryOrder;
++	switch (fFormat) {
++		case MESON_VENC_NV12:
++		case MESON_VENC_NV21:
++			gCanvas->write(kCanvasInput, input, fBytesPerRow, paddedHeight,
++				0);
++			gCanvas->write(kCanvasInput + 1, input + fChromaOffset,
++				fBytesPerRow, paddedHeight / 2, 0);
++			format = fFormat == MESON_VENC_NV12 ? 3 : 2;
++			canvases = 0x15000000 | ((kCanvasInput + 1) << 8)
++				| kCanvasInput;
++			break;
++		case MESON_VENC_RGB24:
++			gCanvas->write(kCanvasInput, input, fBytesPerRow, paddedHeight,
++				0);
++			// 4:4:4, downsampled, converted
++			format = 1 | (1 << 6) | (1 << 12) | (1 << 13);
++			canvases = 0x17000000 | kCanvasInput;
++			break;
++		case MESON_VENC_RGB32:
++			// linear, 4 bytes a pixel (the vendor's width times 3,
++			// §6.9, is wrong): the hardware reads A, R, G, B
++			format = 12 | (1 << 6) | (1 << 12) | (1 << 13);
++			canvases = 0x15000000;
++			linear0 = (3 << 16) | fBytesPerRow;
++			linear1 = input;
++			byteLanes = kByteLanesPixelSwapped;
++			break;
++	}
++
++	// the noise reduction (§6.6): its values, the enable bits per setting
++	static const uint32 kLuma[] = { 0xfc07bf12, 0x001fe40a, 0x08040544,
++		0x2020140a, 0x000fc018 };
++	static const uint32 kChroma[] = { 0xfc07bf10, 0x001fe40a, 0x08040544,
++		0x2020140a, 0x000fc018 };
++	for (int i = 0; i < 5; i++) {
++		uint32 enable = noiseReduction && i == 0 ? 1 : 0;
++		uint32 lumaEnable = noiseReduction && i < 2 ? 1 : 0;
++		_SetDos(HCODEC_MFDIN_REG0D + 4 * i, kLuma[i] | lumaEnable);
++		_SetDos(HCODEC_MFDIN_REG0D + 4 * (5 + i), kChroma[i] | enable);
++	}
++
++	_SetDos(HCODEC_MFDIN_REG1_CTRL,
++		format | (noiseReduction ? 1 << 19 : 0));
++	_SetDos(HCODEC_MFDIN_REG8_DMBL, (paddedWidth << 14) | paddedHeight);
++	_SetDos(HCODEC_MFDIN_REG3_CANV, canvases);
++	_SetDos(HCODEC_MFDIN_REG4_LNR0, linear0);
++	_SetDos(HCODEC_MFDIN_REG5_LNR1, linear1);
++	_SetDos(HCODEC_MFDIN_REG9_ENDN, byteLanes);
++}
++
++
++/*!	The macroblock types the hardware may choose (§7.3), one slice. */
++void
++MesonVenc::_SetCommandParameters(uint32 macroblockType)
++{
++	_SetDos(SCRATCH(IE_ME_MODE), 0x0c);
++	_SetDos(SCRATCH(IE_REF_SEL), 0);
++	_SetDos(SCRATCH(IE_ME_MB_TYPE), macroblockType);
++	_SetDos(SCRATCH(FIXED_SLICE_CFG), 0);
++	_SetDos(SCRATCH(FIXED_SLICE_CFG), 0);
++}
++
++
++/*!	Writes the command (the microcode reads the register) and waits for
++	the done value. The mailbox interrupt wakes the wait; without it, the
++	register is looked at every 2 ms anyway.
++*/
++status_t
++MesonVenc::_Command(uint32 command, uint32 done, bigtime_t timeout)
++{
++	while (acquire_sem_etc(fDoneSem, 1, B_RELATIVE_TIMEOUT, 0) == B_OK)
++		;
++	fIrqLogCount = 0;
++	bigtime_t begin = system_time();
++	_SetDos(SCRATCH(ENCODER_STATUS), command);
++
++	bigtime_t end = begin + timeout;
++	status_t result = B_OK;
++	while (true) {
++		acquire_sem_etc(fDoneSem, 1, B_RELATIVE_TIMEOUT, 2000);
++		uint32 status = _Dos(SCRATCH(ENCODER_STATUS));
++		// GXBB's microcode answers a P picture with IDR_DONE too (as the
++		// vendor driver, which takes any done value, never noticed); the
++		// 5 it reports (and interrupts with) on the way is the slice
++		// header written
++		if (status == done || (done == ENCODER_NON_IDR_DONE
++				&& status == ENCODER_IDR_DONE)) {
++			break;
++		}
++		if (system_time() > end) {
++			TRACE("command %" B_PRIu32 " not done: status %" B_PRIu32
++				", %" B_PRIu32 " bytes, MPSR %#" B_PRIx32 "\n", command,
++				status, _Dos(HCODEC_VLC_TOTAL_BYTES), _Dos(HCODEC_MPSR));
++			result = B_TIMED_OUT;
++			break;
++		}
++	}
++	if (result != B_OK) {
++		int32 count = min_c(fIrqLogCount, 32);
++		for (int32 i = 0; i < count; i++) {
++			TRACE("  command %" B_PRIu32 ": interrupt at %" B_PRId64
++				" us: status %" B_PRIu32 ", %" B_PRIu32 " bytes\n", command,
++				fIrqLog[i].time - begin, fIrqLog[i].status,
++				fIrqLog[i].bytes);
++		}
++	}
++	return result;
++}
++
++
++status_t
++MesonVenc::_CopyOut(meson_venc_output& output, size_t size)
++{
++	if (size > kBitstreamSize)
++		return B_BAD_DATA;
++	if (size > output.buffer_size)
++		return B_BUFFER_OVERFLOW;
++	flush_cache_range(fBitstream.physical, size);
++	if (!IS_USER_ADDRESS(output.buffer)
++		|| user_memcpy(output.buffer, fBitstream.address, size) != B_OK) {
++		return B_BAD_ADDRESS;
++	}
++	output.size = size;
++	return B_OK;
++}
++
++
++status_t
++MesonVenc::_AllocateBuffers()
++{
++	_FreeBuffers();
++
++	uint32 width = align_up(fWidth, 32);
++	uint32 height = align_up(fHeight, 16);
++	size_t frameSize = width * height * 3 / 2;
++	uint32 macroblocks = ((fWidth + 15) / 16) * ((fHeight + 15) / 16);
++
++	status_t status;
++	if ((status = allocate_buffer("meson_venc microcode", kMicrocodeDmaSize,
++			fMicrocode, false)) != B_OK
++		|| (status = allocate_buffer("meson_venc input", fInputSize, fInput,
++			true)) != B_OK
++		|| (status = allocate_buffer("meson_venc frame", frameSize,
++			fFrames[0], false)) != B_OK
++		|| (status = allocate_buffer("meson_venc frame", frameSize,
++			fFrames[1], false)) != B_OK
++		|| (status = allocate_buffer("meson_venc assist", kAssistSize,
++			fAssist, false)) != B_OK
++		|| (status = allocate_buffer("meson_venc bitstream", kBitstreamSize,
++			fBitstream, false)) != B_OK
++		|| (status = allocate_buffer("meson_venc dump", macroblocks * 80,
++			fDump, false)) != B_OK) {
++		TRACE("buffers: %s\n", strerror(status));
++		return status;
++	}
++	return B_OK;
++}
++
++
++void
++MesonVenc::_FreeBuffers()
++{
++	free_buffer(fMicrocode);
++	free_buffer(fInput);
++	free_buffer(fFrames[0]);
++	free_buffer(fFrames[1]);
++	free_buffer(fAssist);
++	free_buffer(fBitstream);
++	free_buffer(fDump);
++}

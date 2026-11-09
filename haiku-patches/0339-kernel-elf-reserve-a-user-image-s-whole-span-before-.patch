@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 7 Nov 2026 22:04:53 -0500
+Subject: [PATCH 339/342] kernel/elf: reserve a user image's whole span before
+ mapping its segments
+
+elf_load_user_image() (the runtime_loader of every new team) mapped the
+text segment at a randomized base sized for itself, then the data
+segment at its fixed distance behind it. When the text landed right
+below an area the team already had, the data segment collided with it
+and the exec failed: "error mapping file data: Invalid Argument!", seen
+once in 3,950 ssh logins on the test board (a failed login).
+
+Reserve the span of all PT_LOAD segments at the randomized base first
+and map the segments at their exact places in it, as the runtime_loader
+does for programs and libraries; whatever they don't use is given back.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/kernel/elf.cpp | 55 ++++++++++++++++++++++++++++++++-------
+ 1 file changed, 46 insertions(+), 9 deletions(-)
+
+diff --git a/src/system/kernel/elf.cpp b/src/system/kernel/elf.cpp
+index 0680407b5d..0adce19c30 100644
+--- a/src/system/kernel/elf.cpp
++++ b/src/system/kernel/elf.cpp
+@@ -1917,12 +1917,55 @@ elf_load_user_image(const char *path, Team *team, uint32 flags, addr_t *entry)
+ 	extended_image_info imageInfo;
+ 	memset(&imageInfo, 0, sizeof(imageInfo));
+ 
+-	addr_t delta = 0;
+-	uint32 addressSpec = B_RANDOMIZED_BASE_ADDRESS;
++	// Reserve the image's whole span at a randomized base first, then map
++	// the segments at their places in it, as the runtime_loader does. A
++	// randomized text area alone may end right below an area the team
++	// already has, and the data segment, which must follow at its fixed
++	// distance, then collides with it (B_BAD_VALUE: now and then an exec
++	// failed with "error mapping file data").
++	addr_t imageStart = ~(addr_t)0;
++	addr_t imageEnd = 0;
++	for (int i = 0; i < elfHeader.e_phnum; i++) {
++		if (programHeaders[i].p_type != PT_LOAD)
++			continue;
++		imageStart = min_c(imageStart,
++			ROUNDDOWN(programHeaders[i].p_vaddr, B_PAGE_SIZE));
++		imageEnd = max_c(imageEnd, ROUNDUP(programHeaders[i].p_vaddr
++			+ programHeaders[i].p_memsz, B_PAGE_SIZE));
++	}
++	if (imageEnd <= imageStart)
++		return B_NOT_AN_EXECUTABLE;
++
++	void* reservedAddress = (void*)imageStart;
++	status = vm_reserve_address_range(team->id, &reservedAddress,
++		B_RANDOMIZED_BASE_ADDRESS, imageEnd - imageStart, 0);
++	if (status != B_OK) {
++		dprintf("error reserving the image's address range: %s!\n",
++			strerror(status));
++		return status;
++	}
++
++	// what the segments don't take of it is given back in any case
++	struct RangeUnreserver {
++		RangeUnreserver(team_id team, void* address, addr_t size)
++			: fTeam(team), fAddress(address), fSize(size)
++		{
++		}
++		~RangeUnreserver()
++		{
++			vm_unreserve_address_range(fTeam, fAddress, fSize);
++		}
++
++		team_id	fTeam;
++		void*	fAddress;
++		addr_t	fSize;
++	} rangeUnreserver(team->id, reservedAddress, imageEnd - imageStart);
++
++	addr_t delta = (addr_t)reservedAddress - imageStart;
++	uint32 addressSpec = B_EXACT_ADDRESS;
+ 	for (int i = 0; i < elfHeader.e_phnum; i++) {
+ 		char regionName[B_OS_NAME_LENGTH];
+ 		char *regionAddress;
+-		char *originalRegionAddress;
+ 		area_id id;
+ 
+ 		mappedAreas[i] = -1;
+@@ -1937,7 +1980,6 @@ elf_load_user_image(const char *path, Team *team, uint32 flags, addr_t *entry)
+ 
+ 		regionAddress = (char *)(ROUNDDOWN(programHeaders[i].p_vaddr,
+ 			B_PAGE_SIZE) + delta);
+-		originalRegionAddress = regionAddress;
+ 
+ 		if (programHeaders[i].p_flags & PF_WRITE) {
+ 			// rw/data segment
+@@ -2024,11 +2066,6 @@ elf_load_user_image(const char *path, Team *team, uint32 flags, addr_t *entry)
+ 			image->text_region.start = (addr_t)regionAddress;
+ 			image->text_region.size = segmentSize;
+ 		}
+-
+-		if (addressSpec != B_EXACT_ADDRESS) {
+-			addressSpec = B_EXACT_ADDRESS;
+-			delta = regionAddress - originalRegionAddress;
+-		}
+ 	}
+ 
+ 	image->data_region.delta = delta;

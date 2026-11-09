@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 18:45:34 -0400
+Subject: [PATCH 132/342] media: a format made again for a known description is
+ the known one
+
+FormatManager::MakeFormatFor() gave every call a new encoding, also for a
+description some add-on had made a format for already: a second decoder for
+FFmpeg's formats (the S905's) got an encoding the readers' streams never
+carry, so it never matched them. It now gets the existing format.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kits/media/FormatManager.cpp | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/kits/media/FormatManager.cpp b/src/kits/media/FormatManager.cpp
+index 12a72c21bd..f139197e51 100644
+--- a/src/kits/media/FormatManager.cpp
++++ b/src/kits/media/FormatManager.cpp
+@@ -192,6 +192,19 @@ FormatManager::MakeFormatFor(const media_format_description* descriptions,
+ {
+ 	BAutolock locker(fLock);
+ 
++	// A description someone made a format for already (a second decoder
++	// for FFmpeg's formats, for one) gets that format: the readers' streams
++	// carry its encoding, which the second decoder's format has to match.
++	for (int32 i = 0; i < descriptionCount; i++) {
++		meta_format other(descriptions[i]);
++		const meta_format* existing = fList.BinarySearch(other,
++			meta_format::CompareDescriptions);
++		if (existing != NULL && existing->format.type == format.type) {
++			format = existing->format;
++			return B_OK;
++		}
++	}
++
+ 	int codec = fNextCodecID;
+ 	switch (format.type) {
+ 		case B_MEDIA_RAW_AUDIO:

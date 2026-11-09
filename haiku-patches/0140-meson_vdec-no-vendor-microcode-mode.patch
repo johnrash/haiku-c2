@@ -1,0 +1,185 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 21:47:03 -0400
+Subject: [PATCH 140/342] meson_vdec: no vendor microcode mode
+
+MESON_VDEC_HEVC_VENDOR ran the HEVC block with the microcode of Amlogic's
+vendor kernel, for research; linux-firmware's gxl_hevc.bin does
+everything, and the microcode is gone from the port.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/drivers/meson_vdec.h          |  3 --
+ .../drivers/video/meson_vdec/meson_vdec.cpp   |  3 +-
+ .../video/meson_vdec/meson_vdec_hevc.cpp      | 41 +++++++------------
+ .../video/meson_vdec/meson_vdec_private.h     |  4 +-
+ 4 files changed, 16 insertions(+), 35 deletions(-)
+
+diff --git a/headers/private/drivers/meson_vdec.h b/headers/private/drivers/meson_vdec.h
+index 7dff592e88..a627cae4e8 100644
+--- a/headers/private/drivers/meson_vdec.h
++++ b/headers/private/drivers/meson_vdec.h
+@@ -43,9 +43,6 @@ enum {
+ 	MESON_VDEC_HEVC = 3,
+ 		// Main and Main 10, 4:2:0, to 8-bit NV12; linux-firmware's
+ 		// gxl_hevc.bin
+-	MESON_VDEC_HEVC_VENDOR = 4,
+-		// the same with the vendor kernel's microcode (for research: it is
+-		// not distributed)
+ };
+ 
+ struct meson_vdec_start {
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+index e97b12ebb9..41dad56520 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+@@ -67,7 +67,6 @@ MesonVdec::MesonVdec(device_node* node)
+ 	fSetupPending(false),
+ 	fEndReached(false),
+ 	fLastSetupInfo(0),
+-	fHevcVendor(false),
+ 	fHevcPicture(-1),
+ 	fHevcPictureOffset(0),
+ 	fHevcCodedWidth(0),
+@@ -764,7 +763,7 @@ MesonVdec::_WarmUp(const meson_vdec_start& start, const void* userFirmware)
+ status_t
+ MesonVdec::_StartSession(meson_vdec_start& start, const void* userFirmware)
+ {
+-	if (start.codec == MESON_VDEC_HEVC || start.codec == MESON_VDEC_HEVC_VENDOR)
++	if (start.codec == MESON_VDEC_HEVC)
+ 		return _StartHevc(start, userFirmware);
+ 	bool h264 = start.codec == MESON_VDEC_H264;
+ 	if (start.codec != MESON_VDEC_MPEG12 && !h264)
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp
+index e05f8f91b2..546fcb62fb 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp
+@@ -3,8 +3,7 @@
+  * Distributed under the terms of the MIT License.
+  *
+  * meson_vdec's HEVC block (PLAN.md M26 stage 3): the S905's HEVC decoder
+- * with linux-firmware's gxl_hevc.bin (MESON_VDEC_HEVC) or, for research,
+- * the vendor kernel's microcode (MESON_VDEC_HEVC_VENDOR). It decodes Main
++ * with linux-firmware's gxl_hevc.bin (MESON_VDEC_HEVC). It decodes Main
+  * and Main 10 streams (4:2:0, up to 1920x1088) to 8-bit NV12
+  * (10-bit ones keep their references compressed, and the NV12 copy is the
+  * firmware's "double write"). The register
+@@ -142,11 +141,11 @@ enum {
+ 	HEVC_LMEM_DUMP_ADR			= HEVC_SCRATCH(15),
+ 	HEVC_DECODE_MODE2			= HEVC_SCRATCH(17),	// gxl_hevc.bin
+ 	HEVC_NAL_SEARCH_CTL			= HEVC_SCRATCH(18),
+-	HEVC_DECODE_MODE			= HEVC_SCRATCH(19),	// gxl; vendor: NAL type
++	HEVC_DECODE_MODE			= HEVC_SCRATCH(19),
+ 	HEVC_DECODE_STOP_POS		= HEVC_SCRATCH(20),
+-	HEVC_AUX_ADR				= HEVC_SCRATCH(21),	// gxl; vendor: swap test
++	HEVC_AUX_ADR				= HEVC_SCRATCH(21),
+ 	HEVC_AUX_DATA_SIZE			= HEVC_SCRATCH(22),
+-	HEVC_DECODE_SIZE			= HEVC_SCRATCH(23),	// vendor: picture count
++	HEVC_DECODE_SIZE			= HEVC_SCRATCH(23),
+ };
+ 
+ enum {
+@@ -160,9 +159,7 @@ enum {
+ 	HEVC_STATUS_DONE			= 0xff,		// host: go on (skip)
+ };
+ 
+-// the parsed parameters (RPM), as gxl_hevc.bin numbers them; the vendor
+-// microcode has 8 tile entries less: its fields from misc_flag0 on are 8
+-// lower
++// the parsed parameters (RPM), as gxl_hevc.bin numbers them
+ enum {
+ 	RPM_RPS						= 0,	// to 15: the current RPS
+ 	RPM_NUM_REF_L0				= 16,
+@@ -378,7 +375,7 @@ MesonVdec::_StartHevcCodec()
+ 	_SetDos(HEVC_IQIT_SCALELUT_WR_ADDR, 0);
+ 	for (int32 i = 0; i < 1024; i++)
+ 		_SetDos(HEVC_IQIT_SCALELUT_DATA, 0);
+-	_SetDos(HEVC_DECODE_SIZE, fHevcVendor ? 0xffffffff : 0);
++	_SetDos(HEVC_DECODE_SIZE, 0);
+ 	_SetDos(HEVC_PARSER_CMD_WRITE, 1 << 16);
+ 	for (size_t i = 0; i < B_COUNT_OF(kParserCommands); i++)
+ 		_SetDos(HEVC_PARSER_CMD_WRITE, kParserCommands[i]);
+@@ -392,17 +389,12 @@ MesonVdec::_StartHevcCodec()
+ 	_SetDos(HEVC_ASSIST_MBOX1_CLR_REG, 1);
+ 	_SetDos(HEVC_ASSIST_MBOX1_MASK, 1);
+ 	_SetDos(HEVC_PSCALE_CTRL, 0);
+-	_SetDos(HEVC_NAL_SEARCH_CTL, fHevcVendor ? 0x8 : 0xc);
++	_SetDos(HEVC_NAL_SEARCH_CTL, 0xc);
+ 	_SetDos(HEVC_DECODE_STOP_POS, 0);
+-	if (fHevcVendor) {
+-		_SetDos(HEVC_AUX_ADR, 0);
+-		_SetDos(HEVC_AUX_DATA_SIZE, 0);
+-	} else {
+-		_SetDos(HEVC_DECODE_MODE, 0);
+-		_SetDos(HEVC_DECODE_MODE2, 0);
+-		_SetDos(HEVC_AUX_ADR, fAux.physical);
+-		_SetDos(HEVC_AUX_DATA_SIZE, (kHevcAuxSize / 16) << 16);
+-	}
++	_SetDos(HEVC_DECODE_MODE, 0);
++	_SetDos(HEVC_DECODE_MODE2, 0);
++	_SetDos(HEVC_AUX_ADR, fAux.physical);
++	_SetDos(HEVC_AUX_DATA_SIZE, (kHevcAuxSize / 16) << 16);
+ }
+ 
+ 
+@@ -439,7 +431,6 @@ MesonVdec::_StartHevc(meson_vdec_start& start, const void* userFirmware)
+ 		return B_BAD_VALUE;
+ 
+ 	fCodec = start.codec;
+-	fHevcVendor = start.codec == MESON_VDEC_HEVC_VENDOR;
+ 	fWidth = fHeight = 0;
+ 	status_t status;
+ 	if ((status = _KeepBuffer("meson_vdec firmware", kFirmwareSize,
+@@ -505,9 +496,8 @@ MesonVdec::_StartHevc(meson_vdec_start& start, const void* userFirmware)
+ 	static bool sReported = false;
+ 	if (!sReported) {
+ 		INFO("HEVC block: parser version %#" B_PRIx32 ", start code %#"
+-			B_PRIx32 ", emulation code %#" B_PRIx32 " (%s firmware)\n",
+-			version, startCode, emulateCode,
+-			fHevcVendor ? "vendor" : "linux-firmware");
++			B_PRIx32 ", emulation code %#" B_PRIx32 "\n", version,
++			startCode, emulateCode);
+ 		sReported = true;
+ 	}
+ 
+@@ -564,8 +554,6 @@ MesonVdec::_StartHevc(meson_vdec_start& start, const void* userFirmware)
+ uint32
+ MesonVdec::_Rpm(uint32 index) const
+ {
+-	if (fHevcVendor && index >= RPM_MISC_FLAG0)
+-		index -= 8;
+ 	return fRpm[(index & ~3u) + 3 - (index & 3)];
+ }
+ 
+@@ -1194,8 +1182,7 @@ MesonVdec::_HevcSlice()
+ 	_SetDos(HEVC_SAO_VB_SIZE, (saoUnit + 0x20) * fHevcCtbRows);
+ 	_SetDos(HEVC_SAO_VB, fWorkspace.physical + kWorkSaoVb);
+ 
+-	if (!fHevcVendor)
+-		_SetDos(HEVC_DECODE_SIZE, 0);
++	_SetDos(HEVC_DECODE_SIZE, 0);
+ 	fHevcSlices++;
+ 	asm volatile("dsb sy" : : : "memory");
+ 	_SetDos(HEVC_WAIT_FLAG, _Dos(HEVC_WAIT_FLAG) | 2);
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
+index cca0b41a43..2636050a87 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
+@@ -315,8 +315,7 @@ private:
+ 
+ 			// HEVC (meson_vdec_hevc.cpp)
+ 			bool				_IsHevc() const
+-									{ return fCodec == MESON_VDEC_HEVC
+-										|| fCodec == MESON_VDEC_HEVC_VENDOR; }
++									{ return fCodec == MESON_VDEC_HEVC; }
+ 			status_t			_StartHevc(meson_vdec_start& start,
+ 									const void* userFirmware);
+ 			void				_PowerUpHevc();
+@@ -421,7 +420,6 @@ private:
+ 			uint32				fLastSetupInfo;
+ 
+ 			// HEVC
+-			bool				fHevcVendor;
+ 			dma_buffer			fAux;
+ 			uint16				fRpm[128];
+ 			int32				fHevcPicture;

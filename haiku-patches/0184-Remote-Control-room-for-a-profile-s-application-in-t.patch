@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 20:38:38 -0400
+Subject: [PATCH 184/342] Remote Control: room for a profile's application in
+ the list
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/preferences/remotecontrol/RemoteWindow.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/preferences/remotecontrol/RemoteWindow.cpp b/src/preferences/remotecontrol/RemoteWindow.cpp
+index 357c8370f4..d078a3c53a 100644
+--- a/src/preferences/remotecontrol/RemoteWindow.cpp
++++ b/src/preferences/remotecontrol/RemoteWindow.cpp
+@@ -284,6 +284,10 @@ RemoteWindow::RemoteWindow()
+ {
+ 	fProfileList = new BListView("profiles");
+ 	fProfileList->SetSelectionMessage(new BMessage(kMsgProfileSelected));
++	// room for a name and the application its profile is for
++	fProfileList->SetExplicitMinSize(BSize(
++		be_plain_font->StringWidth("A remote's name (in MediaPlayer)"),
++		B_SIZE_UNSET));
+ 	BScrollView* profileScroll = new BScrollView("profiles scroll",
+ 		fProfileList, 0, false, true);
+ 	fNewButton = new BButton("New", new BMessage(kMsgNewProfile));

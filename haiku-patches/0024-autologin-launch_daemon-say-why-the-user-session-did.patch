@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 10:09:59 -0400
+Subject: [PATCH 024/342] autologin, launch_daemon: say why the user session
+ did not start
+
+On the ODROID-C2 about one boot in 25 ends without a desktop: no
+autologin, no user launch_daemon, no app_server, and nothing on the
+debug output, since every failure on that path was silent. autologin
+now logs when it starts and each failure, and retries the user lookup
+and the session start for 30 s (in case the registrar is not ready);
+the user launch_daemon logs a missing user, failing to switch to it, and
+a failed session start.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/bin/autologin.cpp               | 41 ++++++++++++++++++++++-------
+ src/servers/launch/LaunchDaemon.cpp | 23 ++++++++--------
+ 2 files changed, 44 insertions(+), 20 deletions(-)
+
+diff --git a/src/bin/autologin.cpp b/src/bin/autologin.cpp
+index 76c69c1f5f..db9b4ea30e 100644
+--- a/src/bin/autologin.cpp
++++ b/src/bin/autologin.cpp
+@@ -4,29 +4,52 @@
+  */
+ 
+ 
++#include <errno.h>
+ #include <pwd.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <string.h>
+ 
+ #include <LaunchRoster.h>
++#include <OS.h>
+ 
+ 
+ int
+ main()
+ {
+-	if (getuid() != 0)
++	debug_printf("autologin: starting\n");
++	if (getuid() != 0) {
++		debug_printf("autologin: not running as root\n");
+ 		return EXIT_FAILURE;
++	}
+ 
+ 	// TODO: This will obviously be done differently in a multi-user
+ 	// environment; we'll probably want to merge this with the standard
+ 	// login application then.
+-	struct passwd* passwd = getpwuid(0);
+-	if (passwd == NULL)
+-		return EXIT_FAILURE;
+-
+-	status_t status = BLaunchRoster().StartSession(passwd->pw_name);
+-	if (status != B_OK)
+-		return EXIT_FAILURE;
+ 
+-	return EXIT_SUCCESS;
++	// The user lookup goes to the registrar; when it or the session start
++	// fails early in the boot, there would be no desktop and no message.
++	// Retry for a while, and say what failed on the debug output.
++	for (int32 attempt = 0; attempt < 30; attempt++) {
++		if (attempt > 0)
++			snooze(1000000);
++
++		errno = 0;
++		struct passwd* passwd = getpwuid(0);
++		if (passwd == NULL) {
++			debug_printf("autologin: no user with ID 0 (%s)\n",
++				errno != 0 ? strerror(errno) : "not found");
++			continue;
++		}
++
++		status_t status = BLaunchRoster().StartSession(passwd->pw_name);
++		if (status != B_OK) {
++			debug_printf("autologin: cannot start the session of \"%s\": %s\n",
++				passwd->pw_name, strerror(status));
++			continue;
++		}
++		debug_printf("autologin: session of \"%s\" started\n", passwd->pw_name);
++		return EXIT_SUCCESS;
++	}
++	return EXIT_FAILURE;
+ }
+diff --git a/src/servers/launch/LaunchDaemon.cpp b/src/servers/launch/LaunchDaemon.cpp
+index 5e30134bde..67ff53c689 100644
+--- a/src/servers/launch/LaunchDaemon.cpp
++++ b/src/servers/launch/LaunchDaemon.cpp
+@@ -2111,24 +2111,21 @@ static int
+ user_main(const char* login)
+ {
+ 	struct passwd* passwd = getpwnam(login);
+-	if (passwd == NULL)
+-		return B_NAME_NOT_FOUND;
+-	if (strcmp(passwd->pw_name, login) != 0)
++	if (passwd == NULL || strcmp(passwd->pw_name, login) != 0) {
++		debug_printf("launch_daemon: no user \"%s\" for the session\n", login);
+ 		return B_NAME_NOT_FOUND;
++	}
+ 
+ 	// Check if there is a user session running already
+ 	uid_t user = passwd->pw_uid;
+ 	gid_t group = passwd->pw_gid;
+ 
+-	if (setsid() < 0)
+-		exit(EXIT_FAILURE);
+-
+-	if (initgroups(login, group) == -1)
+-		exit(EXIT_FAILURE);
+-	if (setgid(group) != 0)
+-		exit(EXIT_FAILURE);
+-	if (setuid(user) != 0)
++	if (setsid() < 0 || initgroups(login, group) == -1 || setgid(group) != 0
++		|| setuid(user) != 0) {
++		debug_printf("launch_daemon: cannot become user \"%s\": %s\n", login,
++			strerror(errno));
+ 		exit(EXIT_FAILURE);
++	}
+ 
+ 	if (passwd->pw_dir != NULL && passwd->pw_dir[0] != '\0') {
+ 		setenv("HOME", passwd->pw_dir, true);
+@@ -2144,6 +2141,10 @@ user_main(const char* login)
+ 	LaunchDaemon* daemon = new LaunchDaemon(true, status);
+ 	if (status == B_OK)
+ 		daemon->Run();
++	else {
++		debug_printf("launch_daemon: session of \"%s\" failed: %s\n", login,
++			strerror(status));
++	}
+ 
+ 	delete daemon;
+ 	return 0;

@@ -1,0 +1,398 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 14:49:53 -0500
+Subject: [PATCH 228/342] ffmpeg plugin: AAC sound tracks, with their
+ configuration
+
+The encoder gave a codec the input's sample format whether it took it or
+not; FFmpeg's AAC encoder takes planar floats only, failed to open at the
+first frame, and every frame after failed too, so an AAC track stayed
+empty. Samples are now converted (libswresample) to the codec's first
+format when it doesn't take theirs. Audio frame times are counted in
+samples, in the codec's time base (they were microseconds, counted twice).
+
+The encoder passes its extradata with each chunk as codec_data, and the
+writer's header now waits for an AAC stream's configuration as it does
+for an H.264 stream's parameter sets: Matroska needs it to be played.
+Chunks wait for the header up to 16 MB, then it is written without what
+didn't come. The writer's chunks go one at a time, as a recording writes
+its video and its sound from two threads.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../media/plugins/ffmpeg/AVCodecEncoder.cpp   | 67 +++++++++++--
+ .../media/plugins/ffmpeg/AVCodecEncoder.h     |  5 +
+ .../media/plugins/ffmpeg/AVFormatWriter.cpp   | 99 +++++++++++++++----
+ .../media/plugins/ffmpeg/AVFormatWriter.h     |  6 +-
+ 4 files changed, 146 insertions(+), 31 deletions(-)
+
+diff --git a/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.cpp b/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.cpp
+index 46f62592fc..ae8d12f4fa 100644
+--- a/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.cpp
++++ b/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.cpp
+@@ -52,6 +52,8 @@ AVCodecEncoder::AVCodecEncoder(uint32 codecID, int bitRateScale)
+ 	fFrame(av_frame_alloc()),
+ 	fSwsContext(NULL),
+ 	fConvertNeon(false),
++	fInputSampleFormat(AV_SAMPLE_FMT_NONE),
++	fResampleContext(NULL),
+ 	fFramesWritten(0)
+ {
+ 	TRACE("AVCodecEncoder::AVCodecEncoder()\n");
+@@ -87,6 +89,7 @@ AVCodecEncoder::~AVCodecEncoder()
+ 
+ 	if (fSwsContext != NULL)
+ 		sws_freeContext(fSwsContext);
++	swr_free(&fResampleContext);
+ 
+ #if LIBAVCODEC_VERSION_MAJOR >= 60
+ 	av_fifo_freep2(&fAudioFifo);
+@@ -395,6 +398,18 @@ AVCodecEncoder::_Setup()
+ 				return B_MEDIA_BAD_FORMAT;
+ 				break;
+ 		}
++		// a codec that doesn't take these samples gets them in its own
++		// first format (_OpenCodecIfNeeded() sets up the conversion)
++		fInputSampleFormat = fCodecContext->sample_fmt;
++		if (fCodec->sample_fmts != NULL) {
++			const AVSampleFormat* format = fCodec->sample_fmts;
++			while (*format != AV_SAMPLE_FMT_NONE && *format != fInputSampleFormat)
++				format++;
++			if (*format == AV_SAMPLE_FMT_NONE)
++				fCodecContext->sample_fmt = fCodec->sample_fmts[0];
++		}
++		// the frames' times are counted in samples
++		fCodecContext->time_base = (AVRational){1, fCodecContext->sample_rate};
+ #if LIBAVCODEC_VERSION_MAJOR >= 60
+ 		if (fInputFormat.u.raw_audio.channel_mask == 0) {
+ 			// guess the channel mask...
+@@ -517,6 +532,23 @@ AVCodecEncoder::_OpenCodecIfNeeded()
+ 	else
+ 		fCodecInitStatus = CODEC_INIT_FAILED;
+ 
++#if LIBAVCODEC_VERSION_MAJOR >= 60
++	swr_free(&fResampleContext);
++	if (fCodecInitStatus == CODEC_INIT_DONE
++		&& fInputFormat.type == B_MEDIA_RAW_AUDIO
++		&& fCodecContext->sample_fmt != fInputSampleFormat) {
++		if (swr_alloc_set_opts2(&fResampleContext,
++				&fCodecContext->ch_layout, fCodecContext->sample_fmt,
++				fCodecContext->sample_rate,
++				&fCodecContext->ch_layout, fInputSampleFormat,
++				fCodecContext->sample_rate, 0, NULL) < 0
++			|| swr_init(fResampleContext) < 0) {
++			swr_free(&fResampleContext);
++			fCodecInitStatus = CODEC_INIT_FAILED;
++		}
++	}
++#endif
++
+ 	TRACE("  avcodec_open(%p, %p): %d\n", fCodecContext, fCodec, result);
+ 
+ 	return fCodecInitStatus == CODEC_INIT_DONE;
+@@ -613,7 +645,21 @@ AVCodecEncoder::_EncodeAudio(const uint8* buffer, size_t bufferSize,
+ 		av_frame_unref(fFrame);
+ 		fFrame->nb_samples = frameCount;
+ 
+-		int count = avcodec_fill_audio_frame(fFrame, get_channel_count(fCodecContext),
++		int count;
++#if LIBAVCODEC_VERSION_MAJOR >= 60
++		fFrame->format = fCodecContext->sample_fmt;
++		fFrame->sample_rate = fCodecContext->sample_rate;
++		av_channel_layout_copy(&fFrame->ch_layout, &fCodecContext->ch_layout);
++		if (fResampleContext != NULL) {
++			// converted into the frame's own buffers
++			count = av_frame_get_buffer(fFrame, 0);
++			if (count == 0) {
++				count = swr_convert(fResampleContext, fFrame->extended_data,
++					frameCount, &buffer, frameCount);
++			}
++		} else
++#endif
++		count = avcodec_fill_audio_frame(fFrame, get_channel_count(fCodecContext),
+ 			fCodecContext->sample_fmt, (const uint8_t*)buffer, bufferSize, 1);
+ 
+ 		if (count < 0) {
+@@ -622,9 +668,8 @@ AVCodecEncoder::_EncodeAudio(const uint8* buffer, size_t bufferSize,
+ 			return B_ERROR;
+ 		}
+ 
+-		/* Set the presentation time of the frame */
+-		fFrame->pts = (bigtime_t)(fFramesWritten * 1000000LL
+-			/ fInputFormat.u.raw_audio.frame_rate);
++		// the presentation time of the frame, in samples (the time base)
++		fFrame->pts = fFramesWritten;
+ 		fFramesWritten += fFrame->nb_samples;
+ 
+ 		ret = avcodec_send_frame(fCodecContext, fFrame);
+@@ -636,8 +681,10 @@ AVCodecEncoder::_EncodeAudio(const uint8* buffer, size_t bufferSize,
+ 		gotPacket = (ret == 0);
+ 	}
+ 
+-	if (buffer && fFrame->extended_data != fFrame->data)
++	if (buffer && fResampleContext == NULL
++		&& fFrame->extended_data != fFrame->data) {
+ 		av_freep(&fFrame->extended_data);
++	}
+ 
+ 	if (ret != 0) {
+ 		TRACE("  avcodec_encode_audio() failed: %s\n", strerror(ret));
+@@ -645,17 +692,21 @@ AVCodecEncoder::_EncodeAudio(const uint8* buffer, size_t bufferSize,
+ 		return B_ERROR;
+ 	}
+ 
+-	fFramesWritten += frameCount;
+-
+ 	if (gotPacket) {
+ 		// Setup media_encode_info, most important is the time stamp.
+-		info->start_time = packet->pts;
++		info->start_time = av_rescale_q(packet->pts, fCodecContext->time_base,
++			(AVRational){1, 1000000});
+ 
+ 		if (packet->flags & AV_PKT_FLAG_KEY)
+ 			info->flags = B_MEDIA_KEY_FRAME;
+ 		else
+ 			info->flags = 0;
+ 
++		// the codec's configuration (AAC's), which the writer puts into
++		// the file's header
++		info->codec_data = fCodecContext->extradata;
++		info->codec_data_size = fCodecContext->extradata_size;
++
+ 		// We got a packet out of the encoder, write it to the output stream
+ 		ret = WriteChunk(packet->data, packet->size, info);
+ 		if (ret != B_OK) {
+diff --git a/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.h b/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.h
+index 9e61ef8356..04bf5007dc 100644
+--- a/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.h
++++ b/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.h
+@@ -10,6 +10,7 @@
+ 
+ extern "C" {
+ 	#include "avcodec.h"
++	#include "swresample.h"
+ 	#include "swscale.h"
+ 	#include "libavutil/fifo.h"
+ }
+@@ -95,6 +96,10 @@ private:
+ #else
+ 			AVFifoBuffer*		fAudioFifo;
+ #endif
++			AVSampleFormat		fInputSampleFormat;
++			SwrContext*			fResampleContext;
++				// to the codec's sample format, when it doesn't take
++				// the input's (AAC takes planar floats only)
+ 
+ 			int64				fFramesWritten;
+ 
+diff --git a/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.cpp b/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.cpp
+index b30cfbd262..ead41f0552 100644
+--- a/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.cpp
++++ b/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.cpp
+@@ -45,6 +45,21 @@ extern "C" {
+ 
+ 
+ static const size_t kIOBufferSize = 64 * 1024;
++static const size_t kMaxPendingSize = 16 * 1024 * 1024;
++	// the header waits for codec data no longer than this many bytes of
++	// chunks
++
++
++/*!	Whether a stream's codec data is still to come with its first chunk:
++	containers such as Matroska need it in their header.
++*/
++static bool
++waits_for_codec_data(const AVCodecParameters* parameters)
++{
++	return (parameters->codec_id == AV_CODEC_ID_H264
++			|| parameters->codec_id == AV_CODEC_ID_AAC)
++		&& parameters->extradata_size == 0;
++}
+ 	// TODO: This could depend on the BMediaFile creation flags, IIRC,
+ 	// they allow to specify a buffering mode.
+ 
+@@ -69,13 +84,11 @@ public:
+ 			status_t			AddTrackInfo(uint32 code, const void* data,
+ 									size_t size, uint32 flags);
+ 
++			void				TakeCodecData(const void* chunkBuffer,
++									size_t chunkSize,
++									const media_encode_info* encodeInfo);
+ 			void				TakeParameterSets(const void* chunkBuffer,
+ 									size_t chunkSize);
+-			bool				WaitsForParameterSets() const
+-									{ return fStream->codecpar->codec_id
+-										== AV_CODEC_ID_H264
+-										&& fStream->codecpar->extradata_size
+-											== 0; }
+ 
+ private:
+ 			AVFormatContext*	fFormatContext;
+@@ -394,6 +407,35 @@ AVFormatWriter::StreamCookie::AddTrackInfo(uint32 code,
+ }
+ 
+ 
++/*!	A stream's codec data from its chunk: an H.264 stream's parameter sets
++	from the chunk itself, other streams' from what the encoder passed with
++	the chunk (the plugin's encoders pass their extradata, an AAC encoder's
++	AudioSpecificConfig, as codec_data).
++*/
++void
++AVFormatWriter::StreamCookie::TakeCodecData(const void* chunkBuffer,
++	size_t chunkSize, const media_encode_info* encodeInfo)
++{
++	AVCodecParameters* parameters = fStream->codecpar;
++	if (parameters->extradata_size > 0)
++		return;
++	if (parameters->codec_id == AV_CODEC_ID_H264) {
++		TakeParameterSets(chunkBuffer, chunkSize);
++		return;
++	}
++	if (encodeInfo->codec_data == NULL || encodeInfo->codec_data_size == 0)
++		return;
++
++	parameters->extradata = (uint8_t*)av_mallocz(encodeInfo->codec_data_size
++		+ AV_INPUT_BUFFER_PADDING_SIZE);
++	if (parameters->extradata == NULL)
++		return;
++	memcpy(parameters->extradata, encodeInfo->codec_data,
++		encodeInfo->codec_data_size);
++	parameters->extradata_size = encodeInfo->codec_data_size;
++}
++
++
+ /*!	An H.264 stream without extradata (from an encoder that puts its
+ 	parameter sets into the stream, as hardware encoders do) gets the
+ 	sequence and picture parameter sets of its first chunk, Annex B as they
+@@ -458,9 +500,9 @@ AVFormatWriter::StreamCookie::TakeParameterSets(const void* chunkBuffer,
+ // #pragma mark - AVFormatWriter
+ 
+ 
+-/*!	A chunk of another stream that came while the header waited for an
+-	H.264 stream's first chunk: its time can't be put into the stream's time
+-	base before the header sets that.
++/*!	A chunk that came while the header waited for the streams' codec data:
++	its time can't be put into the stream's time base before the header sets
++	that.
+ */
+ struct AVFormatWriter::PendingChunk {
+ 	PendingChunk*		next;
+@@ -478,6 +520,7 @@ AVFormatWriter::AVFormatWriter()
+ 	fHeaderError(-1),
+ 	fHeaderDeferred(false),
+ 	fPendingChunks(NULL),
++	fPendingSize(0),
+ 	fIOContext(NULL),
+ 	fStreamLock("stream lock")
+ {
+@@ -572,12 +615,10 @@ AVFormatWriter::CommitHeader()
+ 	// We need to close the codecs we opened, even in case of failure.
+ 	fCodecOpened = true;
+ 
+-	// An H.264 stream that has no extradata yet gets it from its first
+-	// chunk (TakeParameterSets()): the header is written then.
++	// A stream that has no codec data yet gets it with its first chunk
++	// (TakeCodecData()): the header is written once all have it.
+ 	for (unsigned i = 0; i < fFormatContext->nb_streams; i++) {
+-		AVCodecParameters* parameters = fFormatContext->streams[i]->codecpar;
+-		if (parameters->codec_id == AV_CODEC_ID_H264
+-			&& parameters->extradata_size == 0) {
++		if (waits_for_codec_data(fFormatContext->streams[i]->codecpar)) {
+ 			fHeaderDeferred = true;
+ 			return B_OK;
+ 		}
+@@ -633,8 +674,8 @@ AVFormatWriter::Close()
+ 	if (!fCodecOpened)
+ 		return B_NOT_ALLOWED;
+ 
+-	// a file without any H.264 chunk still gets its header, and the chunks
+-	// that waited for it are written
++	// a file whose streams' codec data didn't all come still gets its
++	// header, and the chunks that waited for it are written
+ 	if (fHeaderDeferred) {
+ 		_WriteHeader();
+ 		while (fPendingChunks != NULL) {
+@@ -735,10 +776,21 @@ AVFormatWriter::WriteChunk(void* _cookie, const void* chunkBuffer,
+ 	TRACE_PACKET("AVFormatWriter::WriteChunk(%p, %ld, %p)\n", chunkBuffer,
+ 		chunkSize, encodeInfo);
+ 
++	// the streams' encoders may write from their own threads (a recording's
++	// video and sound): the header and what waits for it go one at a time
++	BAutolock _(fStreamLock);
++
+ 	StreamCookie* cookie = reinterpret_cast<StreamCookie*>(_cookie);
+ 	if (fHeaderDeferred) {
+-		if (!cookie->WaitsForParameterSets()) {
+-			// another stream's chunk: it waits for the header too
++		cookie->TakeCodecData(chunkBuffer, chunkSize, encodeInfo);
++
++		bool waiting = false;
++		for (unsigned i = 0; i < fFormatContext->nb_streams; i++) {
++			if (waits_for_codec_data(fFormatContext->streams[i]->codecpar))
++				waiting = true;
++		}
++		if (waiting && fPendingSize + chunkSize <= kMaxPendingSize) {
++			// another stream's codec data is still to come
+ 			PendingChunk* chunk = (PendingChunk*)malloc(sizeof(PendingChunk)
+ 				+ chunkSize);
+ 			if (chunk == NULL)
+@@ -746,24 +798,25 @@ AVFormatWriter::WriteChunk(void* _cookie, const void* chunkBuffer,
+ 			chunk->next = NULL;
+ 			chunk->cookie = cookie;
+ 			chunk->info = *encodeInfo;
++			chunk->info.codec_data = NULL;
++			chunk->info.codec_data_size = 0;
+ 			chunk->size = chunkSize;
+ 			memcpy(chunk->data, chunkBuffer, chunkSize);
+ 			PendingChunk** last = &fPendingChunks;
+ 			while (*last != NULL)
+ 				last = &(*last)->next;
+ 			*last = chunk;
++			fPendingSize += chunkSize;
+ 			return B_OK;
+ 		}
+-		cookie->TakeParameterSets(chunkBuffer, chunkSize);
+ 		_WriteHeader();
+ 	}
+ 
+ 	if (fHeaderError != 0)
+ 		return B_ERROR;
+ 
+-	status_t status = cookie->WriteChunk(chunkBuffer, chunkSize, encodeInfo);
+-
+-	// what waited for the header
++	// what waited for the header first, keeping each stream's order
++	status_t status = B_OK;
+ 	while (fPendingChunks != NULL) {
+ 		PendingChunk* chunk = fPendingChunks;
+ 		fPendingChunks = chunk->next;
+@@ -773,6 +826,10 @@ AVFormatWriter::WriteChunk(void* _cookie, const void* chunkBuffer,
+ 		}
+ 		free(chunk);
+ 	}
++	fPendingSize = 0;
++
++	if (status == B_OK)
++		status = cookie->WriteChunk(chunkBuffer, chunkSize, encodeInfo);
+ 	return status;
+ }
+ 
+diff --git a/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.h b/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.h
+index b686928985..9a5708564a 100644
+--- a/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.h
++++ b/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.h
+@@ -57,10 +57,12 @@ private:
+ 			bool				fCodecOpened;
+ 			int					fHeaderError;
+ 			bool				fHeaderDeferred;
+-				// until an H.264 stream's parameter sets came
++				// until the streams' codec data came (an H.264 stream's
++				// parameter sets, an AAC stream's configuration)
+ 			struct PendingChunk;
+ 			PendingChunk*		fPendingChunks;
+-				// other streams' chunks, while the header waits
++				// the chunks that came while the header waits
++			size_t				fPendingSize;
+ 
+ 			AVIOContext*		fIOContext;
+ 

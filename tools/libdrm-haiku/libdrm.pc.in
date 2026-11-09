@@ -1,0 +1,8 @@
+libdir=@libdir@
+includedir=@includedir@
+
+Name: libdrm
+Description: libdrm stand-in for Haiku's meson_mali (tools/libdrm-haiku)
+Version: @version@
+Libs: -L${libdir} -ldrm
+Cflags: -I${includedir}

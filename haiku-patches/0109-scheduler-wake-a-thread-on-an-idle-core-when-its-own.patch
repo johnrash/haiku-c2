@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 15:01:07 -0400
+Subject: [PATCH 109/342] scheduler: wake a thread on an idle core when its own
+ core is busy
+
+In low latency mode a woken thread stayed on its last core unless the
+cores' long-term loads were far apart. When that core was busy right
+now, usually with the thread that woke it, the woken thread either
+waited behind it or, with its rotating additional penalty often making
+it the higher priority one, preempted it, while the other cores idled.
+Each release_sem() then cost the releasing thread 80 to 560 us on the
+ODROID-C2, and the last of four threads woken in a row started up to
+1.2 ms late (tools/probes/condwake.c in the port's project).
+
+Now a thread whose core has no idle CPU goes to an idle core of the
+same package, which shares its caches, as Linux's select_idle_sibling()
+does. Power saving mode, which packs threads onto few cores, keeps its
+behaviour.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/kernel/scheduler/low_latency.cpp   | 15 +++++++++++++--
+ src/system/kernel/scheduler/scheduler_cpu.cpp | 19 +++++++++++++++++++
+ src/system/kernel/scheduler/scheduler_cpu.h   |  3 +++
+ 3 files changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/src/system/kernel/scheduler/low_latency.cpp b/src/system/kernel/scheduler/low_latency.cpp
+index bb81211d4b..76c69973b9 100644
+--- a/src/system/kernel/scheduler/low_latency.cpp
++++ b/src/system/kernel/scheduler/low_latency.cpp
+@@ -93,11 +93,22 @@ rebalance(const ThreadData* threadData)
+ 	CoreEntry* core = threadData->Core();
+ 	ASSERT(core != NULL);
+ 
+-	// Get the least loaded core.
+-	ReadSpinLocker coreLocker(gCoreHeapsLock);
+ 	CPUSet mask = threadData->GetCPUMask();
+ 	const bool useMask = !mask.IsEmpty();
+ 
++	// The thread's core is busy right now, but another core of its package
++	// (whose caches it shares) is idle: start there at once rather than
++	// preempting the thread running on its core (often the one waking it,
++	// which then waits while the other cores idle), or waiting behind it.
++	if (!core->HasIdleCPU()) {
++		CoreEntry* idleCore = core->Package()->FindIdleCore(mask);
++		if (idleCore != NULL)
++			return idleCore;
++	}
++
++	// Get the least loaded core.
++	ReadSpinLocker coreLocker(gCoreHeapsLock);
++
+ 	int32 index = 0;
+ 	CoreEntry* other;
+ 	do {
+diff --git a/src/system/kernel/scheduler/scheduler_cpu.cpp b/src/system/kernel/scheduler/scheduler_cpu.cpp
+index 33d316bf04..380b7ffcf3 100644
+--- a/src/system/kernel/scheduler/scheduler_cpu.cpp
++++ b/src/system/kernel/scheduler/scheduler_cpu.cpp
+@@ -660,6 +660,25 @@ PackageEntry::Init(int32 id)
+ }
+ 
+ 
++/*!	An idle core of the package that \a mask allows (an empty mask allows
++	any), or NULL. It may be busy again by the time the caller uses it.
++*/
++CoreEntry*
++PackageEntry::FindIdleCore(const CPUSet& mask)
++{
++	SCHEDULER_ENTER_FUNCTION();
++
++	const bool useMask = !mask.IsEmpty();
++	ReadSpinLocker _(fCoreLock);
++	for (CoreEntry* core = fIdleCores.Last(); core != NULL;
++			core = fIdleCores.GetPrevious(core)) {
++		if (!useMask || core->CPUMask().Matches(mask))
++			return core;
++	}
++	return NULL;
++}
++
++
+ void
+ PackageEntry::AddIdleCore(CoreEntry* core)
+ {
+diff --git a/src/system/kernel/scheduler/scheduler_cpu.h b/src/system/kernel/scheduler/scheduler_cpu.h
+index 1665c51ee0..e6d39255ae 100644
+--- a/src/system/kernel/scheduler/scheduler_cpu.h
++++ b/src/system/kernel/scheduler/scheduler_cpu.h
+@@ -141,6 +141,8 @@ public:
+ 	inline				CPUPriorityHeap*	CPUHeap();
+ 
+ 	inline				int32			ThreadCount() const;
++	inline				bool			HasIdleCPU() const
++											{ return fIdleCPUCount > 0; }
+ 
+ 	inline				void			LockRunQueue();
+ 	inline				void			UnlockRunQueue();
+@@ -234,6 +236,7 @@ public:
+ 	inline				void				CoreWakesUp(CoreEntry* core);
+ 
+ 	inline				CoreEntry*			GetIdleCore(int32 index = 0) const;
++						CoreEntry*			FindIdleCore(const CPUSet& mask);
+ 
+ 						void				AddIdleCore(CoreEntry* core);
+ 						void				RemoveIdleCore(CoreEntry* core);

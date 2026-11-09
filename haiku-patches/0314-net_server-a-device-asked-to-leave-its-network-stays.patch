@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 5 Nov 2026 21:40:25 -0500
+Subject: [PATCH 314/342] net_server: a device asked to leave its network stays
+ off
+
+After "ifconfig <device> leave" (or a disconnect from the Deskbar), the
+autoconfiguration joined a saved network again about 30 seconds later, as
+it does after the link was lost. Asked to leave, a device now stays off
+until it's asked to join a network, or the net_server starts again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/servers/net/NetServer.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/servers/net/NetServer.cpp b/src/servers/net/NetServer.cpp
+index 49881de044..f38358bdf6 100644
+--- a/src/servers/net/NetServer.cpp
++++ b/src/servers/net/NetServer.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include <errno.h>
+ #include <map>
++#include <set>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string>
+@@ -60,6 +61,7 @@ using namespace BNetworkKit;
+ 
+ typedef std::map<std::string, AutoconfigLooper*> LooperMap;
+ typedef std::map<std::string, bigtime_t> JoinTimeMap;
++typedef std::set<std::string> DeviceSet;
+ 
+ static const bigtime_t kJoinGracePeriod = 30000000LL;
+ 	// an automatic join leaves a device alone for this long after it was
+@@ -112,6 +114,8 @@ private:
+ 			BNetworkSettings	fSettings;
+ 			LooperMap			fDeviceMap;
+ 			JoinTimeMap			fJoinTimes;
++			DeviceSet			fLeftDevices;
++				// left a network by request: not joined again by itself
+ 			BMessenger			fServices;
+ };
+ 
+@@ -958,6 +962,10 @@ NetServer::_AutoJoinNetwork(const BMessage& message)
+ 	if (device.HasLink())
+ 		return B_OK;
+ 
++	// Asked to leave its network, a device stays off until asked to join one.
++	if (fLeftDevices.find(name) != fLeftDevices.end())
++		return B_OK;
++
+ 	// A join asked for moments ago (by the user, say) may still be going on.
+ 	JoinTimeMap::const_iterator joined = fJoinTimes.find(name);
+ 	if (joined != fJoinTimes.end()
+@@ -1047,6 +1055,8 @@ NetServer::_JoinNetwork(const BMessage& message, const BNetworkAddress* address,
+ 	}
+ 
+ 	fJoinTimes[deviceName] = system_time();
++	if (message.what != kMsgAutoJoinNetwork)
++		fLeftDevices.erase(deviceName);
+ 
+ 	// Search for a network configuration that may override the defaults
+ 
+@@ -1217,6 +1227,8 @@ NetServer::_LeaveNetwork(const BMessage& message)
+ 	if (message.FindInt32("reason", &reason) != B_OK)
+ 		reason = IEEE80211_REASON_AUTH_LEAVE;
+ 
++	fLeftDevices.insert(deviceName);
++
+ 	// We always try to send the leave request to the wpa_supplicant.
+ 
+ 	BMessenger wpaSupplicant(kWPASupplicantSignature);

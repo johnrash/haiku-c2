@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 17:40:00 -0400
+Subject: [PATCH 126/342] meson_vdec: the end of the stream once the firmware
+ has frames to decode into
+
+AV_SCRATCH_E did not show the firmware waiting for frames at 1080p; the
+driver's own count does: no report waiting for the caller, at most four
+frames with the caller.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/drivers/video/meson_vdec/meson_vdec.cpp    | 11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+index 566afa61f8..fb98e99213 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+@@ -1015,9 +1015,10 @@ MesonVdec::_Write(const uint8* userData, size_t size)
+ /*!	A sequence end code, for the firmware to put out the frames it holds.
+ 	Sent while the firmware still decodes, it lost the pictures it had not
+ 	reported yet (the third from the end; more while it waited for frames
+-	back), so it waits until the firmware has been quiet for a while and
+-	isn't waiting for a frame (AV_SCRATCH_E): it has decoded what it can
+-	(the caller has to take and give back frames meanwhile).
++	back), so it waits until the firmware has been quiet for a while with
++	enough frames to decode into (none of its reports waiting for the
++	caller, at most four frames with the caller): it has decoded what it
++	can. The caller has to take and give back frames meanwhile.
+ */
+ status_t
+ MesonVdec::_EndOfStream()
+@@ -1029,9 +1030,9 @@ MesonVdec::_EndOfStream()
+ 		InterruptsSpinLocker locker(fStateLock);
+ 		_CheckDecoder();
+ 		bigtime_t quiet = system_time() - fLastReport;
+-		bool waiting = _Dos(AV_SCRATCH_E) != 0;
++		bool starved = fQueueCount > 0 || __builtin_popcount(fHeld) > 4;
+ 		locker.Unlock();
+-		if (quiet > 40000 && !waiting)
++		if (quiet > 40000 && !starved)
+ 			break;
+ 		snooze(kPollInterval);
+ 	}

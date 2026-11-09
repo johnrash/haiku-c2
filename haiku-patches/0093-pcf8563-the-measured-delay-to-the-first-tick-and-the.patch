@@ -1,0 +1,221 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 12:10:29 -0400
+Subject: [PATCH 093/342] pcf8563: the measured delay to the first tick, and
+ the clock's drift
+
+On the RTC shield's clock the first tick after STOP is released comes
+63/128 s later (491.5 to 492.3 ms from the start of the release's
+write over six settings), not the 0.5078 s assumed, so the clock's
+second landed 16 ms early. And when the time is set, log how far off
+the clock was from the new time, and how long after it was last read or
+set: its drift.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/drivers/rtc/pcf8563/pcf8563.cpp    | 90 +++++++++++++++----
+ 1 file changed, 74 insertions(+), 16 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/rtc/pcf8563/pcf8563.cpp b/src/add-ons/kernel/drivers/rtc/pcf8563/pcf8563.cpp
+index 96fa37cebf..039c1f0804 100644
+--- a/src/add-ons/kernel/drivers/rtc/pcf8563/pcf8563.cpp
++++ b/src/add-ons/kernel/drivers/rtc/pcf8563/pcf8563.cpp
+@@ -14,9 +14,10 @@
+  *   seconds change and sets the system time again from that moment, to a
+  *   millisecond or two.
+  * - Writing: it stops the clock's divider (STOP), writes the second about
+- *   to come and releases the divider so the next tick, which the datasheet
+- *   puts 0.507813 s after the release, falls on the second. Then it polls
+- *   for that tick and logs how far off it came.
++ *   to come and releases the divider so the next tick, which comes 63/128 s
++ *   (0.492 s) after the release, falls on the second. Then it polls for
++ *   that tick and logs how far off it came, and how far off the clock was
++ *   from the new time before (its drift since it was last set or read).
+  * A clock whose VL flag is set (its supply dropped too low: battery empty,
+  * or never set) is not used until the time is set.
+  *
+@@ -25,7 +26,9 @@
+  */
+ 
+ 
++#include <algorithm>
+ #include <new>
++#include <stdarg.h>
+ #include <stdio.h>
+ #include <string.h>
+ #include <time.h>
+@@ -53,8 +56,9 @@ static const uint8 kSeconds = 0x02;
+ static const uint8 kSecondsVoltageLow = 1 << 7;
+ static const size_t kTimeRegisters = 7;
+ 
+-static const bigtime_t kFirstTickAfterStop = 507813;
+-	// the datasheet: 0.507813 to 0.507935 s after STOP is released
++static const bigtime_t kFirstTickAfterStop = 492188;
++	// 63/128 s after STOP is released: 491.5 to 492.3 ms from the start of
++	// the release's write on the shield's clock, over six settings
+ static const bigtime_t kReleaseWriteTime = 270;
+ 	// from the start of the release's write to the end of its data byte
+ static const bigtime_t kSetMargin = 50000;
+@@ -124,6 +128,13 @@ private:
+ 			bool				fValidAtBoot;
+ 			Measurement			fBootRead;
+ 			Measurement			fLastSet;
++
++			bool				fClockOffsetKnown;
++			bigtime_t			fClockOffset;
++				// the clock shows system_time() + fClockOffset, since:
++			bigtime_t			fClockOffsetSince;
++			bigtime_t			fLastDrift;
++			bigtime_t			fLastDriftOver;
+ };
+ 
+ 
+@@ -139,7 +150,12 @@ Pcf8563::Pcf8563(device_node* node)
+ 	fRequestSem(-1),
+ 	fThread(-1),
+ 	fQuit(false),
+-	fValidAtBoot(false)
++	fValidAtBoot(false),
++	fClockOffsetKnown(false),
++	fClockOffset(0),
++	fClockOffsetSince(0),
++	fLastDrift(0),
++	fLastDriftOver(0)
+ {
+ 	B_INITIALIZE_SPINLOCK(&fRequestLock);
+ 	mutex_init(&fStatusLock, "pcf8563 status");
+@@ -354,6 +370,9 @@ Pcf8563::_ReadAtTick()
+ 	bigtime_t correction = real_time_clock_usecs() - before;
+ 
+ 	MutexLocker locker(fStatusLock);
++	fClockOffsetKnown = true;
++	fClockOffset = seconds * 1000000 - tick;
++	fClockOffsetSince = system_time();
+ 	fBootRead.done = true;
+ 	fBootRead.seconds = seconds;
+ 	fBootRead.error = correction;
+@@ -408,7 +427,17 @@ Pcf8563::_WriteTime(bigtime_t offset)
+ 	}
+ 	bigtime_t error = tick + offset - (seconds + 1) * 1000000;
+ 
++	// how far off the clock was from the new time, since it was last read
++	// or set
+ 	MutexLocker locker(fStatusLock);
++	bool driftKnown = fClockOffsetKnown;
++	if (driftKnown) {
++		fLastDrift = fClockOffset - offset;
++		fLastDriftOver = system_time() - fClockOffsetSince;
++	}
++	fClockOffsetKnown = true;
++	fClockOffset = offset;
++	fClockOffsetSince = system_time();
+ 	fLastSet.done = true;
+ 	fLastSet.seconds = tickSeconds;
+ 	fLastSet.error = error;
+@@ -420,6 +449,14 @@ Pcf8563::_WriteTime(bigtime_t offset)
+ 		"after the release)\n", text, (error < 0 ? -error : error) / 1000,
+ 		(error < 0 ? -error : error) % 1000, error < 0 ? "before" : "after",
+ 		released - release, tick - released);
++	if (driftKnown) {
++		bigtime_t drift = fLastDrift;
++		INFO("before, the clock was %" B_PRId64 ".%03" B_PRId64 " ms %s the "
++			"new time (%" B_PRId64 " s after it was last read or set)\n",
++			(drift < 0 ? -drift : drift) / 1000,
++			(drift < 0 ? -drift : drift) % 1000,
++			drift < 0 ? "behind" : "ahead of", fLastDriftOver / 1000000);
++	}
+ 	return B_OK;
+ }
+ 
+@@ -504,13 +541,27 @@ Pcf8563::_FormatTime(char* buffer, size_t size, int64 seconds)
+ }
+ 
+ 
++static void
++append(char* text, size_t size, size_t& length, const char* format, ...)
++{
++	if (length >= size - 1)
++		return;
++	va_list args;
++	va_start(args, format);
++	int count = vsnprintf(text + length, size - length, format, args);
++	va_end(args);
++	if (count > 0)
++		length = std::min(length + count, size - 1);
++}
++
++
+ /*!	/dev/misc/rtc: the clock's time now, and how the boot reading and the
+ 	last setting went.
+ */
+ status_t
+ Pcf8563::Read(off_t position, char* buffer, size_t* _length)
+ {
+-	char text[640];
++	char text[768];
+ 	size_t length = 0;
+ 	char time[32];
+ 
+@@ -521,46 +572,53 @@ Pcf8563::Read(off_t position, char* buffer, size_t* _length)
+ 		status = _ReadRegisters(kSeconds, registers, kTimeRegisters);
+ 	int64 seconds;
+ 	if (status != B_OK) {
+-		length += snprintf(text + length, sizeof(text) - length,
++		append(text, sizeof(text), length,
+ 			"clock:    can't be read (%s)\n", strerror(status));
+ 	} else if ((control & kControl1Stop) != 0
+ 		|| !_SecondsFromRegisters(registers, &seconds)) {
+-		length += snprintf(text + length, sizeof(text) - length,
++		append(text, sizeof(text), length,
+ 			"clock:    no valid time (%s)\n", (control & kControl1Stop) != 0
+ 				? "stopped" : "battery ran low, or never set");
+ 	} else {
+ 		_FormatTime(time, sizeof(time), seconds);
+-		length += snprintf(text + length, sizeof(text) - length,
++		append(text, sizeof(text), length,
+ 			"clock:    %s (PCF8563 at I2C address %#x)\n", time, fAddress);
+ 	}
+ 
+ 	MutexLocker locker(fStatusLock);
+ 	if (fBootRead.done) {
+ 		_FormatTime(time, sizeof(time), fBootRead.seconds);
+-		length += snprintf(text + length, sizeof(text) - length,
++		append(text, sizeof(text), length,
+ 			"boot:     system time from its tick at %s (%" B_PRId64 " ms "
+ 			"from the first reading)\n", time, fBootRead.error / 1000);
+ 	} else {
+-		length += snprintf(text + length, sizeof(text) - length,
++		append(text, sizeof(text), length,
+ 			"boot:     %s\n", fValidAtBoot
+ 				? "reading at its tick not done" : "not used, no valid time");
+ 	}
+ 	if (fLastSet.done) {
+ 		_FormatTime(time, sizeof(time), fLastSet.seconds);
+ 		bigtime_t error = fLastSet.error;
+-		length += snprintf(text + length, sizeof(text) - length,
++		append(text, sizeof(text), length,
+ 			"last set: ticked to %s %" B_PRId64 ".%03" B_PRId64 " ms %s the "
+ 			"second\n", time, (error < 0 ? -error : error) / 1000,
+ 			(error < 0 ? -error : error) % 1000,
+ 			error < 0 ? "before" : "after");
++		bigtime_t drift = fLastDrift;
++		if (fLastDriftOver > 0) {
++			append(text, sizeof(text), length,
++				"          before, it was %" B_PRId64 ".%03" B_PRId64 " ms %s "
++				"the new time, %" B_PRId64 " s after it was last read or "
++				"set\n", (drift < 0 ? -drift : drift) / 1000,
++				(drift < 0 ? -drift : drift) % 1000,
++				drift < 0 ? "behind" : "ahead of", fLastDriftOver / 1000000);
++		}
+ 	} else {
+-		length += snprintf(text + length, sizeof(text) - length,
++		append(text, sizeof(text), length,
+ 			"last set: not since boot\n");
+ 	}
+ 	locker.Unlock();
+ 
+-	if (length > sizeof(text) - 1)
+-		length = sizeof(text) - 1;
+ 	if (position >= (off_t)length) {
+ 		*_length = 0;
+ 		return B_OK;

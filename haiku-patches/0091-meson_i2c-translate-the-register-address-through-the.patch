@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 12:03:05 -0400
+Subject: [PATCH 091/342] meson_i2c: translate the register address through the
+ bus ranges
+
+The FDT bus returns "reg" relative to the parent bus (0x8500 for I2C A
+in "bus@c1100000"), so the first register access at boot went to
+physical 0x8500 and ended in an external abort (kernel panic on the
+ODROID-C2 with +99). Map it through the ancestors' "ranges", as
+meson_gx_mmc does, and only touch the controllers behind the clock gate
+the driver opens (A, B and C, not AO).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/busses/i2c/meson/meson_i2c.cpp     | 123 +++++++++++++++++-
+ 1 file changed, 120 insertions(+), 3 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp b/src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp
+index fffc4e2bc6..f29ed51c10 100644
+--- a/src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp
++++ b/src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp
+@@ -28,6 +28,8 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#include <AutoDeleterDrivers.h>
++#include <ByteOrder.h>
+ #include <KernelExport.h>
+ #include <bus/FDT.h>
+ #include <cpu.h>
+@@ -104,6 +106,8 @@ static const phys_addr_t kPinMuxBase = 0xc88344b0;
+ 	// PERIPHS_PIN_MUX_0
+ static const phys_addr_t kI2cABase = 0xc1108500;
+ static const phys_addr_t kI2cBBase = 0xc11087c0;
++static const phys_addr_t kI2cCBase = 0xc11087e0;
++	// A, B and C share the clock gate; the AO controller has its own
+ 
+ struct PinMux {
+ 	phys_addr_t	controller;
+@@ -188,15 +192,119 @@ MesonI2c::~MesonI2c()
+ }
+ 
+ 
++//	#pragma mark - device tree helpers
++
++
++static const uint32*
++get_cells_prop(fdt_device_module_info* module, fdt_device* device,
++	const char* name, int* length)
++{
++	return (const uint32*)module->get_prop(device, name, length);
++}
++
++
++static uint32
++get_cell_count(fdt_device_module_info* module, fdt_device* device,
++	const char* name, uint32 defaultValue)
++{
++	int length;
++	const uint32* prop = get_cells_prop(module, device, name, &length);
++	if (prop == NULL || length < 4)
++		return defaultValue;
++	return B_BENDIAN_TO_HOST_INT32(prop[0]);
++}
++
++
++static uint64
++read_cells(const uint32* cells, uint32 count)
++{
++	uint64 value = 0;
++	for (uint32 i = 0; i < count; i++)
++		value = (value << 32) | B_BENDIAN_TO_HOST_INT32(cells[i]);
++	return value;
++}
++
++
++/*!	The FDT bus returns "reg" as written in the node, relative to its parent
++	bus. Map it to a CPU physical address through the "ranges" of each
++	ancestor bus (the I2C controllers sit in "bus@c1100000"). As in
++	meson_gx_mmc.
++*/
++static status_t
++translate_fdt_address(fdt_device_module_info* module, device_node* fdtNode,
++	uint64& address)
++{
++	device_node* busNode = gDeviceManager->get_parent_node(fdtNode);
++	while (busNode != NULL) {
++		DeviceNodePutter<&gDeviceManager> busPutter(busNode);
++
++		driver_module_info* busModule;
++		fdt_device* bus;
++		if (gDeviceManager->get_driver(busNode, &busModule, (void**)&bus)
++				!= B_OK || busModule != (driver_module_info*)module) {
++			return B_OK;
++		}
++
++		int length;
++		const uint32* ranges = get_cells_prop(module, bus, "ranges", &length);
++		if (ranges == NULL)
++			return B_OK;
++
++		device_node* parentNode = gDeviceManager->get_parent_node(busNode);
++		if (length > 0) {
++			uint32 childCells = get_cell_count(module, bus, "#address-cells",
++				2);
++			uint32 sizeCells = get_cell_count(module, bus, "#size-cells", 1);
++			uint32 parentCells = 2;
++			driver_module_info* parentModule;
++			fdt_device* parentBus;
++			if (parentNode != NULL
++				&& gDeviceManager->get_driver(parentNode, &parentModule,
++					(void**)&parentBus) == B_OK
++				&& parentModule == (driver_module_info*)module) {
++				parentCells = get_cell_count(module, parentBus,
++					"#address-cells", 2);
++			}
++
++			uint32 entryCells = childCells + parentCells + sizeCells;
++			uint32 entries = length / 4 / entryCells;
++			bool found = false;
++			for (uint32 i = 0; i < entries && !found; i++) {
++				const uint32* entry = ranges + i * entryCells;
++				uint64 child = read_cells(entry, childCells);
++				uint64 parent = read_cells(entry + childCells, parentCells);
++				uint64 size = read_cells(entry + childCells + parentCells,
++					sizeCells);
++				if (address >= child && address - child < size) {
++					address = address - child + parent;
++					found = true;
++				}
++			}
++			if (!found) {
++				if (parentNode != NULL)
++					gDeviceManager->put_node(parentNode);
++				return B_ENTRY_NOT_FOUND;
++			}
++		}
++
++		busNode = parentNode;
++	}
++	return B_OK;
++}
++
++
++//	#pragma mark - MesonI2c
++
++
+ status_t
+ MesonI2c::Init()
+ {
+-	device_node* parent = gDeviceManager->get_parent_node(fNode);
++	DeviceNodePutter<&gDeviceManager> parent(
++		gDeviceManager->get_parent_node(fNode));
+ 	fdt_device_module_info* fdtModule;
+ 	fdt_device* fdtDevice;
+-	status_t status = gDeviceManager->get_driver(parent,
++	status_t status = gDeviceManager->get_driver(parent.Get(),
+ 		(driver_module_info**)&fdtModule, (void**)&fdtDevice);
+-	gDeviceManager->put_node(parent);
+ 	if (status != B_OK)
+ 		return status;
+ 
+@@ -206,6 +314,15 @@ MesonI2c::Init()
+ 		|| size < kRegistersSize) {
+ 		return B_ERROR;
+ 	}
++	status = translate_fdt_address(fdtModule, parent.Get(), base);
++	if (status != B_OK)
++		return status;
++	if (base != kI2cABase && base != kI2cBBase && base != kI2cCBase) {
++		// not one of the S905's controllers behind this clock gate (the AO
++		// one has another): leave it alone
++		INFO("no controller expected at %#" B_PRIx64 "\n", base);
++		return B_ERROR;
++	}
+ 
+ 	// the registers sit inside a page shared with other controllers
+ 	phys_addr_t pageBase = ROUNDDOWN(base, B_PAGE_SIZE);

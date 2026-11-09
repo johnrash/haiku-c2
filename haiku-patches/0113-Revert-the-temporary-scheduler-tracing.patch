@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 15:23:55 -0400
+Subject: [PATCH 113/342] Revert the temporary scheduler tracing
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/config_headers/tracing_config.h | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/build/config_headers/tracing_config.h b/build/config_headers/tracing_config.h
+index bcad1b249d..2cbab809a5 100644
+--- a/build/config_headers/tracing_config.h
++++ b/build/config_headers/tracing_config.h
+@@ -5,7 +5,7 @@
+ 
+ // enable tracing (0/1)
+ #ifndef ENABLE_TRACING
+-#	define ENABLE_TRACING 1
++#	define ENABLE_TRACING 0
+ #endif
+ 
+ // tracing buffer size (in bytes)
+@@ -46,7 +46,7 @@
+ #define PARANOIA_TRACING_STACK_TRACE			0	/* stack trace depth */
+ #define PORT_TRACING							0
+ #define RUNTIME_LOADER_TRACING					0
+-#define SCHEDULER_TRACING						1
++#define SCHEDULER_TRACING						0
+ #define SCHEDULING_ANALYSIS_TRACING				0
+ #define SIGNAL_TRACING							0
+ #define SLAB_MEMORY_MANAGER_TRACING				0

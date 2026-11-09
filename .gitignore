@@ -1,0 +1,22 @@
+# Separate clones and build output, not part of this repo
+/haiku/
+/buildtools/
+/u-boot/
+/u-boot-qemu/
+/amlogic-boot-fip/
+/generated.*/
+/tftp/
+*.img
+*.mmc
+*.gz
+/out/
+/run/
+/deps/
+/images/
+__pycache__/
+/repo/
+logs/**/core-*
+/firmware/*.hpkg
+/firmware/meson/venc/
+/logs/
+/haiku-verify/

@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 6 Nov 2026 12:16:36 -0500
+Subject: [PATCH 322/342] arp: a host that talks is no longer kept rejected
+
+A request that fails marks the address rejected for ARP_REJECT_TIMEOUT
+(20 s). But anything learned about the host from the network restarted
+the entry's timer as the stale one (30 minutes) and kept it rejected, and
+each ARP packet from the host did it again: a host that kept talking to
+us stayed unreachable for good. On a C2 on Wi-Fi on 2026-11-06, after a
+short outage, the SMB server, the router and the laptop all sat rejected
+with Wi-Fi working; deleting the entries by hand (arp -d) brought each
+back at once. Now what the network tells us about a host ends its
+rejection; static entries are left as they are, and a rejected address
+nobody hears from still goes after 20 s.
+
+tools/arp-learning-test.py on the test board: "failed address that
+talks" stayed rejected on +330, valid now; 9 of 9.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp b/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp
+index 2b14303e18..2c23db0515 100644
+--- a/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp
++++ b/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp
+@@ -410,6 +410,14 @@ arp_update_entry(in_addr_t protocolAddress, sockaddr_dl *hardwareAddress,
+ 
+ 	delete_request_buffer(entry);
+ 
++	if (learned && (entry->flags & ARP_FLAG_PERMANENT) == 0) {
++		// A request that failed rejects the address for ARP_REJECT_TIMEOUT,
++		// but the host has just told us where it is. Kept rejected, the stale
++		// timer below would hold it for good while the host keeps talking to
++		// us: after a short outage, a server or a gateway stayed unreachable.
++		entry->flags &= ~ARP_FLAG_REJECT;
++	}
++
+ 	if ((entry->flags & ARP_FLAG_PERMANENT) == 0) {
+ 		// (re)start the stale timer
+ 		entry->timer_state = ARP_STATE_STALE;

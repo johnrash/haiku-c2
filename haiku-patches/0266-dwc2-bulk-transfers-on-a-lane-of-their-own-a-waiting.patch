@@ -1,0 +1,280 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Tue, 3 Nov 2026 14:01:16 -0500
+Subject: [PATCH 266/342] dwc2: bulk transfers on a lane of their own; a
+ waiting bulk IN gives way
+
+Control and bulk transfers ran one at a time on one channel, and the core
+retries a NAKed bulk IN by itself until data comes. Fine for disks and webcams,
+but a Wi-Fi adapter's read waits for the next radio frame: with it pending, no
+control transfer got through on the whole bus (hubs' port status, the adapter's
+own registers, every device's setup), and the desktop never came up.
+
+Bulk now has a channel and worker of its own. A bulk IN that has moved nothing
+gives way when another bulk transfer is queued, and goes on after it. Packets
+that come in as it halts are kept, and the rest of the transfer follows, so a
+disk read doesn't end short. Isochronous streams move up one channel.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/busses/usb/dwc2.cpp | 90 ++++++++++++++++++++++----
+ src/add-ons/kernel/busses/usb/dwc2.h   | 13 +++-
+ 2 files changed, 87 insertions(+), 16 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.cpp b/src/add-ons/kernel/busses/usb/dwc2.cpp
+index bdb8829a7d..240528a732 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2.cpp
+@@ -15,9 +15,13 @@
+  *   over the network): clock gates, reset, VBUS, PHY, hub reset;
+  * - uses buffer DMA through one bounce buffer with explicit cache
+  *   maintenance (the DMA does not snoop the CPU caches);
+- * - runs transfers one at a time on host channel 0 from a worker thread:
+- *   control transfers stage by stage, bulk in one go, interrupt IN as one
+- *   attempt that is retried every 10 ms while the device NAKs;
++ * - runs transfers one at a time per lane, on a host channel and worker
++ *   thread each: control transfers stage by stage on one, interrupt IN on
++ *   another as one attempt that is retried every 10 ms while the device
++ *   NAKs, and bulk in one go on a third. A bulk IN can wait for ever (a
++ *   network device with nothing to receive): it has control transfers on a
++ *   lane of their own for that reason, and gives way to other bulk transfers
++ *   while nothing has come in;
+  * - reaches low/full speed devices behind a high speed hub (keyboards and
+  *   mice behind the ODROID-C2's GL852G hub) with split transactions, one
+  *   packet per start-split/complete-split pair; like FreeBSD, interrupt
+@@ -87,12 +91,16 @@ static const uint32 kPhyAdpBc = 0x0c;
+ #define PHY_ADP_BC_ACA_ENABLE		(1 << 16)
+ #define PHY_ADP_BC_ACA_FLOATING		(1 << 26)
+ 
+-static const size_t kBounceSize = 64 * 1024;		// control/bulk lane
++static const size_t kBounceSize = 64 * 1024;		// control and bulk lanes
+ static const size_t kInterruptBounceSize = 4096;
+ static const uint32 kControlLane = 0;
+ static const uint32 kInterruptLane = 1;
++static const uint32 kBulkLane = 2;
+ static const uint32 kDataOffset = 64;		// control data after the SETUP
+ static const bigtime_t kInterruptRetryDelay = 10000;
++// how often a waiting bulk IN looks at the queue: with others in it, and without
++static const bigtime_t kBulkYieldCheck = 1000;
++static const bigtime_t kBulkIdleCheck = 20000;
+ 
+ 
+ device_manager_info* gDeviceManager;
+@@ -185,7 +193,7 @@ DWC2::DWC2(Stack* stack, device_node* node, phys_addr_t registers,
+ 		lane.channel = i;
+ 		lane.bounce = NULL;
+ 		lane.bouncePhysical = 0;
+-		lane.bounceSize = i == kControlLane ? kBounceSize : kInterruptBounceSize;
++		lane.bounceSize = i == kInterruptLane ? kInterruptBounceSize : kBounceSize;
+ 		lane.current = NULL;
+ 		lane.workSemaphore = -1;
+ 		lane.thread = -1;
+@@ -193,6 +201,9 @@ DWC2::DWC2(Stack* stack, device_node* node, phys_addr_t registers,
+ 		lane.idle.Init(this, "dwc2 lane idle");
+ 		lane.current = lane.finishing = NULL;
+ 		lane.status = 0;
++		lane.mayYield = false;
++		lane.yielded = false;
++		lane.partial = false;
+ 	}
+ 
+ 	if (!fInitOK)
+@@ -211,7 +222,7 @@ DWC2::DWC2(Stack* stack, device_node* node, phys_addr_t registers,
+ 	// isochronous streams
+ 	uint8* bounce;
+ 	fBounceArea = create_area("dwc2 bounce", (void**)&bounce,
+-		B_ANY_KERNEL_ADDRESS, kBounceSize + kInterruptBounceSize
++		B_ANY_KERNEL_ADDRESS, 2 * kBounceSize + kInterruptBounceSize
+ 			+ kIsoFirstHighSpeedStream * kIsoSlotCount * kIsoSlotSize
+ 			+ kIsoHighSpeedStreams * kIsoSlotCount * kIsoHighSpeedSlotSize,
+ 		B_32_BIT_CONTIGUOUS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
+@@ -471,7 +482,8 @@ DWC2::Start()
+ {
+ 	for (uint32 i = 0; i < kLaneCount; i++) {
+ 		fLanes[i].thread = spawn_kernel_thread(_WorkerThread,
+-			i == kControlLane ? "dwc2 control/bulk" : "dwc2 interrupt",
++			i == kControlLane ? "dwc2 control"
++				: i == kInterruptLane ? "dwc2 interrupt" : "dwc2 bulk",
+ 			B_URGENT_DISPLAY_PRIORITY, &fLanes[i]);
+ 		if (fLanes[i].thread < 0)
+ 			return fLanes[i].thread;
+@@ -674,11 +686,16 @@ DWC2::SubmitTransfer(Transfer* transfer)
+ 	entry->silent = false;
+ 
+ 	dwc2_lane* lane = &fLanes[(pipe->Type() & USB_OBJECT_INTERRUPT_PIPE) != 0
+-		? kInterruptLane : kControlLane];
++		? kInterruptLane
++		: (pipe->Type() & USB_OBJECT_CONTROL_PIPE) != 0
++			? kControlLane : kBulkLane];
+ 	MutexLocker locker(fQueueLock);
+ 	lane->queue.Add(entry);
+ 	locker.Unlock();
+ 	release_sem_etc(lane->workSemaphore, 1, B_DO_NOT_RESCHEDULE);
++	// a bulk IN waiting on this lane gives way (_RunChannel())
++	if (lane == &fLanes[kBulkLane])
++		lane->halted.NotifyAll();
+ 	return B_OK;
+ }
+ 
+@@ -861,7 +878,9 @@ DWC2::_Worker(dwc2_lane* lane)
+ 			actual = 0;
+ 		}
+ 		if (retry) {
+-			entry->due = system_time() + kInterruptRetryDelay;
++			// a bulk IN that gave way goes on after what is queued
++			entry->due = lane->channel == kBulkLane
++				? 0 : system_time() + kInterruptRetryDelay;
+ 			lane->queue.Add(entry);
+ 			lane->idle.NotifyAll();
+ 			continue;
+@@ -975,13 +994,16 @@ DWC2::_DataTransfer(dwc2_lane* lane, Transfer* transfer, bool in,
+ 		uint32 nextPid = pid;
+ 		size_t actual = 0;
+ 		bool nak = false;
++		lane->mayYield = done == 0;
++		lane->partial = false;
+ 		status_t status = _Transaction(lane, pipe, pid, in, kDataOffset, piece,
+ 			&nextPid, &actual, &nak);
+ 		if (status != B_OK)
+ 			return status;
+ 		if (nak) {
+-			// only interrupt endpoints come back with a NAK (bulk NAKs are
+-			// retried by the core or the split code); nothing was moved
++			// interrupt endpoints come back with a NAK, and a bulk IN that
++			// gave way; other bulk NAKs are retried by the core or the split
++			// code. Nothing was moved
+ 			if (done == 0) {
+ 				*_nak = true;
+ 				return B_OK;
+@@ -997,7 +1019,7 @@ DWC2::_DataTransfer(dwc2_lane* lane, Transfer* transfer, bool in,
+ 				return status;
+ 		}
+ 		done += actual;
+-		if (actual < piece)
++		if (actual < piece && !lane->partial)
+ 			break;
+ 	} while (done < length);
+ 
+@@ -1080,13 +1102,21 @@ DWC2::_RunChannel(dwc2_lane* lane, uint32 character, uint32 split,
+ 	// it runs until it is canceled: the class driver has its own timeout.
+ 	// Control transfers get the 5 s USB 2.0 limit, the others (interrupt
+ 	// transfers halt on a NAK) 2 s.
++	// A bulk IN that has moved nothing gives way to the lane's other transfers.
+ 	uint32 type = (character >> HCCHAR_EPTYPE_SHIFT) & 3;
+ 	bigtime_t limit = type == EPTYPE_BULK ? 0
+ 		: type == EPTYPE_CONTROL ? 5000000 : 2000000;
++	bool mayYield = lane->mayYield && type == EPTYPE_BULK && in && split == 0;
++	lane->yielded = false;
+ 	bigtime_t start = system_time();
+ 	uint32 status;
+ 	while (true) {
+-		entry.Wait(B_RELATIVE_TIMEOUT, 100000);
++		bigtime_t wait = 100000;
++		if (mayYield) {
++			MutexLocker locker(fQueueLock);
++			wait = lane->queue.IsEmpty() ? kBulkIdleCheck : kBulkYieldCheck;
++		}
++		entry.Wait(B_RELATIVE_TIMEOUT, wait);
+ 		status = atomic_get(&lane->status);
+ 		if ((status & HCINT_CHHLTD) != 0)
+ 			break;
+@@ -1097,6 +1127,14 @@ DWC2::_RunChannel(dwc2_lane* lane, uint32 character, uint32 split,
+ 			_HaltChannel(lane);
+ 			return canceled ? B_CANCELED : B_DEV_TIMEOUT;
+ 		}
++		if (mayYield && _ShouldYield(lane, packets)) {
++			_HaltChannel(lane);
++			status = atomic_get(&lane->status);
++			if ((status & HCINT_CHHLTD) == 0)
++				return B_DEV_TIMEOUT;
++			lane->yielded = (status & HCINT_XFERCOMPL) == 0;
++			break;
++		}
+ 		lane->halted.Add(&entry);
+ 		// it may have halted before the entry was added again
+ 		status = atomic_get(&lane->status);
+@@ -1165,6 +1203,17 @@ DWC2::_Transaction(dwc2_lane* lane, Pipe* pipe, uint32 pid, bool in,
+ 	result = dwc2_channel_error(status);
+ 	if (result != B_OK)
+ 		return result;
++	if (lane->yielded) {
++		// halted to give way; packets may have come in just then, whole
++		// ones, and then the rest of the transfer follows
++		lane->yielded = false;
++		*_actual = size - (transferSize & HCTSIZ_XFERSIZE_MASK);
++		if (*_actual == 0)
++			*_nak = true;
++		else
++			lane->partial = true;
++		return B_OK;
++	}
+ 	if ((status & HCINT_XFERCOMPL) == 0) {
+ 		if ((status & HCINT_NAK) != 0) {
+ 			*_nak = true;
+@@ -1316,6 +1365,21 @@ DWC2::_RetrySplit(uint32 status, int32& errors, const char* phase)
+ }
+ 
+ 
++/*!	Whether a bulk IN of \a packets packets, which is waiting for its device,
++	should give way: others wait on the lane, and nothing has come in.
++*/
++bool
++DWC2::_ShouldYield(dwc2_lane* lane, uint32 packets)
++{
++	MutexLocker locker(fQueueLock);
++	if (lane->queue.IsEmpty())
++		return false;
++	locker.Unlock();
++	return ((_Read(HC_TSIZ(lane->channel)) >> HCTSIZ_PKTCNT_SHIFT) & 0x3ff)
++		== packets;
++}
++
++
+ void
+ DWC2::_HaltChannel(dwc2_lane* lane)
+ {
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.h b/src/add-ons/kernel/busses/usb/dwc2.h
+index 61c4355e8a..45f0f92b8a 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.h
++++ b/src/add-ons/kernel/busses/usb/dwc2.h
+@@ -28,8 +28,8 @@ struct dwc2_transfer : DoublyLinkedListLinkImpl<dwc2_transfer> {
+ typedef DoublyLinkedList<dwc2_transfer> dwc2_transfer_list;
+ 
+ 
+-static const uint32 kLaneCount = 2;		// channels 0, 1
+-static const uint32 kIsoStreamCount = 4;	// channels 2 to 5
++static const uint32 kLaneCount = 3;		// channels 0, 1, 2
++static const uint32 kIsoStreamCount = 4;	// channels 3 to 6
+ static const uint32 kIsoFirstHighSpeedStream = 2;
+ 	// 2, 3: high speed devices (a webcam's video and its microphone at
+ 	// once); 0, 1: full speed devices behind the hub
+@@ -154,6 +154,12 @@ struct dwc2_lane {
+ 	thread_id			thread;
+ 	ConditionVariable	halted;
+ 	int32				status;
++	bool				mayYield;
++		// the transfer has moved nothing yet: a bulk IN may give way
++	bool				yielded;
++		// _RunChannel() halted the channel to give way
++	bool				partial;
++		// some packets came in as it did: the transfer isn't done
+ };
+ 
+ 
+@@ -222,6 +228,7 @@ private:
+ 									uint32 offset, bool in, uint32* status,
+ 									uint32* transferSize);
+ 			void				_HaltChannel(dwc2_lane* lane);
++			bool				_ShouldYield(dwc2_lane* lane, uint32 packets);
+ 
+ 			// isochronous transfers (dwc2_isochronous.cpp)
+ 			status_t			_InitIsochronous(uint8* bounce,
+@@ -280,7 +287,7 @@ private:
+ 			uint8				fPortResetChange;
+ 
+ 			mutex				fQueueLock;		// both lanes' queues
+-			dwc2_lane			fLanes[kLaneCount];	// control/bulk, interrupt
++			dwc2_lane			fLanes[kLaneCount];	// control, interrupt, bulk
+ 			bool				fStopWorker;
+ 			bool				fWarnedSplit;
+ 			int64				fStatBulkBytes;

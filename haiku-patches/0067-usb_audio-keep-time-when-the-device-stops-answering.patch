@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 17:29:09 -0400
+Subject: [PATCH 067/342] usb_audio: keep time when the device stops answering
+
+A buffer exchange waited without a timeout for the device's next buffer.
+When a second C2's USB adapter was unplugged while playing, the USB
+stack never reported the removal (that part is still open), so the
+media node's output thread waited forever, its clock stopped, and the
+nodes using it as time source failed. Now, after 500 ms without a
+buffer, the exchange goes on as if the device was removed, a buffer
+duration at a time, until its buffers come again (both are logged).
+
+Built only: the stalled case is not reproduced yet, as the adapter is on
+the other board.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/drivers/audio/usb/Device.cpp       | 51 ++++++++++++++-----
+ src/add-ons/kernel/drivers/audio/usb/Device.h |  4 +-
+ src/add-ons/kernel/drivers/audio/usb/Driver.h |  2 +
+ 3 files changed, 44 insertions(+), 13 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Device.cpp b/src/add-ons/kernel/drivers/audio/usb/Device.cpp
+index 7bff275cda..12bf18537c 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Device.cpp
++++ b/src/add-ons/kernel/drivers/audio/usb/Device.cpp
+@@ -24,7 +24,9 @@ Device::Device(usb_device device)
+ 	fNonBlocking(false),
+ 	fAudioControl(this),
+ 	fBuffersReadySem(-1),
+-	fRemovedExchanges(0)
++	fRemovedExchanges(0),
++	fStalled(false),
++	fStalledExchanges(0)
+ {
+ 	const usb_device_descriptor* deviceDescriptor
+ 		= gUSBModule->get_device_descriptor(device);
+@@ -702,18 +704,41 @@ Device::_MultiBufferExchange(multi_buffer_info* multiInfo)
+ 		return _ExchangeWhileRemoved(&Info, multiInfo);
+ 
+ 	for (int i = 0; i < fStreams.Count(); i++) {
+-		if (!fStreams[i]->IsRunning())
++		if (!fStreams[i]->IsRunning()) {
+ 			fStreams[i]->Start();
++			fStalled = false;
++		}
+ 	}
+ 
++	// A device that stops answering without being reported as removed
++	// (the host controller lost it) must not stop the client's clock
++	// either: without buffers for a while, the exchange goes on as if the
++	// device was unplugged, until its buffers come again.
++	bigtime_t timeout = kStallTimeout;
++	if (fStalled && fStreams.Count() > 0)
++		timeout = fStreams[0]->BufferDuration() / fStreams.Count();
+ 	status_t status = acquire_sem_etc(fBuffersReadySem, 1,
+-		B_CAN_INTERRUPT, 0);
++		B_CAN_INTERRUPT | B_RELATIVE_TIMEOUT, timeout);
++	if (fRemoved)
++		return _ExchangeWhileRemoved(&Info, multiInfo);
+ 	if (status == B_TIMED_OUT) {
+-		TRACE(ERR, "Timeout during buffers exchange.\n");
++		if (!fStalled) {
++			TRACE(ERR, "no buffers for %" B_PRIdBIGTIME " ms: the device "
++				"stopped answering, keeping time without it\n",
++				timeout / 1000);
++		}
++		fStalled = true;
++		fStalledExchanges++;
++		return _ExchangeWhileRemoved(&Info, multiInfo, false);
++	}
++	if (status != B_OK)
+ 		return status;
++	if (fStalled) {
++		TRACE(ERR, "buffers again, after %" B_PRIu32 " without\n",
++			fStalledExchanges);
++		fStalled = false;
++		fStalledExchanges = 0;
+ 	}
+-	if (fRemoved)
+-		return _ExchangeWhileRemoved(&Info, multiInfo);
+ 
+ 	status = B_ERROR;
+ 	for (int i = 0; i < fStreams.Count(); i++) {
+@@ -735,14 +760,15 @@ Device::_MultiBufferExchange(multi_buffer_info* multiInfo)
+ }
+ 
+ 
+-/*!	The device was unplugged (and may come back): the exchange goes on in
+-	real time, the streams' buffers in turn, as if they were played and
+-	recorded. A media node using the device as its time source would
+-	otherwise stop its clock, and the nodes that depend on it fail.
++/*!	The device was unplugged (and may come back), or stopped answering:
++	the exchange goes on in real time, the streams' buffers in turn, as if
++	they were played and recorded. A media node using the device as its
++	time source would otherwise stop its clock, and the nodes that depend
++	on it fail. Without \a wait, the caller already waited for a buffer.
+ */
+ status_t
+ Device::_ExchangeWhileRemoved(multi_buffer_info* info,
+-	multi_buffer_info* userInfo)
++	multi_buffer_info* userInfo, bool wait)
+ {
+ 	if (fStreams.Count() == 0)
+ 		return B_ERROR;
+@@ -753,7 +779,8 @@ Device::_ExchangeWhileRemoved(multi_buffer_info* info,
+ 		snooze(10000);
+ 		return B_ERROR;
+ 	}
+-	snooze(duration / fStreams.Count());
++	if (wait)
++		snooze(duration / fStreams.Count());
+ 	stream->SimulateExchange(info);
+ 
+ 	if (user_memcpy(userInfo, info, sizeof(multi_buffer_info)) != B_OK)
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Device.h b/src/add-ons/kernel/drivers/audio/usb/Device.h
+index 2353425da7..18836d4fd7 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Device.h
++++ b/src/add-ons/kernel/drivers/audio/usb/Device.h
+@@ -80,10 +80,12 @@ private:
+ 			status_t		_MultiBufferExchange(multi_buffer_info* Info);
+ 			status_t		_MultiBufferForceStop();
+ 			status_t		_ExchangeWhileRemoved(multi_buffer_info* info,
+-								multi_buffer_info* userInfo);
++								multi_buffer_info* userInfo, bool wait = true);
+ 
+ 			sem_id			fBuffersReadySem;
+ 			uint32			fRemovedExchanges;
++			bool			fStalled;
++			uint32			fStalledExchanges;
+ };
+ 
+ 
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Driver.h b/src/add-ons/kernel/drivers/audio/usb/Driver.h
+index eac1052267..960d057b8b 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Driver.h
++++ b/src/add-ons/kernel/drivers/audio/usb/Driver.h
+@@ -21,6 +21,8 @@ const char* const kVersion = "ver.0.0.5";
+ const uint32 kSamplesBufferSize = 2048;
+ // [sub]buffers count
+ const uint32 kSamplesBufferCount = 2;
++// how long a buffer exchange waits before going on without the device
++const bigtime_t kStallTimeout = 500000;
+ 
+ 
+ extern usb_module_info* gUSBModule;

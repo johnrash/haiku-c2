@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 5 Nov 2026 10:20:09 -0500
+Subject: [PATCH 305/342] tcp: the endpoint's destructor doesn't hold its lock
+ while waiting for timers
+
+Since 2f2dd59e16 destroyed the lock after the wait, the destructor held it
+during wait_for_timer(), and a timer's hook that had already started was
+waiting for that lock: a deadlock of the net timer thread and whichever thread
+was destroying the socket. With that being an interface's receive thread, the
+interface stopped dead, and no TCP timer ran any more.
+
+Unlock for the wait, as the hooks need to get through, and have them return
+when they find the endpoint being destroyed.
+
+It took about 300,000 connections to hit under tcpchurn; with this, none in
+2.49 million, and the lock is still destroyed after the timers are done.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../network/protocols/tcp/TCPEndpoint.cpp      | 18 +++++++++++++-----
+ 1 file changed, 13 insertions(+), 5 deletions(-)
+
+diff --git a/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp b/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+index 8cd1fa0b58..5961b9ec31 100644
+--- a/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
++++ b/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+@@ -324,7 +324,8 @@ enum {
+ 	FLAG_OPTION_SACK_PERMITTED	= 0x80,
+ 	FLAG_AUTO_RECEIVE_BUFFER_SIZE = 0x100,
+ 	FLAG_CAN_NOTIFY 			= 0x200,
+-	FLAG_USER_CLOSED			= 0x400
++	FLAG_USER_CLOSED			= 0x400,
++	FLAG_DESTROYED				= 0x800
+ };
+ 
+ 
+@@ -484,6 +485,11 @@ TCPEndpoint::~TCPEndpoint()
+ 		put_endpoint_manager(fManager);
+ 	}
+ 
++	// A timer's hook may be waiting for the lock already, and waiting for that
++	// hook with the lock held would never end. It finds the flag and returns.
++	fFlags |= FLAG_DESTROYED;
++	mutex_unlock(&fLock);
++
+ 	// we need to wait for all timers to return
+ 	gStackModule->wait_for_timer(&fRetransmitTimer);
+ 	gStackModule->wait_for_timer(&fPersistTimer);
+@@ -2664,8 +2670,10 @@ TCPEndpoint::_RetransmitTimer(net_timer* timer, void* _endpoint)
+ 	T(TimerTriggered(endpoint, "retransmit"));
+ 
+ 	MutexLocker locker(endpoint->fLock);
+-	if (!locker.IsLocked() || gStackModule->is_timer_active(timer))
++	if (!locker.IsLocked() || (endpoint->fFlags & FLAG_DESTROYED) != 0
++		|| gStackModule->is_timer_active(timer)) {
+ 		return;
++	}
+ 
+ 	endpoint->_Retransmit();
+ }
+@@ -2678,7 +2686,7 @@ TCPEndpoint::_PersistTimer(net_timer* timer, void* _endpoint)
+ 	T(TimerTriggered(endpoint, "persist"));
+ 
+ 	MutexLocker locker(endpoint->fLock);
+-	if (!locker.IsLocked())
++	if (!locker.IsLocked() || (endpoint->fFlags & FLAG_DESTROYED) != 0)
+ 		return;
+ 
+ 	// the timer might not have been canceled early enough
+@@ -2696,7 +2704,7 @@ TCPEndpoint::_DelayedAcknowledgeTimer(net_timer* timer, void* _endpoint)
+ 	T(TimerTriggered(endpoint, "delayed ack"));
+ 
+ 	MutexLocker locker(endpoint->fLock);
+-	if (!locker.IsLocked())
++	if (!locker.IsLocked() || (endpoint->fFlags & FLAG_DESTROYED) != 0)
+ 		return;
+ 
+ 	// the timer might not have been canceled early enough
+@@ -2714,7 +2722,7 @@ TCPEndpoint::_TimeWaitTimer(net_timer* timer, void* _endpoint)
+ 	T(TimerTriggered(endpoint, "time-wait"));
+ 
+ 	MutexLocker locker(endpoint->fLock);
+-	if (!locker.IsLocked())
++	if (!locker.IsLocked() || (endpoint->fFlags & FLAG_DESTROYED) != 0)
+ 		return;
+ 
+ 	if ((endpoint->fFlags & FLAG_CLOSED) == 0) {

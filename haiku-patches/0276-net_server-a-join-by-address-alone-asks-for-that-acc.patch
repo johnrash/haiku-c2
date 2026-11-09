@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Tue, 3 Nov 2026 17:40:54 -0500
+Subject: [PATCH 276/342] net_server: a join by address alone asks for that
+ access point
+
+The supplicant took only the network's name and chose an access point itself.
+`ifconfig join <address>` went wherever that led. It now gets the address as
+"bssid", which the supplicant's patch in the project reads. A join by name, and
+the auto join, leave the choice to it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/servers/net/NetServer.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/servers/net/NetServer.cpp b/src/servers/net/NetServer.cpp
+index f72b649a0f..6c0daecec1 100644
+--- a/src/servers/net/NetServer.cpp
++++ b/src/servers/net/NetServer.cpp
+@@ -1038,10 +1038,12 @@ NetServer::_JoinNetwork(const BMessage& message, const BNetworkAddress* address,
+ 
+ 	if (name == NULL)
+ 		message.FindString("name", &name);
++	bool oneAccessPoint = false;
+ 	if (name == NULL) {
+ 		// No name specified, we need a network address
+ 		if (address->Family() != AF_LINK)
+ 			return B_BAD_VALUE;
++		oneAccessPoint = true;
+ 	}
+ 
+ 	fJoinTimes[deviceName] = system_time();
+@@ -1168,6 +1170,11 @@ NetServer::_JoinNetwork(const BMessage& message, const BNetworkAddress* address,
+ 		status = join.AddString("name", network.name);
+ 	if (status == B_OK)
+ 		status = join.AddFlat("address", &network.address);
++	if (status == B_OK && oneAccessPoint) {
++		// joined by address alone: the supplicant is to use that one
++		status = join.AddData("bssid", B_RAW_TYPE,
++			network.address.LinkLevelAddress(), 6);
++	}
+ 	if (status == B_OK && !askForConfig)
+ 		status = join.AddUInt32("authentication", network.authentication_mode);
+ 	if (status == B_OK && password != NULL)

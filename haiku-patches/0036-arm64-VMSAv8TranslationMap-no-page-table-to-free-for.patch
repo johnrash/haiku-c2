@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 20:44:45 -0400
+Subject: [PATCH 036/342] arm64: VMSAv8TranslationMap: no page table to free
+ for an unused map
+
+The page table is allocated with the first mapping. When fork_team()
+failed before mapping anything (low memory), deleting the new address
+space freed page table 0 and faulted on physical address 0 in the
+kernel: a panic instead of a failed fork.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/kernel/arch/arm64/VMSAv8TranslationMap.cpp | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/src/system/kernel/arch/arm64/VMSAv8TranslationMap.cpp b/src/system/kernel/arch/arm64/VMSAv8TranslationMap.cpp
+index c4ca593238..5512b8e98e 100644
+--- a/src/system/kernel/arch/arm64/VMSAv8TranslationMap.cpp
++++ b/src/system/kernel/arch/arm64/VMSAv8TranslationMap.cpp
+@@ -151,9 +151,13 @@ VMSAv8TranslationMap::~VMSAv8TranslationMap()
+ 		}
+ 	}
+ 
+-	vm_page_reservation reservation = {};
+-	FreeTable(fPageTable, 0, fInitialLevel, &reservation);
+-	vm_page_unreserve_pages(&reservation);
++	// The page table is only allocated with the first mapping: a map whose
++	// address space never got one (a fork that failed early) has none.
++	if (fPageTable != 0) {
++		vm_page_reservation reservation = {};
++		FreeTable(fPageTable, 0, fInitialLevel, &reservation);
++		vm_page_unreserve_pages(&reservation);
++	}
+ }
+ 
+ 

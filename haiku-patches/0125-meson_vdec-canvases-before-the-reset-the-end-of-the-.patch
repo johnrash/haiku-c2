@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 17:37:29 -0400
+Subject: [PATCH 125/342] meson_vdec: canvases before the reset; the end of the
+ stream not while the firmware waits for a frame
+
+The power cycle at init didn't help the first session's first
+macroblock; writing the canvases before the power-up's reset is the
+next try. The end of the stream waited for a quiet firmware, which it
+also is while waiting for a frame back (AV_SCRATCH_E); sent then, the
+last six pictures of a 1080p stream were lost.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../drivers/video/meson_vdec/meson_vdec.cpp   | 36 ++++++++++---------
+ 1 file changed, 20 insertions(+), 16 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+index affadecad7..566afa61f8 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+@@ -465,13 +465,6 @@ MesonVdec::Init(phys_addr_t dos, phys_addr_t parser, int32 vdecIrq,
+ 			&_ParserInterrupt, this, 0) == B_OK) {
+ 		fParserIrq = parserIrq;
+ 	}
+-	// The first session after boot decoded the first picture's first
+-	// macroblock wrongly (its top two blocks), the later ones didn't: they
+-	// come after a power-down, whose resets the power-up doesn't do. One
+-	// now, before any session.
+-	_PowerUp();
+-	_PowerDown();
+-
+ 	INFO("DOS %#" B_PRIxPHYSADDR ", parser %#" B_PRIxPHYSADDR
+ 		", interrupts %" B_PRId32 " and %" B_PRId32 "\n", dos, parser,
+ 		fVdecIrq, fParserIrq);
+@@ -758,12 +751,8 @@ void
+ MesonVdec::_StartCodec()
+ {
+ 	for (uint32 i = 0; i < kFrameCount; i++) {
+-		phys_addr_t frame = fFrames.physical + i * fFrameSize;
+ 		uint32 luma = kFirstCanvas + 2 * i;
+ 		uint32 chroma = luma + 1;
+-		_WriteCanvas(luma, frame, fBytesPerRow, align_up(fHeight, 32));
+-		_WriteCanvas(chroma, frame + fLumaSize, fBytesPerRow,
+-			align_up(fHeight, 32) / 2);
+ 		_SetDos(AV_SCRATCH_0 + 4 * i, luma | (chroma << 8) | (chroma << 16));
+ 	}
+ 	_SetDos(POWER_CTL_VLD, 1 << 4);
+@@ -856,6 +845,18 @@ MesonVdec::_Start(meson_vdec_start& start, const void* userFirmware)
+ 	if (get_sem_count(fParserSem, &count) == B_OK && count > 0)
+ 		acquire_sem_etc(fParserSem, count, 0, 0);
+ 
++	// The canvases go in before the power-up's reset: written after it, the
++	// first session after boot decoded the first picture's first
++	// macroblock wrongly (its top two blocks; later sessions, whose frames
++	// mostly land where the previous session's were, didn't), as if the
++	// decoder kept the canvases it saw when it came out of reset.
++	for (uint32 i = 0; i < kFrameCount; i++) {
++		phys_addr_t frame = fFrames.physical + i * fFrameSize;
++		uint32 luma = kFirstCanvas + 2 * i;
++		_WriteCanvas(luma, frame, fBytesPerRow, align_up(fHeight, 32));
++		_WriteCanvas(luma + 1, frame + fLumaSize, fBytesPerRow,
++			align_up(fHeight, 32) / 2);
++	}
+ 	_PowerUp();
+ 	_SetupVififo();
+ 	status = _LoadFirmware(userFirmware);
+@@ -1012,22 +1013,25 @@ MesonVdec::_Write(const uint8* userData, size_t size)
+ 
+ 
+ /*!	A sequence end code, for the firmware to put out the frames it holds.
+-	Sent while the firmware still decodes, it lost the picture it had not
+-	reported yet (the third from the end), so it waits until the firmware
+-	has been quiet for a while (the caller has to take frames meanwhile).
++	Sent while the firmware still decodes, it lost the pictures it had not
++	reported yet (the third from the end; more while it waited for frames
++	back), so it waits until the firmware has been quiet for a while and
++	isn't waiting for a frame (AV_SCRATCH_E): it has decoded what it can
++	(the caller has to take and give back frames meanwhile).
+ */
+ status_t
+ MesonVdec::_EndOfStream()
+ {
+ 	if (!fRunning)
+ 		return B_NOT_ALLOWED;
+-	bigtime_t timeout = system_time() + 1000000;
++	bigtime_t timeout = system_time() + 3000000;
+ 	while (system_time() < timeout) {
+ 		InterruptsSpinLocker locker(fStateLock);
+ 		_CheckDecoder();
+ 		bigtime_t quiet = system_time() - fLastReport;
++		bool waiting = _Dos(AV_SCRATCH_E) != 0;
+ 		locker.Unlock();
+-		if (quiet > 40000)
++		if (quiet > 40000 && !waiting)
+ 			break;
+ 		snooze(kPollInterval);
+ 	}

@@ -1,0 +1,181 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 20:51:14 -0500
+Subject: [PATCH 245/342] meson_mali: cache cleaning only for the buffers a
+ client maps
+
+Before every GPU job the job thread wrote back and invalidated the CPU's
+lines of every buffer the job uses, and those of the buffers it wrote
+after it: at 1900x1000, 2.4 of the frame's 8.2 ms on the GPU's side
+(colour and depth buffers, 7.6 MB each, a line at a time). The CPU never
+touches most of them: lima maps the buffers it reads or writes itself,
+not a depth buffer or the GP's varyings.
+
+A client can now say which buffers it maps (MALI_IOCTL_HAIKU_CPU_MAPPED,
+from Haiku's libdrm stand-in when it clones one); from its first call
+on, only those are cleaned around its jobs, and a buffer once when it is
+first mapped (lines fetched ahead through the kernel's map of all memory
+would be stale). A client that never calls it gets every buffer cleaned,
+as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/drivers/meson_mali.h          |  7 +++
+ .../misc/meson_mali/meson_mali_jobs.cpp       | 50 +++++++++++++++++--
+ .../misc/meson_mali/meson_mali_private.h      |  7 +++
+ 3 files changed, 59 insertions(+), 5 deletions(-)
+
+diff --git a/headers/private/drivers/meson_mali.h b/headers/private/drivers/meson_mali.h
+index c1bf7a9f97..8241f36fce 100644
+--- a/headers/private/drivers/meson_mali.h
++++ b/headers/private/drivers/meson_mali.h
+@@ -35,6 +35,13 @@
+ #define MALI_IOCTL_CTX_CREATE		0x80086445
+ #define MALI_IOCTL_CTX_FREE			0x40086446
+ 
++// Haiku's own: an int32, the area_id of a buffer the client mapped (cloned).
++// From a client's first call on, the driver keeps the CPU's caches in step
++// with the GPU only for the buffers the client mapped: the others are the
++// GPU's alone, and their lines needn't be cleaned around every job. A
++// client that never calls it gets every buffer cleaned, as before.
++#define MALI_IOCTL_HAIKU_CPU_MAPPED	0x4d414c4d	// 'MALM'
++
+ enum {
+ 	MALI_PARAM_GPU_ID = 0,
+ 	MALI_PARAM_NUM_PP,
+diff --git a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_jobs.cpp b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_jobs.cpp
+index 9a5e1174ba..e66de76151 100644
+--- a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_jobs.cpp
++++ b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_jobs.cpp
+@@ -13,7 +13,10 @@
+  *   expects, without fences on the buffers;
+  * - buffers are cached for the CPU (userland clones their areas): their
+  *   lines are written back and invalidated before a job, and those of the
+- *   buffers it writes again after it;
++ *   buffers it writes again after it; for a client that says which buffers
++ *   it maps (MALI_IOCTL_HAIKU_CPU_MAPPED), only those: the CPU never
++ *   touches the others (a depth buffer, the GP's varyings), and they were
++ *   cleaned when made;
+  * - sync objects hold the sequence number of the job they wait for;
+  * - a heap buffer (the GP's tile heap) starts with kHeapInitialSize bytes
+  *   of memory; when the GP runs out, the job thread doubles it and the GP
+@@ -384,6 +387,8 @@ MesonMali::Control(mali_file* file, uint32 op, void* buffer, size_t length)
+ 			return _GemSubmit(file, buffer);
+ 		case MALI_IOCTL_GEM_WAIT:
+ 			return _GemWait(file, buffer);
++		case MALI_IOCTL_HAIKU_CPU_MAPPED:
++			return _CpuMapped(file, buffer);
+ 		case MALI_IOCTL_SYNCOBJ_CREATE:
+ 			return _SyncobjCreate(file, buffer);
+ 		case MALI_IOCTL_SYNCOBJ_DESTROY:
+@@ -621,6 +626,37 @@ MesonMali::_SyncobjWait(mali_file* file, void* buffer)
+ }
+ 
+ 
++/*!	A buffer the client mapped: from now on its lines are cleaned around
++	the jobs that use it. Once now too: lines the CPU may have fetched
++	ahead through the kernel's map of all memory while the buffer was the
++	GPU's alone would be stale.
++*/
++status_t
++MesonMali::_CpuMapped(mali_file* file, void* buffer)
++{
++	int32 area;
++	if (user_memcpy(&area, buffer, sizeof(area)) != B_OK)
++		return B_BAD_ADDRESS;
++
++	MutexLocker locker(file->lock);
++	mali_buffer* object = NULL;
++	for (uint32 i = 0; i < file->bufferSlots; i++) {
++		if (file->buffers[i] != NULL && file->buffers[i]->area == area) {
++			object = file->buffers[i];
++			break;
++		}
++	}
++	if (object == NULL || object->heap)
++		return B_BAD_VALUE;
++	file->tracksCpuMaps = true;
++	if (!object->cpuMapped) {
++		object->cpuMapped = true;
++		_CleanBuffer(object);
++	}
++	return B_OK;
++}
++
++
+ status_t
+ MesonMali::_GemWait(mali_file* file, void* buffer)
+ {
+@@ -758,6 +794,7 @@ MesonMali::_GemSubmit(mali_file* file, void* buffer)
+ 	// queued in order; the in_sync objects are signalled by then
+ 	MutexLocker queueLocker(fQueueLock);
+ 	task->sequence = fNextSequence++;
++	task->tracksCpuMaps = file->tracksCpuMaps;
+ 	for (uint32 i = 0; i < task->bufferCount; i++) {
+ 		if ((task->bufferFlags[i] & MALI_SUBMIT_BO_WRITE) != 0)
+ 			task->buffers[i]->lastWrite = task->sequence;
+@@ -837,8 +874,9 @@ MesonMali::_RunTask(mali_task* task)
+ {
+ 	bigtime_t start = system_time();
+ 	for (uint32 i = 0; i < task->bufferCount; i++) {
+-		if (!task->buffers[i]->heap)
+-			_CleanBuffer(task->buffers[i]);
++		mali_buffer* buffer = task->buffers[i];
++		if (!buffer->heap && (!task->tracksCpuMaps || buffer->cpuMapped))
++			_CleanBuffer(buffer);
+ 	}
+ 	bigtime_t cleaned = system_time();
+ 
+@@ -849,9 +887,11 @@ MesonMali::_RunTask(mali_task* task)
+ 	bigtime_t ran = system_time();
+ 
+ 	for (uint32 i = 0; i < task->bufferCount; i++) {
++		mali_buffer* buffer = task->buffers[i];
+ 		if ((task->bufferFlags[i] & MALI_SUBMIT_BO_WRITE) != 0
+-			&& !task->buffers[i]->heap) {
+-			_CleanBuffer(task->buffers[i]);
++			&& !buffer->heap
++			&& (!task->tracksCpuMaps || buffer->cpuMapped)) {
++			_CleanBuffer(buffer);
+ 		}
+ 	}
+ 	int pipe = task->pipe == MALI_PIPE_GP ? 0 : 1;
+diff --git a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_private.h b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_private.h
+index a56e2225d2..52dab4c116 100644
+--- a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_private.h
++++ b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_private.h
+@@ -205,6 +205,9 @@ struct mali_buffer {
+ 	area_id		heapAreas[kMaxHeapAreas];
+ 	uint64		lastRead;	// the last tasks that use it (sequence numbers)
+ 	uint64		lastWrite;
++	bool		cpuMapped;
++		// a client mapped it (MALI_IOCTL_HAIKU_CPU_MAPPED): its lines are
++		// cleaned around jobs; never once it is the GPU's alone
+ };
+ 
+ 
+@@ -217,6 +220,8 @@ struct mali_file {
+ 	bool*			syncobjsUsed;
+ 	uint32			syncobjSlots;
+ 	uint32			nextContext;
++	bool			tracksCpuMaps;
++		// it says which buffers it maps: only those are cleaned for jobs
+ };
+ 
+ 
+@@ -233,6 +238,7 @@ struct mali_task {
+ 	uint32*			bufferFlags;
+ 	mali_buffer*	heap;		// a GP job's tile heap, if a heap buffer
+ 	uint64			sequence;
++	bool			tracksCpuMaps;	// its file's, when submitted
+ };
+ 
+ 
+@@ -311,6 +317,7 @@ private:
+ 			status_t			_GemClose(mali_file* file, void* buffer);
+ 			status_t			_GemSubmit(mali_file* file, void* buffer);
+ 			status_t			_GemWait(mali_file* file, void* buffer);
++			status_t			_CpuMapped(mali_file* file, void* buffer);
+ 			status_t			_SyncobjCreate(mali_file* file,
+ 									void* buffer);
+ 			status_t			_SyncobjDestroy(mali_file* file,

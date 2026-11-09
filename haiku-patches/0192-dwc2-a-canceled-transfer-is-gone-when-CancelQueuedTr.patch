@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 01:20:25 -0500
+Subject: [PATCH 192/342] dwc2: a canceled transfer is gone when
+ CancelQueuedTransfers() returns
+
+Unplugging a hub with a keyboard behind it panicked the test board: "USB
+object did not become idle!" in the explore thread, as the removed
+device's interrupt pipe was destroyed (Pipe::~Pipe waits only 2 ms for
+the references to go). The keyboard's last transfer was still running in
+a lane, retrying start-splits that failed with transaction errors, and it
+holds a pipe reference until the lane deletes it; CancelQueuedTransfers()
+only marked it and returned, and the lane looked at the mark only when a
+channel wait timed out (every 100 ms).
+
+Now CancelQueuedTransfers() wakes the lane and waits (up to a second)
+until the transfer it runs is finished and deleted; _RunChannel() stops a
+canceled transfer before its next transaction; and a forced cancel (a
+destroyed pipe) doesn't call the running transfer's callback, as for the
+queued ones. Not when called from the lane's own thread (a callback that
+cancels). Boot-tested on the test board; the unplug itself is not tested
+again yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/busses/usb/dwc2.cpp | 53 +++++++++++++++++++++++++-
+ src/add-ons/kernel/busses/usb/dwc2.h   |  5 +++
+ 2 files changed, 57 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.cpp b/src/add-ons/kernel/busses/usb/dwc2.cpp
+index 1d09c3ec7f..24f9f34cbb 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2.cpp
+@@ -190,6 +190,8 @@ DWC2::DWC2(Stack* stack, device_node* node, phys_addr_t registers,
+ 		lane.workSemaphore = -1;
+ 		lane.thread = -1;
+ 		lane.halted.Init(this, "dwc2 channel");
++		lane.idle.Init(this, "dwc2 lane idle");
++		lane.current = lane.finishing = NULL;
+ 		lane.status = 0;
+ 	}
+ 
+@@ -668,6 +670,7 @@ DWC2::SubmitTransfer(Transfer* transfer)
+ 	entry->transfer = transfer;
+ 	entry->due = 0;
+ 	entry->canceled = false;
++	entry->silent = false;
+ 
+ 	dwc2_lane* lane = &fLanes[(pipe->Type() & USB_OBJECT_INTERRUPT_PIPE) != 0
+ 		? kInterruptLane : kControlLane];
+@@ -688,6 +691,7 @@ DWC2::CancelQueuedTransfers(Pipe* pipe, bool force)
+ 	}
+ 
+ 	dwc2_transfer_list canceled;
++	dwc2_transfer* running[kLaneCount];
+ 
+ 	MutexLocker locker(fQueueLock);
+ 	for (uint32 i = 0; i < kLaneCount; i++) {
+@@ -701,9 +705,16 @@ DWC2::CancelQueuedTransfers(Pipe* pipe, bool force)
+ 			}
+ 			entry = next;
+ 		}
++		running[i] = NULL;
+ 		if (lane.current != NULL
+ 			&& lane.current->transfer->TransferPipe() == pipe) {
+ 			lane.current->canceled = true;
++			if (force)
++				lane.current->silent = true;
++			running[i] = lane.current;
++		} else if (lane.finishing != NULL
++			&& lane.finishing->transfer->TransferPipe() == pipe) {
++			running[i] = lane.finishing;
+ 		}
+ 	}
+ 	locker.Unlock();
+@@ -716,6 +727,34 @@ DWC2::CancelQueuedTransfers(Pipe* pipe, bool force)
+ 		delete entry->transfer;
+ 		delete entry;
+ 	}
++
++	// The transfer a lane runs holds a reference to the pipe until the lane
++	// has deleted it, and a destroyed pipe waits only 2 ms for that
++	// (Object::WaitForIdle()), while a split transaction can take a lot
++	// longer (a removed hub's device, its retries): wake the lane, which
++	// sees the flag, and wait for it. Not in a lane's own thread (a
++	// completion callback that cancels).
++	thread_id self = find_thread(NULL);
++	for (uint32 i = 0; i < kLaneCount; i++) {
++		dwc2_lane& lane = fLanes[i];
++		if (running[i] == NULL || lane.thread == self)
++			continue;
++		lane.halted.NotifyAll();
++		bigtime_t timeout = system_time() + 1000000;
++		locker.Lock();
++		while ((lane.current == running[i] || lane.finishing == running[i])
++			&& system_time() < timeout) {
++			ConditionVariableEntry wait;
++			lane.idle.Add(&wait);
++			locker.Unlock();
++			wait.Wait(B_ABSOLUTE_TIMEOUT, timeout);
++			locker.Lock();
++		}
++		if (lane.current == running[i] || lane.finishing == running[i]) {
++			dprintf("dwc2: a canceled transfer still runs after 1 s\n");
++		}
++		locker.Unlock();
++	}
+ 	return B_OK;
+ }
+ 
+@@ -820,12 +859,20 @@ DWC2::_Worker(dwc2_lane* lane)
+ 		if (retry) {
+ 			entry->due = system_time() + kInterruptRetryDelay;
+ 			lane->queue.Add(entry);
++			lane->idle.NotifyAll();
+ 			continue;
+ 		}
++		lane->finishing = entry;
+ 		locker.Unlock();
+ 
+-		transfer->Finished(status, actual);
++		if (!entry->silent)
++			transfer->Finished(status, actual);
+ 		delete transfer;
++
++		locker.Lock();
++		lane->finishing = NULL;
++		lane->idle.NotifyAll();
++		locker.Unlock();
+ 		delete entry;
+ 	}
+ }
+@@ -1003,6 +1050,10 @@ DWC2::_RunChannel(dwc2_lane* lane, uint32 character, uint32 split,
+ 	uint32 packets, uint32 pid, uint32 offset, bool in, uint32* _status,
+ 	uint32* _transferSize)
+ {
++	// a canceled transfer stops at its next transaction (CancelQueuedTransfers())
++	if (lane->current != NULL && *(volatile bool*)&lane->current->canceled)
++		return B_CANCELED;
++
+ 	phys_addr_t physical = lane->bouncePhysical + offset;
+ 	dwc2_dcache_maintain(physical, size, in);
+ 
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.h b/src/add-ons/kernel/busses/usb/dwc2.h
+index 9843abbc46..ed2d78f09a 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.h
++++ b/src/add-ons/kernel/busses/usb/dwc2.h
+@@ -22,6 +22,7 @@ struct dwc2_transfer : DoublyLinkedListLinkImpl<dwc2_transfer> {
+ 	Transfer*		transfer;
+ 	bigtime_t		due;			// interrupt transfers: next attempt
+ 	bool			canceled;
++	bool			silent;			// canceled without its callback
+ };
+ 
+ typedef DoublyLinkedList<dwc2_transfer> dwc2_transfer_list;
+@@ -120,6 +121,10 @@ struct dwc2_lane {
+ 	size_t				bounceSize;
+ 	dwc2_transfer_list	queue;
+ 	dwc2_transfer*		current;
++	dwc2_transfer*		finishing;
++		// done, being handed back and deleted: it still holds its pipe
++	ConditionVariable	idle;
++		// current or finishing went away
+ 	sem_id				workSemaphore;
+ 	thread_id			thread;
+ 	ConditionVariable	halted;

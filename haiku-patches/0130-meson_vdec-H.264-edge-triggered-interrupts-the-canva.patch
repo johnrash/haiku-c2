@@ -1,0 +1,1184 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 18:09:08 -0400
+Subject: [PATCH 130/342] meson_vdec: H.264; edge-triggered interrupts; the
+ canvas module
+
+H.264 with the GXBB firmware (its 20 KB extension in a buffer of its own):
+the firmware asks for frames once it has read the SPS (command 1), which a
+thread of the session answers with the reference count + 5 frames (at most
+24), one area each, and the motion vector buffer; frames come up to six a
+report with their stream offsets (WRITE gives the offsets of the data), two
+hand-back slots. The end of the stream is a 16x16 IDR picture, whose own
+frame request is left unanswered. Facts: the port's docs/m26-vdec-h264-facts.md.
+
+The interrupts are edges as the device tree says; GET_FRAME waits no longer
+than its timeout.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/drivers/meson_vdec.h          |  23 +-
+ .../drivers/video/meson_vdec/meson_vdec.cpp   | 687 +++++++++++++++---
+ 2 files changed, 599 insertions(+), 111 deletions(-)
+
+diff --git a/headers/private/drivers/meson_vdec.h b/headers/private/drivers/meson_vdec.h
+index 28f71b17c8..4131c2d469 100644
+--- a/headers/private/drivers/meson_vdec.h
++++ b/headers/private/drivers/meson_vdec.h
+@@ -11,11 +11,13 @@
+ 
+ /*!	The Amlogic S905's (Meson GXBB) video decoder, /dev/video/meson_vdec/0.
+ 	One session at a time: start it with the codec's firmware, write the
+-	compressed stream (an elementary stream: MPEG-1/2 so far), take the
+-	decoded frames in display order and give each back when done with it.
+-	The frames are NV12 (a Y plane, then interleaved Cb and Cr at half the
+-	height) in one area the caller clones; their contents are valid from
+-	GET_FRAME until RECYCLE_FRAME.
++	compressed stream (an elementary stream: MPEG-1/2, or H.264 in Annex B
++	form), take the decoded frames in display order and give each back when
++	done with it. The frames are NV12 (a Y plane, then interleaved Cb and Cr
++	at half the height) in an area the caller clones; their contents are
++	valid from GET_FRAME until RECYCLE_FRAME. For H.264, the firmware asks
++	for the frames once it has read the sequence parameter set: START gives
++	no area then (frames < 0), each frame names its area.
+ */
+ 
+ #define MESON_VDEC_DEVICE		"/dev/video/meson_vdec/0"
+@@ -37,6 +39,7 @@ enum {
+ 
+ enum {
+ 	MESON_VDEC_MPEG12 = 1,
++	MESON_VDEC_H264 = 2,
+ };
+ 
+ struct meson_vdec_start {
+@@ -47,16 +50,20 @@ struct meson_vdec_start {
+ 	uint32			height;			// in
+ 	uint32			frame_count;	// out: frames in the area
+ 	size_t			frame_size;		// out: bytes per frame
+-	area_id			frames;			// out: all frames, one after the other
++	area_id			frames;			// out: all frames, one after the other;
++									// < 0 if not known yet
+ };
+ 
+ struct meson_vdec_write {
+ 	const void*		data;
+ 	size_t			size;
++	uint32			offset;			// out: where in the stream it starts
+ };
+ 
+ #define MESON_VDEC_FRAME_END_OF_STREAM	0x1
+ 	// no frame: the stream ended and every frame was handed out
++#define MESON_VDEC_FRAME_DAMAGED		0x2
++	// decoded, but the stream had errors
+ 
+ struct meson_vdec_frame {
+ 	bigtime_t		timeout;		// in: relative
+@@ -66,6 +73,10 @@ struct meson_vdec_frame {
+ 	uint32			height;
+ 	uint32			bytes_per_row;	// out: of Y and of CbCr
+ 	uint32			chroma_offset;	// out: CbCr, from the frame's start
++	area_id			frames;			// out: the area the frame is in
++	size_t			offset;			// out: the frame's start in it
++	uint32			stream_offset;	// out: H.264: where in the stream its
++									// picture is (as WRITE's offset)
+ };
+ 
+ 
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+index fb98e99213..2817dcd5c9 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+@@ -3,18 +3,22 @@
+  * Distributed under the terms of the MIT License.
+  *
+  * meson_vdec: the Amlogic S905's (Meson GXBB) video decoder, VDEC_1, for
+- * MPEG-1/2 so far, as video/meson_vdec/0 (headers/private/drivers/
++ * MPEG-1/2 and H.264, as video/meson_vdec/0 (headers/private/drivers/
+  * meson_vdec.h).
+  *
+  * The decoder is an AMRISC processor running Amlogic's firmware, which the
+  * caller hands in. The elementary stream goes through the stream parser
+  * (ESPARSER) into a ring in memory (the VIFIFO) that the decoder reads; it
+- * decodes into eight NV12 frames, each two canvases, and reports each
+- * decoded frame in a scratch register with a mailbox interrupt. The
+- * register facts are in the port's docs/m26-vdec-facts.md.
++ * decodes into NV12 frames, each two canvases, and reports decoded frames
++ * in scratch registers with a mailbox interrupt. MPEG-1/2 decodes into
++ * eight frames given at the start. The H.264 firmware asks for its frames
++ * once it has read the sequence parameter set (its command 1), which a
++ * thread of the session answers. The register facts are in the port's
++ * docs/m26-vdec-facts.md and docs/m26-vdec-h264-facts.md.
+  *
+- * Both interrupts are rising edges, which the GIC takes as levels here, so
+- * every wait also looks at the registers itself every few milliseconds.
++ * Both interrupts are rising edges (the device tree says so; the GIC is set
++ * up for that). Every wait also looks at the registers itself every few
++ * milliseconds, in case an interrupt is lost.
+  */
+ 
+ 
+@@ -28,10 +32,12 @@
+ #include <device_manager.h>
+ #include <debug.h>
+ #include <kernel.h>
++#include <arch/int.h>
+ #include <lock.h>
+ #include <util/AutoLock.h>
+ #include <vm/vm.h>
+ 
++#include <meson_canvas.h>
+ #include <meson_vdec.h>
+ 
+ 
+@@ -45,7 +51,6 @@
+ static const phys_addr_t kAoBase = 0xc8100000;
+ static const phys_addr_t kHhiBase = 0xc883c000;
+ static const phys_addr_t kResetBase = 0xc1104000;
+-static const phys_addr_t kDmcBase = 0xc8838000;
+ 
+ // AO (byte offsets)
+ enum {
+@@ -75,18 +80,7 @@ enum {
+ };
+ #define RESET1_PARSER				(1 << 8)	// a pulse
+ 
+-// DMC canvas lookup table (byte offsets)
+-enum {
+-	DMC_CAV_LUT_DATAL			= 0x48,
+-	DMC_CAV_LUT_DATAH			= 0x4c,
+-	DMC_CAV_LUT_ADDR			= 0x50,
+-};
+-#define CANVAS_LUT_WRITE			(1 << 9)
+-#define CANVAS_ENDIAN_SHIFT			26
+-#define CANVAS_SWAP_64				7
+-
+-// the decoder's canvases: 2 a frame (Y, CbCr); the display uses 0x4e, 0x60
+-// and 0x61
++// the decoder's canvases (meson_canvas.h): 2 a frame (Y, CbCr)
+ static const uint32 kFirstCanvas = 0x80;
+ 
+ // DOS (byte offsets)
+@@ -101,7 +95,13 @@ enum {
+ 	PSCALE_CTRL					= 0x2444,
+ 	GCLK_EN						= 0x260c,
+ 	MDEC_PIC_DC_CTRL			= 0x2638,
++	ANC0_CANVAS_ADDR			= 0x2640,	// H.264: to 23, the frames
++	MDEC_PIC_DC_THRESH			= 0x26e0,
+ 	AV_SCRATCH_0				= 0x2700,	// to _7: the frames' canvases
++											// H.264: the command
++	AV_SCRATCH_1				= 0x2704,	// H.264: to _6, frame reports
++	AV_SCRATCH_2				= 0x2708,
++	AV_SCRATCH_3				= 0x270c,
+ 	AV_SCRATCH_4				= 0x2710,	// later: sequence info
+ 	AV_SCRATCH_5				= 0x2714,	// later: picture info
+ 	AV_SCRATCH_6				= 0x2718,	// later: the width
+@@ -114,6 +114,9 @@ enum {
+ 	AV_SCRATCH_D				= 0x2734,	// the frame's stream offset
+ 	AV_SCRATCH_E				= 0x2738,	// waiting for a frame?
+ 	AV_SCRATCH_F				= 0x273c,	// 1: fatal error
++	AV_SCRATCH_G				= 0x2740,	// H.264: the extension
++	AV_SCRATCH_I				= 0x2748,	// H.264: the SEI buffer
++	AV_SCRATCH_J				= 0x274c,	// H.264: SEI data
+ 	MPEG1_2_REG					= 0x3004,
+ 	PIC_HEAD_INFO				= 0x300c,
+ 	POWER_CTL_VLD				= 0x3020,
+@@ -169,6 +172,7 @@ enum {
+ #define PARSER_INT_HOST_START_CODE	(1 << 8)
+ 
+ static const uint32 kFirmwareSize = 16 * 1024;
++	// what the IMEM DMA loads; the H.264 file has an extension after it
+ static const size_t kVififoSize = 8 * 1024 * 1024;
+ static const size_t kWorkspaceSize = 128 * 1024;
+ static const uint32 kWorkspaceOffset = 0x1400;
+@@ -180,12 +184,49 @@ static const uint32 kMarkerSize = 512;
+ static const size_t kVififoMargin = 6 * 1024;
+ 	// the parser's own FIFO
+ static const uint32 kFrameCount = 8;
++	// MPEG-1/2's
++static const uint32 kMaxFrames = 24;
++	// H.264's at most (and the queue's)
+ static const uint32 kMaxWidth = 1920;
+ static const uint32 kMaxHeight = 1088;
+ static const bigtime_t kPollInterval = 2000;
+ 
++// H.264
++static const uint32 kH264ExtensionSize = 20 * 1024;
++static const size_t kH264WorkspaceSize = 0x1ee000;
++static const uint32 kH264WorkspaceBias = 0x01000000;
++	// the firmware adds it to the workspace address it is given
++static const size_t kH264SeiSize = 8 * 1024;
++static const uint32 kH264MaxReportFrames = 6;
++static const uint32 kMotionVectorBytes = 96;	// per macroblock and reference
++
++enum {
++	H264_COMMAND_SEQUENCE		= 1,	// geometry known, wants frames
++	H264_COMMAND_FRAMES			= 2,	// frames decoded
++	H264_COMMAND_FATAL			= 6,
++	H264_COMMAND_BAD_WIDTH		= 7,
++	H264_COMMAND_BAD_HEIGHT		= 8,
++};
++#define H264_STATUS_INDEX_MASK		0x1f
++#define H264_STATUS_ERROR			(1 << 9)
++#define H264_SEI_READY				(1 << 15)
++
++/*!	The end of an H.264 stream: a 16x16 IDR picture (SPS, PPS, slice;
++	encoded with x264). Before decoding an IDR picture, the firmware puts
++	out all it holds; the picture itself changes the size, which stops the
++	firmware until it gets frames for it, and it doesn't.
++*/
++static const uint8 kH264EndOfStream[] = {
++	0x00, 0x00, 0x00, 0x01, 0x67, 0x4d, 0x40, 0x0a, 0xda, 0x7b, 0x01, 0x10,
++	0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x06, 0x40, 0xf1, 0x22, 0x6a,
++	0x00, 0x00, 0x00, 0x01, 0x68, 0xef, 0x0f, 0x2c, 0x80, 0x00, 0x00, 0x01,
++	0x65, 0x88, 0x84, 0x1f, 0xff, 0xfe, 0xf4, 0xa3, 0xf8, 0x14, 0xd2, 0x6c,
++	0x4d
++};
++
+ 
+ device_manager_info* gDeviceManager;
++meson_canvas_module_info* gCanvas;
+ 
+ 
+ /*!	Writes back and invalidates the cache lines of a physical range through
+@@ -230,7 +271,8 @@ public:
+ 								~MesonVdec();
+ 
+ 			status_t			Init(phys_addr_t dos, phys_addr_t parser,
+-									int32 vdecIrq, int32 parserIrq);
++									int32 vdecIrq, int32 parserIrq,
++									bool edgeTriggered);
+ 			device_node*		Node() const { return fNode; }
+ 
+ 			status_t			Open();
+@@ -243,12 +285,17 @@ private:
+ 	static	int32				_VdecInterrupt(void* data);
+ 	static	int32				_ParserInterrupt(void* data);
+ 			bool				_CheckDecoder();
++			bool				_CheckMpeg12();
++			bool				_CheckH264();
+ 			bool				_CheckParser();
++			void				_QueueFrame(uint32 index, uint32 info,
++									uint32 offset);
+ 
+ 			status_t			_Start(meson_vdec_start& start,
+ 									const void* userFirmware);
+ 			void				_Stop();
+-			status_t			_Write(const uint8* userData, size_t size);
++			status_t			_Write(const uint8* userData, size_t size,
++									uint32* _offset);
+ 			status_t			_Submit(size_t payload, bool marker);
+ 			status_t			_EndOfStream();
+ 			status_t			_GetFrame(meson_vdec_frame& frame);
+@@ -259,6 +306,10 @@ private:
+ 			void				_SetupVififo();
+ 			status_t			_LoadFirmware(const void* userFirmware);
+ 			void				_StartCodec();
++			status_t			_StartH264(const void* userFirmware);
++	static	status_t			_SetupThread(void* data);
++			status_t			_SetupH264Frames(const uint32* info);
++			void				_FreeH264Frames();
+ 			void				_InitParser();
+ 			void				_WriteCanvas(uint32 index,
+ 									phys_addr_t address, uint32 bytesPerRow,
+@@ -284,13 +335,11 @@ private:
+ 			area_id				fAoArea;
+ 			area_id				fHhiArea;
+ 			area_id				fResetArea;
+-			area_id				fDmcArea;
+ 			volatile uint32*	fDos;
+ 			volatile uint32*	fParser;
+ 			volatile uint32*	fAo;
+ 			volatile uint32*	fHhi;
+ 			volatile uint32*	fReset;
+-			volatile uint32*	fDmc;
+ 			int32				fVdecIrq;
+ 			int32				fParserIrq;
+ 
+@@ -307,16 +356,39 @@ private:
+ 			dma_buffer			fWorkspace;
+ 			dma_buffer			fInput;
+ 			dma_buffer			fFrames;
++			uint32				fCodec;
+ 			uint32				fWidth;
+ 			uint32				fHeight;
+ 			uint32				fBytesPerRow;
+ 			uint32				fLumaSize;
+ 			size_t				fFrameSize;
++			uint32				fFrameCount;
++			uint32				fStreamBytes;
++				// written to the VIFIFO this session: the offsets the
++				// H.264 firmware gives its frames count from its start
++			uint32				fEndOffset;
++
++			// H.264: the extension of the firmware, the firmware's own
++			// memory, and the frames (one area each) and their motion
++			// vectors, which the firmware asks for
++			dma_buffer			fExtension;
++			dma_buffer			fSei;
++			dma_buffer			fMotionVectors;
++			dma_buffer			fFrameBuffers[kMaxFrames];
++			thread_id			fSetupThread;
++			sem_id				fSetupSem;
++			bool				fSetupPending;
++				// its command 1 waits for the setup thread
++			uint32				fSetupInfo[4];
++				// AV_SCRATCH_1, 2, 3 and 6 of the command
++			uint32				fDecodeErrors;
++			uint32				fBadPictures;
+ 
+ 			sem_id				fFrameSem;
+ 			sem_id				fParserSem;
+-			uint32				fQueue[kFrameCount];
+-			uint32				fQueueInfo[kFrameCount];
++			uint32				fQueue[kMaxFrames];
++			uint32				fQueueInfo[kMaxFrames];
++			uint32				fQueueOffset[kMaxFrames];
+ 			uint32				fQueueHead;
+ 			uint32				fQueueCount;
+ 			uint32				fHeld;
+@@ -358,23 +430,30 @@ MesonVdec::MesonVdec(device_node* node)
+ 	fAoArea(-1),
+ 	fHhiArea(-1),
+ 	fResetArea(-1),
+-	fDmcArea(-1),
+ 	fDos(NULL),
+ 	fParser(NULL),
+ 	fAo(NULL),
+ 	fHhi(NULL),
+ 	fReset(NULL),
+-	fDmc(NULL),
+ 	fVdecIrq(-1),
+ 	fParserIrq(-1),
+ 	fOpen(false),
+ 	fRunning(false),
+ 	fEndOfStream(false),
++	fCodec(0),
+ 	fWidth(0),
+ 	fHeight(0),
+ 	fBytesPerRow(0),
+ 	fLumaSize(0),
+ 	fFrameSize(0),
++	fFrameCount(0),
++	fStreamBytes(0),
++	fEndOffset(0),
++	fSetupThread(-1),
++	fSetupSem(-1),
++	fSetupPending(false),
++	fDecodeErrors(0),
++	fBadPictures(0),
+ 	fFrameSem(-1),
+ 	fParserSem(-1),
+ 	fQueueHead(0),
+@@ -405,8 +484,9 @@ MesonVdec::~MesonVdec()
+ 		remove_io_interrupt_handler(fParserIrq, &_ParserInterrupt, this);
+ 	delete_sem(fFrameSem);
+ 	delete_sem(fParserSem);
+-	area_id areas[] = { fDosArea, fParserArea, fAoArea, fHhiArea, fResetArea,
+-		fDmcArea };
++	delete_sem(fSetupSem);
++	area_id areas[] = { fDosArea, fParserArea, fAoArea, fHhiArea,
++		fResetArea };
+ 	for (size_t i = 0; i < B_COUNT_OF(areas); i++) {
+ 		if (areas[i] >= 0)
+ 			delete_area(areas[i]);
+@@ -433,7 +513,7 @@ map_registers(const char* name, phys_addr_t base, size_t size, area_id& area,
+ 
+ status_t
+ MesonVdec::Init(phys_addr_t dos, phys_addr_t parser, int32 vdecIrq,
+-	int32 parserIrq)
++	int32 parserIrq, bool edgeTriggered)
+ {
+ 	status_t status;
+ 	if ((status = map_registers("meson_vdec dos", dos, 0x10000, fDosArea,
+@@ -445,18 +525,27 @@ MesonVdec::Init(phys_addr_t dos, phys_addr_t parser, int32 vdecIrq,
+ 		|| (status = map_registers("meson_vdec hhi", kHhiBase, B_PAGE_SIZE,
+ 			fHhiArea, fHhi)) != B_OK
+ 		|| (status = map_registers("meson_vdec reset", kResetBase,
+-			B_PAGE_SIZE, fResetArea, fReset)) != B_OK
+-		|| (status = map_registers("meson_vdec dmc", kDmcBase, B_PAGE_SIZE,
+-			fDmcArea, fDmc)) != B_OK) {
++			B_PAGE_SIZE, fResetArea, fReset)) != B_OK) {
+ 		return status;
+ 	}
+ 
+ 	fFrameSem = create_sem(0, "meson_vdec frames");
+ 	fParserSem = create_sem(0, "meson_vdec parser");
+-	if (fFrameSem < 0 || fParserSem < 0)
++	fSetupSem = create_sem(0, "meson_vdec setup");
++	if (fFrameSem < 0 || fParserSem < 0 || fSetupSem < 0)
+ 		return B_NO_MORE_SEMS;
+ 
+ 	// interrupts are masked at the source until a session starts
++	if (edgeTriggered) {
++		if (vdecIrq > 0) {
++			arch_int_configure_io_interrupt(vdecIrq, B_EDGE_TRIGGERED,
++				B_RISING_EDGE_POLARITY);
++		}
++		if (parserIrq > 0) {
++			arch_int_configure_io_interrupt(parserIrq, B_EDGE_TRIGGERED,
++				B_RISING_EDGE_POLARITY);
++		}
++	}
+ 	if (vdecIrq > 0 && install_io_interrupt_handler(vdecIrq,
+ 			&_VdecInterrupt, this, 0) == B_OK) {
+ 		fVdecIrq = vdecIrq;
+@@ -466,8 +555,8 @@ MesonVdec::Init(phys_addr_t dos, phys_addr_t parser, int32 vdecIrq,
+ 		fParserIrq = parserIrq;
+ 	}
+ 	INFO("DOS %#" B_PRIxPHYSADDR ", parser %#" B_PRIxPHYSADDR
+-		", interrupts %" B_PRId32 " and %" B_PRId32 "\n", dos, parser,
+-		fVdecIrq, fParserIrq);
++		", interrupts %" B_PRId32 " and %" B_PRId32 " (%s)\n", dos, parser,
++		fVdecIrq, fParserIrq, edgeTriggered ? "edges" : "levels");
+ 	return B_OK;
+ }
+ 
+@@ -512,8 +601,9 @@ MesonVdec::_DumpTrace(bool debugger)
+ //	#pragma mark - interrupts
+ 
+ 
+-/*!	Takes a frame the firmware reported, or its fatal error. Called with
+-	fStateLock held, from the interrupt or from a waiting thread.
++/*!	Takes what the firmware reported: frames, its fatal error, for H.264 its
++	wish for frames. Called with fStateLock held, from the interrupt or from
++	a waiting thread.
+ */
+ bool
+ MesonVdec::_CheckDecoder()
+@@ -521,6 +611,28 @@ MesonVdec::_CheckDecoder()
+ 	if (!fRunning)
+ 		return false;
+ 	_SetDos(ASSIST_MBOX1_CLR_REG, 1);
++	return fCodec == MESON_VDEC_H264 ? _CheckH264() : _CheckMpeg12();
++}
++
++
++void
++MesonVdec::_QueueFrame(uint32 index, uint32 info, uint32 offset)
++{
++	if (fQueueCount >= kMaxFrames)
++		return;
++	uint32 slot = (fQueueHead + fQueueCount) % kMaxFrames;
++	fQueue[slot] = index;
++	fQueueInfo[slot] = info;
++	fQueueOffset[slot] = offset;
++	fQueueCount++;
++	fFramesDecoded++;
++	release_sem_etc(fFrameSem, 1, B_DO_NOT_RESCHEDULE);
++}
++
++
++bool
++MesonVdec::_CheckMpeg12()
++{
+ 	if (_Dos(AV_SCRATCH_F) == 1) {
+ 		if (!fFatal)
+ 			release_sem_etc(fFrameSem, 1, B_DO_NOT_RESCHEDULE);
+@@ -537,20 +649,98 @@ MesonVdec::_CheckDecoder()
+ 		fFramesSkipped++;
+ 	} else {
+ 		uint32 index = ((report & 0xf) - 1) & (kFrameCount - 1);
+-		if (fQueueCount < kFrameCount) {
+-			uint32 slot = (fQueueHead + fQueueCount) % kFrameCount;
+-			fQueue[slot] = index;
+-			fQueueInfo[slot] = _Dos(AV_SCRATCH_5);
+-			fQueueCount++;
+-			fFramesDecoded++;
+-			release_sem_etc(fFrameSem, 1, B_DO_NOT_RESCHEDULE);
+-		}
++		_QueueFrame(index, _Dos(AV_SCRATCH_5), _Dos(AV_SCRATCH_D));
+ 	}
+ 	_SetDos(AV_SCRATCH_9, 0);
+ 	return true;
+ }
+ 
+ 
++/*!	The H.264 firmware's command in AV_SCRATCH_0: its wish for frames
++	(left for the setup thread, which answers in the same register), decoded
++	frames (up to six, each with its status in AV_SCRATCH_1-6 and its
++	stream offset's high half in AV_SCRATCH_A-C), or a fatal error.
++*/
++bool
++MesonVdec::_CheckH264()
++{
++	uint32 command = _Dos(AV_SCRATCH_0);
++	bool handled = true;
++	switch (command & 0xff) {
++		case 0:
++			handled = false;
++			break;
++
++		case H264_COMMAND_SEQUENCE:
++			if (fSetupPending)
++				break;
++			fSetupPending = true;
++			fSetupInfo[0] = _Dos(AV_SCRATCH_1);
++			fSetupInfo[1] = _Dos(AV_SCRATCH_2);
++			fSetupInfo[2] = _Dos(AV_SCRATCH_3);
++			fSetupInfo[3] = _Dos(AV_SCRATCH_6);
++			_Trace('C', command, fSetupInfo[0], fSetupInfo[3],
++				fSetupInfo[1]);
++			release_sem_etc(fSetupSem, 1, B_DO_NOT_RESCHEDULE);
++			break;
++
++		case H264_COMMAND_FRAMES:
++		{
++			fLastReport = system_time();
++			uint32 errors = _Dos(AV_SCRATCH_D);
++			if (errors != 0) {
++				fDecodeErrors += errors;
++				_SetDos(AV_SCRATCH_D, 0);
++			}
++			uint32 count = (command >> 8) & 0xff;
++			if (count > kH264MaxReportFrames)
++				count = kH264MaxReportFrames;
++			for (uint32 i = 0; i < count; i++) {
++				uint32 status = _Dos(AV_SCRATCH_1 + 4 * i);
++				uint32 high = _Dos(AV_SCRATCH_A + 4 * (i / 2));
++				uint32 offset = (((i & 1) != 0 ? high >> 16 : high & 0xffff)
++					<< 16) | (status >> 16);
++				uint32 index = status & H264_STATUS_INDEX_MASK;
++				_Trace('R', status, offset, count, errors);
++				if ((status & H264_STATUS_ERROR) != 0)
++					fBadPictures++;
++				if (fEndOfStream && offset >= fEndOffset) {
++					// the end of the stream's own picture
++					fFramesSkipped++;
++					continue;
++				}
++				if (index >= fFrameCount) {
++					fFramesSkipped++;
++					continue;
++				}
++				_QueueFrame(index, status, offset);
++			}
++			_SetDos(AV_SCRATCH_0, 0);
++			break;
++		}
++
++		case H264_COMMAND_FATAL:
++		case H264_COMMAND_BAD_WIDTH:
++		case H264_COMMAND_BAD_HEIGHT:
++			// the firmware stays stopped; nothing to acknowledge
++			if (!fFatal) {
++				_Trace('F', command, _Dos(AV_SCRATCH_1));
++				release_sem_etc(fFrameSem, 1, B_DO_NOT_RESCHEDULE);
++			}
++			fFatal = true;
++			break;
++
++		default:
++			_Trace('?', command);
++			_SetDos(AV_SCRATCH_0, 0);
++			break;
++	}
++	if ((_Dos(AV_SCRATCH_J) & H264_SEI_READY) != 0)
++		_SetDos(AV_SCRATCH_J, 0);
++	return handled;
++}
++
++
+ /*!	Whether the parser found the marker after the data it was given (all of
+ 	it is in the VIFIFO then). Called with fStateLock held.
+ */
+@@ -636,12 +826,8 @@ void
+ MesonVdec::_WriteCanvas(uint32 index, phys_addr_t address,
+ 	uint32 bytesPerRow, uint32 height)
+ {
+-	uint32 width = bytesPerRow / 8;
+-	fDmc[DMC_CAV_LUT_DATAL / 4] = (address / 8) | (width << 29);
+-	fDmc[DMC_CAV_LUT_DATAH / 4] = (width >> 3) | (height << 9)
+-		| (CANVAS_SWAP_64 << CANVAS_ENDIAN_SHIFT);
+-	fDmc[DMC_CAV_LUT_ADDR / 4] = CANVAS_LUT_WRITE | index;
+-	(void)fDmc[DMC_CAV_LUT_DATAH / 4];
++	gCanvas->write(index, address, bytesPerRow, height,
++		MESON_CANVAS_SWAP_64);
+ }
+ 
+ 
+@@ -800,15 +986,22 @@ MesonVdec::_Start(meson_vdec_start& start, const void* userFirmware)
+ {
+ 	if (fRunning)
+ 		return B_BUSY;
+-	if (start.codec != MESON_VDEC_MPEG12
+-		|| start.firmware_size != kFirmwareSize
+-		|| start.width < 16 || start.width > kMaxWidth
+-		|| start.height < 16 || start.height > kMaxHeight) {
++	bool h264 = start.codec == MESON_VDEC_H264;
++	if (start.codec != MESON_VDEC_MPEG12 && !h264)
++		return B_BAD_VALUE;
++	if (start.firmware_size
++			!= (h264 ? kFirmwareSize + kH264ExtensionSize : kFirmwareSize)
++		|| !IS_USER_ADDRESS(userFirmware)) {
++		return B_BAD_VALUE;
++	}
++	if (!h264 && (start.width < 16 || start.width > kMaxWidth
++			|| start.height < 16 || start.height > kMaxHeight)) {
+ 		return B_BAD_VALUE;
+ 	}
+ 
+-	fWidth = start.width;
+-	fHeight = start.height;
++	fCodec = start.codec;
++	fWidth = h264 ? 0 : start.width;
++	fHeight = h264 ? 0 : start.height;
+ 	fBytesPerRow = align_up(fWidth, 32);
+ 	fLumaSize = align_up(fBytesPerRow * align_up(fHeight, 32), 64 * 1024);
+ 	fFrameSize = ROUNDUP(fLumaSize + fLumaSize / 2, B_PAGE_SIZE);
+@@ -818,17 +1011,27 @@ MesonVdec::_Start(meson_vdec_start& start, const void* userFirmware)
+ 			fFirmware, false)) != B_OK
+ 		|| (status = _AllocateBuffer("meson_vdec vififo", kVififoSize,
+ 			fVififo, false)) != B_OK
+-		|| (status = _AllocateBuffer("meson_vdec workspace", kWorkspaceSize,
+-			fWorkspace, false)) != B_OK
++		|| (status = _AllocateBuffer("meson_vdec workspace",
++			h264 ? kH264WorkspaceSize : kWorkspaceSize, fWorkspace, false))
++				!= B_OK
+ 		|| (status = _AllocateBuffer("meson_vdec input",
+ 			kInputSize + kMinimumFetch + kMarkerSize, fInput, false)) != B_OK
+-		|| (status = _AllocateBuffer("meson_vdec frames",
+-			kFrameCount * fFrameSize, fFrames, true)) != B_OK) {
+-		INFO("no memory for a session (%" B_PRIuSIZE " bytes of frames): "
+-			"%s\n", kFrameCount * fFrameSize, strerror(status));
++		|| (!h264 && (status = _AllocateBuffer("meson_vdec frames",
++			kFrameCount * fFrameSize, fFrames, true)) != B_OK)
++		|| (h264 && (status = _AllocateBuffer("meson_vdec extension",
++			kH264ExtensionSize, fExtension, false)) != B_OK)
++		|| (h264 && (status = _AllocateBuffer("meson_vdec sei", kH264SeiSize,
++			fSei, false)) != B_OK)) {
++		INFO("no memory for a session: %s\n", strerror(status));
+ 		_Stop();
+ 		return status;
+ 	}
++	if (h264 && fWorkspace.physical < kH264WorkspaceBias) {
++		// the firmware's address would wrap around
++		INFO("workspace below 16 MB\n");
++		_Stop();
++		return B_NO_MEMORY;
++	}
+ 
+ 	{
+ 		InterruptsSpinLocker locker(fStateLock);
+@@ -838,19 +1041,27 @@ MesonVdec::_Start(meson_vdec_start& start, const void* userFirmware)
+ 		fFatal = false;
+ 		fLastReport = 0;
+ 		fEndOfStream = false;
++		fStreamBytes = 0;
++		fEndOffset = 0;
++		fFrameCount = h264 ? 0 : kFrameCount;
++		fSetupPending = false;
++		fDecodeErrors = 0;
++		fBadPictures = 0;
++	}
++	sem_id sems[] = { fFrameSem, fParserSem, fSetupSem };
++	for (size_t i = 0; i < B_COUNT_OF(sems); i++) {
++		int32 count;
++		if (get_sem_count(sems[i], &count) == B_OK && count > 0)
++			acquire_sem_etc(sems[i], count, 0, 0);
+ 	}
+-	int32 count;
+-	if (get_sem_count(fFrameSem, &count) == B_OK && count > 0)
+-		acquire_sem_etc(fFrameSem, count, 0, 0);
+-	if (get_sem_count(fParserSem, &count) == B_OK && count > 0)
+-		acquire_sem_etc(fParserSem, count, 0, 0);
+ 
+ 	// The canvases go in before the power-up's reset: written after it, the
+ 	// first session after boot decoded the first picture's first
+ 	// macroblock wrongly (its top two blocks; later sessions, whose frames
+ 	// mostly land where the previous session's were, didn't), as if the
+-	// decoder kept the canvases it saw when it came out of reset.
+-	for (uint32 i = 0; i < kFrameCount; i++) {
++	// decoder kept the canvases it saw when it came out of reset. (H.264's
++	// come later, when the firmware asks for frames.)
++	for (uint32 i = 0; !h264 && i < kFrameCount; i++) {
+ 		phys_addr_t frame = fFrames.physical + i * fFrameSize;
+ 		uint32 luma = kFirstCanvas + 2 * i;
+ 		_WriteCanvas(luma, frame, fBytesPerRow, align_up(fHeight, 32));
+@@ -860,31 +1071,220 @@ MesonVdec::_Start(meson_vdec_start& start, const void* userFirmware)
+ 	_PowerUp();
+ 	_SetupVififo();
+ 	status = _LoadFirmware(userFirmware);
++	if (status == B_OK && h264)
++		status = _StartH264(userFirmware);
+ 	if (status != B_OK) {
+ 		_PowerDown();
+ 		_Stop();
+ 		return status;
+ 	}
+-	_StartCodec();
++	if (!h264)
++		_StartCodec();
+ 	_SetDos(ASSIST_MBOX1_CLR_REG, 1);
+ 	_SetDos(ASSIST_MBOX1_MASK, 1);
+ 	_SetDos(MDEC_PIC_DC_CTRL, _Dos(MDEC_PIC_DC_CTRL) | MDEC_PIC_DC_NV12);
+ 	fRunning = true;
++	if (h264) {
++		fSetupThread = spawn_kernel_thread(&_SetupThread, "meson_vdec setup",
++			B_URGENT_DISPLAY_PRIORITY, this);
++		if (fSetupThread >= 0)
++			resume_thread(fSetupThread);
++	}
+ 	_SetDos(MPSR, 1);
+ 	spin(20);
+ 	_InitParser();
+ 
+-	start.frame_count = kFrameCount;
+-	start.frame_size = fFrameSize;
+-	start.frames = fFrames.area;
+-	INFO("session: MPEG-1/2 %" B_PRIu32 "x%" B_PRIu32 ", frames of %"
+-		B_PRIuSIZE " bytes at %#" B_PRIxPHYSADDR ", VIFIFO at %#"
+-		B_PRIxPHYSADDR "\n", fWidth, fHeight, fFrameSize, fFrames.physical,
+-		fVififo.physical);
++	start.frame_count = h264 ? 0 : kFrameCount;
++	start.frame_size = h264 ? 0 : fFrameSize;
++	start.frames = h264 ? -1 : fFrames.area;
++	if (h264) {
++		INFO("session: H.264, VIFIFO at %#" B_PRIxPHYSADDR ", workspace at %#"
++			B_PRIxPHYSADDR "\n", fVififo.physical, fWorkspace.physical);
++	} else {
++		INFO("session: MPEG-1/2 %" B_PRIu32 "x%" B_PRIu32 ", frames of %"
++			B_PRIuSIZE " bytes at %#" B_PRIxPHYSADDR ", VIFIFO at %#"
++			B_PRIxPHYSADDR "\n", fWidth, fHeight, fFrameSize,
++			fFrames.physical, fVififo.physical);
++	}
++	return B_OK;
++}
++
++
++/*!	The H.264 firmware's start: its extension (the 20 KB after what the
++	IMEM DMA loaded) in a buffer of its own, its workspace and SEI buffer.
++	It asks for frames later (_SetupH264Frames()).
++*/
++status_t
++MesonVdec::_StartH264(const void* userFirmware)
++{
++	if (user_memcpy(fExtension.address,
++			(const uint8*)userFirmware + kFirmwareSize, kH264ExtensionSize)
++				!= B_OK) {
++		return B_BAD_ADDRESS;
++	}
++	flush_cache_range(fExtension.physical, kH264ExtensionSize);
++
++	uint32 workspace = fWorkspace.physical - kH264WorkspaceBias;
++	_SetDos(POWER_CTL_VLD, _Dos(POWER_CTL_VLD) | (1 << 9) | (1 << 6));
++	_SetDos(AV_SCRATCH_1, workspace);
++	_SetDos(AV_SCRATCH_G, fExtension.physical);
++	_SetDos(AV_SCRATCH_I, fSei.physical - workspace);
++	_SetDos(AV_SCRATCH_F, (_Dos(AV_SCRATCH_F) & ~0x3cu) | 0x90);
++	_SetDos(MDEC_PIC_DC_THRESH, 0x404038aa);
++	// what an earlier session left: no command, no frames handed back
++	_SetDos(AV_SCRATCH_0, 0);
++	_SetDos(AV_SCRATCH_7, 0);
++	_SetDos(AV_SCRATCH_8, 0);
++	_SetDos(AV_SCRATCH_J, 0);
++	return B_OK;
++}
++
++
++/*static*/ status_t
++MesonVdec::_SetupThread(void* data)
++{
++	MesonVdec* device = (MesonVdec*)data;
++	while (acquire_sem(device->fSetupSem) == B_OK) {
++		InterruptsSpinLocker locker(device->fStateLock);
++		if (!device->fRunning)
++			break;
++		if (!device->fSetupPending || device->fEndOfStream) {
++			// The end of the stream's own picture asks for frames of its
++			// size: left unanswered, the firmware stops there.
++			continue;
++		}
++		uint32 info[4];
++		memcpy(info, device->fSetupInfo, sizeof(info));
++		locker.Unlock();
++
++		status_t status = device->_SetupH264Frames(info);
++		if (status != B_OK) {
++			INFO("no frames for the stream: %s\n", strerror(status));
++			locker.Lock();
++			if (!device->fFatal)
++				release_sem_etc(device->fFrameSem, 1, B_DO_NOT_RESCHEDULE);
++			device->fFatal = true;
++		}
++	}
++	return B_OK;
++}
++
++
++/*!	Gives the H.264 firmware the frames for the stream it found (its
++	command 1, \a info: AV_SCRATCH_1, 2, 3 and 6): the stream's reference
++	frame count and five more (at most 24), each in an area of its own, and
++	room for their motion vectors. A later command (the stream changed)
++	reuses the frames if they are enough, else replaces them once the caller
++	gave all back.
++*/
++status_t
++MesonVdec::_SetupH264Frames(const uint32* info)
++{
++	uint32 mbWidth = info[0] & 0xff;
++	uint32 mbTotal = (info[0] >> 8) & 0xffff;
++	uint32 maxReferences = ((info[0] >> 24) & 0x7f) + 1;
++	if (mbWidth == 0 || mbTotal < mbWidth)
++		return B_BAD_DATA;
++	uint32 mbHeight = mbTotal / mbWidth;
++	uint32 cropBottom = info[3] & 0xff;
++	uint32 cropRight = (info[3] >> 16) & 0xff;
++	if (16 * mbWidth > kMaxWidth || 16 * mbHeight > kMaxHeight
++		|| cropRight >= 16 * mbWidth || cropBottom >= 16 * mbHeight) {
++		INFO("stream of %" B_PRIu32 "x%" B_PRIu32 " macroblocks: too large\n",
++			mbWidth, mbHeight);
++		return B_BAD_VALUE;
++	}
++	uint32 count = min_c(max_c(maxReferences + 5, 2), kMaxFrames);
++	uint32 bytesPerRow = align_up(16 * mbWidth, 32);
++	uint32 rows = align_up(16 * mbHeight, 32);
++	uint32 lumaSize = align_up(bytesPerRow * rows, 64 * 1024);
++	size_t frameSize = ROUNDUP(lumaSize + lumaSize / 2, B_PAGE_SIZE);
++
++	if (fFrameCount < count || fFrameSize < frameSize) {
++		if (fFrameCount > 0) {
++			// the caller has the old frames to give back first
++			bigtime_t timeout = system_time() + 5000000;
++			while (true) {
++				InterruptsSpinLocker locker(fStateLock);
++				bool done = fHeld == 0 && fQueueCount == 0;
++				locker.Unlock();
++				if (done)
++					break;
++				if (system_time() > timeout || !fRunning)
++					return B_TIMED_OUT;
++				snooze(5000);
++			}
++			_FreeH264Frames();
++		}
++		for (uint32 i = 0; i < count; i++) {
++			char name[32];
++			snprintf(name, sizeof(name), "meson_vdec frame %" B_PRIu32, i);
++			status_t status = _AllocateBuffer(name, frameSize,
++				fFrameBuffers[i], true);
++			if (status != B_OK) {
++				INFO("no memory for frame %" B_PRIu32 " of %" B_PRIu32 ", %"
++					B_PRIuSIZE " bytes\n", i, count, frameSize);
++				_FreeH264Frames();
++				return status;
++			}
++		}
++		fFrameSize = frameSize;
++	} else
++		count = fFrameCount;
++
++	for (uint32 i = 0; i < count; i++) {
++		uint32 luma = kFirstCanvas + 2 * i;
++		uint32 chroma = luma + 1;
++		_WriteCanvas(luma, fFrameBuffers[i].physical, bytesPerRow, rows);
++		_WriteCanvas(chroma, fFrameBuffers[i].physical + lumaSize,
++			bytesPerRow, rows / 2);
++		_SetDos(ANC0_CANVAS_ADDR + 4 * i,
++			luma | (chroma << 8) | (chroma << 16));
++	}
++
++	_FreeBuffer(fMotionVectors);
++	size_t motionVectors = (size_t)align_up(mbWidth, 4)
++		* align_up(mbHeight, 4) * kMotionVectorBytes * maxReferences;
++	status_t status = _AllocateBuffer("meson_vdec motion vectors",
++		motionVectors, fMotionVectors, false);
++	if (status != B_OK)
++		return status;
++
++	InterruptsSpinLocker locker(fStateLock);
++	if (!fRunning)
++		return B_OK;
++	fFrameCount = count;
++	fWidth = 16 * mbWidth - cropRight;
++	fHeight = 16 * mbHeight - cropBottom;
++	fBytesPerRow = bytesPerRow;
++	fLumaSize = lumaSize;
++	_SetDos(AV_SCRATCH_1, fMotionVectors.physical);
++	_SetDos(AV_SCRATCH_4, fMotionVectors.physical + motionVectors);
++	_SetDos(AV_SCRATCH_0, (maxReferences << 24) | (count << 16)
++		| ((maxReferences - 1) << 8));
++		// last: it lets the firmware go on
++	fSetupPending = false;
++	_Trace('P', info[0], count, frameSize, motionVectors);
++	locker.Unlock();
++
++	INFO("H.264 %" B_PRIu32 "x%" B_PRIu32 " (%" B_PRIu32 "x%" B_PRIu32
++		" macroblocks), %" B_PRIu32 " references: %" B_PRIu32 " frames of %"
++		B_PRIuSIZE " bytes\n", fWidth, fHeight, mbWidth, mbHeight,
++		maxReferences, count, frameSize);
+ 	return B_OK;
+ }
+ 
+ 
++void
++MesonVdec::_FreeH264Frames()
++{
++	for (uint32 i = 0; i < kMaxFrames; i++)
++		_FreeBuffer(fFrameBuffers[i]);
++	InterruptsSpinLocker locker(fStateLock);
++	fFrameCount = 0;
++}
++
++
+ void
+ MesonVdec::_Stop()
+ {
+@@ -894,13 +1294,23 @@ MesonVdec::_Stop()
+ 		InterruptsSpinLocker locker(fStateLock);
+ 		fRunning = false;
+ 		locker.Unlock();
++		if (fSetupThread >= 0) {
++			release_sem(fSetupSem);
++			wait_for_thread(fSetupThread, NULL);
++			fSetupThread = -1;
++		}
+ 		_PowerDown();
+ 		INFO("session ended: %" B_PRIu32 " frames decoded, %" B_PRIu32
+ 			" skipped, %" B_PRIu32 " buffers submitted, %" B_PRIu32
+-			" parser timeouts\n", fFramesDecoded, fFramesSkipped, fSubmitted,
+-			fParserTimeouts);
++			" parser timeouts, %" B_PRIu32 " decode errors, %" B_PRIu32
++			" damaged pictures\n", fFramesDecoded, fFramesSkipped, fSubmitted,
++			fParserTimeouts, fDecodeErrors, fBadPictures);
+ 		_DumpTrace(false);
+ 	}
++	_FreeBuffer(fExtension);
++	_FreeBuffer(fSei);
++	_FreeBuffer(fMotionVectors);
++	_FreeH264Frames();
+ 	_FreeBuffer(fFirmware);
+ 	_FreeBuffer(fVififo);
+ 	_FreeBuffer(fWorkspace);
+@@ -943,6 +1353,7 @@ MesonVdec::_Submit(size_t payload, bool marker)
+ 	_SetParser(PARSER_FETCH_CMD,
+ 		PARSER_FETCH_ENDIAN_64 | (length + kMarkerSize));
+ 	fSubmitted++;
++	fStreamBytes += length;
+ 	_Trace(marker ? 'S' : 'E', payload, _Parser(PARSER_VIDEO_WP),
+ 		_Dos(VLD_MEM_VIFIFO_LEVEL));
+ 
+@@ -974,13 +1385,18 @@ MesonVdec::_Submit(size_t payload, bool marker)
+ }
+ 
+ 
++/*!	Writes \a size bytes of the stream to the VIFIFO, in pieces of up to
++	kInputSize. \a _offset: where in the stream they start, as the H.264
++	firmware counts its frames' offsets.
++*/
+ status_t
+-MesonVdec::_Write(const uint8* userData, size_t size)
++MesonVdec::_Write(const uint8* userData, size_t size, uint32* _offset)
+ {
+ 	if (!fRunning)
+ 		return B_NOT_ALLOWED;
+ 	if (!IS_USER_ADDRESS(userData))
+ 		return B_BAD_ADDRESS;
++	*_offset = fStreamBytes;
+ 
+ 	while (size > 0) {
+ 		size_t piece = size < kInputSize ? size : kInputSize;
+@@ -1025,6 +1441,22 @@ MesonVdec::_EndOfStream()
+ {
+ 	if (!fRunning)
+ 		return B_NOT_ALLOWED;
++	if (fCodec == MESON_VDEC_H264) {
++		// a 16x16 IDR picture and the parser's marker in 4 KB: what the
++		// firmware reports of it (at or after fEndOffset) is dropped
++		memset(fInput.address, 0, kMinimumFetch);
++		memcpy(fInput.address, kH264EndOfStream, sizeof(kH264EndOfStream));
++		uint8* marker = fInput.address + sizeof(kH264EndOfStream);
++		marker[2] = 0x01;
++		marker[3] = 0xff;
++		{
++			InterruptsSpinLocker locker(fStateLock);
++			fEndOffset = fStreamBytes;
++			fEndOfStream = true;
++		}
++		_Submit(kMinimumFetch, false);
++		return B_OK;
++	}
+ 	bigtime_t timeout = system_time() + 3000000;
+ 	while (system_time() < timeout) {
+ 		InterruptsSpinLocker locker(fStateLock);
+@@ -1061,8 +1493,10 @@ MesonVdec::_GetFrame(meson_vdec_frame& frame)
+ 			endOfStream = true;
+ 			timeout = min_c(timeout, system_time() + 300000);
+ 		}
++		bigtime_t wait = min_c(max_c(timeout - system_time(), 0),
++			kPollInterval);
+ 		if (acquire_sem_etc(fFrameSem, 1, B_RELATIVE_TIMEOUT | B_CAN_INTERRUPT,
+-				kPollInterval) == B_OK) {
++				wait) == B_OK) {
+ 			break;
+ 		}
+ 		InterruptsSpinLocker locker(fStateLock);
+@@ -1070,8 +1504,8 @@ MesonVdec::_GetFrame(meson_vdec_frame& frame)
+ 		locker.Unlock();
+ 		if (reported)
+ 			continue;
+-		if (system_time() > timeout) {
+-			if (fEndOfStream) {
++		if (system_time() >= timeout) {
++			if (fEndOfStream && frame.timeout > 0) {
+ 				memset(&frame, 0, sizeof(frame));
+ 				frame.flags = MESON_VDEC_FRAME_END_OF_STREAM;
+ 				return B_OK;
+@@ -1089,24 +1523,37 @@ MesonVdec::_GetFrame(meson_vdec_frame& frame)
+ 	if (fQueueCount == 0)
+ 		return B_ERROR;
+ 	uint32 index = fQueue[fQueueHead];
+-	fQueueHead = (fQueueHead + 1) % kFrameCount;
++	uint32 info = fQueueInfo[fQueueHead];
++	uint32 offset = fQueueOffset[fQueueHead];
++	fQueueHead = (fQueueHead + 1) % kMaxFrames;
+ 	fQueueCount--;
+ 	fHeld |= 1 << index;
+-	locker.Unlock();
+-
+-	flush_cache_range(fFrames.physical + index * fFrameSize, fFrameSize);
+ 	memset(&frame, 0, sizeof(frame));
+ 	frame.index = index;
+ 	frame.width = fWidth;
+ 	frame.height = fHeight;
+ 	frame.bytes_per_row = fBytesPerRow;
+ 	frame.chroma_offset = fLumaSize;
++	frame.stream_offset = offset;
++	locker.Unlock();
++
++	if (fCodec == MESON_VDEC_H264) {
++		flush_cache_range(fFrameBuffers[index].physical, fFrameSize);
++		frame.frames = fFrameBuffers[index].area;
++		frame.offset = 0;
++		if ((info & H264_STATUS_ERROR) != 0)
++			frame.flags |= MESON_VDEC_FRAME_DAMAGED;
++	} else {
++		flush_cache_range(fFrames.physical + index * fFrameSize, fFrameSize);
++		frame.frames = fFrames.area;
++		frame.offset = (size_t)index * fFrameSize;
++	}
+ 	return B_OK;
+ }
+ 
+ 
+ /*!	Gives a frame back to the firmware: one at a time, once it took the
+-	last.
++	last; the H.264 firmware has two places for them.
+ */
+ status_t
+ MesonVdec::_Recycle(uint32 index)
+@@ -1115,11 +1562,23 @@ MesonVdec::_Recycle(uint32 index)
+ 		return B_NOT_ALLOWED;
+ 	{
+ 		InterruptsSpinLocker locker(fStateLock);
+-		if (index >= kFrameCount || (fHeld & (1 << index)) == 0)
++		if (index >= fFrameCount || (fHeld & (1 << index)) == 0)
+ 			return B_BAD_VALUE;
+ 	}
++	bool h264 = fCodec == MESON_VDEC_H264;
+ 	bigtime_t timeout = system_time() + 500000;
+-	while (_Dos(AV_SCRATCH_8) != 0) {
++	while (true) {
++		InterruptsSpinLocker locker(fStateLock);
++		uint32 slot = AV_SCRATCH_8;
++		if (h264 && _Dos(AV_SCRATCH_7) == 0)
++			slot = AV_SCRATCH_7;
++		if (_Dos(slot) == 0) {
++			fHeld &= ~(1 << index);
++			_Trace('B', index + 1, slot, _Dos(AV_SCRATCH_E));
++			_SetDos(slot, index + 1);
++			return B_OK;
++		}
++		locker.Unlock();
+ 		if (system_time() > timeout) {
+ 			INFO("the firmware does not take frame %" B_PRIu32 " back\n",
+ 				index);
+@@ -1127,12 +1586,6 @@ MesonVdec::_Recycle(uint32 index)
+ 		}
+ 		snooze(500);
+ 	}
+-	InterruptsSpinLocker locker(fStateLock);
+-	fHeld &= ~(1 << index);
+-	_Trace('B', index + 1, _Dos(AV_SCRATCH_E));
+-	locker.Unlock();
+-	_SetDos(AV_SCRATCH_8, index + 1);
+-	return B_OK;
+ }
+ 
+ 
+@@ -1186,7 +1639,11 @@ MesonVdec::Control(uint32 op, void* buffer, size_t length)
+ 				return B_BAD_ADDRESS;
+ 			}
+ 			MutexLocker locker(fLock);
+-			return _Write((const uint8*)write.data, write.size);
++			status_t status = _Write((const uint8*)write.data, write.size,
++				&write.offset);
++			if (status != B_OK)
++				return status;
++			return user_memcpy(buffer, &write, sizeof(write));
+ 		}
+ 
+ 		case MESON_VDEC_END_OF_STREAM:
+@@ -1234,17 +1691,28 @@ MesonVdec::Control(uint32 op, void* buffer, size_t length)
+ void
+ MesonVdec::Dump()
+ {
+-	kprintf("meson_vdec: %s, %" B_PRIu32 "x%" B_PRIu32 ", %" B_PRIu32
+-		" frames decoded, %" B_PRIu32 " skipped, queue %" B_PRIu32
+-		", held %#" B_PRIx32 "%s\n", fRunning ? "running" : "stopped",
+-		fWidth, fHeight, fFramesDecoded, fFramesSkipped, fQueueCount, fHeld,
+-		fFatal ? ", fatal error" : "");
++	kprintf("meson_vdec: %s %s, %" B_PRIu32 "x%" B_PRIu32 ", %" B_PRIu32
++		" frames, %" B_PRIu32 " decoded, %" B_PRIu32 " skipped, queue %"
++		B_PRIu32 ", held %#" B_PRIx32 "%s%s\n",
++		fCodec == MESON_VDEC_H264 ? "H.264" : "MPEG-1/2",
++		fRunning ? "running" : "stopped", fWidth, fHeight, fFrameCount,
++		fFramesDecoded, fFramesSkipped, fQueueCount, fHeld,
++		fFatal ? ", fatal error" : "",
++		fSetupPending ? ", waiting for frames" : "");
++	kprintf("  stream: %" B_PRIu32 " bytes written%s, end at %" B_PRIu32
++		"; %" B_PRIu32 " decode errors, %" B_PRIu32 " damaged pictures\n",
++		fStreamBytes, fEndOfStream ? " and ended" : "", fEndOffset,
++		fDecodeErrors, fBadPictures);
+ 	_DumpTrace(true);
+ 	kprintf("  interrupts: decoder %" B_PRIu32 ", parser %" B_PRIu32
+ 		"; %" B_PRIu32 " buffers submitted, %" B_PRIu32 " parser timeouts\n",
+ 		fVdecInterrupts, fParserInterrupts, fSubmitted, fParserTimeouts);
+ 	if (!fRunning)
+ 		return;
++	kprintf("  scratch 0-3 %#" B_PRIx32 " %#" B_PRIx32 " %#" B_PRIx32 " %#"
++		B_PRIx32 ", J %#" B_PRIx32 "\n", _Dos(AV_SCRATCH_0),
++		_Dos(AV_SCRATCH_1), _Dos(AV_SCRATCH_1 + 4), _Dos(AV_SCRATCH_1 + 8),
++		_Dos(AV_SCRATCH_J));
+ 	kprintf("  MPSR %#" B_PRIx32 ", scratch 4-9 %#" B_PRIx32 " %#" B_PRIx32
+ 		" %" B_PRIu32 " %" B_PRIu32 " %#" B_PRIx32 " %#" B_PRIx32
+ 		", C %" B_PRIu32 ", D %#" B_PRIx32 ", E %#" B_PRIx32 ", F %#"
+@@ -1346,11 +1814,19 @@ init_driver(device_node* node, void** _cookie)
+ 	fdtModule->get_interrupt(fdtDevice, 0, NULL, &vdecIrq);
+ 	fdtModule->get_interrupt(fdtDevice, 1, NULL, &parserIrq);
+ 
++	// the GIC's interrupt cells: type, number, flags (1: rising edge)
++	int interruptsLength;
++	const uint32* interrupts = (const uint32*)fdtModule->get_prop(fdtDevice,
++		"interrupts", &interruptsLength);
++	bool edgeTriggered = interrupts != NULL && interruptsLength >= 24
++		&& (B_BENDIAN_TO_HOST_INT32(interrupts[2]) & 3) != 0
++		&& (B_BENDIAN_TO_HOST_INT32(interrupts[5]) & 3) != 0;
++
+ 	MesonVdec* device = new(std::nothrow) MesonVdec(node);
+ 	if (device == NULL)
+ 		return B_NO_MEMORY;
+ 	status_t status = device->Init(dos, parser, (int32)vdecIrq,
+-		(int32)parserIrq);
++		(int32)parserIrq, edgeTriggered);
+ 	if (status != B_OK) {
+ 		delete device;
+ 		return status;
+@@ -1452,6 +1928,7 @@ device_control(void* cookie, uint32 op, void* buffer, size_t length)
+ 
+ module_dependency module_dependencies[] = {
+ 	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&gDeviceManager },
++	{ MESON_CANVAS_MODULE_NAME, (module_info**)&gCanvas },
+ 	{}
+ };
+ 

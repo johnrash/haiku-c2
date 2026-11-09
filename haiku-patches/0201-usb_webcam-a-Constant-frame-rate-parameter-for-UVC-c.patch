@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 02:37:37 -0500
+Subject: [PATCH 201/342] usb_webcam: a "Constant frame rate" parameter for UVC
+ cameras (M45)
+
+UVC cameras with the auto-exposure priority control (the camera
+terminal's bmControls D2) may lower their frame rate to expose longer:
+the C920 does by default, and gives 15 frames a second in a dim room.
+The parameter (Exposure: Constant frame rate) sets the priority to 0,
+so the camera keeps its frame rate (and gains up instead). It starts as
+the camera has it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../usb_webcam/addons/uvc/UVCCamDevice.cpp    | 49 ++++++++++++++++++-
+ .../usb_webcam/addons/uvc/UVCCamDevice.h      |  6 +++
+ 2 files changed, 53 insertions(+), 2 deletions(-)
+
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+index bd3babfe5f..ca6654cf33 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+@@ -96,7 +96,10 @@ UVCCamDevice::UVCCamDevice(CamDeviceAddon& _addon, BUSBDevice* _device)
+ 	fNewestDecoded(0),
+ 	fReadyStamp(0),
+ 	fReadyPending(false),
+-	fDecoding(false)
++	fDecoding(false),
++	fCameraTerminalID(0),
++	fCameraControls(0),
++	fConstantFrameRate(0)
+ {
+ 	for (int32 i = 0; i < kDecoderCount; i++) {
+ 		fDecoders[i] = -1;
+@@ -457,6 +460,12 @@ UVCCamDevice::_ParseVideoControl(const usbvc_class_descriptor* _descriptor,
+ 			if (descriptor->terminalType == 0x201) {
+ 				const usb_video_camera_terminal_descriptor* desc
+ 					= (const usb_video_camera_terminal_descriptor*)descriptor;
++				// bControlSize at 14, bmControls after it
++				const uint8* raw = (const uint8*)descriptor;
++				fCameraTerminalID = descriptor->terminalID;
++				fCameraControls = 0;
++				for (size_t i = 0; i < 4 && 15 + i < len && i < raw[14]; i++)
++					fCameraControls |= (uint32)raw[15 + i] << (i * 8);
+ 				printf("\tObjectiveFocalLength Min/Max %d/%d\n",
+ 					desc->objective_focal_length_min,
+ 					desc->objective_focal_length_max);
+@@ -1167,6 +1176,23 @@ UVCCamDevice::AddParameters(BParameterGroup* group, int32& index)
+ 			}
+ 		}
+ 	}
++
++	// auto-exposure priority (bmControls D2): whether the camera may lower
++	// the frame rate to expose longer in low light, as the C920 does by
++	// default (15 frames a second in a dim room)
++	if ((fCameraControls & (1 << 2)) != 0) {
++		uint8 priority;
++		if (fDevice->ControlTransfer(USB_REQTYPE_CLASS
++				| USB_REQTYPE_INTERFACE_IN, USB_VIDEO_RC_GET_CUR,
++				USB_VIDEO_CT_AE_PRIORITY_CONTROL << 8,
++				(fCameraTerminalID << 8) | fControlIndex, sizeof(priority),
++				&priority) == sizeof(priority)) {
++			fConstantFrameRate = priority == 0 ? 1 : 0;
++		}
++		BParameterGroup* subgroup = group->MakeGroup("Exposure");
++		subgroup->MakeDiscreteParameter(index + 14, B_MEDIA_RAW_VIDEO,
++			"Constant frame rate", B_ENABLE);
++	}
+ }
+ 
+ 
+@@ -1286,6 +1312,11 @@ UVCCamDevice::GetParameterValue(int32 id, bigtime_t* last_change, void* value,
+ 			}
+ 			*last_change = fLastParameterChanges;
+ 			return B_OK;
++		case 14:
++			*size = sizeof(int32);
++			*(int32*)value = fConstantFrameRate;
++			*last_change = fLastParameterChanges;
++			return B_OK;
+ 
+ 	}
+ 	return B_BAD_VALUE;
+@@ -1376,6 +1407,7 @@ UVCCamDevice::SetParameterValue(int32 id, bigtime_t when, const void* value,
+ 			fLastParameterChanges = when;
+ 			return _SetParameterValue(USB_VIDEO_PU_GAIN_CONTROL, (int16)fGain);
+ 		case 13:
++		{
+ 			// debug_printf("\tPowerline Frequency:\n");
+ 			// debug_printf("\tValue = %f\n",*((float*)value));
+ 			if (!value || (size != sizeof(float)))
+@@ -1391,7 +1423,20 @@ UVCCamDevice::SetParameterValue(int32 id, bigtime_t when, const void* value,
+ 			fLastParameterChanges = when;
+ 			return _SetParameterValue(USB_VIDEO_PU_POWER_LINE_FREQUENCY_CONTROL,
+ 				(int8)fPowerlineFrequency);
+-
++		}
++		case 14:
++		{
++			if (!value || size < sizeof(int32))
++				return B_BAD_VALUE;
++			fConstantFrameRate = *(const int32*)value != 0 ? 1 : 0;
++			fLastParameterChanges = when;
++			uint8 priority = fConstantFrameRate ? 0 : 1;
++			return fDevice->ControlTransfer(USB_REQTYPE_CLASS
++					| USB_REQTYPE_INTERFACE_OUT, USB_VIDEO_RC_SET_CUR,
++					USB_VIDEO_CT_AE_PRIORITY_CONTROL << 8,
++					(fCameraTerminalID << 8) | fControlIndex, sizeof(priority),
++					&priority) == sizeof(priority) ? B_OK : B_ERROR;
++		}
+ 	}
+ 	return B_BAD_VALUE;
+ }
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+index d817ca5d02..92b5b219e6 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+@@ -154,6 +154,12 @@ private:
+ 			int					fBacklightCompensationBinary;
+ 			int					fPowerlineFrequency;
+ 
++			uint8				fCameraTerminalID;
++			uint32				fCameraControls;
++				// the camera terminal's bmControls
++			int32				fConstantFrameRate;
++				// auto-exposure priority 0: the frame rate stays in low light
++
+ 
+ };
+ 

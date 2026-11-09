@@ -1,0 +1,111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 18:34:20 -0400
+Subject: [PATCH 069/342] app_server: B_RGB32 bitmaps are drawn opaque
+
+A B_RGB32 bitmap has no alpha, but the B_OP_COPY and B_OP_OVER copies
+(unscaled and nearest neighbour) took its fourth byte along into the
+frame buffer, often 0. meson_hdmi keys its video overlay by that alpha:
+while a video played, MediaPlayer's level meter (a B_RGB32 bitmap it
+fills itself) showed black in a window and the video through it in full
+screen. Those copies now set the alpha to 255 for B_RGB32 sources;
+B_RGBA32 bitmaps keep theirs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../Painter/bitmap_painter/BitmapPainter.cpp   |  9 ++++++++-
+ .../bitmap_painter/DrawBitmapNearestNeighbor.h |  8 ++++++--
+ .../Painter/bitmap_painter/DrawBitmapNoScale.h | 18 +++++++++++++++++-
+ 3 files changed, 31 insertions(+), 4 deletions(-)
+
+diff --git a/src/servers/app/drawing/Painter/bitmap_painter/BitmapPainter.cpp b/src/servers/app/drawing/Painter/bitmap_painter/BitmapPainter.cpp
+index 26c7118ba9..816b49eeba 100644
+--- a/src/servers/app/drawing/Painter/bitmap_painter/BitmapPainter.cpp
++++ b/src/servers/app/drawing/Painter/bitmap_painter/BitmapPainter.cpp
+@@ -117,6 +117,12 @@ Painter::BitmapPainter::Draw(const BRect& sourceRect,
+ 		// optimized version if there is no scale
+ 		if (!_HasScale() && !_HasAffineTransform() && !_HasAlphaMask()) {
+ 			if (fPainter->fDrawingMode == B_OP_COPY) {
++				if (fColorSpace == B_RGB32) {
++					DrawBitmapNoScale<Bgr32CopyOpaque> drawNoScale;
++					drawNoScale.Draw(fPainter->fInternal, fBitmap, 4, fOffset,
++						fDestinationRect);
++					return;
++				}
+ 				DrawBitmapNoScale<Bgr32Copy> drawNoScale;
+ 				drawNoScale.Draw(fPainter->fInternal, fBitmap, 4, fOffset,
+ 					fDestinationRect);
+@@ -151,7 +157,8 @@ Painter::BitmapPainter::Draw(const BRect& sourceRect,
+ 					fBitmap, fOffset, fScaleX, fScaleY, fDestinationRect);
+ 			} else {
+ 				DrawBitmapNearestNeighborCopy::Draw(fPainter, fPainter->fInternal,
+-					fBitmap, fOffset, fScaleX, fScaleY, fDestinationRect);
++					fBitmap, fOffset, fScaleX, fScaleY, fDestinationRect,
++					fColorSpace == B_RGB32 ? 0xff000000 : 0);
+ 			}
+ 			return;
+ 		}
+diff --git a/src/servers/app/drawing/Painter/bitmap_painter/DrawBitmapNearestNeighbor.h b/src/servers/app/drawing/Painter/bitmap_painter/DrawBitmapNearestNeighbor.h
+index 74f00fb930..e9cdbf980d 100644
+--- a/src/servers/app/drawing/Painter/bitmap_painter/DrawBitmapNearestNeighbor.h
++++ b/src/servers/app/drawing/Painter/bitmap_painter/DrawBitmapNearestNeighbor.h
+@@ -15,8 +15,12 @@ struct DrawBitmapNearestNeighborCopy {
+ 	static void
+ 	Draw(const Painter* painter, PainterAggInterface& aggInterface,
+ 		agg::rendering_buffer& bitmap, BPoint offset,
+-		double scaleX, double scaleY, BRect destinationRect)
++		double scaleX, double scaleY, BRect destinationRect,
++		uint32 alphaBits = 0)
+ 	{
++		// alphaBits: 0xff000000 makes B_RGB32 sources opaque, see
++		// Bgr32CopyOpaque
++
+ 		//bigtime_t now = system_time();
+ 		uint32 dstWidth = destinationRect.IntegerWidth() + 1;
+ 		uint32 dstHeight = destinationRect.IntegerHeight() + 1;
+@@ -126,7 +130,7 @@ struct DrawBitmapNearestNeighborCopy {
+ 				uint32* d = (uint32*)dst;
+ 
+ 				for (int32 x = xIndexL; x <= xIndexR; x++) {
+-					*d = *(uint32*)(src + xIndices[x]);
++					*d = *(uint32*)(src + xIndices[x]) | alphaBits;
+ 					d++;
+ 				}
+ 				dst += dstBPR;
+diff --git a/src/servers/app/drawing/Painter/bitmap_painter/DrawBitmapNoScale.h b/src/servers/app/drawing/Painter/bitmap_painter/DrawBitmapNoScale.h
+index 3c6a460de2..fb18bd7b06 100644
+--- a/src/servers/app/drawing/Painter/bitmap_painter/DrawBitmapNoScale.h
++++ b/src/servers/app/drawing/Painter/bitmap_painter/DrawBitmapNoScale.h
+@@ -130,15 +130,31 @@ struct Bgr32Copy : public DrawBitmapNoScale<Bgr32Copy>
+ };
+ 
+ 
++// B_RGB32 sources have no alpha: what is in their fourth byte (often 0) must
++// not end up in the frame buffer, where meson_hdmi keys its video overlay
++// by the alpha.
++struct Bgr32CopyOpaque : public DrawBitmapNoScale<Bgr32CopyOpaque>
++{
++	void BlendRow(uint8* dst, const uint8* src, int32 numPixels)
++	{
++		uint32* d = (uint32*)dst;
++		const uint32* s = (const uint32*)src;
++		while (numPixels--)
++			*d++ = *s++ | 0xff000000;
++	}
++};
++
++
+ struct Bgr32Over : public DrawBitmapNoScale<Bgr32Over>
+ {
++	// B_RGB32 sources only, see Bgr32CopyOpaque
+ 	void BlendRow(uint8* dst, const uint8* src, int32 numPixels)
+ 	{
+ 		uint32* d = (uint32*)dst;
+ 		uint32* s = (uint32*)src;
+ 		while (numPixels--) {
+ 			if (*s != B_TRANSPARENT_MAGIC_RGBA32)
+-				*(uint32*)d = *(uint32*)s;
++				*(uint32*)d = *(uint32*)s | 0xff000000;
+ 			d++;
+ 			s++;
+ 		}

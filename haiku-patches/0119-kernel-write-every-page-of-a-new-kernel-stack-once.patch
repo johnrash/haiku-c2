@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 16:41:42 -0400
+Subject: [PATCH 119/342] kernel: write every page of a new kernel stack once
+
+On arm64 without hardware dirty bit management (the ODROID-C2's
+Cortex-A53), a writable page is mapped read-only until its first write,
+whose fault sets it writable. That fault can't be taken on the kernel
+stack itself: the exception entry pushes its frame into the same page
+and faults again. Kernel stacks only got all their pages written by the
+debug fill of KDEBUG builds, so a kernel built with KDEBUG_LEVEL 1
+panicked at boot: main2 reached the stack's second page, 4.6 KB into it,
+inside an exception ("a write to a read-only page of main2's kernel
+stack").
+
+create_kernel_stack() now writes one word to every page. Kernel stacks
+stay wired, so the pages never become clean again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/kernel/thread.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/system/kernel/thread.cpp b/src/system/kernel/thread.cpp
+index 9bc54cdf35..7bc744d063 100644
+--- a/src/system/kernel/thread.cpp
++++ b/src/system/kernel/thread.cpp
+@@ -235,6 +235,18 @@ create_kernel_stack(void* cookie, void* object)
+ 
+ 	addr_t top = base + KERNEL_STACK_SIZE
+ 		+ KERNEL_STACK_GUARD_PAGES * B_PAGE_SIZE;
++
++	// Write every page once. arm64 without hardware dirty bit management
++	// maps a writable page read-only until its first write faults, and that
++	// fault can't be taken on the kernel stack itself: the exception entry
++	// pushes its frame into the same page and faults again. Kernel stacks
++	// stay wired, so they never become clean again. (Debug builds also fill
++	// the stack on every use, which used to hide this.)
++	for (addr_t page = base + KERNEL_STACK_GUARD_PAGES * B_PAGE_SIZE;
++			page < top; page += B_PAGE_SIZE) {
++		*(volatile uint32*)page = 0;
++	}
++
+ 	free_kernel_stack(area, base, top);
+ 	return B_OK;
+ }

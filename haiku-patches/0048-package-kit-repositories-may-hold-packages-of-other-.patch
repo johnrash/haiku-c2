@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 02:15:43 -0400
+Subject: [PATCH 048/342] package kit: repositories may hold packages of other
+ vendors
+
+BRepositoryWriter refused packages whose vendor differs from the
+repository's. A port's own repository holds Haiku's packages, ported
+software and applications from several vendors, and nothing that reads
+repositories relies on one vendor; HaikuDepot shows each package's
+vendor as its publisher.
+
+Tested: package_repo creates the ODROID-C2 port's repository of 38
+packages from 11 vendors.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kits/package/hpkg/RepositoryWriterImpl.cpp | 11 +++--------
+ 1 file changed, 3 insertions(+), 8 deletions(-)
+
+diff --git a/src/kits/package/hpkg/RepositoryWriterImpl.cpp b/src/kits/package/hpkg/RepositoryWriterImpl.cpp
+index aba31387c2..9996c5ccf6 100644
+--- a/src/kits/package/hpkg/RepositoryWriterImpl.cpp
++++ b/src/kits/package/hpkg/RepositoryWriterImpl.cpp
+@@ -401,14 +401,9 @@ RepositoryWriterImpl::_RegisterCurrentPackageInfo()
+ 		return B_NAME_IN_USE;
+ 	}
+ 
+-	// all packages must have the same vendor as the repository
+-	const BString& expectedVendor = fRepositoryInfo->Vendor();
+-	if (fPackageInfo.Vendor().ICompare(expectedVendor) != 0) {
+-		fListener->PrintError("package '%s' has unexpected vendor '%s' "
+-			"(expected '%s')!\n", fPackageInfo.Name().String(),
+-			fPackageInfo.Vendor().String(), expectedVendor.String());
+-		return B_BAD_DATA;
+-	}
++	// Packages from other vendors than the repository's are fine: a port's
++	// own repository holds Haiku, ported software and applications, and
++	// nothing that reads repositories relies on one vendor.
+ 
+ 	// all packages must have an architecture that's compatible with the one
+ 	// used by the repository

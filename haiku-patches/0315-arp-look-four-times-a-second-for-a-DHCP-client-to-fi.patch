@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 5 Nov 2026 21:48:58 -0500
+Subject: [PATCH 315/342] arp: look four times a second for a DHCP client to
+ finish
+
+The link-up announcements waited for IFF_CONFIGURING to clear in steps of a
+second, which was up to a second of the address unannounced after a move
+between access points: 2.3 seconds from the acknowledgement to the first
+announcement in one. A quarter of a second now, for the same 30 seconds.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp b/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp
+index e770983f04..e377ac90ef 100644
+--- a/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp
++++ b/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp
+@@ -986,9 +986,10 @@ arp_announce_timer(struct net_timer* timer, void* data)
+ 
+ 	// A DHCP client asks for the address again after a link came back: the
+ 	// announcements are for the address it ends up with.
++	// Looked at four times a second, for up to 30 seconds.
+ 	if ((interface->flags & IFF_CONFIGURING) != 0) {
+-		if (++protocol->announce_waits < 30)
+-			sStackModule->set_timer(&protocol->announce_timer, 1000000);
++		if (++protocol->announce_waits < 120)
++			sStackModule->set_timer(&protocol->announce_timer, 250000);
+ 		return;
+ 	}
+ 

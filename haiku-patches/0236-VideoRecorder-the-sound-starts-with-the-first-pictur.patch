@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 15:55:18 -0500
+Subject: [PATCH 236/342] VideoRecorder: the sound starts with the first
+ picture
+
+The sound was put from the first buffer that came after the first
+picture was written, as if it started with the picture; its start may
+take a while (once 0.6 s), and the whole track was early by that much.
+The first buffer's start (its arrival less its length) is now set
+against the first picture's arrival: silence fills the time between, or
+what came before the picture is left out. A line in the log for each
+clip says how much, and how long the pictures and the sound are.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apps/codycam/VideoRecorder.cpp | 76 ++++++++++++++++++++++++++++--
+ src/apps/codycam/VideoRecorder.h   | 12 +++++
+ 2 files changed, 85 insertions(+), 3 deletions(-)
+
+diff --git a/src/apps/codycam/VideoRecorder.cpp b/src/apps/codycam/VideoRecorder.cpp
+index 71134f8b37..30e4741dc1 100644
+--- a/src/apps/codycam/VideoRecorder.cpp
++++ b/src/apps/codycam/VideoRecorder.cpp
+@@ -7,6 +7,7 @@
+ #include "VideoRecorder.h"
+ 
+ #include <math.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -42,7 +43,15 @@ VideoRecorder::VideoRecorder()
+ 	fError(B_OK),
+ 	fAudioLock("video recorder sound"),
+ 	fAudioTrack(NULL),
+-	fAudioFrameSize(0)
++	fAudioFrameSize(0),
++	fAudioFrameRate(0),
++	fAudioUnsigned(false),
++	fFirstPictureArrival(-1),
++	fAudioFrames(0),
++	fAudioAligned(0),
++	fLastAudioArrival(-1),
++	fLastPictureArrival(-1),
++	fAudioLate(0)
+ {
+ }
+ 
+@@ -160,6 +169,12 @@ VideoRecorder::Start(const char* path, uint32 width, uint32 height,
+ 	fFramesWritten = 0;
+ 	fError = B_OK;
+ 	fQuit = false;
++	fFirstPictureArrival = -1;
++	fAudioFrames = 0;
++	fAudioAligned = 0;
++	fLastAudioArrival = -1;
++	fLastPictureArrival = -1;
++	fAudioLate = 0;
+ 	fThread = spawn_thread(_ThreadEntry, "video recorder", B_NORMAL_PRIORITY,
+ 		this);
+ 	if (fThread < 0) {
+@@ -198,6 +213,7 @@ VideoRecorder::Stop()
+ 	if (fFile == NULL)
+ 		return B_OK;
+ 
++	bigtime_t stopTime = system_time();
+ 	fQuit = true;
+ 	release_sem(fFrameSem);
+ 	status_t result;
+@@ -209,8 +225,22 @@ VideoRecorder::Stop()
+ 	BMediaTrack* audioTrack = fAudioTrack;
+ 	fAudioTrack = NULL;
+ 	fAudioLock.Unlock();
+-	if (audioTrack != NULL)
++	if (audioTrack != NULL) {
+ 		audioTrack->Flush();
++		printf("VideoRecorder: %" B_PRId64 " pictures (%.3f s), sound %.3f s "
++			"(%.3f s of it %s at the start)\n", fFramesWritten,
++			fFramesWritten / fFrameRate, fAudioFrames / fAudioFrameRate,
++			(fAudioAligned < 0 ? -fAudioAligned : fAudioAligned)
++				/ fAudioFrameRate,
++			fAudioAligned < 0 ? "left out" : "silence");
++		printf("VideoRecorder: after the first picture, the last picture "
++			"came at %.3f s, the last sound at %.3f s, the stop at %.3f s; "
++			"%" B_PRId32 " sound buffers late\n",
++			(fLastPictureArrival - fFirstPictureArrival) / 1000000.0,
++			(fLastAudioArrival - fFirstPictureArrival) / 1000000.0,
++			(stopTime - fFirstPictureArrival) / 1000000.0, fAudioLate);
++		fflush(stdout);
++	}
+ 
+ 	fTrack->Flush();
+ 	status_t status = fError;
+@@ -250,6 +280,9 @@ VideoRecorder::_AddAudioTrack(const media_file_format& fileFormat,
+ 				break;
+ 			}
+ 			fAudioFrameSize = sampleSize * audio.channel_count;
++			fAudioFrameRate = audio.frame_rate;
++			fAudioUnsigned
++				= audio.format == media_raw_audio_format::B_AUDIO_UCHAR;
+ 			fAudioTrack = track;
+ 			return;
+ 		}
+@@ -264,7 +297,41 @@ VideoRecorder::AddAudio(const void* data, size_t size)
+ 	// from the first picture on, so that both start together
+ 	if (fAudioTrack == NULL || fFramesWritten == 0 || fAudioFrameSize == 0)
+ 		return;
+-	fAudioTrack->WriteFrames(data, size / fAudioFrameSize);
++	int64 frames = size / fAudioFrameSize;
++	bigtime_t now = system_time();
++	if (fLastAudioArrival >= 0 && fAudioFrameRate > 0
++		&& now - fLastAudioArrival > 2 * frames * 1000000.0 / fAudioFrameRate)
++		fAudioLate++;
++	fLastAudioArrival = now;
++	if (fAudioFrames == 0 && fAudioFrameRate > 0) {
++		// The sound starts with the first picture: its first buffer was
++		// recorded in the buffer's time before it came; the time between
++		// the picture and that becomes silence (the sound's start may take
++		// a while), or what came before the picture is left out.
++		bigtime_t start = system_time()
++			- (bigtime_t)(frames * 1000000.0 / fAudioFrameRate);
++		int64 offset = llround((start - fFirstPictureArrival)
++			* fAudioFrameRate / 1000000.0);
++		if (offset > 0) {
++			uint8 silence[4096];
++			memset(silence, fAudioUnsigned ? 0x80 : 0, sizeof(silence));
++			int64 perWrite = sizeof(silence) / fAudioFrameSize;
++			for (int64 left = offset; left > 0; left -= perWrite) {
++				fAudioTrack->WriteFrames(silence,
++					left < perWrite ? left : perWrite);
++			}
++		} else if (offset < 0) {
++			int64 skip = -offset < frames ? -offset : frames;
++			data = (const uint8*)data + skip * fAudioFrameSize;
++			frames -= skip;
++		}
++		fAudioAligned = offset;
++		fAudioFrames += offset > 0 ? offset : 0;
++	}
++	if (frames <= 0)
++		return;
++	fAudioFrames += frames;
++	fAudioTrack->WriteFrames(data, frames);
+ }
+ 
+ 
+@@ -320,6 +387,9 @@ VideoRecorder::_Thread()
+ 					fFramesWritten = target;
+ 					break;
+ 				}
++				if (fFirstPictureArrival < 0)
++					fFirstPictureArrival = arrival;
++				fLastPictureArrival = arrival;
+ 				fError = fTrack->WriteFrames(fWorking, 1,
+ 					fFramesWritten == 0 ? B_MEDIA_KEY_FRAME : 0);
+ 				fFramesWritten++;
+diff --git a/src/apps/codycam/VideoRecorder.h b/src/apps/codycam/VideoRecorder.h
+index d55449a04a..2fd529ccae 100644
+--- a/src/apps/codycam/VideoRecorder.h
++++ b/src/apps/codycam/VideoRecorder.h
+@@ -90,6 +90,18 @@ private:
+ 			BMediaTrack*		fAudioTrack;
+ 				// under fAudioLock: the sound comes from another thread
+ 			size_t				fAudioFrameSize;
++			float				fAudioFrameRate;
++			bool				fAudioUnsigned;
++			// the first picture's arrival (system time): the sound starts
++			// with it
++			bigtime_t			fFirstPictureArrival;
++			int64				fAudioFrames;
++			int64				fAudioAligned;
++				// silence put in front (> 0) or sound left out (< 0)
++			bigtime_t			fLastAudioArrival;
++			bigtime_t			fLastPictureArrival;
++			int32				fAudioLate;
++				// buffers that came more than two buffers' time apart
+ };
+ 
+ 

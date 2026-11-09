@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Tue, 3 Nov 2026 14:54:39 -0500
+Subject: [PATCH 271/342] dwc2: report the split gaps of isochronous IN
+ streams, too
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/busses/usb/dwc2.h               |  2 +-
+ src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp | 10 +++++-----
+ 2 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.h b/src/add-ons/kernel/busses/usb/dwc2.h
+index 0a21dbb8df..de296324df 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.h
++++ b/src/add-ons/kernel/busses/usb/dwc2.h
+@@ -76,7 +76,7 @@ struct dwc2_iso_statistics {
+ 	uint64		late;				// skipped: the timer came too late
+ 	uint64		errors;
+ 	uint32		lastError;			// channel status
+-	uint64		gaps;				// OUT: parts not in consecutive
++	uint64		gaps;				// parts not in consecutive
+ 									// microframes
+ 	uint64		empty;				// IN: zero-length packets
+ 	uint32		completeSplits[8];	// IN: data at complete-split n
+diff --git a/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp b/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
+index 57d3ec512c..d2a71b2674 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
+@@ -419,11 +419,11 @@ DWC2::_CancelIsochronous(Pipe* pipe, bool force)
+ 				stats.overruns, stats.incomplete, stats.shortPackets,
+ 				stats.empty);
+ 		} else if (in) {
+-			snprintf(detail, sizeof(detail), "%" B_PRIu64 " empty, data at"
+-				" complete-split 1-4: %" B_PRIu32 " %" B_PRIu32 " %" B_PRIu32
+-				" %" B_PRIu32, stats.empty, stats.completeSplits[1],
+-				stats.completeSplits[2], stats.completeSplits[3],
+-				stats.completeSplits[4]);
++			snprintf(detail, sizeof(detail), "%" B_PRIu64 " split gaps, %"
++				B_PRIu64 " empty, data at complete-split 1-4: %" B_PRIu32 " %"
++				B_PRIu32 " %" B_PRIu32 " %" B_PRIu32, stats.gaps, stats.empty,
++				stats.completeSplits[1], stats.completeSplits[2],
++				stats.completeSplits[3], stats.completeSplits[4]);
+ 		} else {
+ 			snprintf(detail, sizeof(detail), "%" B_PRIu64 " split gaps",
+ 				stats.gaps);

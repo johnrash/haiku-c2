@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 6 Nov 2026 22:44:56 -0500
+Subject: [PATCH 327/342] DHCPClient: ask for broadcast answers while there is
+ no lease
+
+When a C2's lease from a wireless bridge ended with the bridge
+gone, the router NAKed its renewal and the client discovered again every
+minute or so, with the bridge's address still on the interface. The
+router answered each DISCOVER within 4 ms with an offer sent to the
+offered address, and IPv4 dropped every one: it takes a unicast for an
+address the interface doesn't have only on an interface without any
+address (and sends back host unreachable). The board kept using a NAKed
+address with no lease.
+
+In INIT, SELECTING, REQUESTING, INIT-REBOOT and REBOOTING the client now
+sets the BROADCAST flag, as RFC 2131 4.1 has a client do that can't take
+such unicasts, so the offer and the ACK come as broadcasts. Renewing and
+rebinding, which have an address, are unchanged.
+
+tools/dhcp-moved-test.sh on the test board's cable (a 60 s lease, then a
+router that NAKs it and offers another address): on +334 the board looped
+for 100 s on the old address, never seeing an offer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/servers/net/DHCPClient.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/servers/net/DHCPClient.cpp b/src/servers/net/DHCPClient.cpp
+index 06e1552343..869721eca7 100644
+--- a/src/servers/net/DHCPClient.cpp
++++ b/src/servers/net/DHCPClient.cpp
+@@ -1046,6 +1046,18 @@ DHCPClient::_PrepareMessage(dhcp_message& message, dhcp_state state)
+ 		/ 1000000LL, 65535));
+ 	memcpy(message.mac_address, fMAC, 6);
+ 
++	// Without a lease, ask for the answers as broadcasts (RFC 2131 4.1).
++	// Sent to the offered address, they would be dropped while the
++	// interface still has another one (IPv4 takes a unicast for an address
++	// it doesn't have only on an interface without any): a lease that has
++	// ended, a NAK, a move to another network. A C2 on Wi-Fi kept a bridge's
++	// lease that way when the bridge was gone, never seeing the router's
++	// offers.
++	if (state == INIT || state == SELECTING || state == REQUESTING
++		|| state == INIT_REBOOT || state == REBOOTING) {
++		message.flags = htons(DHCP_FLAG_BROADCAST);
++	}
++
+ 	message_type type = message.Type();
+ 
+ 	uint8 *next = message.PrepareMessage(type);

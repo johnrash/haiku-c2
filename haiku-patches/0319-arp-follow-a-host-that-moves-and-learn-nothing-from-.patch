@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 6 Nov 2026 08:42:41 -0500
+Subject: [PATCH 319/342] arp: follow a host that moves, and learn nothing from
+ probes
+
+arp_update_entry() refused any new hardware address for an address it had
+resolved, until the entry went stale after 30 minutes. Behind a repeater
+that translates hardware addresses, a laptop that moved between it and the
+router showed up under two addresses, and the board kept the old one: the
+laptop couldn't reach it (2026-11-05). Addresses learned from the network
+now follow the host, except within a second of the last update (a proxy
+answering as well; Linux's locktime), unless the host announces itself.
+Local, published and permanent entries still change only by hand, and
+local configuration is unchanged.
+
+Probes (RFC 5227 2.1.1) have the sender address 0.0.0.0. Requests and
+replies stored it as a host, and could change the hardware address of the
+local 0.0.0.0 entry of an interface without an address. They're answered
+as before but teach nothing now.
+
+tools/arp-learning-test.py on the test board: 3 of 7 checks before, 7 of 7
+after.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../network/datalink_protocols/arp/arp.cpp    | 51 ++++++++++++++-----
+ 1 file changed, 39 insertions(+), 12 deletions(-)
+
+diff --git a/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp b/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp
+index e377ac90ef..2b14303e18 100644
+--- a/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp
++++ b/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp
+@@ -110,6 +110,7 @@ struct arp_entry {
+ #define ARP_STATE_STALE				8
+ 
+ #define ARP_STALE_TIMEOUT	30 * 60000000LL		// 30 minutes
++#define ARP_LOCK_TIME		1000000LL			// 1 second
+ #define ARP_REJECT_TIMEOUT	20000000LL			// 20 seconds
+ #define ARP_REQUEST_TIMEOUT	1000000LL			// 1 second
+ 
+@@ -351,12 +352,20 @@ arp_entry::ScheduleRemoval()
+ 	to update a local existing entry but didn't ask for it (by setting
+ 	\a flags to ARP_FLAG_LOCAL), an error is returned.
+ 
++	\a learned is for an address the network told us (\a gratuitous if the
++	sender announced its own address): a host that comes back with another
++	hardware address, a device that moved behind a translating repeater for
++	example, gets it, but not within ARP_LOCK_TIME of the last update, when
++	a proxy answering for it as well would make the entry flap. Local,
++	published and permanent entries never change that way.
++
+ 	This function does not lock the cache - you have to do it yourself
+ 	before calling it.
+ */
+ static status_t
+ arp_update_entry(in_addr_t protocolAddress, sockaddr_dl *hardwareAddress,
+-	uint32 flags, arp_entry **_entry = NULL)
++	uint32 flags, arp_entry **_entry = NULL, bool learned = false,
++	bool gratuitous = false)
+ {
+ 	ASSERT_LOCKED_MUTEX(&sCacheLock);
+ 	TRACE(("%s(" FMT_IPv4 ", " FMT_MAC ", flags 0x%" B_PRIx32 ")\n", __FUNCTION__,
+@@ -364,19 +373,31 @@ arp_update_entry(in_addr_t protocolAddress, sockaddr_dl *hardwareAddress,
+ 
+ 	arp_entry *entry = arp_entry::Lookup(protocolAddress);
+ 	if (entry != NULL) {
+-		// We disallow updating of entries that had been resolved before,
+-		// but to a different address (only for those that belong to a
+-		// specific address - redefining INADDR_ANY is always allowed).
+-		// Right now, you have to manually purge the ARP entries (or wait some
+-		// time) to let us switch to the new address.
++		// An entry that had been resolved before, but to a different address
++		// (redefining INADDR_ANY is always allowed)
+ 		if (protocolAddress != INADDR_ANY
+ 			&& entry->hardware_address.sdl_alen != 0
+ 			&& memcmp(LLADDR(&entry->hardware_address),
+ 				LLADDR(hardwareAddress), ETHER_ADDRESS_LENGTH)) {
+ 			uint8* data = LLADDR(hardwareAddress);
+-			dprintf("ARP host " FMT_IPv4 " updated with different hardware address " FMT_MAC ".\n",
++			if (!learned || (entry->flags
++					& (ARP_FLAG_LOCAL | ARP_FLAG_PUBLISH | ARP_FLAG_PERMANENT))
++						!= 0) {
++				// Our own, published or static entries change only by hand
++				dprintf("ARP host " FMT_IPv4 " updated with different hardware address " FMT_MAC ".\n",
++					PRINTF_IPv4(ntohl(protocolAddress)), PRINTF_MAC(data));
++				return B_ERROR;
++			}
++			if (!gratuitous
++				&& system_time() - entry->timestamp < ARP_LOCK_TIME) {
++				// a second answer at once: keep the first
++				if (_entry)
++					*_entry = entry;
++				return B_OK;
++			}
++
++			dprintf("ARP host " FMT_IPv4 " moved to hardware address " FMT_MAC ".\n",
+ 				PRINTF_IPv4(ntohl(protocolAddress)), PRINTF_MAC(data));
+-			return B_ERROR;
+ 		}
+ 
+ 		entry->hardware_address = *hardwareAddress;
+@@ -610,10 +631,12 @@ handle_arp_request(net_buffer *buffer, arp_header &header)
+ {
+ 	MutexLocker locker(sCacheLock);
+ 
+-	if (!sIgnoreReplies) {
++	if (!sIgnoreReplies && header.protocol_sender != INADDR_ANY) {
++		// remember the address of the sender as we might need it later
++		// (a probe's 0.0.0.0, RFC 5227 2.1.1, belongs to nobody)
+ 		arp_update_entry(header.protocol_sender,
+-			(sockaddr_dl *)buffer->source, 0);
+-			// remember the address of the sender as we might need it later
++			(sockaddr_dl *)buffer->source, 0, NULL, true,
++			header.protocol_sender == header.protocol_target);
+ 	}
+ 
+ 	// check if this request is for us
+@@ -660,8 +683,12 @@ handle_arp_reply(net_buffer *buffer, arp_header &header)
+ 	if (sIgnoreReplies)
+ 		return;
+ 
++	if (header.protocol_sender == INADDR_ANY)
++		return;
++
+ 	MutexLocker locker(sCacheLock);
+-	arp_update_entry(header.protocol_sender, (sockaddr_dl *)buffer->source, 0);
++	arp_update_entry(header.protocol_sender, (sockaddr_dl *)buffer->source, 0,
++		NULL, true, header.protocol_sender == header.protocol_target);
+ }
+ 
+ 

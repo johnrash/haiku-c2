@@ -1,0 +1,191 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 02:13:16 -0400
+Subject: [PATCH 044/342] app_server: Advanced SIMD bilinear scaling on arm64
+
+The bilinear row loop that x86 has in MMX/SSE assembly
+(bilinear_scale_xloop_mmxsse), in C with arm_neon.h intrinsics: same
+arithmetic, so the results equal the default C version's. arm64 always
+takes the SIMD path for 32 bit copies, like x86 with MMX and SSE, so it
+also replaces the low filter ratio version at scales 1.5, 2, 2.5 and 3
+(which rounds pixels on the source grid differently).
+
+1280x720 to 1600x900 on the ODROID-C2: 41.5 -> 33.1 ms, the same result
+byte for byte; 1919x1079: 58.9 -> 46.0 ms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/servers/app/drawing/Painter/Jamfile       |  2 +
+ .../bitmap_painter/DrawBitmapBilinear.h       | 23 +++++--
+ .../painter_bilinear_scale_neon.c             | 69 +++++++++++++++++++
+ 3 files changed, 89 insertions(+), 5 deletions(-)
+ create mode 100644 src/servers/app/drawing/Painter/bitmap_painter/painter_bilinear_scale_neon.c
+
+diff --git a/src/servers/app/drawing/Painter/Jamfile b/src/servers/app/drawing/Painter/Jamfile
+index 1a39071a18..5a159ee5ad 100644
+--- a/src/servers/app/drawing/Painter/Jamfile
++++ b/src/servers/app/drawing/Painter/Jamfile
+@@ -16,6 +16,8 @@ SEARCH_SOURCE += [ FDirName $(SUBDIR) bitmap_painter ] ;
+ local PAINTER_ARCH_SOURCES ;
+ if $(TARGET_ARCH) = x86 {
+ 	PAINTER_ARCH_SOURCES = painter_bilinear_scale.nasm ;
++} else if $(TARGET_ARCH) = arm64 {
++	PAINTER_ARCH_SOURCES = painter_bilinear_scale_neon.c ;
+ }
+ 
+ Includes [ FGristFiles AGGTextRenderer.cpp BitmapPainter.cpp Painter.cpp ]
+diff --git a/src/servers/app/drawing/Painter/bitmap_painter/DrawBitmapBilinear.h b/src/servers/app/drawing/Painter/bitmap_painter/DrawBitmapBilinear.h
+index 6c4f42e6cf..ea866d473c 100644
+--- a/src/servers/app/drawing/Painter/bitmap_painter/DrawBitmapBilinear.h
++++ b/src/servers/app/drawing/Painter/bitmap_painter/DrawBitmapBilinear.h
+@@ -17,8 +17,17 @@
+ extern "C" {
+ 	void bilinear_scale_xloop_mmxsse(const uint8* src, void* dst,
+ 		void* xWeights, uint32 xmin, uint32 xmax, uint32 wTop, uint32 srcBPR);
++	void bilinear_scale_xloop_neon(const uint8* src, void* dst,
++		void* xWeights, uint32 xmin, uint32 xmax, uint32 wTop, uint32 srcBPR);
+ }
+ 
++#if defined(__i386__)
++#	define BILINEAR_SCALE_XLOOP	bilinear_scale_xloop_mmxsse
++#elif defined(__aarch64__)
++	// Advanced SIMD is part of every AArch64 CPU
++#	define BILINEAR_SCALE_XLOOP	bilinear_scale_xloop_neon
++#endif
++
+ 
+ extern uint32 gSIMDFlags;
+ 
+@@ -406,7 +415,7 @@ struct BilinearLowFilterRatio :
+ };
+ 
+ 
+-#ifdef __i386__
++#ifdef BILINEAR_SCALE_XLOOP
+ 
+ struct BilinearSimd : DrawBitmapBilinearOptimized<BilinearSimd> {
+ 	void DrawToClipRect(int32 xIndexL, int32 xIndexR, int32 y1, int32 y2)
+@@ -433,7 +442,7 @@ struct BilinearSimd : DrawBitmapBilinearOptimized<BilinearSimd> {
+ 			// buffer handle for destination to be incremented per
+ 			// pixel
+ 			uint8* d = fDestination;
+-			bilinear_scale_xloop_mmxsse(src, fDestination, fWeightsX, xIndexL,
++			BILINEAR_SCALE_XLOOP(src, fDestination, fWeightsX, xIndexL,
+ 				xIndexMax, wTop, fSourceBytesPerRow);
+ 			// increase pointer by processed pixels
+ 			d += (xIndexMax - xIndexL + 1) * 4;
+@@ -476,7 +485,7 @@ struct BilinearSimd : DrawBitmapBilinearOptimized<BilinearSimd> {
+ 	}
+ };
+ 
+-#endif	// __i386__
++#endif	// BILINEAR_SCALE_XLOOP
+ 
+ 
+ template<class ColorType, class DrawMode>
+@@ -599,8 +608,12 @@ struct DrawBitmapBilinear {
+ 
+ 		if (typeid(ColorType) == typeid(ColorTypeRgb)
+ 			&& typeid(DrawMode) == typeid(DrawModeCopy)) {
++#if defined(__aarch64__)
++			if (true)
++#else
+ 			uint32 neededSIMDFlags = APPSERVER_SIMD_MMX | APPSERVER_SIMD_SSE;
+ 			if ((gSIMDFlags & neededSIMDFlags) == neededSIMDFlags)
++#endif
+ 				codeSelect = kUseSIMDVersion;
+ 			else {
+ 				if (scaleX == scaleY && (scaleX == 1.5 || scaleX == 2.0
+@@ -627,7 +640,7 @@ struct DrawBitmapBilinear {
+ 				break;
+ 			}
+ 
+-#ifdef __i386__
++#ifdef BILINEAR_SCALE_XLOOP
+ 			case kUseSIMDVersion:
+ 			{
+ 				BilinearSimd bilinearPainter;
+@@ -635,7 +648,7 @@ struct DrawBitmapBilinear {
+ 					filterData);
+ 				break;
+ 			}
+-#endif	// __i386__
++#endif	// BILINEAR_SCALE_XLOOP
+ 		}
+ 
+ #ifdef FILTER_INFOS_ON_HEAP
+diff --git a/src/servers/app/drawing/Painter/bitmap_painter/painter_bilinear_scale_neon.c b/src/servers/app/drawing/Painter/bitmap_painter/painter_bilinear_scale_neon.c
+new file mode 100644
+index 0000000000..13efd7f8d8
+--- /dev/null
++++ b/src/servers/app/drawing/Painter/bitmap_painter/painter_bilinear_scale_neon.c
+@@ -0,0 +1,69 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++// The build includes GCC's headers like its own, with -Werror.
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wsign-compare"
++#pragma GCC diagnostic ignored "-Wmissing-braces"
++#include <arm_neon.h>
++#pragma GCC diagnostic pop
++
++#include <SupportDefs.h>
++
++
++void bilinear_scale_xloop_neon(const uint8* src, void* dst, void* xWeights,
++	uint32 xmin, uint32 xmax, uint32 wTop, uint32 srcBPR);
++
++
++// as BitmapPainterPrivate::FilterInfo
++typedef struct {
++	uint16	index;	// byte offset of the left pixel in the source row
++	uint16	weight;	// of the left pixel, 0-255
++} FilterWeight;
++
++
++/*!	One row of bilinear scaling for 32 bit pixels, as
++	BilinearDefault::DrawToClipRect() computes it for the pixels that need
++	both neighbours (and as painter_bilinear_scale.nasm on x86, which also
++	writes the fourth byte): for each channel
++	((left * wLeft + right * wRight) * wTop
++		+ (bottomLeft * wLeft + bottomRight * wRight) * wBottom) >> 16.
++*/
++void
++bilinear_scale_xloop_neon(const uint8* src, void* dst, void* xWeights,
++	uint32 xmin, uint32 xmax, uint32 wTop, uint32 srcBPR)
++{
++	const FilterWeight* weights = (const FilterWeight*)xWeights;
++	uint32* d = (uint32*)dst;
++	const uint16 wBottom = 255 - wTop;
++
++	for (uint32 x = xmin; x <= xmax; x++) {
++		const uint8* s = src + weights[x].index;
++		const uint32 wLeft = weights[x].weight;
++		const uint32 wRight = 255 - wLeft;
++
++		// left and right pixel of both rows
++		uint8x8_t top = vld1_u8(s);
++		uint8x8_t bottom = vld1_u8(s + srcBPR);
++		// wLeft for the left pixel's bytes, wRight for the right one's
++		uint8x8_t w = vcreate_u8((uint64)(wRight * 0x01010101u) << 32
++			| wLeft * 0x01010101u);
++
++		uint16x8_t topProducts = vmull_u8(top, w);
++		uint16x8_t bottomProducts = vmull_u8(bottom, w);
++		uint16x4_t topSum = vadd_u16(vget_low_u16(topProducts),
++			vget_high_u16(topProducts));
++		uint16x4_t bottomSum = vadd_u16(vget_low_u16(bottomProducts),
++			vget_high_u16(bottomProducts));
++
++		uint32x4_t sum = vmull_n_u16(topSum, wTop);
++		sum = vmlal_n_u16(sum, bottomSum, wBottom);
++		uint16x4_t result = vshrn_n_u32(sum, 16);
++		uint8x8_t bytes = vmovn_u16(vcombine_u16(result, result));
++		vst1_lane_u32(d, vreinterpret_u32_u8(bytes), 0);
++		d++;
++	}
++}

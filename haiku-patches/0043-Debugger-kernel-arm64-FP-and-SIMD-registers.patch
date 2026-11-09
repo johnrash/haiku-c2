@@ -1,0 +1,321 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 02:13:03 -0400
+Subject: [PATCH 043/342] Debugger, kernel: arm64 FP and SIMD registers
+
+arm64_debug_cpu_state gains fpsr, fpcr and v0-v31 (128 bits each); the
+kernel fills them in from the thread's saved FPU state and writes them
+back on a set. The Debugger kit's arm64 CPU state and architecture add
+the registers after cpsr, in index order (DwarfImageDebugInfo indexes the
+register array), map v0-v31 to DWARF registers 64-95, mark v8-v15 as
+callee-preserved and give them same-value CFA rules.
+
+Tested on the ODROID-C2 with tools/probes/dbgtest.cpp of the port: v31
+written through the debug nub survives a single step and reads back.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/os/arch/arm64/arch_debugger.h         |  7 ++
+ .../debugger/arch/arm64/ArchitectureARM64.cpp | 74 ++++++++++++++++---
+ .../debugger/arch/arm64/ArchitectureARM64.h   |  4 +
+ .../debugger/arch/arm64/CpuStateARM64.cpp     | 26 +++++++
+ src/kits/debugger/arch/arm64/CpuStateARM64.h  |  6 ++
+ .../kernel/arch/arm64/arch_user_debugger.cpp  |  8 ++
+ 6 files changed, 113 insertions(+), 12 deletions(-)
+
+diff --git a/headers/os/arch/arm64/arch_debugger.h b/headers/os/arch/arm64/arch_debugger.h
+index 0f2487f785..f6874f7896 100644
+--- a/headers/os/arch/arm64/arch_debugger.h
++++ b/headers/os/arch/arm64/arch_debugger.h
+@@ -5,12 +5,19 @@
+ #ifndef _ARCH_ARM64_DEBUGGER_H
+ #define _ARCH_ARM64_DEBUGGER_H
+ 
++struct arm64_fp_register {
++	unsigned long	value[2];	/* 128 bits: v<n>, also q<n>, d<n>, s<n> */
++};
++
+ struct arm64_debug_cpu_state {
+ 	unsigned long x[30];
+ 	unsigned long lr;
+ 	unsigned long sp;
+ 	unsigned long elr;
+ 	unsigned int  spsr;
++	unsigned int  fpsr;
++	unsigned int  fpcr;
++	struct arm64_fp_register v[32];
+ } __attribute__((aligned(16)));
+ 
+ #endif	// _ARCH_ARM_DEBUGGER_H
+diff --git a/src/kits/debugger/arch/arm64/ArchitectureARM64.cpp b/src/kits/debugger/arch/arm64/ArchitectureARM64.cpp
+index b8cdcb0aa4..40b6826c27 100644
+--- a/src/kits/debugger/arch/arm64/ArchitectureARM64.cpp
++++ b/src/kits/debugger/arch/arm64/ArchitectureARM64.cpp
+@@ -11,6 +11,7 @@
+ #include <String.h>
+ 
+ #include "ARM64AssemblyLanguage.h"
++#include "CfaContext.h"
+ #include "CpuStateARM64.h"
+ #include "DisassembledCode.h"
+ #include "FunctionDebugInfo.h"
+@@ -25,10 +26,12 @@
+ #include "disasm/DisassemblerARM64.h"
+ 
+ 
+-// DWARF register numbers: x0-x30 are 0-30 and sp is 31, as our indices.
+-// The program counter has none in call frame information (the return address
+-// column is x30), so the unwound CPU states leave it unset (CpuStateARM64).
+-static const int32 kDwarfRegisterCount = 32;
++// DWARF register numbers: x0-x30 are 0-30 and sp is 31, as our indices;
++// v0-v31 are 64-95. The program counter has none in call frame information
++// (the return address column is x30), so the unwound CPU states leave it
++// unset (CpuStateARM64).
++static const int32 kDwarfRegisterCount = 96;
++static const int32 kDwarfV0 = 64;
+ 
+ // stp x29, x30, [sp, #-N]!  and  mov x29, sp
+ static const uint32 kPushFrameRecordMask = 0xffc07fff;
+@@ -48,7 +51,11 @@ struct ArchitectureARM64::ToDwarfRegisterMap : RegisterMap {
+ 
+ 	virtual int32 MapRegisterIndex(int32 index) const
+ 	{
+-		return index >= 0 && index < kDwarfRegisterCount ? index : -1;
++		if (index >= 0 && index <= ARM64_REGISTER_SP)
++			return index;
++		if (index >= ARM64_REGISTER_V0 && index <= ARM64_REGISTER_V31)
++			return kDwarfV0 + index - ARM64_REGISTER_V0;
++		return -1;
+ 	}
+ };
+ 
+@@ -64,7 +71,11 @@ struct ArchitectureARM64::FromDwarfRegisterMap : RegisterMap {
+ 
+ 	virtual int32 MapRegisterIndex(int32 index) const
+ 	{
+-		return index >= 0 && index < kDwarfRegisterCount ? index : -1;
++		if (index >= 0 && index <= ARM64_REGISTER_SP)
++			return index;
++		if (index >= kDwarfV0 && index < kDwarfV0 + 32)
++			return ARM64_REGISTER_V0 + index - kDwarfV0;
++		return -1;
+ 	}
+ };
+ 
+@@ -120,10 +131,24 @@ ArchitectureARM64::Init()
+ 			REGISTER_TYPE_STACK_POINTER, true);
+ 		_AddIntegerRegister(ARM64_REGISTER_PC, "pc",
+ 			REGISTER_TYPE_INSTRUCTION_POINTER, false);
+-		if (!fRegisters.Add(Register(ARM64_REGISTER_CPSR, "cpsr", 32,
+-				B_UINT32_TYPE, REGISTER_TYPE_SPECIAL_PURPOSE, true))) {
+-			throw std::bad_alloc();
++		_AddRegister(ARM64_REGISTER_CPSR, "cpsr", 32, B_UINT32_TYPE,
++			REGISTER_TYPE_SPECIAL_PURPOSE, true);
++
++		static const char* const kVectorNames[] = {
++			"v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
++			"v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19",
++			"v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28",
++			"v29", "v30", "v31"
++		};
++		for (int32 i = 0; i < 32; i++) {
++			// the low halves of v8-v15 are callee-saved (AAPCS64)
++			_AddRegister(ARM64_REGISTER_V0 + i, kVectorNames[i], 128,
++				B_RAW_TYPE, REGISTER_TYPE_GENERAL_PURPOSE, i >= 8 && i <= 15);
+ 		}
++		_AddRegister(ARM64_REGISTER_FPSR, "fpsr", 32, B_UINT32_TYPE,
++			REGISTER_TYPE_SPECIAL_PURPOSE, true);
++		_AddRegister(ARM64_REGISTER_FPCR, "fpcr", 32, B_UINT32_TYPE,
++			REGISTER_TYPE_SPECIAL_PURPOSE, true);
+ 	} catch (std::bad_alloc&) {
+ 		return B_NO_MEMORY;
+ 	}
+@@ -543,16 +568,41 @@ ArchitectureARM64::GetReturnAddressLocation(StackFrame* frame,
+ 
+ 
+ void
+-ArchitectureARM64::_AddIntegerRegister(int32 index, const char* name,
+-	register_type type, bool calleePreserved)
++ArchitectureARM64::_AddRegister(int32 index, const char* name, uint32 bitSize,
++	uint32 valueType, register_type type, bool calleePreserved)
+ {
+-	if (!fRegisters.Add(Register(index, name, 64, B_UINT64_TYPE, type,
++	if (!fRegisters.Add(Register(index, name, bitSize, valueType, type,
+ 			calleePreserved))) {
+ 		throw std::bad_alloc();
+ 	}
+ }
+ 
+ 
++void
++ArchitectureARM64::_AddIntegerRegister(int32 index, const char* name,
++	register_type type, bool calleePreserved)
++{
++	_AddRegister(index, name, 64, B_UINT64_TYPE, type, calleePreserved);
++}
++
++
++status_t
++ArchitectureARM64::InitRegisterRules(CfaContext& context) const
++{
++	status_t error = Architecture::InitRegisterRules(context);
++	if (error != B_OK)
++		return error;
++
++	// The base class only sets up DWARF registers below our register count;
++	// the vector registers are 64-95. GCC assumes "same value" for them, as
++	// for the others.
++	for (int32 i = 0; i < 32; i++)
++		context.RegisterRule(kDwarfV0 + i)->SetToSameValue();
++
++	return B_OK;
++}
++
++
+ bool
+ ArchitectureARM64::_HasFunctionPrologue(FunctionDebugInfo* function) const
+ {
+diff --git a/src/kits/debugger/arch/arm64/ArchitectureARM64.h b/src/kits/debugger/arch/arm64/ArchitectureARM64.h
+index 0dfb03a2b7..0b41568662 100644
+--- a/src/kits/debugger/arch/arm64/ArchitectureARM64.h
++++ b/src/kits/debugger/arch/arm64/ArchitectureARM64.h
+@@ -26,6 +26,7 @@ public:
+ 
+ 	virtual	int32				CountRegisters() const;
+ 	virtual	const Register*		Registers() const;
++	virtual status_t			InitRegisterRules(CfaContext& context) const;
+ 
+ 	virtual	status_t			GetDwarfRegisterMaps(RegisterMap** _toDwarf,
+ 									RegisterMap** _fromDwarf) const;
+@@ -79,6 +80,9 @@ private:
+ 			struct FromDwarfRegisterMap;
+ 
+ private:
++			void				_AddRegister(int32 index, const char* name,
++									uint32 bitSize, uint32 valueType,
++									register_type type, bool calleePreserved);
+ 			void				_AddIntegerRegister(int32 index,
+ 									const char* name, register_type type,
+ 									bool calleePreserved);
+diff --git a/src/kits/debugger/arch/arm64/CpuStateARM64.cpp b/src/kits/debugger/arch/arm64/CpuStateARM64.cpp
+index 58c87ebc8d..44cb6ae388 100644
+--- a/src/kits/debugger/arch/arm64/CpuStateARM64.cpp
++++ b/src/kits/debugger/arch/arm64/CpuStateARM64.cpp
+@@ -18,6 +18,7 @@ CpuStateARM64::CpuStateARM64()
+ 	fSetRegisters()
+ {
+ 	memset(fRegisters, 0, sizeof(fRegisters));
++	memset(fVectorRegisters, 0, sizeof(fVectorRegisters));
+ }
+ 
+ 
+@@ -31,6 +32,11 @@ CpuStateARM64::CpuStateARM64(const arm64_debug_cpu_state& state)
+ 	SetIntRegister(ARM64_REGISTER_SP, state.sp);
+ 	SetIntRegister(ARM64_REGISTER_PC, state.elr);
+ 	SetIntRegister(ARM64_REGISTER_CPSR, state.spsr);
++	SetIntRegister(ARM64_REGISTER_FPSR, state.fpsr);
++	SetIntRegister(ARM64_REGISTER_FPCR, state.fpcr);
++	memcpy(fVectorRegisters, state.v, sizeof(fVectorRegisters));
++	for (int32 i = 0; i < 32; i++)
++		fSetRegisters[ARM64_REGISTER_V0 + i] = 1;
+ }
+ 
+ 
+@@ -47,6 +53,8 @@ CpuStateARM64::Clone(CpuState*& _clone) const
+ 		return B_NO_MEMORY;
+ 
+ 	memcpy(newState->fRegisters, fRegisters, sizeof(fRegisters));
++	memcpy(newState->fVectorRegisters, fVectorRegisters,
++		sizeof(fVectorRegisters));
+ 	newState->fSetRegisters = fSetRegisters;
+ 
+ 	_clone = newState;
+@@ -68,6 +76,9 @@ CpuStateARM64::UpdateDebugState(void* state, size_t size) const
+ 	arm64State->sp = IntRegisterValue(ARM64_REGISTER_SP);
+ 	arm64State->elr = IntRegisterValue(ARM64_REGISTER_PC);
+ 	arm64State->spsr = IntRegisterValue(ARM64_REGISTER_CPSR);
++	arm64State->fpsr = IntRegisterValue(ARM64_REGISTER_FPSR);
++	arm64State->fpcr = IntRegisterValue(ARM64_REGISTER_FPCR);
++	memcpy(arm64State->v, fVectorRegisters, sizeof(arm64State->v));
+ 
+ 	return B_OK;
+ }
+@@ -121,6 +132,11 @@ CpuStateARM64::GetRegisterValue(const Register* reg, BVariant& _value) const
+ 	if (!IsRegisterSet(index))
+ 		return false;
+ 
++	if (index >= ARM64_REGISTER_V0 && index <= ARM64_REGISTER_V31) {
++		_value.SetTo(fVectorRegisters[index - ARM64_REGISTER_V0].value);
++		return true;
++	}
++
+ 	if (reg->BitSize() == 32)
+ 		_value.SetTo((uint32)fRegisters[index]);
+ 	else
+@@ -136,6 +152,16 @@ CpuStateARM64::SetRegisterValue(const Register* reg, const BVariant& value)
+ 	if (index < 0 || index >= ARM64_REGISTER_COUNT)
+ 		return false;
+ 
++	if (index >= ARM64_REGISTER_V0 && index <= ARM64_REGISTER_V31) {
++		if (value.Size() > sizeof(arm64_fp_register))
++			return false;
++		arm64_fp_register& vector = fVectorRegisters[index - ARM64_REGISTER_V0];
++		memset(&vector, 0, sizeof(vector));
++		memcpy(vector.value, value.ToPointer(), value.Size());
++		fSetRegisters[index] = 1;
++		return true;
++	}
++
+ 	SetIntRegister(index, value.ToUInt64());
+ 	return true;
+ }
+diff --git a/src/kits/debugger/arch/arm64/CpuStateARM64.h b/src/kits/debugger/arch/arm64/CpuStateARM64.h
+index 2ae3ca0340..f0e3612a75 100644
+--- a/src/kits/debugger/arch/arm64/CpuStateARM64.h
++++ b/src/kits/debugger/arch/arm64/CpuStateARM64.h
+@@ -21,6 +21,10 @@ enum {
+ 	ARM64_REGISTER_SP = 31,
+ 	ARM64_REGISTER_PC,
+ 	ARM64_REGISTER_CPSR,
++	ARM64_REGISTER_V0,				// v0-v31: 128 bits each
++	ARM64_REGISTER_V31 = ARM64_REGISTER_V0 + 31,
++	ARM64_REGISTER_FPSR,
++	ARM64_REGISTER_FPCR,
+ 
+ 	ARM64_REGISTER_COUNT
+ };
+@@ -58,6 +62,8 @@ private:
+ 
+ private:
+ 			uint64				fRegisters[ARM64_REGISTER_COUNT];
++				// the integer ones (x0-x30, sp, pc, cpsr, fpsr, fpcr)
++			arm64_fp_register	fVectorRegisters[32];
+ 			RegisterBitSet		fSetRegisters;
+ };
+ 
+diff --git a/src/system/kernel/arch/arm64/arch_user_debugger.cpp b/src/system/kernel/arch/arm64/arch_user_debugger.cpp
+index 8abefac7fa..a4b23adeb3 100644
+--- a/src/system/kernel/arch/arm64/arch_user_debugger.cpp
++++ b/src/system/kernel/arch/arm64/arch_user_debugger.cpp
+@@ -277,6 +277,11 @@ arch_set_debug_cpu_state(const debug_cpu_state *cpuState)
+ 	frame->elr = cpuState->elr;
+ 	// userland may only change the condition flags
+ 	frame->spsr = (frame->spsr & ~SPSR_NZCV) | (cpuState->spsr & SPSR_NZCV);
++
++	// the FPU state is restored from the iframe on the way back
++	memcpy(frame->fpu.regs, cpuState->v, sizeof(frame->fpu.regs));
++	frame->fpu.fpsr = cpuState->fpsr;
++	frame->fpu.fpcr = cpuState->fpcr;
+ }
+ 
+ 
+@@ -290,6 +295,9 @@ get_cpu_state(iframe* frame, debug_cpu_state* cpuState)
+ 	cpuState->sp = frame->sp;
+ 	cpuState->elr = frame->elr;
+ 	cpuState->spsr = frame->spsr;
++	cpuState->fpsr = frame->fpu.fpsr;
++	cpuState->fpcr = frame->fpu.fpcr;
++	memcpy(cpuState->v, frame->fpu.regs, sizeof(cpuState->v));
+ }
+ 
+ 

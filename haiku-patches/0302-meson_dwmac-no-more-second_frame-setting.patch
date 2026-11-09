@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 4 Nov 2026 21:40:09 -0500
+Subject: [PATCH 302/342] meson_dwmac: no more "second_frame" setting
+
+With the slot race fixed, three TCP streams and pings both ways without operate on
+second frame ran 8 rounds of 24 s, 8.4 GB, with no stall, against 25 stalls and a
+dead link in 2 rounds before. So the setting has no stall left to bring back.
+Operate on second frame stays on for its speed: about 64 MB/s against 51.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../drivers/network/ether/meson_dwmac/meson_dwmac.cpp | 11 +++--------
+ 1 file changed, 3 insertions(+), 8 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp b/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
+index e263475580..31a58c634f 100644
+--- a/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
++++ b/src/add-ons/kernel/drivers/network/ether/meson_dwmac/meson_dwmac.cpp
+@@ -324,7 +324,6 @@ private:
+ 
+ 			int32				fTxStuckSeconds;
+ 			int32				fTxSendersOvertaken;
+-			bool				fSecondFrame;
+ };
+ 
+ 
+@@ -358,8 +357,7 @@ MesonDwmac::MesonDwmac(device_node* node)
+ 	fSpeed(0),
+ 	fLinkStateSemaphore(-1),
+ 	fTxStuckSeconds(0),
+-	fTxSendersOvertaken(0),
+-	fSecondFrame(true)
++	fTxSendersOvertaken(0)
+ {
+ 	memset(fMacAddress, 0, sizeof(fMacAddress));
+ 	mutex_init(&fRxLock, "meson_dwmac rx");
+@@ -565,8 +563,8 @@ MesonDwmac::_Start()
+ 	_Write(kDmaStatus, DMA_STATUS_CLEAR_MASK);
+ 	_Write(kDmaInterruptEnable, INTERRUPT_NIE | INTERRUPT_AIE | INTERRUPT_FBE
+ 		| INTERRUPT_RUE | INTERRUPT_RIE | INTERRUPT_TIE);
+-	_Write(kDmaOperationMode, OPERATION_RSF | OPERATION_TSF
+-		| (fSecondFrame ? OPERATION_OSF : 0) | OPERATION_ST | OPERATION_SR);
++	_Write(kDmaOperationMode, OPERATION_RSF | OPERATION_TSF | OPERATION_OSF
++		| OPERATION_ST | OPERATION_SR);
+ }
+ 
+ 
+@@ -884,9 +882,6 @@ MesonDwmac::_ConfigureEee()
+ 	void* settings = load_driver_settings("meson_dwmac");
+ 	if (settings != NULL) {
+ 		keep = get_driver_boolean_parameter(settings, "eee", false, true);
+-		// off, the stall _CheckTransmit() repairs comes within a few GB
+-		fSecondFrame = get_driver_boolean_parameter(settings, "second_frame",
+-			true, true);
+ 		unload_driver_settings(settings);
+ 	}
+ 

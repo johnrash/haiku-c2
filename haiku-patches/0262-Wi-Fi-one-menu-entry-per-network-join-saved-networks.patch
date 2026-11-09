@@ -1,0 +1,467 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Mon, 2 Nov 2026 22:32:46 -0500
+Subject: [PATCH 262/342] Wi-Fi: one menu entry per network; join saved
+ networks again
+
+The Deskbar network menu and the Network preferences listed a network
+once for each access point and band it came through, and hidden
+networks without a name: WirelessNetworkMenuItem::MergeNetworks() keeps
+one entry per name, the associated access point or else the strongest.
+
+net_server tried to join a saved network after the first scan only:
+when that scan missed the network, or the join failed, there was none
+until a reboot. Now every scan without a link may join, after 30 s, then
+1, 2, 4 and every 8 minutes, and the AutoconfigLooper scans for it while
+the interface is up; a join asked for in the last 30 s is left alone.
+Auto join takes the strongest access point with the saved name. A join
+for an access point other than the one a network was saved with (as
+the menu's are) finds the saved settings, the password, by name.
+
+The network settings wrote access point addresses with "%2x", a space
+in place of a leading zero.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apps/networkstatus/NetworkStatusView.cpp  |  2 +
+ .../networkstatus/WirelessNetworkMenuItem.cpp | 42 ++++++++-
+ .../networkstatus/WirelessNetworkMenuItem.h   |  7 ++
+ .../network/libnetapi/NetworkSettings.cpp     |  2 +-
+ src/preferences/network/InterfaceView.cpp     |  2 +
+ src/servers/net/AutoconfigLooper.cpp          | 81 +++++++++++++----
+ src/servers/net/AutoconfigLooper.h            |  7 +-
+ src/servers/net/NetServer.cpp                 | 91 +++++++++++++++----
+ 8 files changed, 195 insertions(+), 39 deletions(-)
+
+diff --git a/src/apps/networkstatus/NetworkStatusView.cpp b/src/apps/networkstatus/NetworkStatusView.cpp
+index 9b825851b7..88152050d7 100644
+--- a/src/apps/networkstatus/NetworkStatusView.cpp
++++ b/src/apps/networkstatus/NetworkStatusView.cpp
+@@ -410,6 +410,8 @@ NetworkStatusView::MouseDown(BPoint point)
+ 		uint32 networksCount = 0;
+ 		wireless_network* networks = NULL;
+ 		device.GetNetworks(networks, networksCount);
++		networksCount = WirelessNetworkMenuItem::MergeNetworks(networks,
++			networksCount, associated);
+ 		for (uint32 i = 0; i < networksCount; i++) {
+ 			const wireless_network& network = networks[i];
+ 			BMessage* message = new BMessage(kMsgJoinNetwork);
+diff --git a/src/apps/networkstatus/WirelessNetworkMenuItem.cpp b/src/apps/networkstatus/WirelessNetworkMenuItem.cpp
+index 940711db66..9cc6e2c05c 100644
+--- a/src/apps/networkstatus/WirelessNetworkMenuItem.cpp
++++ b/src/apps/networkstatus/WirelessNetworkMenuItem.cpp
+@@ -99,7 +99,47 @@ WirelessNetworkMenuItem::DrawRadioIcon()
+ }
+ 
+ 
+-/*static*/ int
++/*static*/ /*!	Leaves one entry for each network name in \a networks, a scan's results,
++	and returns how many there are: a network often comes through several
++	access points and bands, each a result of its own. The entry kept is the
++	one the device is associated with, if any, or else the strongest. Hidden
++	networks, which have no name, are left out.
++*/
++/*static*/ uint32
++WirelessNetworkMenuItem::MergeNetworks(wireless_network* networks,
++	uint32 count, const std::set<BNetworkAddress>& associated)
++{
++	uint32 kept = 0;
++	for (uint32 i = 0; i < count; i++) {
++		const wireless_network network = networks[i];
++		if (network.name[0] == '\0')
++			continue;
++
++		uint32 index = 0;
++		while (index < kept && strncmp(networks[index].name, network.name,
++				sizeof(network.name)) != 0) {
++			index++;
++		}
++		if (index == kept) {
++			networks[kept++] = network;
++			continue;
++		}
++
++		bool isAssociated
++			= associated.find(network.address) != associated.end();
++		bool keptIsAssociated
++			= associated.find(networks[index].address) != associated.end();
++		if ((isAssociated && !keptIsAssociated)
++			|| (isAssociated == keptIsAssociated
++				&& network.signal_strength > networks[index].signal_strength)) {
++			networks[index] = network;
++		}
++	}
++	return kept;
++}
++
++
++int
+ WirelessNetworkMenuItem::CompareSignalStrength(const BMenuItem* a,
+ 	const BMenuItem* b)
+ {
+diff --git a/src/apps/networkstatus/WirelessNetworkMenuItem.h b/src/apps/networkstatus/WirelessNetworkMenuItem.h
+index f0d0b719bf..3434a752d0 100644
+--- a/src/apps/networkstatus/WirelessNetworkMenuItem.h
++++ b/src/apps/networkstatus/WirelessNetworkMenuItem.h
+@@ -7,8 +7,11 @@
+ 
+ 
+ #include <MenuItem.h>
++#include <NetworkAddress.h>
+ #include <NetworkDevice.h>
+ 
++#include <set>
++
+ 
+ class WirelessNetworkMenuItem : public BMenuItem {
+ public:
+@@ -23,6 +26,10 @@ public:
+ 
+ 	static	int					CompareSignalStrength(const BMenuItem* a,
+ 									const BMenuItem* b);
++	static	uint32				MergeNetworks(wireless_network* networks,
++									uint32 count,
++									const std::set<BNetworkAddress>&
++										associated);
+ 
+ protected:
+ 	virtual	void				DrawContent();
+diff --git a/src/kits/network/libnetapi/NetworkSettings.cpp b/src/kits/network/libnetapi/NetworkSettings.cpp
+index 21fc389dc0..35d872309a 100644
+--- a/src/kits/network/libnetapi/NetworkSettings.cpp
++++ b/src/kits/network/libnetapi/NetworkSettings.cpp
+@@ -710,7 +710,7 @@ BNetworkSettings::_ConvertNetworkToSettings(BMessage& message)
+ 			if (index > 0)
+ 				formatted.Append(":");
+ 			char buffer[3];
+-			snprintf(buffer, sizeof(buffer), "%2x", macAddress[index]);
++			snprintf(buffer, sizeof(buffer), "%02x", macAddress[index]);
+ 			formatted.Append(buffer, sizeof(buffer));
+ 
+ 			if (macAddress[index] != 0)
+diff --git a/src/preferences/network/InterfaceView.cpp b/src/preferences/network/InterfaceView.cpp
+index 5267f6d146..49b4594833 100644
+--- a/src/preferences/network/InterfaceView.cpp
++++ b/src/preferences/network/InterfaceView.cpp
+@@ -292,6 +292,8 @@ InterfaceView::_Update(bool updateWirelessNetworks)
+ 		}
+ 
+ 		ArrayDeleter<wireless_network> networksDeleter(networks);
++		networksCount = WirelessNetworkMenuItem::MergeNetworks(networks,
++			networksCount, associated);
+ 
+ 		// go through menu items and remove networks that have dropped out
+ 		for (int32 index = 0; index < count; index++) {
+diff --git a/src/servers/net/AutoconfigLooper.cpp b/src/servers/net/AutoconfigLooper.cpp
+index 42bae2a7da..9b2a1f1961 100644
+--- a/src/servers/net/AutoconfigLooper.cpp
++++ b/src/servers/net/AutoconfigLooper.cpp
+@@ -18,6 +18,8 @@
+ #include <sys/socket.h>
+ #include <sys/sockio.h>
+ 
++#include <MessageRunner.h>
++#include <NetworkDevice.h>
+ #include <NetworkInterface.h>
+ #include <NetworkNotifications.h>
+ 
+@@ -26,6 +28,14 @@
+ 
+ 
+ static const uint32 kMsgReadyToRun = 'rdyr';
++static const uint32 kMsgRescan = 'rscn';
++
++static const bigtime_t kRescanCheckInterval = 10000000LL;
++static const bigtime_t kAutoJoinInterval = 30000000LL;
++static const int32 kMaxAutoJoinBackOff = 4;
++	// A wireless device without a link joins a saved network after a scan
++	// that finds one; it scans for that itself, too. It tries again 30 s
++	// after an attempt, then 1, 2, 4 and every 8 minutes, until it has a link.
+ 
+ 
+ AutoconfigLooper::AutoconfigLooper(BMessenger target, const char* device)
+@@ -34,7 +44,10 @@ AutoconfigLooper::AutoconfigLooper(BMessenger target, const char* device)
+ 	fDevice(device),
+ 	fCurrentClient(NULL),
+ 	fLastMediaStatus(0),
+-	fJoiningNetwork(false)
++	fRescanRunner(NULL),
++	fNextAutoJoin(0),
++	fNextRescan(0),
++	fAutoJoinAttempts(0)
+ {
+ 	BMessage ready(kMsgReadyToRun);
+ 	PostMessage(&ready);
+@@ -43,6 +56,7 @@ AutoconfigLooper::AutoconfigLooper(BMessenger target, const char* device)
+ 
+ AutoconfigLooper::~AutoconfigLooper()
+ {
++	delete fRescanRunner;
+ 	_RemoveClient();
+ }
+ 
+@@ -145,6 +159,31 @@ AutoconfigLooper::_ReadyToRun()
+ 		// a link changed notification that might race us.
+ 		fLastMediaStatus |= IFM_ACTIVE;
+ 	}
++
++	if (BNetworkDevice(fDevice.String()).IsWireless()) {
++		BMessage rescan(kMsgRescan);
++		fRescanRunner = new BMessageRunner(BMessenger(this), &rescan,
++			kRescanCheckInterval);
++	}
++}
++
++
++void
++AutoconfigLooper::_AutoJoin()
++{
++	if ((fLastMediaStatus & IFM_ACTIVE) != 0 || system_time() < fNextAutoJoin)
++		return;
++
++	fNextAutoJoin = system_time() + (kAutoJoinInterval
++		<< min_c(fAutoJoinAttempts, kMaxAutoJoinBackOff));
++	fAutoJoinAttempts++;
++
++	// The net_server leaves a device alone that was asked to join a network
++	// only moments ago, so this doesn't interfere with a join in progress
++	// (whose scans end up here as well).
++	BMessage message(kMsgAutoJoinNetwork);
++	message.AddString("device", fDevice);
++	fTarget.SendMessage(&message);
+ }
+ 
+ 
+@@ -184,8 +223,14 @@ AutoconfigLooper::_NetworkMonitorNotification(BMessage* message)
+ 				// Reconfigure the interface when we have a link again
+ 				_ConfigureIPv4();
+ 				//_ConfigureIPv6();	// TODO: router advertisement and dhcpv6
++				fAutoJoinAttempts = 0;
+ 			} else if ((media & IFM_ACTIVE) == 0) {
+ 				_RemoveClient();
++				if ((fLastMediaStatus & IFM_ACTIVE) != 0) {
++					// leave the wpa_supplicant some time to get the link
++					// back on its own
++					fNextAutoJoin = system_time() + kAutoJoinInterval;
++				}
+ 			}
+ 
+ 			fLastMediaStatus = media;
+@@ -193,25 +238,9 @@ AutoconfigLooper::_NetworkMonitorNotification(BMessage* message)
+ 		}
+ 
+ 		case B_NETWORK_WLAN_SCANNED:
+-		{
+-			if (fJoiningNetwork || (fLastMediaStatus & IFM_ACTIVE) != 0) {
+-				// We already have a link or are already joining.
+-				break;
+-			}
+-
+-			fJoiningNetwork = true;
+-				// TODO: For now we never reset this flag. We can only do that
+-				// after infrastructure has been added to discern a scan reason.
+-				// If we would always auto join we would possibly interfere
+-				// with active scans in the process of connecting to an AP
+-				// either for the initial connection, or after connection loss
+-				// to re-establish the link.
+-
+-			BMessage message(kMsgAutoJoinNetwork);
+-			message.AddString("device", fDevice);
+-			fTarget.SendMessage(&message);
++			// any scan while there is no link may join a saved network
++			_AutoJoin();
+ 			break;
+-		}
+ 	}
+ }
+ 
+@@ -228,6 +257,20 @@ AutoconfigLooper::MessageReceived(BMessage* message)
+ 			_ConfigureIPv4Failed();
+ 			break;
+ 
++		case kMsgRescan:
++			// a scan, whose result leads to an automatic join (above); at
++			// most every 30 s, should no result come. Not for an interface
++			// that was set down: Scan() would bring it up.
++			if ((fLastMediaStatus & IFM_ACTIVE) == 0
++				&& system_time() >= fNextAutoJoin
++				&& system_time() >= fNextRescan
++				&& (BNetworkInterface(fDevice.String()).Flags() & IFF_UP)
++					!= 0) {
++				fNextRescan = system_time() + kAutoJoinInterval;
++				BNetworkDevice(fDevice.String()).Scan(false, false);
++			}
++			break;
++
+ 		case B_NETWORK_MONITOR:
+ 			_NetworkMonitorNotification(message);
+ 			break;
+diff --git a/src/servers/net/AutoconfigLooper.h b/src/servers/net/AutoconfigLooper.h
+index 948b9b4d6f..335a485463 100644
+--- a/src/servers/net/AutoconfigLooper.h
++++ b/src/servers/net/AutoconfigLooper.h
+@@ -15,6 +15,7 @@
+ #include <netinet6/in6.h>
+ 
+ class AutoconfigClient;
++class BMessageRunner;
+ 
+ class AutoconfigLooper : public BLooper {
+ public:
+@@ -32,12 +33,16 @@ private:
+ 			void				_ConfigureIPv4Failed();
+ 			void				_ReadyToRun();
+ 			void				_NetworkMonitorNotification(BMessage* message);
++			void				_AutoJoin();
+ 
+ 			BMessenger			fTarget;
+ 			BString				fDevice;
+ 			AutoconfigClient*	fCurrentClient;
+ 			int32				fLastMediaStatus;
+-			bool				fJoiningNetwork;
++			BMessageRunner*		fRescanRunner;
++			bigtime_t			fNextAutoJoin;
++			bigtime_t			fNextRescan;
++			int32				fAutoJoinAttempts;
+ };
+ 
+ #endif	// AUTOCONFIG_LOOPER_H
+diff --git a/src/servers/net/NetServer.cpp b/src/servers/net/NetServer.cpp
+index 94a079709a..f72b649a0f 100644
+--- a/src/servers/net/NetServer.cpp
++++ b/src/servers/net/NetServer.cpp
+@@ -59,6 +59,11 @@ using namespace BNetworkKit;
+ 
+ 
+ typedef std::map<std::string, AutoconfigLooper*> LooperMap;
++typedef std::map<std::string, bigtime_t> JoinTimeMap;
++
++static const bigtime_t kJoinGracePeriod = 30000000LL;
++	// an automatic join leaves a device alone for this long after it was
++	// asked to join a network, which may still be in progress
+ 
+ 
+ class NetServer : public BServer {
+@@ -106,6 +111,7 @@ private:
+ private:
+ 			BNetworkSettings	fSettings;
+ 			LooperMap			fDeviceMap;
++			JoinTimeMap			fJoinTimes;
+ 			BMessenger			fServices;
+ };
+ 
+@@ -949,32 +955,68 @@ NetServer::_AutoJoinNetwork(const BMessage& message)
+ 		return B_BAD_VALUE;
+ 
+ 	BNetworkDevice device(name);
++	if (device.HasLink())
++		return B_OK;
++
++	// A join asked for moments ago (by the user, say) may still be going on.
++	JoinTimeMap::const_iterator joined = fJoinTimes.find(name);
++	if (joined != fJoinTimes.end()
++		&& system_time() - joined->second < kJoinGracePeriod) {
++		return B_BUSY;
++	}
++
++	wireless_network* networks = NULL;
++	uint32 networkCount = 0;
++	device.GetNetworks(networks, networkCount);
++	ArrayDeleter<wireless_network> networksDeleter(networks);
+ 
+-	// Choose among configured networks
++	// Choose among configured networks, in their order: the access point a
++	// network was saved with, if it is in range, or else the strongest one
++	// with its name, as one network often comes through several access
++	// points and bands.
+ 
+ 	uint32 cookie = 0;
+ 	BMessage networkMessage;
+ 	while (fSettings.GetNextNetwork(cookie, networkMessage) == B_OK) {
+-		status_t status = B_ERROR;
+ 		wireless_network network;
+-		const char* networkName;
+-		BNetworkAddress link;
++		bool found = false;
+ 
++		// (a network saved in this session has its access point as
++		// "address"; from the settings file, it has none)
+ 		const char* mac = NULL;
+-		if (networkMessage.FindString("mac", &mac) == B_OK) {
+-			link.SetTo(AF_LINK, mac);
+-			status = device.GetNetwork(link, network);
+-		} else if (networkMessage.FindString("name", &networkName) == B_OK)
+-			status = device.GetNetwork(networkName, network);
+-
+-		if (status == B_OK) {
+-			status = _JoinNetwork(message, mac != NULL ? &link : NULL,
+-				network.name);
+-			printf("auto join network \"%s\": %s\n", network.name,
+-				strerror(status));
+-			if (status == B_OK)
+-				return B_OK;
++		BNetworkAddress link;
++		if (((networkMessage.FindString("mac", &mac) == B_OK
++					&& link.SetTo(AF_LINK, mac) == B_OK)
++				|| (networkMessage.FindFlat("address", &link) == B_OK
++					&& link.Family() == AF_LINK))
++			&& device.GetNetwork(link, network) == B_OK) {
++			found = true;
++		}
++
++		const char* networkName = networkMessage.GetString("name", NULL);
++		if (!found && networkName != NULL && networkName[0] != '\0') {
++			for (uint32 i = 0; i < networkCount; i++) {
++				if (strncmp(networks[i].name, networkName,
++						sizeof(networks[i].name)) != 0
++					|| (found && networks[i].signal_strength
++						<= network.signal_strength)) {
++					continue;
++				}
++				network = networks[i];
++				found = true;
++			}
+ 		}
++		if (!found)
++			continue;
++
++		char joinName[sizeof(network.name) + 1];
++		memcpy(joinName, network.name, sizeof(network.name));
++		joinName[sizeof(network.name)] = '\0';
++
++		status_t status = _JoinNetwork(message, &network.address, joinName);
++		printf("auto join network \"%s\": %s\n", joinName, strerror(status));
++		if (status == B_OK)
++			return B_OK;
+ 	}
+ 
+ 	return B_NO_INIT;
+@@ -1002,6 +1044,8 @@ NetServer::_JoinNetwork(const BMessage& message, const BNetworkAddress* address,
+ 			return B_BAD_VALUE;
+ 	}
+ 
++	fJoinTimes[deviceName] = system_time();
++
+ 	// Search for a network configuration that may override the defaults
+ 
+ 	bool found = false;
+@@ -1026,6 +1070,19 @@ NetServer::_JoinNetwork(const BMessage& message, const BNetworkAddress* address,
+ 			}
+ 		}
+ 	}
++	if (!found && name != NULL) {
++		// The network was saved with another of its access points (or
++		// bands): its settings, the password among them, still apply.
++		cookie = 0;
++		while (fSettings.GetNextNetwork(cookie, networkMessage) == B_OK) {
++			const char* networkName;
++			if (networkMessage.FindString("name", &networkName) == B_OK
++				&& !strcmp(name, networkName)) {
++				found = true;
++				break;
++			}
++		}
++	}
+ 
+ 	const char* password;
+ 	if (message.FindString("password", &password) != B_OK && found)

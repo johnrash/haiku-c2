@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 6 Nov 2026 22:44:56 -0500
+Subject: [PATCH 326/342] usb_audio: don't take a replugged device whose
+ configuration lacks a stream's interface
+
+Plugged in again while open, a device is taken back by the Device object
+that had it (CompareAndReattach()), and each stream sets its alternate
+interface from the new configuration by the indices it had. On the test
+board an AB13X whose port was switched off during playback came back with
+a configuration read badly ("invalid descriptor length 0 in
+configuration"): its interface list had no alternates, and
+OnSetConfiguration() handed set_alt_interface() NULL plus one entry, a
+kernel page fault at 0x30. The NULL check after the indexing could never
+catch it.
+
+A stream now checks that its interface and alternate are in the
+configuration; a replugged device that doesn't fit is refused (and the
+Device object keeps its old handle), so it is offered as a new device,
+which fails cleanly with such a configuration. The endpoint lookup also
+skips endpoints without a descriptor.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/drivers/audio/usb/Device.cpp       | 14 ++++++++++---
+ .../kernel/drivers/audio/usb/Stream.cpp       | 20 ++++++++++++++-----
+ 2 files changed, 26 insertions(+), 8 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Device.cpp b/src/add-ons/kernel/drivers/audio/usb/Device.cpp
+index aea3b48e49..ca7d6d3695 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Device.cpp
++++ b/src/add-ons/kernel/drivers/audio/usb/Device.cpp
+@@ -481,10 +481,13 @@ Device::CompareAndReattach(usb_device device)
+ 	// and transfers, clear the removed state and open the device if it was
+ 	// previously opened. A client exchanging buffers meanwhile starts the
+ 	// streams once the device isn't removed: only with their new pipes.
++	usb_device previous = fDevice;
+ 	fDevice = device;
+ 	status_t result = _SetupEndpoints();
+-	if (result != B_OK)
++	if (result != B_OK) {
++		fDevice = previous;
+ 		return result;
++	}
+ 
+ 	// we need to setup hardware on device replug
+ 	result = SetupDevice(true);
+@@ -970,8 +973,13 @@ Device::_SetupEndpoints()
+ 		if (status != B_OK)
+ 			return status;
+ 
+-		for (int i = 0; i < fStreams.Count(); i++)
+-			fStreams[i]->OnSetConfiguration(fDevice, config);
++		for (int i = 0; i < fStreams.Count(); i++) {
++			status = fStreams[i]->OnSetConfiguration(fDevice, config);
++			// a replugged device whose configuration doesn't fit its streams
++			// isn't taken (it is offered as a new device then)
++			if (status != B_OK && replugged)
++				return status;
++		}
+ 
+ 		return B_OK;
+ 	}
+diff --git a/src/add-ons/kernel/drivers/audio/usb/Stream.cpp b/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
+index 26b137deda..474c2cbd9f 100644
+--- a/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
++++ b/src/add-ons/kernel/drivers/audio/usb/Stream.cpp
+@@ -279,12 +279,21 @@ Stream::OnSetConfiguration(usb_device device,
+ 		return B_ERROR;
+ 	}
+ 
++	// A device plugged in again may come with a configuration that lacks
++	// the interface or its alternate (seen when its descriptors were read
++	// while it was still settling: "invalid descriptor length 0").
++	if (fInterface >= config->interface_count
++		|| config->interface[fInterface].alt == NULL
++		|| fActiveAlternate >= config->interface[fInterface].alt_count
++		|| config->interface[fInterface].alt[fActiveAlternate].descr
++			== NULL) {
++		TRACE(ERR, "%s stream: interface %d alternate %d is not in the "
++			"configuration\n", fIsInput ? "Input" : "Output", (int)fInterface,
++			(int)fActiveAlternate);
++		return B_BAD_VALUE;
++	}
+ 	usb_interface_info* interface
+ 		= &config->interface[fInterface].alt[fActiveAlternate];
+-	if (interface == NULL) {
+-		TRACE(ERR, "NULL interface. Not set.\n");
+-		return B_ERROR;
+-	}
+ 
+ 	status_t status = gUSBModule->set_alt_interface(device, interface);
+ 	uint8 address = fAlternates[fActiveAlternate]->Endpoint()->fEndpointAddress;
+@@ -292,7 +301,8 @@ Stream::OnSetConfiguration(usb_device device,
+ 	TRACE(INF, "set_alt_interface %x\n", status);
+ 
+ 	for (size_t i = 0; i < interface->endpoint_count; i++) {
+-		if (address == interface->endpoint[i].descr->endpoint_address) {
++		if (interface->endpoint[i].descr != NULL
++			&& address == interface->endpoint[i].descr->endpoint_address) {
+ 			fStreamEndpoint = interface->endpoint[i].handle;
+ 			TRACE(INF, "%s Stream Endpoint [address %#04x] handle is: %#010x.\n",
+ 				fIsInput ? "Input" : "Output", address, fStreamEndpoint);

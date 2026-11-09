@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 09:30:13 -0400
+Subject: [PATCH 167/342] Remote Control add-on: held buttons repeat at most
+ five times a second
+
+Remotes repeat their frames 10 to 20 times a second (the RM-RK52 every
+46 ms); a key repeat for each queued 30 of MediaPlayer's 5 s winds a
+second. Repeats now start after 0.6 s (a short press of the RM-RK52
+lasts up to 0.46 s) and come every 0.2 s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../remote_control/RemoteControlDevice.cpp      | 17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.cpp b/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.cpp
+index 565e330b7f..995c91bc60 100644
+--- a/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.cpp
++++ b/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.cpp
+@@ -11,9 +11,9 @@
+  * up and so on) work as the keyboard's do.
+  *
+  * A remote repeats its frame while a button is held: the key stays down
+- * until no repeat came for kRelease, and repeats after kRepeatDelay for
+- * buttons that ask for it. While the Remote Control preferences learn a
+- * remote, presses go to them instead.
++ * until no repeat came for kRelease, and repeats after kRepeatDelay, every
++ * kRepeatInterval, for buttons that ask for it. While the Remote Control
++ * preferences learn a remote, presses go to them instead.
+  */
+ 
+ 
+@@ -48,6 +48,9 @@ static const bigtime_t kRelease = 200000;
+ // held buttons that repeat start repeating after this: longer than the
+ // frames a short press sends (the JVC RM-RK52 sends 6 to 10, 46 ms apart)
+ static const bigtime_t kRepeatDelay = 600000;
++// and then at most this often: remotes repeat their frames 10 to 20 times a
++// second, too fast for keys like MediaPlayer's 5 s wind
++static const bigtime_t kRepeatInterval = 200000;
+ 
+ 
+ class RemoteReceiver {
+@@ -79,6 +82,7 @@ private:
+ 			Button				fHeldButton;
+ 			bigtime_t			fPressed;
+ 			bigtime_t			fReleaseAt;
++			bigtime_t			fRepeated;
+ 			int32				fRepeats;
+ };
+ 
+@@ -95,6 +99,7 @@ RemoteReceiver::RemoteReceiver(RemoteControlDevice* device, const char* path,
+ 	fHeld(false),
+ 	fPressed(0),
+ 	fReleaseAt(0),
++	fRepeated(0),
+ 	fRepeats(0)
+ {
+ 	fRef.name = (char*)fName.String();
+@@ -372,8 +377,11 @@ RemoteControlDevice::HandleEvent(RemoteReceiver* receiver,
+ 		&& button->key == receiver->fHeldButton.key) {
+ 		// still held
+ 		receiver->fReleaseAt = now + kRelease;
+-		if (button->repeat && now - receiver->fPressed >= kRepeatDelay)
++		if (button->repeat && now - receiver->fPressed >= kRepeatDelay
++			&& now - receiver->fRepeated >= kRepeatInterval) {
++			receiver->fRepeated = now;
+ 			RepeatKey(receiver);
++		}
+ 		return;
+ 	}
+ 
+@@ -385,6 +393,7 @@ RemoteControlDevice::HandleEvent(RemoteReceiver* receiver,
+ 	receiver->fHeldButton = *button;
+ 	receiver->fPressed = now;
+ 	receiver->fReleaseAt = now + kRelease;
++	receiver->fRepeated = 0;
+ 	receiver->fRepeats = 1;
+ 	if (button->modifiers != 0)
+ 		_ModifiersMessage(0, button->modifiers);

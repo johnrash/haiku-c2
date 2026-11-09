@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 20:41:30 -0500
+Subject: [PATCH 244/342] app_server: B_RGB32 bitmaps made opaque four pixels
+ at a time, aligned
+
+Measured in one process (tools/probes/opaquecopy.cpp in the port's
+project, a 1900x1000 bitmap): a pixel at a time 7.2 ms, four at a time
+5.1 ms with an aligned destination but 8.3 ms without (stores across
+cache lines), memcpy then the alpha 8.2 ms, memcpy alone 5.4 ms. A
+window's place in the back buffer is seldom aligned, which made
+e276a15609 slower in app_server. The destination is aligned first now:
+5.0 ms. (The comparisons in app_server before were across boots.)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../bitmap_painter/DrawBitmapNoScale.h        | 29 ++++++++++++++-----
+ 1 file changed, 21 insertions(+), 8 deletions(-)
+
+diff --git a/src/servers/app/drawing/Painter/bitmap_painter/DrawBitmapNoScale.h b/src/servers/app/drawing/Painter/bitmap_painter/DrawBitmapNoScale.h
+index c88f088293..731c03bdaa 100644
+--- a/src/servers/app/drawing/Painter/bitmap_painter/DrawBitmapNoScale.h
++++ b/src/servers/app/drawing/Painter/bitmap_painter/DrawBitmapNoScale.h
+@@ -133,10 +133,11 @@ struct Bgr32Copy : public DrawBitmapNoScale<Bgr32Copy>
+ // B_RGB32 sources have no alpha: what is in their fourth byte (often 0) must
+ // not end up in the frame buffer, where meson_hdmi keys its video overlay
+ // by the alpha.
+-// The row is copied with memcpy (Arm's, which streams large copies faster
+-// than a loop: a 1900x1000 bitmap 11.7 ms against 13.1 one pixel at a time
+-// and 14.8 four at a time), then made opaque where it is, still in the
+-// cache.
++// Four pixels at a time (GCC's vector types), the destination aligned
++// first: a window's place in the back buffer seldom is, and stores across
++// cache lines cost on the Cortex-A53. A 1900x1000 bitmap: 5.0 ms, against
++// 7.2 a pixel at a time and 5.4 with memcpy (tools/probes/opaquecopy.cpp in
++// the port's project).
+ typedef uint32 bgr32_vector __attribute__((vector_size(16), aligned(4),
+ 	may_alias));
+ 
+@@ -144,14 +145,26 @@ struct Bgr32CopyOpaque : public DrawBitmapNoScale<Bgr32CopyOpaque>
+ {
+ 	void BlendRow(uint8* dst, const uint8* src, int32 numPixels)
+ 	{
+-		memcpy(dst, src, numPixels * 4);
+ 		uint32* d = (uint32*)dst;
++		const uint32* s = (const uint32*)src;
++		while (numPixels > 0 && ((addr_t)d & 15) != 0) {
++			*d++ = *s++ | 0xff000000;
++			numPixels--;
++		}
+ 		const bgr32_vector opaque = { 0xff000000, 0xff000000, 0xff000000,
+ 			0xff000000 };
+-		for (; numPixels >= 4; numPixels -= 4, d += 4)
+-			*(bgr32_vector*)d |= opaque;
++		for (; numPixels >= 16; numPixels -= 16, s += 16, d += 16) {
++			bgr32_vector a = *(const bgr32_vector*)s | opaque;
++			bgr32_vector b = *(const bgr32_vector*)(s + 4) | opaque;
++			bgr32_vector c = *(const bgr32_vector*)(s + 8) | opaque;
++			bgr32_vector e = *(const bgr32_vector*)(s + 12) | opaque;
++			*(bgr32_vector*)d = a;
++			*(bgr32_vector*)(d + 4) = b;
++			*(bgr32_vector*)(d + 8) = c;
++			*(bgr32_vector*)(d + 12) = e;
++		}
+ 		while (numPixels--)
+-			*d++ |= 0xff000000;
++			*d++ = *s++ | 0xff000000;
+ 	}
+ };
+ 

@@ -1,0 +1,239 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 19:18:37 -0400
+Subject: [PATCH 180/342] ffmpeg plugin: pictures whose size changed fit into
+ the negotiated output
+
+A stream that changed its picture size after the output format was
+negotiated (a 720p H.264 file that goes on at 1080p, 360p, portrait)
+crashed MediaPlayer: _DecodeVideo() copied each picture at its new size
+into the caller's buffer, which has the negotiated size, and the swscale
+context stayed made for the first size ("Slice parameters 0, 1080 are
+invalid"). Now the media header keeps the negotiated size, a picture of
+another size is scaled to fit in it with its aspect kept and black around
+it, and the swscale context follows the picture's size. Upstream has the
+same code.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../media/plugins/ffmpeg/AVCodecDecoder.cpp   | 111 ++++++++++++++----
+ .../media/plugins/ffmpeg/AVCodecDecoder.h     |  12 ++
+ 2 files changed, 103 insertions(+), 20 deletions(-)
+
+diff --git a/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.cpp b/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.cpp
+index 2d8a219bad..b8e7ffb6da 100644
+--- a/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.cpp
++++ b/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.cpp
+@@ -115,6 +115,15 @@ AVCodecDecoder::AVCodecDecoder()
+ 
+ 	fOutputColorSpace(B_NO_COLOR_SPACE),
+ 	fOutputBytesPerRow(0),
++	fOutputWidth(0),
++	fOutputHeight(0),
++#if USE_SWS_FOR_COLOR_SPACE_CONVERSION
++	fSwsSourceWidth(0),
++	fSwsSourceHeight(0),
++	fSwsSourceFormat(AV_PIX_FMT_NONE),
++	fSwsWidth(0),
++	fSwsHeight(0),
++#endif
+ 	fDecodedVideoBufferSize(0),
+ 	fOutputFrameCount(0),
+ 	fOutputFrameRate(1.0),
+@@ -514,6 +523,9 @@ AVCodecDecoder::_NegotiateVideoOutputFormat(media_format* inOutFormat)
+ 		fOutputColorSpace = B_RGB32;
+ 	// a larger row stride when asked for, as an overlay may need
+ 	fOutputBytesPerRow = inOutFormat->u.raw_video.display.bytes_per_row;
++	// the first picture's size, set below
++	fOutputWidth = 0;
++	fOutputHeight = 0;
+ 
+ #if USE_SWS_FOR_COLOR_SPACE_CONVERSION
+ 	if (fSwsContext != NULL)
+@@ -595,6 +607,10 @@ AVCodecDecoder::_NegotiateVideoOutputFormat(media_format* inOutFormat)
+ 		= fHeader.u.raw_video.display_line_count;
+ 	inOutFormat->u.raw_video.display.bytes_per_row
+ 		= fHeader.u.raw_video.bytes_per_row;
++	// the caller's buffers have this size from now on, whatever the
++	// stream's pictures do
++	fOutputWidth = fHeader.u.raw_video.display_line_width;
++	fOutputHeight = fHeader.u.raw_video.display_line_count;
+ 
+ #ifdef TRACE_AV_CODEC
+ 	char buffer[1024];
+@@ -1596,27 +1612,27 @@ AVCodecDecoder::_UpdateMediaHeaderForVideoFrame()
+ 	fHeader.file_pos = 0;
+ 	fHeader.orig_size = 0;
+ 	fHeader.start_time = fRawDecodedPicture->best_effort_timestamp;
++	// the negotiated size, also when the stream's pictures changed theirs
++	int width = fOutputWidth > 0 ? fOutputWidth : fRawDecodedPicture->width;
++	int height = fOutputHeight > 0
++		? fOutputHeight : fRawDecodedPicture->height;
+ 	fHeader.size_used = av_image_get_buffer_size(
+-		colorspace_to_pixfmt(fOutputColorSpace), fRawDecodedPicture->width,
+-		fRawDecodedPicture->height, 1);
+-	fHeader.u.raw_video.display_line_width = fRawDecodedPicture->width;
+-	fHeader.u.raw_video.display_line_count = fRawDecodedPicture->height;
++		colorspace_to_pixfmt(fOutputColorSpace), width, height, 1);
++	fHeader.u.raw_video.display_line_width = width;
++	fHeader.u.raw_video.display_line_count = height;
+ 	fHeader.u.raw_video.bytes_per_row
+ 		= CalculateBytesPerRowWithColorSpaceAndVideoWidth(fOutputColorSpace,
+-			fRawDecodedPicture->width);
++			width);
+ 	if (fOutputColorSpace == B_NV12) {
+ 		// the Y plane's rows; the CbCr plane's are as long
+-		fHeader.u.raw_video.bytes_per_row
+-			= (fRawDecodedPicture->width + 3) & ~3;
++		fHeader.u.raw_video.bytes_per_row = (width + 3) & ~3;
+ 	}
+ 	if (fOutputBytesPerRow > fHeader.u.raw_video.bytes_per_row) {
+ 		fHeader.u.raw_video.bytes_per_row = fOutputBytesPerRow;
+-		fHeader.size_used = (size_t)fOutputBytesPerRow
+-			* fRawDecodedPicture->height;
++		fHeader.size_used = (size_t)fOutputBytesPerRow * height;
+ 	}
+ 	if (fOutputColorSpace == B_NV12) {
+ 		// the CbCr plane follows the Y plane (BBitmap's B_NV12)
+-		int height = fRawDecodedPicture->height;
+ 		fHeader.size_used = (size_t)fHeader.u.raw_video.bytes_per_row
+ 			* (height + (height + 1) / 2);
+ 	}
+@@ -1625,7 +1641,7 @@ AVCodecDecoder::_UpdateMediaHeaderForVideoFrame()
+ 	fHeader.u.raw_video.field_number = 0;
+ 	fHeader.u.raw_video.pulldown_number = 0;
+ 	fHeader.u.raw_video.first_active_line = 1;
+-	fHeader.u.raw_video.line_count = fRawDecodedPicture->height;
++	fHeader.u.raw_video.line_count = height;
+ 
+ 	ConvertAVCodecContextToVideoAspectWidthAndHeight(*fCodecContext,
+ 		fHeader.u.raw_video.pixel_width_aspect,
+@@ -1690,13 +1706,44 @@ AVCodecDecoder::_DeinterlaceAndColorConvertVideoFrame()
+ 		useDeinterlacedPicture = true;
+ 	}
+ 
++	// The picture fills the output, or, when the stream's pictures changed
++	// size after the output format was negotiated, is scaled to fit in it,
++	// keeping its aspect, with black around it.
++	int outputWidth = fHeader.u.raw_video.display_line_width;
++	int outputHeight = fHeader.u.raw_video.display_line_count;
++	bool fitted = displayWidth != outputWidth
++		|| displayHeight != outputHeight;
++	int fitWidth = outputWidth;
++	int fitHeight = outputHeight;
++	if (fitted) {
++		if ((int64)displayWidth * outputHeight
++				> (int64)displayHeight * outputWidth) {
++			fitHeight = (int64)displayHeight * outputWidth / displayWidth;
++		} else
++			fitWidth = (int64)displayWidth * outputHeight / displayHeight;
++		fitWidth = max_c(fitWidth & ~1, 2);
++		fitHeight = max_c(fitHeight & ~1, 2);
++	}
++	int fitLeft = ((outputWidth - fitWidth) / 2) & ~1;
++	int fitTop = ((outputHeight - fitHeight) / 2) & ~1;
++
+ 	// Some decoders do not set pix_fmt until they have decoded 1 frame
+ #if USE_SWS_FOR_COLOR_SPACE_CONVERSION
+-	if (fSwsContext == NULL) {
++	if (fSwsContext == NULL || fSwsSourceWidth != displayWidth
++		|| fSwsSourceHeight != displayHeight
++		|| fSwsSourceFormat != fCodecContext->pix_fmt
++		|| fSwsWidth != fitWidth || fSwsHeight != fitHeight) {
++		if (fSwsContext != NULL)
++			sws_freeContext(fSwsContext);
+ 		fSwsContext = sws_getContext(displayWidth, displayHeight,
+-			fCodecContext->pix_fmt, displayWidth, displayHeight,
++			fCodecContext->pix_fmt, fitWidth, fitHeight,
+ 			colorspace_to_pixfmt(fOutputColorSpace),
+ 			SWS_FAST_BILINEAR, NULL, NULL, NULL);
++		fSwsSourceWidth = displayWidth;
++		fSwsSourceHeight = displayHeight;
++		fSwsSourceFormat = fCodecContext->pix_fmt;
++		fSwsWidth = fitWidth;
++		fSwsHeight = fitHeight;
+ 	}
+ #else
+ 	if (fFormatConversionFunc == NULL) {
+@@ -1720,19 +1767,43 @@ AVCodecDecoder::_DeinterlaceAndColorConvertVideoFrame()
+ 	if (fDecodedData == NULL)
+ 		return B_NO_MEMORY;
+ 
++	size_t bytesPerRow = fHeader.u.raw_video.bytes_per_row;
+ 	fPostProcessedDecodedPicture->data[0] = fDecodedData;
+-	fPostProcessedDecodedPicture->linesize[0]
+-		= fHeader.u.raw_video.bytes_per_row;
++	fPostProcessedDecodedPicture->linesize[0] = bytesPerRow;
+ 	if (fOutputColorSpace == B_NV12) {
+ 		// the CbCr plane after the Y plane
+ 		fPostProcessedDecodedPicture->data[1] = fDecodedData
+-			+ (size_t)fHeader.u.raw_video.bytes_per_row * displayHeight;
+-		fPostProcessedDecodedPicture->linesize[1]
+-			= fHeader.u.raw_video.bytes_per_row;
++			+ bytesPerRow * outputHeight;
++		fPostProcessedDecodedPicture->linesize[1] = bytesPerRow;
++	}
++	if (fitted) {
++		// black, then the picture's place in it
++		if (fOutputColorSpace == B_NV12) {
++			memset(fDecodedData, 16, bytesPerRow * outputHeight);
++			memset(fPostProcessedDecodedPicture->data[1], 128,
++				bytesPerRow * ((outputHeight + 1) / 2));
++			fPostProcessedDecodedPicture->data[0]
++				+= fitTop * bytesPerRow + fitLeft;
++			fPostProcessedDecodedPicture->data[1]
++				+= fitTop / 2 * bytesPerRow + fitLeft;
++		} else if (fOutputColorSpace == B_YCbCr422) {
++			static const uint8 kBlack[4] = { 16, 128, 16, 128 };
++			for (int y = 0; y < outputHeight; y++) {
++				uint8* row = fDecodedData + y * bytesPerRow;
++				for (int x = 0; x < outputWidth * 2; x += 4)
++					memcpy(row + x, kBlack, 4);
++			}
++			fPostProcessedDecodedPicture->data[0]
++				+= fitTop * bytesPerRow + fitLeft * 2;
++		} else {
++			memset(fDecodedData, 0, bytesPerRow * outputHeight);
++			fPostProcessedDecodedPicture->data[0]
++				+= fitTop * bytesPerRow + fitLeft * 4;
++		}
+ 	}
+ 
+ #if defined(__aarch64__)
+-	if (fOutputColorSpace == B_YCbCr422
++	if (!fitted && fOutputColorSpace == B_YCbCr422
+ 		&& fCodecContext->pix_fmt == AV_PIX_FMT_YUV420P) {
+ 		// swscale does this in C on arm64
+ 		if (useDeinterlacedPicture) {
+@@ -1752,7 +1823,7 @@ AVCodecDecoder::_DeinterlaceAndColorConvertVideoFrame()
+ #if USE_SWS_FOR_COLOR_SPACE_CONVERSION
+ 	if (fSwsContext != NULL) {
+ #else
+-	if (fFormatConversionFunc != NULL) {
++	if (fFormatConversionFunc != NULL && !fitted) {
+ #endif
+ 		if (useDeinterlacedPicture) {
+ 			AVFrame deinterlacedFrame;
+diff --git a/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.h b/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.h
+index a2c1b13e37..a1fa899dd5 100644
+--- a/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.h
++++ b/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.h
+@@ -140,6 +140,18 @@ private:
+ 			color_space			fOutputColorSpace;
+ 			uint32				fOutputBytesPerRow;
+ 									// as asked for; 0: the natural one
++			int32				fOutputWidth;
++			int32				fOutputHeight;
++									// as negotiated (0 before): pictures
++									// of another size are fitted in
++#if USE_SWS_FOR_COLOR_SPACE_CONVERSION
++			int32				fSwsSourceWidth;
++			int32				fSwsSourceHeight;
++			enum AVPixelFormat	fSwsSourceFormat;
++			int32				fSwsWidth;
++			int32				fSwsHeight;
++									// what fSwsContext converts
++#endif
+ 			size_t				fDecodedVideoBufferSize;
+ 			int32				fOutputFrameCount;
+ 			float				fOutputFrameRate;

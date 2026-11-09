@@ -1,0 +1,2080 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 22:30:49 -0400
+Subject: [PATCH 187/342] meson_mali: buffers, the GPU's address space, lima's
+ ioctls, jobs
+
+PLAN.md M43 stage 3, the kernel side: the lima interface (Linux's request
+values and layouts, headers/private/drivers/meson_mali.h) with buffers as
+cloneable areas mapped into one GPU address space, contexts, sync objects
+holding a job's sequence number, buffer waits, and a job thread that runs
+GP and PP jobs one at a time in submission order: L2 flush, MMU zap, soft
+reset, the frame (PP jobs through the broadcast window, with the load
+balancer or per-PP tile lists), completion by interrupt, a 10 s timeout,
+and hard resets and MMU recovery after an error. Buffers are cached for
+the CPU and cleaned around jobs. Version 1.0: no growing heaps.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/drivers/meson_mali.h          | 151 +++
+ .../kernel/drivers/misc/meson_mali/Jamfile    |   1 +
+ .../drivers/misc/meson_mali/meson_mali.cpp    | 481 ++++++----
+ .../misc/meson_mali/meson_mali_jobs.cpp       | 879 ++++++++++++++++++
+ .../misc/meson_mali/meson_mali_private.h      | 357 +++++++
+ 5 files changed, 1673 insertions(+), 196 deletions(-)
+ create mode 100644 headers/private/drivers/meson_mali.h
+ create mode 100644 src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_jobs.cpp
+ create mode 100644 src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_private.h
+
+diff --git a/headers/private/drivers/meson_mali.h b/headers/private/drivers/meson_mali.h
+new file mode 100644
+index 0000000000..c1bf7a9f97
+--- /dev/null
++++ b/headers/private/drivers/meson_mali.h
+@@ -0,0 +1,151 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef _MESON_MALI_H
++#define _MESON_MALI_H
++
++
++/*!	The interface of meson_mali, the Mali-450 driver (PLAN.md M43): the one
++	Mesa's lima driver uses on Linux, with the same ioctl request values and
++	structure layouts, so that a small libdrm stand-in can pass lima's calls
++	through (docs/m43-mali-facts.md §5, docs/m43-mesa-lima-haiku.md §1).
++	Differences: a buffer's "offset" (MALI_IOCTL_GEM_INFO) is the area_id
++	of the buffer, to be cloned instead of mmap()ed; sync objects can't be
++	exported or imported as files; there are no global names or prime
++	handles.
++*/
++
++
++#include <SupportDefs.h>
++
++
++#define MESON_MALI_DEVICE			"/dev/misc/mali/0"
++
++// ioctl requests (Linux's encoding of the DRM ioctls)
++#define MALI_IOCTL_GEM_CLOSE		0x40086409
++#define MALI_IOCTL_SYNCOBJ_CREATE	0xc00864bf
++#define MALI_IOCTL_SYNCOBJ_DESTROY	0xc00864c0
++#define MALI_IOCTL_SYNCOBJ_WAIT		0xc02064c3
++#define MALI_IOCTL_GET_PARAM		0xc0106440
++#define MALI_IOCTL_GEM_CREATE		0xc0106441
++#define MALI_IOCTL_GEM_INFO			0xc0106442
++#define MALI_IOCTL_GEM_SUBMIT		0x40306443
++#define MALI_IOCTL_GEM_WAIT			0x40106444
++#define MALI_IOCTL_CTX_CREATE		0x80086445
++#define MALI_IOCTL_CTX_FREE			0x40086446
++
++enum {
++	MALI_PARAM_GPU_ID = 0,
++	MALI_PARAM_NUM_PP,
++	MALI_PARAM_GP_VERSION,
++	MALI_PARAM_PP_VERSION
++};
++#define MALI_GPU_ID_MALI450			2
++
++#define MALI_BO_FLAG_HEAP			0x1
++#define MALI_SUBMIT_BO_READ			0x1
++#define MALI_SUBMIT_BO_WRITE		0x2
++#define MALI_SUBMIT_FLAG_EXPLICIT_FENCE	0x1
++#define MALI_PIPE_GP				0
++#define MALI_PIPE_PP				1
++#define MALI_GEM_WAIT_READ			0x1
++#define MALI_GEM_WAIT_WRITE			0x2
++#define MALI_SYNCOBJ_CREATE_SIGNALED	0x1
++#define MALI_SYNCOBJ_WAIT_ALL		0x1
++
++typedef struct mali_gem_close {
++	uint32		handle;
++	uint32		pad;
++} mali_gem_close;
++
++typedef struct mali_syncobj_create {
++	uint32		handle;		// out
++	uint32		flags;
++} mali_syncobj_create;
++
++typedef struct mali_syncobj_destroy {
++	uint32		handle;
++	uint32		pad;
++} mali_syncobj_destroy;
++
++typedef struct mali_syncobj_wait {
++	uint64		handles;		// a uint32 array
++	int64		timeout_nsec;	// absolute, monotonic clock
++	uint32		count_handles;
++	uint32		flags;
++	uint32		first_signaled;
++	uint32		pad;
++} mali_syncobj_wait;
++
++typedef struct mali_get_param {
++	uint32		param;
++	uint32		pad;
++	uint64		value;			// out
++} mali_get_param;
++
++typedef struct mali_gem_create {
++	uint32		size;
++	uint32		flags;
++	uint32		handle;			// out
++	uint32		pad;
++} mali_gem_create;
++
++typedef struct mali_gem_info {
++	uint32		handle;
++	uint32		va;				// out: the GPU's address
++	uint64		offset;			// out: the area_id to clone
++} mali_gem_info;
++
++typedef struct mali_gem_submit_bo {
++	uint32		handle;
++	uint32		flags;			// MALI_SUBMIT_BO_*
++} mali_gem_submit_bo;
++
++typedef struct mali_gp_frame {
++	uint32		frame[6];
++} mali_gp_frame;
++
++typedef struct mali_m450_pp_frame {
++	uint32		frame[23];
++	uint32		num_pp;
++	uint32		wb[36];
++	uint32		use_dlbu;
++	uint32		_pad;
++	union {
++		uint32	plbu_array_address[8];
++		uint32	dlbu_regs[4];
++	};
++	uint32		fragment_stack_address[8];
++} mali_m450_pp_frame;
++
++typedef struct mali_gem_submit {
++	uint32		ctx;
++	uint32		pipe;			// MALI_PIPE_*
++	uint32		nr_bos;
++	uint32		frame_size;
++	uint64		bos;			// a mali_gem_submit_bo array
++	uint64		frame;			// a mali_gp_frame or mali_m450_pp_frame
++	uint32		flags;
++	uint32		out_sync;
++	uint32		in_sync[2];
++} mali_gem_submit;
++
++typedef struct mali_gem_wait {
++	uint32		handle;
++	uint32		op;				// MALI_GEM_WAIT_*
++	int64		timeout_ns;		// absolute, monotonic clock
++} mali_gem_wait;
++
++typedef struct mali_ctx_create {
++	uint32		id;				// out
++	uint32		_pad;
++} mali_ctx_create;
++
++typedef struct mali_ctx_free {
++	uint32		id;
++	uint32		_pad;
++} mali_ctx_free;
++
++
++#endif	// _MESON_MALI_H
+diff --git a/src/add-ons/kernel/drivers/misc/meson_mali/Jamfile b/src/add-ons/kernel/drivers/misc/meson_mali/Jamfile
+index 86971ed3c2..9086dd3e50 100644
+--- a/src/add-ons/kernel/drivers/misc/meson_mali/Jamfile
++++ b/src/add-ons/kernel/drivers/misc/meson_mali/Jamfile
+@@ -6,5 +6,6 @@ UsePrivateHeaders drivers ;
+ if $(TARGET_ARCH) = arm64 {
+ 	KernelAddon meson_mali :
+ 		meson_mali.cpp
++		meson_mali_jobs.cpp
+ 	;
+ }
+diff --git a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali.cpp b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali.cpp
+index ed860fad83..1bd0deead5 100644
+--- a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali.cpp
++++ b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali.cpp
+@@ -3,13 +3,15 @@
+  * Distributed under the terms of the MIT License.
+  *
+  * meson_mali: the ODROID-C2's Mali-450 MP3 GPU, for Mesa's lima driver
+- * (PLAN.md M43). This is stage 2, the bring-up: the clock, the GPU's own
+- * power management unit, the version registers, the two L2 caches, the
+- * geometry processor's (GP) and pixel processors' (PP) soft resets, the four
+- * MMUs on an empty address space (the load balancer's page mapped at its
+- * fixed address), the load balancer (DLBU) and broadcast units, and the ten
+- * interrupts, checked with the reset-completed interrupts. Jobs and lima's
+- * interface come in stage 3.
++ * (PLAN.md M43). This file brings the GPU up: the clock, the GPU's own power
++ * management unit, the version registers, the two L2 caches, the geometry
++ * processor's (GP) and pixel processors' (PP) resets, the four MMUs on the
++ * GPU's address space (the load balancer's page mapped at its fixed
++ * address), the load balancer (DLBU) and broadcast units, and the ten
++ * interrupts, checked with the reset-completed interrupts; and it takes
++ * the jobs' interrupts. meson_mali_jobs.cpp has the buffers, the address
++ * space, lima's ioctls (headers/private/drivers/meson_mali.h) and the job
++ * thread.
+  *
+  * The facts are in the port's docs/m43-mali-facts.md (the GPU) and
+  * docs/m43-gxbb-mali-integration-facts.md (its clock and interrupts on the
+@@ -33,112 +35,16 @@
+ #include <vm/vm.h>
+ 
+ 
++#include "meson_mali_private.h"
++
++
+ #define DRIVER_MODULE_NAME	"drivers/misc/meson_mali/driver_v1"
+ #define DEVICE_MODULE_NAME	"drivers/misc/meson_mali/device_v1"
+ 
+-#define INFO(x...)	dprintf("meson_mali: " x)
+-
+ 
+ static device_manager_info* gDeviceManager;
+ 
+ 
+-// the blocks, from the GPU's base (Mali-450)
+-static const uint32 kGp = 0x00000;
+-static const uint32 kPpL2 = 0x01000;
+-static const uint32 kPmu = 0x02000;
+-static const uint32 kGpMmu = 0x03000;
+-static const uint32 kPpMmu[] = { 0x04000, 0x05000, 0x06000 };
+-static const uint32 kPp[] = { 0x08000, 0x0a000, 0x0c000 };
+-static const uint32 kGpL2 = 0x10000;
+-static const uint32 kBcast = 0x13000;
+-static const uint32 kDlbu = 0x14000;
+-static const uint32 kPpBroadcast = 0x16000;
+-static const size_t kWindowSize = 0x40000;
+-static const uint32 kPpCount = 3;
+-
+-// GP
+-enum {
+-	GP_CMD				= 0x20,
+-	GP_INT_RAWSTAT		= 0x24,
+-	GP_INT_CLEAR		= 0x28,
+-	GP_INT_MASK			= 0x2c,
+-	GP_INT_STAT			= 0x30,
+-	GP_STATUS			= 0x68,
+-	GP_VERSION			= 0x6c,
+-};
+-static const uint32 kGpSoftReset = 0x400;
+-static const uint32 kGpResetCompleted = 1 << 19;
+-static const uint32 kGpInterruptsAll = 0x00787fff;
+-static const uint32 kGpInterruptsUsed = 0x00706e47;
+-
+-// PP
+-enum {
+-	PP_VERSION			= 0x1000,
+-	PP_STATUS			= 0x1008,
+-	PP_CTRL				= 0x100c,
+-	PP_INT_RAWSTAT		= 0x1020,
+-	PP_INT_CLEAR		= 0x1024,
+-	PP_INT_MASK			= 0x1028,
+-	PP_INT_STATUS		= 0x102c,
+-};
+-static const uint32 kPpSoftReset = 0x80;
+-static const uint32 kPpResetCompleted = 1 << 12;
+-static const uint32 kPpInterruptsAll = 0x1fff;
+-static const uint32 kPpInterruptsUsed = 0x0f19;
+-
+-// MMU
+-enum {
+-	MMU_DTE_ADDR		= 0x00,
+-	MMU_STATUS			= 0x04,
+-	MMU_COMMAND			= 0x08,
+-	MMU_PAGE_FAULT_ADDR	= 0x0c,
+-	MMU_INT_RAWSTAT		= 0x14,
+-	MMU_INT_CLEAR		= 0x18,
+-	MMU_INT_MASK		= 0x1c,
+-	MMU_INT_STATUS		= 0x20,
+-};
+-enum {
+-	MMU_ENABLE_PAGING	= 0,
+-	MMU_HARD_RESET		= 6,
+-};
+-static const uint32 kMmuPagingEnabled = 1 << 0;
+-static const uint32 kMmuInterrupts = 0x3;
+-	// page fault, read bus error
+-
+-// L2 cache
+-enum {
+-	L2_SIZE				= 0x04,
+-	L2_STATUS			= 0x08,
+-	L2_COMMAND			= 0x10,
+-	L2_MAX_READS		= 0x18,
+-	L2_ENABLE			= 0x1c,
+-};
+-
+-// PMU: STATUS has a bit per domain, 1 = off
+-enum {
+-	PMU_POWER_UP		= 0x00,
+-	PMU_STATUS			= 0x08,
+-	PMU_INT_MASK		= 0x0c,
+-	PMU_INT_RAWSTAT		= 0x10,
+-	PMU_INT_CLEAR		= 0x18,
+-	PMU_SW_DELAY		= 0x1c,
+-};
+-static const uint32 kPmuDomains = 0x7;
+-	// GP, PP0, PP1-PP3
+-
+-// DLBU, BCAST
+-enum {
+-	DLBU_MASTER_TLLIST_PHYS_ADDR	= 0x00,
+-	DLBU_MASTER_TLLIST_VADDR		= 0x04,
+-	BCAST_BROADCAST_MASK			= 0x00,
+-	BCAST_INTERRUPT_MASK			= 0x04,
+-};
+-
+-// page tables: two levels of 4 KiB; the DLBU page at a fixed address
+-static const uint32 kPageDirectoryPresent = 0x1;
+-static const uint32 kPageFlags = 0x1df;
+-static const uint32 kDlbuAddress = 0xfff00000;
+-
+ // the clock (HHI_MALI_CLK_CNTL): two halves, [11:0] and [27:16] (source
+ // [11:9], gate [8], divider [6:0]); bit 31 selects the second
+ static const phys_addr_t kHhiBase = 0xc883c000;
+@@ -155,87 +61,10 @@ static const uint32 kClockRates[] = {
+ };	// kHz by source (0: xtal, 1: GP0 PLL, 2/3: audio PLLs, 4: fclk/7, ...)
+ 
+ 
+-static const char* const kInterruptNames[] = {
++const char* const kInterruptNames[kIrqCount] = {
+ 	"gp", "gpmmu", "pp", "pmu", "pp0", "ppmmu0", "pp1", "ppmmu1", "pp2",
+ 	"ppmmu2"
+ };
+-enum {
+-	kIrqGp, kIrqGpMmu, kIrqPp, kIrqPmu, kIrqPp0, kIrqPpMmu0, kIrqPp1,
+-	kIrqPpMmu1, kIrqPp2, kIrqPpMmu2, kIrqCount
+-};
+-
+-
+-struct dma_buffer {
+-	area_id		area;
+-	uint32*		address;
+-	phys_addr_t	physical;
+-
+-	dma_buffer() : area(-1), address(NULL), physical(0) {}
+-};
+-
+-
+-class MesonMali;
+-
+-struct interrupt_line {
+-	MesonMali*	device;
+-	int32		index;		// kIrq*
+-	int32		vector;
+-	int32		count;
+-};
+-
+-
+-class MesonMali {
+-public:
+-								MesonMali(device_node* node);
+-								~MesonMali();
+-
+-			status_t			Init(phys_addr_t base,
+-									const int32* interrupts);
+-			device_node*		Node() const { return fNode; }
+-			void				Dump();
+-
+-private:
+-			uint32				_Read(uint32 offset) const
+-									{ return fRegisters[offset / 4]; }
+-			void				_Write(uint32 offset, uint32 value)
+-									{ fRegisters[offset / 4] = value; }
+-			uint32				_Hhi(uint32 offset) const
+-									{ return fHhi[offset / 4]; }
+-			void				_SetHhi(uint32 offset, uint32 value)
+-									{ fHhi[offset / 4] = value; }
+-
+-			bool				_Poll(uint32 offset, uint32 mask,
+-									uint32 value, bigtime_t timeout,
+-									bigtime_t interval = 0) const;
+-			void				_SetClock();
+-			uint32				_ClockRate() const;
+-			status_t			_PowerUp();
+-			void				_InitL2(uint32 base, const char* name);
+-			status_t			_ResetGp();
+-			status_t			_ResetPp(uint32 index);
+-			status_t			_InitMmu(uint32 base, const char* name);
+-			status_t			_AllocatePage(const char* name,
+-									dma_buffer& buffer);
+-			void				_FreePage(dma_buffer& buffer);
+-			void				_InstallInterrupts(const int32* vectors);
+-			void				_TestInterrupts();
+-
+-	static	int32				_Interrupt(void* data);
+-			int32				_HandleInterrupt(interrupt_line& line);
+-
+-			device_node*		fNode;
+-			area_id				fArea;
+-			volatile uint32*	fRegisters;
+-			area_id				fHhiArea;
+-			volatile uint32*	fHhi;
+-			phys_addr_t			fBase;
+-			dma_buffer			fPageDirectory;
+-			dma_buffer			fPageTable;
+-			dma_buffer			fDlbuPage;
+-			interrupt_line		fLines[kIrqCount];
+-			uint32				fGpVersion;
+-			uint32				fPpVersion[kPpCount];
+-};
+ 
+ 
+ static MesonMali* sDevice;
+@@ -245,7 +74,7 @@ static MesonMali* sDevice;
+ 	GPU doesn't snoop the CPU's caches. Through the kernel's map of all
+ 	memory.
+ */
+-static void
++void
+ flush_cache_range(phys_addr_t physical, size_t size)
+ {
+ 	uint64 ctr;
+@@ -283,8 +112,30 @@ MesonMali::MesonMali(device_node* node)
+ 	fHhiArea(-1),
+ 	fHhi(NULL),
+ 	fBase(0),
+-	fGpVersion(0)
++	fGpVersion(0),
++	fRanges(NULL),
++	fRangeCount(0),
++	fRangeSlots(0),
++	fQueueHead(NULL),
++	fQueueTail(NULL),
++	fNextSequence(1),
++	fCompleted(0),
++	fJobThread(-1),
++	fQuit(false),
++	fJobDone(-1),
++	fRunningPipe(-1),
++	fJobError(0),
++	fPpPending(0),
++	fPpDone(0),
++	fPpCount(0),
++	fJobs(0),
++	fFailedJobs(0)
+ {
++	mutex_init(&fLock, "meson_mali");
++	mutex_init(&fQueueLock, "meson_mali queue");
++	fQueueCondition.Init(this, "meson_mali queue");
++	fCompletion.Init(this, "meson_mali completion");
++	B_INITIALIZE_SPINLOCK(&fJobLock);
+ 	for (int32 i = 0; i < kIrqCount; i++) {
+ 		fLines[i].device = this;
+ 		fLines[i].index = i;
+@@ -297,6 +148,16 @@ MesonMali::MesonMali(device_node* node)
+ 
+ MesonMali::~MesonMali()
+ {
++	if (fJobThread >= 0) {
++		mutex_lock(&fQueueLock);
++		fQuit = true;
++		fQueueCondition.NotifyAll();
++		mutex_unlock(&fQueueLock);
++		status_t result;
++		wait_for_thread(fJobThread, &result);
++	}
++	if (fJobDone >= 0)
++		delete_sem(fJobDone);
+ 	if (fRegisters != NULL) {
+ 		// quiet: no interrupts from the blocks
+ 		_Write(kGp + GP_INT_MASK, 0);
+@@ -313,8 +174,12 @@ MesonMali::~MesonMali()
+ 		}
+ 	}
+ 	_FreePage(fDlbuPage);
+-	_FreePage(fPageTable);
++	for (uint32 i = 0; i < B_COUNT_OF(fPageTables); i++)
++		_FreePage(fPageTables[i]);
+ 	_FreePage(fPageDirectory);
++	free(fRanges);
++	mutex_destroy(&fQueueLock);
++	mutex_destroy(&fLock);
+ 	if (fHhiArea >= 0)
+ 		delete_area(fHhiArea);
+ 	if (fArea >= 0)
+@@ -530,6 +395,111 @@ MesonMali::_InitMmu(uint32 base, const char* name)
+ }
+ 
+ 
++void
++MesonMali::_FlushL2(uint32 base)
++{
++	_Write(base + L2_COMMAND, 1);
++	if (!_Poll(base + L2_STATUS, 1, 0, 1000))
++		INFO("L2 %#" B_PRIx32 ": still busy after a flush\n", base);
++}
++
++
++/*!	After an error or a timeout: the bus stopped, then a hard reset. */
++void
++MesonMali::_HardResetGp()
++{
++	_Write(kGp + GP_PERF_CNT_0_LIMIT, 0xc0ffe000);
++	_Write(kGp + GP_INT_MASK, 0);
++	_Write(kGp + GP_CMD, kGpStopBus);
++	if (!_Poll(kGp + GP_STATUS, kGpStatusBusStopped, kGpStatusBusStopped,
++			100, 5)) {
++		INFO("GP: the bus doesn't stop\n");
++	}
++	_Write(kGp + GP_CMD, kGpHardReset);
++	bigtime_t deadline = system_time() + 100;
++	while (true) {
++		_Write(kGp + GP_PERF_CNT_0_LIMIT, 0xc01a0000);
++		if (_Read(kGp + GP_PERF_CNT_0_LIMIT) == 0xc01a0000)
++			break;
++		if (system_time() > deadline) {
++			INFO("GP: no hard reset\n");
++			break;
++		}
++		spin(5);
++	}
++	_Write(kGp + GP_PERF_CNT_0_LIMIT, 0);
++	_Write(kGp + GP_INT_CLEAR, kGpInterruptsAll);
++	_Write(kGp + GP_INT_MASK, kGpInterruptsUsed);
++}
++
++
++void
++MesonMali::_HardResetPp(uint32 index)
++{
++	uint32 base = kPp[index];
++	_Write(base + PP_PERF_CNT_0_LIMIT, 0xc0ffe000);
++	_Write(base + PP_INT_MASK, 0);
++	_Write(base + PP_CTRL, kPpStopBus);
++	if (!_Poll(base + PP_STATUS, kPpStatusBusStopped, kPpStatusBusStopped,
++			100, 5)) {
++		INFO("PP%" B_PRIu32 ": the bus doesn't stop\n", index);
++	}
++	_Write(base + PP_CTRL, kPpForceReset);
++	bigtime_t deadline = system_time() + 100;
++	while (true) {
++		_Write(base + PP_PERF_CNT_0_LIMIT, 0xc01a0000);
++		if (_Read(base + PP_PERF_CNT_0_LIMIT) == 0xc01a0000)
++			break;
++		if (system_time() > deadline) {
++			INFO("PP%" B_PRIu32 ": no hard reset\n", index);
++			break;
++		}
++		spin(5);
++	}
++	_Write(base + PP_PERF_CNT_0_LIMIT, 0);
++	_Write(base + PP_INT_CLEAR, kPpInterruptsAll);
++	_Write(base + PP_INT_MASK, kPpInterruptsUsed);
++}
++
++
++/*!	The MMU forgets its translations (the page tables changed): stalled,
++	the TLB zapped, going again.
++*/
++void
++MesonMali::_ZapMmu(uint32 base)
++{
++	_Write(base + MMU_COMMAND, MMU_ENABLE_STALL);
++	if (!_Poll(base + MMU_STATUS, kMmuStallActive, kMmuStallActive, 100))
++		INFO("MMU %#" B_PRIx32 ": no stall\n", base);
++	_Write(base + MMU_COMMAND, MMU_ZAP_CACHE);
++	_Write(base + MMU_COMMAND, MMU_DISABLE_STALL);
++	if (!_Poll(base + MMU_STATUS, kMmuStallActive, 0, 100))
++		INFO("MMU %#" B_PRIx32 ": still stalled\n", base);
++}
++
++
++/*!	After a page fault: a hard reset and the address space again. */
++void
++MesonMali::_RecoverMmu(uint32 base)
++{
++	if ((_Read(base + MMU_STATUS) & kMmuPageFaultActive) == 0) {
++		_Write(base + MMU_INT_MASK, kMmuInterrupts);
++		return;
++	}
++	_Write(base + MMU_INT_MASK, 0);
++	_Write(base + MMU_DTE_ADDR, 0xcafebabe);
++	_Write(base + MMU_COMMAND, MMU_HARD_RESET);
++	if (!_Poll(base + MMU_DTE_ADDR, ~0u, 0, 100))
++		INFO("MMU %#" B_PRIx32 ": no hard reset\n", base);
++	_Write(base + MMU_INT_CLEAR, kMmuInterrupts);
++	_Write(base + MMU_INT_MASK, kMmuInterrupts);
++	_Write(base + MMU_DTE_ADDR, (uint32)fPageDirectory.physical);
++	_Write(base + MMU_COMMAND, MMU_ENABLE_PAGING);
++	if (!_Poll(base + MMU_STATUS, kMmuPagingEnabled, kMmuPagingEnabled, 100))
++		INFO("MMU %#" B_PRIx32 ": paging not enabled\n", base);
++}
++
++
+ status_t
+ MesonMali::Init(phys_addr_t base, const int32* interrupts)
+ {
+@@ -583,18 +553,19 @@ MesonMali::Init(phys_addr_t base, const int32* interrupts)
+ 
+ 	// The empty address space the MMUs hold while idle: nothing but the
+ 	// DLBU's page at its fixed address.
++	dma_buffer& dlbuTable = fPageTables[kDlbuAddress >> 22];
+ 	if ((status = _AllocatePage("meson_mali page directory", fPageDirectory))
+ 			!= B_OK
+-		|| (status = _AllocatePage("meson_mali page table", fPageTable))
++		|| (status = _AllocatePage("meson_mali page table", dlbuTable))
+ 			!= B_OK
+ 		|| (status = _AllocatePage("meson_mali dlbu", fDlbuPage)) != B_OK) {
+ 		return status;
+ 	}
+-	fPageTable.address[(kDlbuAddress >> 12) & 0x3ff]
++	dlbuTable.address[(kDlbuAddress >> 12) & 0x3ff]
+ 		= (uint32)fDlbuPage.physical | kPageFlags;
+ 	fPageDirectory.address[kDlbuAddress >> 22]
+-		= (uint32)fPageTable.physical | kPageDirectoryPresent;
+-	flush_cache_range(fPageTable.physical, B_PAGE_SIZE);
++		= (uint32)dlbuTable.physical | kPageDirectoryPresent;
++	flush_cache_range(dlbuTable.physical, B_PAGE_SIZE);
+ 	flush_cache_range(fPageDirectory.physical, B_PAGE_SIZE);
+ 
+ 	if ((status = _InitMmu(kGpMmu, "GP MMU")) != B_OK)
+@@ -614,6 +585,15 @@ MesonMali::Init(phys_addr_t base, const int32* interrupts)
+ 
+ 	_InstallInterrupts(interrupts);
+ 	_TestInterrupts();
++
++	fJobDone = create_sem(0, "meson_mali job done");
++	if (fJobDone < 0)
++		return fJobDone;
++	fJobThread = spawn_kernel_thread(_JobThread, "meson_mali jobs",
++		B_URGENT_DISPLAY_PRIORITY, this);
++	if (fJobThread < 0)
++		return fJobThread;
++	resume_thread(fJobThread);
+ 	return B_OK;
+ }
+ 
+@@ -683,6 +663,22 @@ MesonMali::_Interrupt(void* data)
+ int32
+ MesonMali::_HandleInterrupt(interrupt_line& line)
+ {
++	// a running job's
++	SpinLocker jobLocker(fJobLock);
++	if (fRunningPipe == MALI_PIPE_GP && line.index == kIrqGp) {
++		int32 result = _GpJobInterrupt();
++		if (result == B_HANDLED_INTERRUPT)
++			atomic_add(&line.count, 1);
++		return result;
++	}
++	if (fRunningPipe == MALI_PIPE_PP && line.index == kIrqPp) {
++		int32 result = _PpJobInterrupt();
++		if (result == B_HANDLED_INTERRUPT)
++			atomic_add(&line.count, 1);
++		return result;
++	}
++	jobLocker.Unlock();
++
+ 	uint32 status = 0;
+ 	switch (line.index) {
+ 		case kIrqGp:
+@@ -722,13 +718,20 @@ MesonMali::_HandleInterrupt(interrupt_line& line)
+ 			status = _Read(base + MMU_INT_STATUS);
+ 			if (status == 0)
+ 				break;
+-			// a fault stops the pipe; stage 3 recovers it
++			// a fault ends the pipe's job: the job thread recovers
+ 			_Write(base + MMU_INT_MASK, 0);
+ 			_Write(base + MMU_INT_CLEAR, status);
+ 			dprintf("meson_mali: %s: %s at %#" B_PRIx32 "\n",
+ 				kInterruptNames[line.index],
+ 				(status & 1) != 0 ? "page fault" : "bus error",
+ 				_Read(base + MMU_PAGE_FAULT_ADDR));
++			SpinLocker locker(fJobLock);
++			int32 pipe = line.index == kIrqGpMmu
++				? MALI_PIPE_GP : MALI_PIPE_PP;
++			if (fRunningPipe == pipe && fJobError == 0) {
++				fJobError = 0x80000000 | status;
++				release_sem_etc(fJobDone, 1, B_DO_NOT_RESCHEDULE);
++			}
+ 			break;
+ 		}
+ 
+@@ -745,6 +748,70 @@ MesonMali::_HandleInterrupt(interrupt_line& line)
+ }
+ 
+ 
++/*!	The GP's interrupt while it runs a job: an error ends it; else it is
++	done when a list ended and neither unit is still active. With fJobLock
++	held.
++*/
++int32
++MesonMali::_GpJobInterrupt()
++{
++	uint32 status = _Read(kGp + GP_INT_STAT);
++	if (status == 0)
++		return B_UNHANDLED_INTERRUPT;
++	uint32 state = _Read(kGp + GP_STATUS);
++	bool done = false;
++	if ((status & kGpInterruptsError) != 0) {
++		fJobError = status;
++		_Write(kGp + GP_INT_MASK, 0);
++		done = true;
++	} else if ((status & (kGpVsEnd | kGpPlbuEnd)) != 0
++		&& (state & (kGpStatusVsActive | kGpStatusPlbuActive)) == 0) {
++		done = true;
++	}
++	_Write(kGp + GP_INT_CLEAR, status);
++	if (done) {
++		fRunningPipe = -1;
++		release_sem_etc(fJobDone, 1, B_DO_NOT_RESCHEDULE);
++	}
++	return B_HANDLED_INTERRUPT;
++}
++
++
++/*!	The PPs' broadcast interrupt while they run a job: each PP is done
++	when it reports (an error ends it too) or has stopped rendering; the
++	job, when all are. With fJobLock held.
++*/
++int32
++MesonMali::_PpJobInterrupt()
++{
++	bool handled = false;
++	for (uint32 i = 0; i < fPpCount; i++) {
++		if ((fPpDone & (1u << i)) != 0)
++			continue;
++		uint32 base = kPp[i];
++		uint32 state = _Read(base + PP_STATUS);
++		uint32 status = _Read(base + PP_INT_STATUS);
++		if (status != 0) {
++			if ((status & kPpInterruptsError) != 0) {
++				fJobError = status;
++				_Write(base + PP_INT_MASK, 0);
++			}
++			_Write(base + PP_INT_CLEAR, status);
++			handled = true;
++		} else if ((state & kPpStatusRendering) != 0)
++			continue;
++		fPpDone |= 1u << i;
++		fPpPending--;
++	}
++	if (fPpPending == 0 && fRunningPipe == MALI_PIPE_PP) {
++		fRunningPipe = -1;
++		release_sem_etc(fJobDone, 1, B_DO_NOT_RESCHEDULE);
++		handled = true;
++	}
++	return handled ? B_HANDLED_INTERRUPT : B_UNHANDLED_INTERRUPT;
++}
++
++
+ void
+ MesonMali::Dump()
+ {
+@@ -773,6 +840,9 @@ MesonMali::Dump()
+ 		", PP status %#" B_PRIx32 " enable %#" B_PRIx32 "\n",
+ 		_Read(kGpL2 + L2_STATUS), _Read(kGpL2 + L2_ENABLE),
+ 		_Read(kPpL2 + L2_STATUS), _Read(kPpL2 + L2_ENABLE));
++	kprintf("  jobs: %" B_PRIu32 " (%" B_PRIu32 " failed), sequence %"
++		B_PRIu64 " done of %" B_PRIu64 ", running pipe %" B_PRId32 "\n",
++		fJobs, fFailedJobs, fCompleted, fNextSequence - 1, fRunningPipe);
+ 	kprintf("  interrupts:");
+ 	for (int32 i = 0; i < kIrqCount; i++) {
+ 		kprintf(" %s(%" B_PRId32 ") %" B_PRId32, kInterruptNames[i],
+@@ -1036,11 +1106,26 @@ device_uninit(void* deviceCookie)
+ }
+ 
+ 
++struct file_cookie {
++	MesonMali*	device;
++	mali_file*	file;
++};
++
++
+ static status_t
+ device_open(void* deviceCookie, const char* path, int openMode,
+ 	void** _cookie)
+ {
+-	*_cookie = deviceCookie;
++	file_cookie* cookie = new(std::nothrow) file_cookie;
++	if (cookie == NULL)
++		return B_NO_MEMORY;
++	cookie->device = (MesonMali*)deviceCookie;
++	status_t status = cookie->device->OpenFile(&cookie->file);
++	if (status != B_OK) {
++		delete cookie;
++		return status;
++	}
++	*_cookie = cookie;
+ 	return B_OK;
+ }
+ 
+@@ -1053,8 +1138,11 @@ device_close(void* cookie)
+ 
+ 
+ static status_t
+-device_free(void* cookie)
++device_free(void* _cookie)
+ {
++	file_cookie* cookie = (file_cookie*)_cookie;
++	cookie->device->FreeFile(cookie->file);
++	delete cookie;
+ 	return B_OK;
+ }
+ 
+@@ -1077,9 +1165,10 @@ device_write(void* cookie, off_t position, const void* buffer,
+ 
+ 
+ static status_t
+-device_control(void* cookie, uint32 op, void* buffer, size_t length)
++device_control(void* _cookie, uint32 op, void* buffer, size_t length)
+ {
+-	return B_DEV_INVALID_IOCTL;
++	file_cookie* cookie = (file_cookie*)_cookie;
++	return cookie->device->Control(cookie->file, op, buffer, length);
+ }
+ 
+ 
+diff --git a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_jobs.cpp b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_jobs.cpp
+new file mode 100644
+index 0000000000..8f6827a77f
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_jobs.cpp
+@@ -0,0 +1,879 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * meson_mali's buffers, the GPU's address space, lima's ioctls and the job
++ * thread (PLAN.md M43 stage 3; docs/m43-mali-facts.md §3-5,
++ * docs/m43-mesa-lima-haiku.md §1.8).
++ *
++ * This first version keeps it simple:
++ * - one address space for every open file, the one the MMUs hold;
++ * - one job at a time, in the order they were submitted, GP and PP alike:
++ *   that orders a PP job after the GP job whose output it reads, as lima
++ *   expects, without fences on the buffers;
++ * - buffers are cached for the CPU (userland clones their areas): their
++ *   lines are written back and invalidated before a job, and those of the
++ *   buffers it writes again after it;
++ * - sync objects hold the sequence number of the job they wait for;
++ * - no heap buffers that grow (the driver says version 1.0).
++ */
++
++
++#include <new>
++#include <stdlib.h>
++#include <string.h>
++
++#include <kernel.h>
++#include <util/AutoLock.h>
++#include <vm/vm.h>
++
++#include "meson_mali_private.h"
++
++
++static const uint32 kMaxSubmitBuffers = 1024;
++static const uint32 kMaxWaitHandles = 64;
++
++
++//	#pragma mark - buffers and the address space
++
++
++status_t
++MesonMali::_CreateBuffer(size_t size, mali_buffer** _buffer)
++{
++	size = ROUNDUP(size, B_PAGE_SIZE);
++	mali_buffer* buffer = new(std::nothrow) mali_buffer;
++	if (buffer == NULL)
++		return B_NO_MEMORY;
++	memset(buffer, 0, sizeof(*buffer));
++	buffer->refCount = 1;
++	buffer->size = size;
++	buffer->pageCount = size / B_PAGE_SIZE;
++	buffer->pages = (phys_addr_t*)malloc(buffer->pageCount
++		* sizeof(phys_addr_t));
++	if (buffer->pages == NULL) {
++		delete buffer;
++		return B_NO_MEMORY;
++	}
++
++	// all of the C2's memory is below 4 GB, as the GPU's MMU needs
++	void* address;
++	buffer->area = create_area("meson_mali buffer", &address,
++		B_ANY_KERNEL_ADDRESS, size, B_FULL_LOCK,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA | B_READ_AREA | B_WRITE_AREA
++			| B_CLONEABLE_AREA);
++	if (buffer->area < 0) {
++		status_t status = buffer->area;
++		free(buffer->pages);
++		delete buffer;
++		return status;
++	}
++	for (uint32 i = 0; i < buffer->pageCount; i++) {
++		physical_entry entry;
++		get_memory_map((uint8*)address + i * B_PAGE_SIZE, B_PAGE_SIZE,
++			&entry, 1);
++		buffer->pages[i] = entry.address;
++	}
++	memset(address, 0, size);
++	_CleanBuffer(buffer);
++
++	MutexLocker locker(fLock);
++	status_t status = _AllocateAddress(size, &buffer->va);
++	if (status == B_OK)
++		status = _MapPages(buffer);
++	if (status != B_OK) {
++		delete_area(buffer->area);
++		free(buffer->pages);
++		delete buffer;
++		return status;
++	}
++	*_buffer = buffer;
++	return B_OK;
++}
++
++
++void
++MesonMali::_AcquireBuffer(mali_buffer* buffer)
++{
++	atomic_add(&buffer->refCount, 1);
++}
++
++
++void
++MesonMali::_ReleaseBuffer(mali_buffer* buffer)
++{
++	if (atomic_add(&buffer->refCount, -1) != 1)
++		return;
++	MutexLocker locker(fLock);
++	_UnmapPages(buffer);
++	_FreeAddress(buffer->va, buffer->size);
++	locker.Unlock();
++	delete_area(buffer->area);
++		// clones in userland keep the pages until they go
++	free(buffer->pages);
++	delete buffer;
++}
++
++
++/*!	Writes back and invalidates the CPU's lines of the buffer: before a job
++	(what the CPU wrote reaches memory) and after one that wrote it (what
++	the CPU reads next comes from memory). By physical runs.
++*/
++void
++MesonMali::_CleanBuffer(mali_buffer* buffer)
++{
++	uint32 first = 0;
++	for (uint32 i = 1; i <= buffer->pageCount; i++) {
++		if (i < buffer->pageCount
++			&& buffer->pages[i] == buffer->pages[i - 1] + B_PAGE_SIZE) {
++			continue;
++		}
++		flush_cache_range(buffer->pages[first],
++			(size_t)(i - first) * B_PAGE_SIZE);
++		first = i;
++	}
++}
++
++
++/*!	The lowest free range of GPU addresses for \a size bytes, between
++	kFirstBufferAddress and the DLBU page. With fLock held.
++*/
++status_t
++MesonMali::_AllocateAddress(size_t size, uint32* _address)
++{
++	uint64 start = kFirstBufferAddress;
++	uint32 index = 0;
++	for (; index < fRangeCount; index++) {
++		if (fRanges[index].start >= start + size)
++			break;
++		start = (uint64)fRanges[index].start + fRanges[index].size;
++	}
++	if (start + size > kDlbuAddress)
++		return B_NO_MEMORY;
++
++	if (fRangeCount == fRangeSlots) {
++		uint32 slots = fRangeSlots > 0 ? fRangeSlots * 2 : 64;
++		address_range* ranges = (address_range*)realloc(fRanges,
++			slots * sizeof(address_range));
++		if (ranges == NULL)
++			return B_NO_MEMORY;
++		fRanges = ranges;
++		fRangeSlots = slots;
++	}
++	memmove(fRanges + index + 1, fRanges + index,
++		(fRangeCount - index) * sizeof(address_range));
++	fRanges[index].start = (uint32)start;
++	fRanges[index].size = (uint32)size;
++	fRangeCount++;
++	*_address = (uint32)start;
++	return B_OK;
++}
++
++
++void
++MesonMali::_FreeAddress(uint32 address, size_t size)
++{
++	for (uint32 i = 0; i < fRangeCount; i++) {
++		if (fRanges[i].start != address)
++			continue;
++		memmove(fRanges + i, fRanges + i + 1,
++			(fRangeCount - i - 1) * sizeof(address_range));
++		fRangeCount--;
++		return;
++	}
++}
++
++
++/*!	The buffer's pages into the page tables at its address (page tables
++	made as needed). The MMUs forget old translations when the next job
++	starts. With fLock held.
++*/
++status_t
++MesonMali::_MapPages(mali_buffer* buffer)
++{
++	uint32 i = 0;
++	while (i < buffer->pageCount) {
++		uint32 address = buffer->va + i * B_PAGE_SIZE;
++		uint32 directoryIndex = address >> 22;
++		dma_buffer& table = fPageTables[directoryIndex];
++		if (table.area < 0) {
++			status_t status = _AllocatePage("meson_mali page table", table);
++			if (status != B_OK)
++				return status;
++			fPageDirectory.address[directoryIndex]
++				= (uint32)table.physical | kPageDirectoryPresent;
++			flush_cache_range(fPageDirectory.physical + directoryIndex * 4,
++				4);
++		}
++		uint32 first = (address >> 12) & 0x3ff;
++		uint32 entry = first;
++		for (; entry < 1024 && i < buffer->pageCount; entry++, i++)
++			table.address[entry] = (uint32)buffer->pages[i] | kPageFlags;
++		flush_cache_range(table.physical + first * 4, (entry - first) * 4);
++	}
++	return B_OK;
++}
++
++
++void
++MesonMali::_UnmapPages(mali_buffer* buffer)
++{
++	uint32 i = 0;
++	while (i < buffer->pageCount) {
++		uint32 address = buffer->va + i * B_PAGE_SIZE;
++		dma_buffer& table = fPageTables[address >> 22];
++		uint32 first = (address >> 12) & 0x3ff;
++		uint32 entry = first;
++		for (; entry < 1024 && i < buffer->pageCount; entry++, i++) {
++			if (table.area >= 0)
++				table.address[entry] = 0;
++		}
++		if (table.area >= 0) {
++			flush_cache_range(table.physical + first * 4,
++				(entry - first) * 4);
++		}
++	}
++}
++
++
++//	#pragma mark - files
++
++
++status_t
++MesonMali::OpenFile(mali_file** _file)
++{
++	mali_file* file = new(std::nothrow) mali_file;
++	if (file == NULL)
++		return B_NO_MEMORY;
++	memset(file, 0, sizeof(*file));
++	mutex_init(&file->lock, "meson_mali file");
++	*_file = file;
++	return B_OK;
++}
++
++
++void
++MesonMali::FreeFile(mali_file* file)
++{
++	for (uint32 i = 0; i < file->bufferSlots; i++) {
++		if (file->buffers[i] != NULL)
++			_ReleaseBuffer(file->buffers[i]);
++	}
++	free(file->buffers);
++	free(file->syncobjs);
++	free(file->syncobjsUsed);
++	mutex_destroy(&file->lock);
++	delete file;
++}
++
++
++/*!	The buffer of \a handle with a reference, or NULL. */
++mali_buffer*
++MesonMali::_LookUp(mali_file* file, uint32 handle)
++{
++	MutexLocker locker(file->lock);
++	if (handle == 0 || handle > file->bufferSlots
++		|| file->buffers[handle - 1] == NULL) {
++		return NULL;
++	}
++	mali_buffer* buffer = file->buffers[handle - 1];
++	_AcquireBuffer(buffer);
++	return buffer;
++}
++
++
++status_t
++MesonMali::Control(mali_file* file, uint32 op, void* buffer, size_t length)
++{
++	switch (op) {
++		case MALI_IOCTL_GET_PARAM:
++			return _GetParam(buffer);
++		case MALI_IOCTL_GEM_CREATE:
++			return _GemCreate(file, buffer);
++		case MALI_IOCTL_GEM_INFO:
++			return _GemInfo(file, buffer);
++		case MALI_IOCTL_GEM_CLOSE:
++			return _GemClose(file, buffer);
++		case MALI_IOCTL_GEM_SUBMIT:
++			return _GemSubmit(file, buffer);
++		case MALI_IOCTL_GEM_WAIT:
++			return _GemWait(file, buffer);
++		case MALI_IOCTL_SYNCOBJ_CREATE:
++			return _SyncobjCreate(file, buffer);
++		case MALI_IOCTL_SYNCOBJ_DESTROY:
++			return _SyncobjDestroy(file, buffer);
++		case MALI_IOCTL_SYNCOBJ_WAIT:
++			return _SyncobjWait(file, buffer);
++
++		case MALI_IOCTL_CTX_CREATE:
++		{
++			mali_ctx_create context;
++			MutexLocker locker(file->lock);
++			context.id = file->nextContext++;
++			context._pad = 0;
++			locker.Unlock();
++			return user_memcpy(buffer, &context, sizeof(context));
++		}
++		case MALI_IOCTL_CTX_FREE:
++		{
++			mali_ctx_free context;
++			if (user_memcpy(&context, buffer, sizeof(context)) != B_OK)
++				return B_BAD_ADDRESS;
++			MutexLocker locker(file->lock);
++			return context._pad == 0 && context.id < file->nextContext
++				? B_OK : B_BAD_VALUE;
++		}
++	}
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++status_t
++MesonMali::_GetParam(void* buffer)
++{
++	mali_get_param param;
++	if (user_memcpy(&param, buffer, sizeof(param)) != B_OK)
++		return B_BAD_ADDRESS;
++	if (param.pad != 0)
++		return B_BAD_VALUE;
++	switch (param.param) {
++		case MALI_PARAM_GPU_ID:
++			param.value = MALI_GPU_ID_MALI450;
++			break;
++		case MALI_PARAM_NUM_PP:
++			param.value = kPpCount;
++			break;
++		case MALI_PARAM_GP_VERSION:
++			param.value = fGpVersion;
++			break;
++		case MALI_PARAM_PP_VERSION:
++			param.value = fPpVersion[0];
++			break;
++		default:
++			return B_BAD_VALUE;
++	}
++	return user_memcpy(buffer, &param, sizeof(param));
++}
++
++
++status_t
++MesonMali::_GemCreate(mali_file* file, void* buffer)
++{
++	mali_gem_create create;
++	if (user_memcpy(&create, buffer, sizeof(create)) != B_OK)
++		return B_BAD_ADDRESS;
++	// a heap buffer is backed in full: they don't grow here
++	if (create.pad != 0 || (create.flags & ~MALI_BO_FLAG_HEAP) != 0
++		|| create.size == 0) {
++		return B_BAD_VALUE;
++	}
++
++	mali_buffer* object;
++	status_t status = _CreateBuffer(create.size, &object);
++	if (status != B_OK)
++		return status;
++
++	MutexLocker locker(file->lock);
++	uint32 slot = 0;
++	while (slot < file->bufferSlots && file->buffers[slot] != NULL)
++		slot++;
++	if (slot == file->bufferSlots) {
++		uint32 slots = file->bufferSlots > 0 ? file->bufferSlots * 2 : 64;
++		mali_buffer** buffers = (mali_buffer**)realloc(file->buffers,
++			slots * sizeof(mali_buffer*));
++		if (buffers == NULL) {
++			locker.Unlock();
++			_ReleaseBuffer(object);
++			return B_NO_MEMORY;
++		}
++		memset(buffers + file->bufferSlots, 0,
++			(slots - file->bufferSlots) * sizeof(mali_buffer*));
++		file->buffers = buffers;
++		file->bufferSlots = slots;
++	}
++	file->buffers[slot] = object;
++	locker.Unlock();
++
++	create.handle = slot + 1;
++	create.size = object->size;
++	return user_memcpy(buffer, &create, sizeof(create));
++}
++
++
++status_t
++MesonMali::_GemInfo(mali_file* file, void* buffer)
++{
++	mali_gem_info info;
++	if (user_memcpy(&info, buffer, sizeof(info)) != B_OK)
++		return B_BAD_ADDRESS;
++	mali_buffer* object = _LookUp(file, info.handle);
++	if (object == NULL)
++		return B_ENTRY_NOT_FOUND;
++	info.va = object->va;
++	info.offset = (uint64)object->area;
++	_ReleaseBuffer(object);
++	return user_memcpy(buffer, &info, sizeof(info));
++}
++
++
++status_t
++MesonMali::_GemClose(mali_file* file, void* buffer)
++{
++	mali_gem_close close;
++	if (user_memcpy(&close, buffer, sizeof(close)) != B_OK)
++		return B_BAD_ADDRESS;
++	MutexLocker locker(file->lock);
++	if (close.handle == 0 || close.handle > file->bufferSlots
++		|| file->buffers[close.handle - 1] == NULL) {
++		return B_BAD_VALUE;
++	}
++	mali_buffer* object = file->buffers[close.handle - 1];
++	file->buffers[close.handle - 1] = NULL;
++	locker.Unlock();
++	// a job that still uses it holds a reference of its own
++	_ReleaseBuffer(object);
++	return B_OK;
++}
++
++
++status_t
++MesonMali::_SyncobjCreate(mali_file* file, void* buffer)
++{
++	mali_syncobj_create create;
++	if (user_memcpy(&create, buffer, sizeof(create)) != B_OK)
++		return B_BAD_ADDRESS;
++
++	MutexLocker locker(file->lock);
++	uint32 slot = 0;
++	while (slot < file->syncobjSlots && file->syncobjsUsed[slot])
++		slot++;
++	if (slot == file->syncobjSlots) {
++		uint32 slots = file->syncobjSlots > 0 ? file->syncobjSlots * 2 : 16;
++		uint64* syncobjs = (uint64*)realloc(file->syncobjs,
++			slots * sizeof(uint64));
++		if (syncobjs == NULL)
++			return B_NO_MEMORY;
++		file->syncobjs = syncobjs;
++		bool* used = (bool*)realloc(file->syncobjsUsed, slots * sizeof(bool));
++		if (used == NULL)
++			return B_NO_MEMORY;
++		memset(used + file->syncobjSlots, 0, slots - file->syncobjSlots);
++		file->syncobjsUsed = used;
++		file->syncobjSlots = slots;
++	}
++	// without a job yet, it counts as signalled
++	file->syncobjs[slot] = 0;
++	file->syncobjsUsed[slot] = true;
++	locker.Unlock();
++
++	create.handle = slot + 1;
++	return user_memcpy(buffer, &create, sizeof(create));
++}
++
++
++status_t
++MesonMali::_SyncobjDestroy(mali_file* file, void* buffer)
++{
++	mali_syncobj_destroy destroy;
++	if (user_memcpy(&destroy, buffer, sizeof(destroy)) != B_OK)
++		return B_BAD_ADDRESS;
++	MutexLocker locker(file->lock);
++	if (destroy.handle == 0 || destroy.handle > file->syncobjSlots
++		|| !file->syncobjsUsed[destroy.handle - 1]) {
++		return B_BAD_VALUE;
++	}
++	file->syncobjsUsed[destroy.handle - 1] = false;
++	return B_OK;
++}
++
++
++status_t
++MesonMali::_SyncobjWait(mali_file* file, void* buffer)
++{
++	mali_syncobj_wait wait;
++	if (user_memcpy(&wait, buffer, sizeof(wait)) != B_OK)
++		return B_BAD_ADDRESS;
++	if (wait.count_handles == 0 || wait.count_handles > kMaxWaitHandles)
++		return B_BAD_VALUE;
++	uint32 handles[kMaxWaitHandles];
++	if (user_memcpy(handles, (void*)(addr_t)wait.handles,
++			wait.count_handles * sizeof(uint32)) != B_OK) {
++		return B_BAD_ADDRESS;
++	}
++
++	// The jobs finish in order: waiting for all is waiting for the last;
++	// for one, for the first.
++	bool all = (wait.flags & MALI_SYNCOBJ_WAIT_ALL) != 0;
++	uint64 target = all ? 0 : UINT64_MAX;
++	uint32 first = 0;
++	MutexLocker locker(file->lock);
++	for (uint32 i = 0; i < wait.count_handles; i++) {
++		uint32 handle = handles[i];
++		if (handle == 0 || handle > file->syncobjSlots
++			|| !file->syncobjsUsed[handle - 1]) {
++			return B_ENTRY_NOT_FOUND;
++		}
++		uint64 sequence = file->syncobjs[handle - 1];
++		if (all ? sequence > target : sequence < target) {
++			target = sequence;
++			first = i;
++		}
++	}
++	locker.Unlock();
++
++	status_t status = _WaitFor(target, wait.timeout_nsec,
++		wait.timeout_nsec <= 0);
++	if (status == B_BUSY)
++		status = B_TIMED_OUT;
++	if (status != B_OK)
++		return status;
++	if (!all) {
++		wait.first_signaled = first;
++		return user_memcpy(buffer, &wait, sizeof(wait));
++	}
++	return B_OK;
++}
++
++
++status_t
++MesonMali::_GemWait(mali_file* file, void* buffer)
++{
++	mali_gem_wait wait;
++	if (user_memcpy(&wait, buffer, sizeof(wait)) != B_OK)
++		return B_BAD_ADDRESS;
++	if ((wait.op & ~(MALI_GEM_WAIT_READ | MALI_GEM_WAIT_WRITE)) != 0)
++		return B_BAD_VALUE;
++	if (wait.op == 0)
++		return B_OK;
++	mali_buffer* object = _LookUp(file, wait.handle);
++	if (object == NULL)
++		return B_BAD_VALUE;
++
++	MutexLocker locker(fQueueLock);
++	// to read: the jobs that write it; to write: all that use it
++	uint64 target = object->lastWrite;
++	if ((wait.op & MALI_GEM_WAIT_WRITE) != 0)
++		target = max_c(target, object->lastRead);
++	locker.Unlock();
++	_ReleaseBuffer(object);
++
++	return _WaitFor(target, wait.timeout_ns,
++		wait.timeout_ns <= (int64)system_time() * 1000);
++}
++
++
++/*!	Waits until the job with \a sequence (and all before) finished, until
++	\a timeoutNs (absolute, monotonic: system_time() in nanoseconds;
++	INT64_MAX: forever). A poll returns B_BUSY instead of B_TIMED_OUT.
++*/
++status_t
++MesonMali::_WaitFor(uint64 sequence, int64 timeoutNs, bool poll)
++{
++	bigtime_t deadline = timeoutNs == INT64_MAX
++		? B_INFINITE_TIMEOUT : timeoutNs / 1000;
++	MutexLocker locker(fQueueLock);
++	while (fCompleted < sequence) {
++		if (poll || (deadline != B_INFINITE_TIMEOUT
++				&& deadline <= system_time())) {
++			return poll ? B_BUSY : B_TIMED_OUT;
++		}
++		ConditionVariableEntry entry;
++		fCompletion.Add(&entry);
++		locker.Unlock();
++		status_t status = entry.Wait(B_CAN_INTERRUPT
++			| (deadline != B_INFINITE_TIMEOUT ? B_ABSOLUTE_TIMEOUT : 0),
++			deadline);
++		locker.Lock();
++		if (status == B_INTERRUPTED)
++			return B_INTERRUPTED;
++	}
++	return B_OK;
++}
++
++
++//	#pragma mark - jobs
++
++
++status_t
++MesonMali::_GemSubmit(mali_file* file, void* buffer)
++{
++	mali_gem_submit submit;
++	if (user_memcpy(&submit, buffer, sizeof(submit)) != B_OK)
++		return B_BAD_ADDRESS;
++	if (submit.pipe > MALI_PIPE_PP || submit.nr_bos == 0
++		|| submit.nr_bos > kMaxSubmitBuffers
++		|| (submit.flags & ~MALI_SUBMIT_FLAG_EXPLICIT_FENCE) != 0
++		|| submit.frame_size != (submit.pipe == MALI_PIPE_GP
++			? sizeof(mali_gp_frame) : sizeof(mali_m450_pp_frame))) {
++		return B_BAD_VALUE;
++	}
++
++	mali_task* task = new(std::nothrow) mali_task;
++	if (task == NULL)
++		return B_NO_MEMORY;
++	memset(task, 0, sizeof(*task));
++	task->pipe = submit.pipe;
++	mali_gem_submit_bo* objects = (mali_gem_submit_bo*)malloc(submit.nr_bos
++		* sizeof(mali_gem_submit_bo));
++	task->buffers = (mali_buffer**)calloc(submit.nr_bos,
++		sizeof(mali_buffer*));
++	task->bufferFlags = (uint32*)malloc(submit.nr_bos * sizeof(uint32));
++	status_t status = B_OK;
++	if (objects == NULL || task->buffers == NULL || task->bufferFlags == NULL)
++		status = B_NO_MEMORY;
++	else if (user_memcpy(&task->frame, (void*)(addr_t)submit.frame,
++			submit.frame_size) != B_OK
++		|| user_memcpy(objects, (void*)(addr_t)submit.bos,
++			submit.nr_bos * sizeof(mali_gem_submit_bo)) != B_OK) {
++		status = B_BAD_ADDRESS;
++	}
++
++	// the frame
++	if (status == B_OK && submit.pipe == MALI_PIPE_GP) {
++		const uint32* frame = task->frame.gp.frame;
++		if (frame[0] > frame[1] || frame[2] > frame[3] || frame[4] > frame[5]
++			|| (frame[0] == frame[1] && frame[2] == frame[3])) {
++			status = B_BAD_VALUE;
++		}
++	} else if (status == B_OK) {
++		if (task->frame.pp.num_pp == 0 || task->frame.pp.num_pp > kPpCount
++			|| task->frame.pp._pad != 0) {
++			status = B_BAD_VALUE;
++		}
++	}
++
++	// the sync object, and the buffers with a reference each
++	if (status == B_OK) {
++		MutexLocker locker(file->lock);
++		if (submit.out_sync != 0 && (submit.out_sync > file->syncobjSlots
++				|| !file->syncobjsUsed[submit.out_sync - 1])) {
++			status = B_ENTRY_NOT_FOUND;
++		}
++	}
++	for (uint32 i = 0; status == B_OK && i < submit.nr_bos; i++) {
++		task->buffers[i] = _LookUp(file, objects[i].handle);
++		if (task->buffers[i] == NULL)
++			status = B_ENTRY_NOT_FOUND;
++		task->bufferFlags[i] = objects[i].flags;
++		task->bufferCount = i + 1;
++	}
++	free(objects);
++	if (status != B_OK) {
++		_FreeTask(task);
++		return status;
++	}
++
++	// queued in order; the in_sync objects are signalled by then
++	MutexLocker queueLocker(fQueueLock);
++	task->sequence = fNextSequence++;
++	for (uint32 i = 0; i < task->bufferCount; i++) {
++		if ((task->bufferFlags[i] & MALI_SUBMIT_BO_WRITE) != 0)
++			task->buffers[i]->lastWrite = task->sequence;
++		else
++			task->buffers[i]->lastRead = task->sequence;
++	}
++	if (fQueueTail != NULL)
++		fQueueTail->next = task;
++	else
++		fQueueHead = task;
++	fQueueTail = task;
++	uint64 sequence = task->sequence;
++	fQueueCondition.NotifyOne();
++	queueLocker.Unlock();
++
++	if (submit.out_sync != 0) {
++		MutexLocker locker(file->lock);
++		if (submit.out_sync <= file->syncobjSlots
++			&& file->syncobjsUsed[submit.out_sync - 1]) {
++			file->syncobjs[submit.out_sync - 1] = sequence;
++		}
++	}
++	return B_OK;
++}
++
++
++void
++MesonMali::_FreeTask(mali_task* task)
++{
++	for (uint32 i = 0; i < task->bufferCount; i++) {
++		if (task->buffers[i] != NULL)
++			_ReleaseBuffer(task->buffers[i]);
++	}
++	free(task->buffers);
++	free(task->bufferFlags);
++	delete task;
++}
++
++
++/*static*/ status_t
++MesonMali::_JobThread(void* data)
++{
++	MesonMali* device = (MesonMali*)data;
++	MutexLocker locker(device->fQueueLock);
++	while (true) {
++		while (device->fQueueHead == NULL && !device->fQuit) {
++			ConditionVariableEntry entry;
++			device->fQueueCondition.Add(&entry);
++			locker.Unlock();
++			entry.Wait();
++			locker.Lock();
++		}
++		mali_task* task = device->fQueueHead;
++		if (task == NULL)
++			break;
++		device->fQueueHead = task->next;
++		if (device->fQueueHead == NULL)
++			device->fQueueTail = NULL;
++		locker.Unlock();
++
++		if (!device->fQuit)
++			device->_RunTask(task);
++
++		locker.Lock();
++		device->fCompleted = task->sequence;
++		device->fCompletion.NotifyAll();
++		locker.Unlock();
++		device->_FreeTask(task);
++		locker.Lock();
++	}
++	return B_OK;
++}
++
++
++void
++MesonMali::_RunTask(mali_task* task)
++{
++	for (uint32 i = 0; i < task->bufferCount; i++)
++		_CleanBuffer(task->buffers[i]);
++
++	bool done = task->pipe == MALI_PIPE_GP ? _RunGp(task) : _RunPp(task);
++	fJobs++;
++	if (!done)
++		fFailedJobs++;
++
++	for (uint32 i = 0; i < task->bufferCount; i++) {
++		if ((task->bufferFlags[i] & MALI_SUBMIT_BO_WRITE) != 0)
++			_CleanBuffer(task->buffers[i]);
++	}
++}
++
++
++bool
++MesonMali::_RunGp(mali_task* task)
++{
++	const uint32* frame = task->frame.gp.frame;
++	uint32 command = 0;
++	if (frame[0] != frame[1])
++		command |= kGpStartVs;
++	if (frame[2] != frame[3])
++		command |= kGpStartPlbu;
++
++	_FlushL2(kGpL2);
++	_ZapMmu(kGpMmu);
++	_ResetGp();
++	while (acquire_sem_etc(fJobDone, 1, B_RELATIVE_TIMEOUT, 0) == B_OK)
++		;
++
++	InterruptsSpinLocker locker(fJobLock);
++	fJobError = 0;
++	fRunningPipe = MALI_PIPE_GP;
++	for (uint32 i = 0; i < 6; i++)
++		_Write(kGp + i * 4, frame[i]);
++	_Write(kGp + GP_CMD, kGpUpdatePlbuAlloc);
++	_Write(kGp + GP_CMD, command);
++	locker.Unlock();
++
++	status_t status = acquire_sem_etc(fJobDone, 1, B_RELATIVE_TIMEOUT,
++		kJobTimeout);
++	locker.Lock();
++	uint32 error = fJobError;
++	fRunningPipe = -1;
++	locker.Unlock();
++	if (status == B_OK && error == 0)
++		return true;
++
++	INFO("GP job %" B_PRIu64 ": %s, error %#" B_PRIx32 ", status %#" B_PRIx32
++		", raw %#" B_PRIx32 ", MMU status %#" B_PRIx32 " fault at %#" B_PRIx32
++		"\n", task->sequence, status == B_OK ? "failed" : "timed out", error,
++		_Read(kGp + GP_STATUS), _Read(kGp + GP_INT_RAWSTAT),
++		_Read(kGpMmu + MMU_STATUS), _Read(kGpMmu + MMU_PAGE_FAULT_ADDR));
++	_HardResetGp();
++	_RecoverMmu(kGpMmu);
++	return false;
++}
++
++
++bool
++MesonMali::_RunPp(mali_task* task)
++{
++	mali_m450_pp_frame& frame = task->frame.pp;
++	uint32 count = frame.num_pp;
++	uint32 mask = (1u << count) - 1;
++
++	_FlushL2(kPpL2);
++	for (uint32 i = 0; i < kPpCount; i++)
++		_ZapMmu(kPpMmu[i]);
++	for (uint32 i = 0; i < count; i++) {
++		if (_ResetPp(i) != B_OK)
++			INFO("PP%" B_PRIu32 ": no soft reset\n", i);
++	}
++	while (acquire_sem_etc(fJobDone, 1, B_RELATIVE_TIMEOUT, 0) == B_OK)
++		;
++
++	// the load balancer hands out the tile lists, or each PP has its own
++	if (frame.use_dlbu != 0) {
++		_Write(kDlbu + DLBU_PP_ENABLE_MASK, mask);
++		frame.frame[0] = kDlbuAddress;
++		for (uint32 i = 0; i < 4; i++)
++			_Write(kDlbu + DLBU_TLLIST_VBASEADDR + i * 4, frame.dlbu_regs[i]);
++	} else
++		_Write(kDlbu + DLBU_PP_ENABLE_MASK, 0);
++	_Write(kBcast + BCAST_BROADCAST_MASK,
++		(_Read(kBcast + BCAST_BROADCAST_MASK) & 0xffff0000) | mask);
++
++	for (uint32 i = 0; i < 23; i++)
++		_Write(kPpBroadcast + PP_FRAME + i * 4, frame.frame[i]);
++	for (uint32 unit = 0; unit < 3; unit++) {
++		for (uint32 i = 0; i < 12; i++) {
++			_Write(kPpBroadcast + PP_WB0 + unit * 0x100 + i * 4,
++				frame.wb[unit * 12 + i]);
++		}
++	}
++	for (uint32 i = 0; i < count; i++) {
++		_Write(kPp[i] + PP_STACK, frame.fragment_stack_address[i]);
++		if (frame.use_dlbu == 0)
++			_Write(kPp[i] + PP_FRAME, frame.plbu_array_address[i]);
++	}
++
++	InterruptsSpinLocker locker(fJobLock);
++	fJobError = 0;
++	fPpCount = count;
++	fPpPending = count;
++	fPpDone = 0;
++	fRunningPipe = MALI_PIPE_PP;
++	_Write(kPpBroadcast + PP_CTRL, kPpStartRendering);
++	locker.Unlock();
++
++	status_t status = acquire_sem_etc(fJobDone, 1, B_RELATIVE_TIMEOUT,
++		kJobTimeout);
++	locker.Lock();
++	uint32 error = fJobError;
++	fRunningPipe = -1;
++	locker.Unlock();
++	if (status == B_OK && error == 0)
++		return true;
++
++	INFO("PP job %" B_PRIu64 ": %s, error %#" B_PRIx32 ", %" B_PRIu32
++		" of %" B_PRIu32 " PPs done; PP0 status %#" B_PRIx32 " raw %#"
++		B_PRIx32 ", MMU0 status %#" B_PRIx32 " fault at %#" B_PRIx32 "\n",
++		task->sequence, status == B_OK ? "failed" : "timed out", error,
++		count - fPpPending, count, _Read(kPp[0] + PP_STATUS),
++		_Read(kPp[0] + PP_INT_RAWSTAT), _Read(kPpMmu[0] + MMU_STATUS),
++		_Read(kPpMmu[0] + MMU_PAGE_FAULT_ADDR));
++	for (uint32 i = 0; i < kPpCount; i++)
++		_HardResetPp(i);
++	_Write(kBcast + BCAST_BROADCAST_MASK, ((1 << kPpCount) - 1) << 16);
++	_Write(kBcast + BCAST_INTERRUPT_MASK, (1 << kPpCount) - 1);
++	for (uint32 i = 0; i < kPpCount; i++)
++		_RecoverMmu(kPpMmu[i]);
++	return false;
++}
+diff --git a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_private.h b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_private.h
+new file mode 100644
+index 0000000000..9c8a3d973a
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali_private.h
+@@ -0,0 +1,357 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef MESON_MALI_PRIVATE_H
++#define MESON_MALI_PRIVATE_H
++
++
++#include <KernelExport.h>
++#include <condition_variable.h>
++#include <device_manager.h>
++#include <lock.h>
++
++#include <meson_mali.h>
++
++
++#define INFO(x...)	dprintf("meson_mali: " x)
++
++
++// the blocks, from the GPU's base (Mali-450)
++static const uint32 kGp = 0x00000;
++static const uint32 kPpL2 = 0x01000;
++static const uint32 kPmu = 0x02000;
++static const uint32 kGpMmu = 0x03000;
++static const uint32 kPpMmu[] = { 0x04000, 0x05000, 0x06000 };
++static const uint32 kPp[] = { 0x08000, 0x0a000, 0x0c000 };
++static const uint32 kGpL2 = 0x10000;
++static const uint32 kBcast = 0x13000;
++static const uint32 kDlbu = 0x14000;
++static const uint32 kPpBroadcast = 0x16000;
++static const size_t kWindowSize = 0x40000;
++static const uint32 kPpCount = 3;
++
++// GP
++enum {
++	GP_CMD				= 0x20,
++	GP_INT_RAWSTAT		= 0x24,
++	GP_INT_CLEAR		= 0x28,
++	GP_INT_MASK			= 0x2c,
++	GP_INT_STAT			= 0x30,
++	GP_PERF_CNT_0_LIMIT	= 0x54,
++	GP_STATUS			= 0x68,
++	GP_VERSION			= 0x6c,
++};
++static const uint32 kGpStartVs = 1 << 0;
++static const uint32 kGpStartPlbu = 1 << 1;
++static const uint32 kGpUpdatePlbuAlloc = 1 << 4;
++static const uint32 kGpHardReset = 1 << 5;
++static const uint32 kGpStopBus = 1 << 9;
++static const uint32 kGpSoftReset = 1 << 10;
++static const uint32 kGpVsEnd = 1 << 0;
++static const uint32 kGpPlbuEnd = 1 << 1;
++static const uint32 kGpPlbuOutOfMemory = 1 << 2;
++static const uint32 kGpResetCompleted = 1 << 19;
++static const uint32 kGpInterruptsAll = 0x00787fff;
++static const uint32 kGpInterruptsError = 0x00706e44;
++static const uint32 kGpInterruptsUsed = 0x00706e47;
++static const uint32 kGpStatusVsActive = 1 << 1;
++static const uint32 kGpStatusBusStopped = 1 << 2;
++static const uint32 kGpStatusPlbuActive = 1 << 3;
++
++// PP
++enum {
++	PP_FRAME			= 0x0000,
++	PP_STACK			= 0x0030,
++	PP_WB0				= 0x0100,
++	PP_VERSION			= 0x1000,
++	PP_STATUS			= 0x1008,
++	PP_CTRL				= 0x100c,
++	PP_INT_RAWSTAT		= 0x1020,
++	PP_INT_CLEAR		= 0x1024,
++	PP_INT_MASK			= 0x1028,
++	PP_INT_STATUS		= 0x102c,
++	PP_PERF_CNT_0_LIMIT	= 0x1088,
++};
++static const uint32 kPpStopBus = 1 << 0;
++static const uint32 kPpForceReset = 1 << 5;
++static const uint32 kPpStartRendering = 1 << 6;
++static const uint32 kPpSoftReset = 1 << 7;
++static const uint32 kPpResetCompleted = 1 << 12;
++static const uint32 kPpInterruptsAll = 0x1fff;
++static const uint32 kPpInterruptsError = 0x0f18;
++static const uint32 kPpInterruptsUsed = 0x0f19;
++static const uint32 kPpStatusRendering = 1 << 0;
++static const uint32 kPpStatusBusStopped = 1 << 4;
++
++// MMU
++enum {
++	MMU_DTE_ADDR		= 0x00,
++	MMU_STATUS			= 0x04,
++	MMU_COMMAND			= 0x08,
++	MMU_PAGE_FAULT_ADDR	= 0x0c,
++	MMU_INT_RAWSTAT		= 0x14,
++	MMU_INT_CLEAR		= 0x18,
++	MMU_INT_MASK		= 0x1c,
++	MMU_INT_STATUS		= 0x20,
++};
++enum {
++	MMU_ENABLE_PAGING	= 0,
++	MMU_ENABLE_STALL	= 2,
++	MMU_DISABLE_STALL	= 3,
++	MMU_ZAP_CACHE		= 4,
++	MMU_HARD_RESET		= 6,
++};
++static const uint32 kMmuPagingEnabled = 1 << 0;
++static const uint32 kMmuPageFaultActive = 1 << 1;
++static const uint32 kMmuStallActive = 1 << 2;
++static const uint32 kMmuInterrupts = 0x3;
++	// page fault, read bus error
++
++// L2 cache
++enum {
++	L2_SIZE				= 0x04,
++	L2_STATUS			= 0x08,
++	L2_COMMAND			= 0x10,
++	L2_MAX_READS		= 0x18,
++	L2_ENABLE			= 0x1c,
++};
++
++// PMU: STATUS has a bit per domain, 1 = off
++enum {
++	PMU_POWER_UP		= 0x00,
++	PMU_STATUS			= 0x08,
++	PMU_INT_MASK		= 0x0c,
++	PMU_INT_RAWSTAT		= 0x10,
++	PMU_INT_CLEAR		= 0x18,
++	PMU_SW_DELAY		= 0x1c,
++};
++static const uint32 kPmuDomains = 0x7;
++	// GP, PP0, PP1-PP3
++
++// DLBU, BCAST
++enum {
++	DLBU_MASTER_TLLIST_PHYS_ADDR	= 0x00,
++	DLBU_MASTER_TLLIST_VADDR		= 0x04,
++	DLBU_TLLIST_VBASEADDR			= 0x08,
++	DLBU_PP_ENABLE_MASK				= 0x18,
++	BCAST_BROADCAST_MASK			= 0x00,
++	BCAST_INTERRUPT_MASK			= 0x04,
++};
++
++// page tables: two levels of 4 KiB; the DLBU page at a fixed address
++static const uint32 kPageDirectoryPresent = 0x1;
++static const uint32 kPageFlags = 0x1df;
++static const uint32 kDlbuAddress = 0xfff00000;
++static const uint32 kFirstBufferAddress = 0x00100000;
++	// buffers between it and the DLBU page (VA 0 stays unused)
++
++static const bigtime_t kJobTimeout = 10000000;
++
++
++enum {
++	kIrqGp, kIrqGpMmu, kIrqPp, kIrqPmu, kIrqPp0, kIrqPpMmu0, kIrqPp1,
++	kIrqPpMmu1, kIrqPp2, kIrqPpMmu2, kIrqCount
++};
++extern const char* const kInterruptNames[kIrqCount];
++
++
++void flush_cache_range(phys_addr_t physical, size_t size);
++	// meson_mali.cpp: writes back and invalidates the CPU's lines
++
++
++struct dma_buffer {
++	area_id		area;
++	uint32*		address;
++	phys_addr_t	physical;
++
++	dma_buffer() : area(-1), address(NULL), physical(0) {}
++};
++
++
++class MesonMali;
++
++struct interrupt_line {
++	MesonMali*	device;
++	int32		index;		// kIrq*
++	int32		vector;
++	int32		count;
++};
++
++
++/*!	A buffer (a GEM object): an area of its own, cloneable so that
++	userland can map it; its pages mapped at \c va for the GPU.
++*/
++struct mali_buffer {
++	int32		refCount;
++	area_id		area;
++	size_t		size;
++	uint32		pageCount;
++	phys_addr_t* pages;
++	uint32		va;
++	uint64		lastRead;	// the last tasks that use it (sequence numbers)
++	uint64		lastWrite;
++};
++
++
++/*!	An open file: its buffer handles, sync objects and contexts. */
++struct mali_file {
++	mutex			lock;
++	mali_buffer**	buffers;	// handle - 1
++	uint32			bufferSlots;
++	uint64*			syncobjs;	// handle - 1: sequence number, 0 = done
++	bool*			syncobjsUsed;
++	uint32			syncobjSlots;
++	uint32			nextContext;
++};
++
++
++/*!	A job for one pipe, queued until the job thread runs it. */
++struct mali_task {
++	mali_task*		next;
++	uint32			pipe;
++	union {
++		mali_gp_frame		gp;
++		mali_m450_pp_frame	pp;
++	} frame;
++	uint32			bufferCount;
++	mali_buffer**	buffers;
++	uint32*			bufferFlags;
++	uint64			sequence;
++};
++
++
++class MesonMali {
++public:
++								MesonMali(device_node* node);
++								~MesonMali();
++
++			status_t			Init(phys_addr_t base,
++									const int32* interrupts);
++			device_node*		Node() const { return fNode; }
++			void				Dump();
++
++			// files and their ioctls (meson_mali_jobs.cpp)
++			status_t			OpenFile(mali_file** _file);
++			void				FreeFile(mali_file* file);
++			status_t			Control(mali_file* file, uint32 op,
++									void* buffer, size_t length);
++
++private:
++			uint32				_Read(uint32 offset) const
++									{ return fRegisters[offset / 4]; }
++			void				_Write(uint32 offset, uint32 value)
++									{ fRegisters[offset / 4] = value; }
++			uint32				_Hhi(uint32 offset) const
++									{ return fHhi[offset / 4]; }
++			void				_SetHhi(uint32 offset, uint32 value)
++									{ fHhi[offset / 4] = value; }
++
++			bool				_Poll(uint32 offset, uint32 mask,
++									uint32 value, bigtime_t timeout,
++									bigtime_t interval = 0) const;
++			void				_SetClock();
++			uint32				_ClockRate() const;
++			status_t			_PowerUp();
++			void				_InitL2(uint32 base, const char* name);
++			void				_FlushL2(uint32 base);
++			status_t			_ResetGp();
++			status_t			_ResetPp(uint32 index);
++			void				_HardResetGp();
++			void				_HardResetPp(uint32 index);
++			status_t			_InitMmu(uint32 base, const char* name);
++			void				_ZapMmu(uint32 base);
++			void				_RecoverMmu(uint32 base);
++			status_t			_AllocatePage(const char* name,
++									dma_buffer& buffer);
++			void				_FreePage(dma_buffer& buffer);
++			void				_InstallInterrupts(const int32* vectors);
++			void				_TestInterrupts();
++
++	static	int32				_Interrupt(void* data);
++			int32				_HandleInterrupt(interrupt_line& line);
++			int32				_GpJobInterrupt();
++			int32				_PpJobInterrupt();
++
++			// buffers and the GPU's address space (meson_mali_jobs.cpp)
++			status_t			_CreateBuffer(size_t size,
++									mali_buffer** _buffer);
++			void				_AcquireBuffer(mali_buffer* buffer);
++			void				_ReleaseBuffer(mali_buffer* buffer);
++			status_t			_AllocateAddress(size_t size,
++									uint32* _address);
++			void				_FreeAddress(uint32 address, size_t size);
++			status_t			_MapPages(mali_buffer* buffer);
++			void				_UnmapPages(mali_buffer* buffer);
++			void				_CleanBuffer(mali_buffer* buffer);
++
++			mali_buffer*		_LookUp(mali_file* file, uint32 handle);
++			status_t			_GetParam(void* buffer);
++			status_t			_GemCreate(mali_file* file, void* buffer);
++			status_t			_GemInfo(mali_file* file, void* buffer);
++			status_t			_GemClose(mali_file* file, void* buffer);
++			status_t			_GemSubmit(mali_file* file, void* buffer);
++			status_t			_GemWait(mali_file* file, void* buffer);
++			status_t			_SyncobjCreate(mali_file* file,
++									void* buffer);
++			status_t			_SyncobjDestroy(mali_file* file,
++									void* buffer);
++			status_t			_SyncobjWait(mali_file* file, void* buffer);
++			status_t			_WaitFor(uint64 sequence, int64 timeoutNs,
++									bool poll);
++
++			// the job thread
++	static	status_t			_JobThread(void* data);
++			void				_RunTask(mali_task* task);
++			bool				_RunGp(mali_task* task);
++			bool				_RunPp(mali_task* task);
++			void				_FreeTask(mali_task* task);
++
++			device_node*		fNode;
++			area_id				fArea;
++			volatile uint32*	fRegisters;
++			area_id				fHhiArea;
++			volatile uint32*	fHhi;
++			phys_addr_t			fBase;
++			dma_buffer			fPageDirectory;
++			dma_buffer			fPageTables[1024];
++			dma_buffer			fDlbuPage;
++			interrupt_line		fLines[kIrqCount];
++			uint32				fGpVersion;
++			uint32				fPpVersion[kPpCount];
++
++			// buffers and addresses: under fLock
++			mutex				fLock;
++			struct address_range {
++				uint32			start;
++				uint32			size;
++			};
++			address_range*		fRanges;		// in use, sorted
++			uint32				fRangeCount;
++			uint32				fRangeSlots;
++
++			// the queue and the sequence numbers: under fQueueLock
++			mutex				fQueueLock;
++			ConditionVariable	fQueueCondition;
++			ConditionVariable	fCompletion;
++			mali_task*			fQueueHead;
++			mali_task*			fQueueTail;
++			uint64				fNextSequence;
++			uint64				fCompleted;
++			thread_id			fJobThread;
++			bool				fQuit;
++
++			// the running job: under fJobLock (also from interrupts)
++			spinlock			fJobLock;
++			sem_id				fJobDone;
++			int32				fRunningPipe;	// -1: none
++			uint32				fJobError;
++			uint32				fPpPending;
++			uint32				fPpDone;
++			uint32				fPpCount;		// of the running job
++			uint32				fJobs;
++			uint32				fFailedJobs;
++};
++
++
++#endif	// MESON_MALI_PRIVATE_H

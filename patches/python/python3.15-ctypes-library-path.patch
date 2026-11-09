@@ -1,0 +1,20 @@
+ctypes.util.find_library() on Haiku: LIBRARY_PATH is not set everywhere
+(not in an ssh session); without it, Haiku's usual library directories.
+
+Copyright 2026, haiku-odroid-c2 port authors. MIT License.
+
+--- a/Lib/ctypes/util.py	2026-11-07 13:09:28.908569421 -0500
++++ b/Lib/ctypes/util.py	2026-11-07 13:09:28.917842601 -0500
+@@ -395,7 +395,11 @@
+         def find_library(name):
+             if name in ('c', 'm'):
+                 return find_library('root')
+-            for directory in os.environ['LIBRARY_PATH'].split(os.pathsep):
++            # LIBRARY_PATH is not set everywhere (in an ssh session, say)
++            libraryPath = os.environ.get('LIBRARY_PATH',
++                '%A/lib:/boot/home/config/non-packaged/lib:/boot/home/config/lib'
++                ':/boot/system/non-packaged/lib:/boot/system/lib')
++            for directory in libraryPath.split(os.pathsep):
+                 if directory.startswith("%A/"):
+                     directory = directory.replace('%A',
+                         os.path.dirname(os.path.abspath(sys.argv[0] or os.getcwd())))

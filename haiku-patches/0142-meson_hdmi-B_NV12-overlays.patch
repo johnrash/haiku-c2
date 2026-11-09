@@ -1,0 +1,256 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 22:35:08 -0400
+Subject: [PATCH 142/342] meson_hdmi: B_NV12 overlays
+
+The video layer (VD1) reads NV12 buffers too: one canvas for each plane
+(the CbCr planes take canvases 0x62 and 0x63), the planes read apart,
+the colour map for Cb first, and the formatter takes a chroma line for
+each other line. The facts are in the port's docs/m26-vd1-nv12-facts.md
+(from Linux's display driver, facts only). On the ODROID-C2, a test
+picture shows the same as with B_YCbCr422.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/drivers/meson_canvas.h        |  4 +-
+ .../graphics/meson_hdmi/meson_hdmi_info.h     |  2 +
+ .../accelerants/meson_hdmi/accelerant.cpp     | 16 +++--
+ .../graphics/meson_hdmi/meson_hdmi.cpp        | 68 +++++++++++++------
+ 4 files changed, 62 insertions(+), 28 deletions(-)
+
+diff --git a/headers/private/drivers/meson_canvas.h b/headers/private/drivers/meson_canvas.h
+index df4586e04e..eaec11baa0 100644
+--- a/headers/private/drivers/meson_canvas.h
++++ b/headers/private/drivers/meson_canvas.h
+@@ -15,8 +15,8 @@
+ 	through three registers in turn, so the drivers that use canvases write
+ 	them through this module, which does it under one lock.
+ 
+-	The indexes in use: 0x4e (the frame buffer, U-Boot's choice) and 0x60,
+-	0x61 (the video layer) by meson_hdmi; 0x80-0xbf by meson_vdec.
++	The indexes in use: 0x4e (the frame buffer, U-Boot's choice) and
++	0x60-0x63 (the video layer) by meson_hdmi; 0x80-0xbf by meson_vdec.
+ */
+ 
+ #define MESON_CANVAS_MODULE_NAME	"generic/meson_canvas/v1"
+diff --git a/headers/private/graphics/meson_hdmi/meson_hdmi_info.h b/headers/private/graphics/meson_hdmi/meson_hdmi_info.h
+index c1d7b4bafb..bcb9dd44c6 100644
+--- a/headers/private/graphics/meson_hdmi/meson_hdmi_info.h
++++ b/headers/private/graphics/meson_hdmi/meson_hdmi_info.h
+@@ -53,7 +53,9 @@ struct meson_hdmi_overlay_buffer {
+ 
+ struct meson_hdmi_overlay_config {
+ 	area_id			buffer;			// -1 hides the overlay
++	uint32			space;			// B_YCbCr422 or B_NV12
+ 	uint32			bytes_per_row;
++		// B_NV12: of both planes; the CbCr plane follows the Y plane
+ 	uint16			width;			// of the buffer, in pixels
+ 	uint16			height;
+ 
+diff --git a/src/add-ons/accelerants/meson_hdmi/accelerant.cpp b/src/add-ons/accelerants/meson_hdmi/accelerant.cpp
+index 096c3988cd..cf5e644768 100644
+--- a/src/add-ons/accelerants/meson_hdmi/accelerant.cpp
++++ b/src/add-ons/accelerants/meson_hdmi/accelerant.cpp
+@@ -9,7 +9,7 @@
+ 	overlay. This side only clones the shared info and the frame buffer and
+ 	passes requests on.
+ 
+-	One overlay channel, for B_YCbCr422 buffers. The driver maps overlay
++	One overlay channel, for B_YCbCr422 and B_NV12 buffers. The driver maps overlay
+ 	buffers into the kernel's address space with user access, so the
+ 	address it returns works in app_server and in the client that draws
+ 	into the overlay bitmap. The video shows where the frame buffer's alpha
+@@ -286,7 +286,7 @@ meson_overlay_count(const display_mode* mode)
+ static const uint32*
+ meson_overlay_supported_spaces(const display_mode* mode)
+ {
+-	static const uint32 kSpaces[] = { B_YCbCr422, 0 };
++	static const uint32 kSpaces[] = { B_YCbCr422, B_NV12, 0 };
+ 	return kSpaces;
+ }
+ 
+@@ -304,7 +304,7 @@ meson_allocate_overlay_buffer(color_space space, uint16 width, uint16 height)
+ {
+ 	// the video layer's formatter and the VPP line buffers take lines of
+ 	// up to 2048 pixels; MediaPlayer uses a normal bitmap for larger ones
+-	if (space != B_YCbCr422 || width == 0 || height == 0
++	if ((space != B_YCbCr422 && space != B_NV12) || width == 0 || height == 0
+ 		|| width > kMaxOverlayWidth || height > kMaxOverlayHeight) {
+ 		return NULL;
+ 	}
+@@ -320,10 +320,15 @@ meson_allocate_overlay_buffer(color_space space, uint16 width, uint16 height)
+ 		return NULL;
+ 
+ 	// the canvas takes rows in units of 8 bytes; 32 keep them in whole
+-	// DDR bursts
+-	uint32 bytesPerRow = ((uint32)((width + 1) & ~1) * 2 + 31) & ~31u;
++	// DDR bursts. NV12: the Y plane, then the CbCr plane with the same rows
++	// (as BBitmap has it)
++	uint32 bytesPerPixel = space == B_NV12 ? 1 : 2;
++	uint32 bytesPerRow
++		= ((uint32)((width + 1) & ~1) * bytesPerPixel + 31) & ~31u;
+ 	meson_hdmi_overlay_buffer request;
+ 	request.size = (size_t)bytesPerRow * height;
++	if (space == B_NV12)
++		request.size += (size_t)bytesPerRow * ((height + 1) / 2);
+ 	if (ioctl(sInfo.device, MESON_HDMI_ALLOCATE_OVERLAY_BUFFER, &request,
+ 			sizeof(request)) != 0) {
+ 		return NULL;
+@@ -435,6 +440,7 @@ meson_configure_overlay(overlay_token token, const overlay_buffer* buffer,
+ 			return B_NOT_SUPPORTED;
+ 		}
+ 		config.buffer = slot->area;
++		config.space = buffer->space;
+ 		config.bytes_per_row = buffer->bytes_per_row;
+ 		config.width = buffer->width;
+ 		config.height = buffer->height;
+diff --git a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+index 91c745a237..18c091ae99 100644
+--- a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
++++ b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+@@ -22,10 +22,10 @@
+ 	settings (~/config/settings/kernel/drivers/meson_hdmi) keeps the device
+ 	unpublished, so app_server stays on the "framebuffer" driver.
+ 
+-	Video overlays use the VD1 video layer: B_YCbCr422 buffers of physically
+-	contiguous memory, scaled by the VPP scaler and shown under OSD1 where
+-	the frame buffer's alpha is 0, which is where app_server draws the
+-	overlay's key colour.
++	Video overlays use the VD1 video layer: B_YCbCr422 or B_NV12 buffers of
++	physically contiguous memory, scaled by the VPP scaler and shown under
++	OSD1 where the frame buffer's alpha is 0, which is where app_server
++	draws the overlay's key colour.
+ 
+ 	HDMI audio (meson_hdmi_audio.cpp) is a multi_audio device the driver
+ 	publishes as well; it shares the HDMI TX ports.
+@@ -175,6 +175,7 @@ enum {
+ 
+ // VD1_IF0_GEN_REG
+ #define VD_ENABLE					(1 << 0)
++#define VD_SEPARATE_PLANES			(1 << 1)	// NV12: Y and CbCr apart
+ #define VD_LITTLE_ENDIAN			(1 << 4)
+ #define VD_CHROMA_REPEAT_LAST_LINE	(1 << 6)
+ #define VD_BYTES_PER_PIXEL(n)		((n) << 14)	// 1: 4:2:2 stored together
+@@ -182,7 +183,10 @@ enum {
+ #define VD_URGENT_LUMA				(1 << 27)
+ #define VD_URGENT_CHROMA			(1 << 28)
+ 
+-// VIU_VD1_FMT_CTRL: the formatter turns 4:2:2 into 4:4:4
++// VD1_IF0_GEN_REG2
++#define VD_COLOR_MAP_NV12			1			// Cb first in the CbCr plane
++
++// VIU_VD1_FMT_CTRL: the formatter turns 4:2:2 or 4:2:0 into 4:4:4
+ #define VD_VERT_FORMAT				(1 << 0)
+ #define VD_VERT_PHASE_STEP(n)		((n) << 1)	// 3.4 fixed point
+ #define VD_VERT_INITIAL_PHASE(n)	((n) << 8)
+@@ -254,8 +258,10 @@ enum {
+ #define CANVAS_SWAP_64				7			// byte order within 64 bits
+ 
+ // canvases for the video layer, used in turn so that a new buffer only
+-// replaces the shown one at the start of a frame
++// replaces the shown one at the start of a frame; NV12's CbCr planes have
++// their own
+ static const uint32 kVideoCanvas[2] = { 0x60, 0x61 };
++static const uint32 kVideoChromaCanvas[2] = { 0x62, 0x63 };
+ static const uint32 kMaxOverlayBuffers = 8;
+ static const uint32 kMaxOverlaySize = 2048;
+ 	// pixels per line and lines: the formatter's and scaler's limits
+@@ -1867,11 +1873,15 @@ MesonHdmi::ConfigureOverlay(const meson_hdmi_overlay_config& config)
+ 			break;
+ 		}
+ 	}
+-	if (info == NULL || config.width < 2 || config.height < 1
++	bool nv12 = config.space == B_NV12;
++	if (info == NULL || (config.space != B_YCbCr422 && !nv12)
++		|| config.width < 2 || config.height < 1
+ 		|| config.width > kMaxOverlaySize || config.height > kMaxOverlaySize
+-		|| config.bytes_per_row < (uint32)config.width * 2
++		|| config.bytes_per_row < (uint32)config.width * (nv12 ? 1 : 2)
+ 		|| config.bytes_per_row % 8 != 0
+-		|| (size_t)config.bytes_per_row * config.height > info->size
++		|| (size_t)config.bytes_per_row
++			* (config.height + (nv12 ? (config.height + 1) / 2 : 0))
++			> info->size
+ 		|| config.source_width == 0 || config.source_height == 0
+ 		|| config.source_left + config.source_width > config.width
+ 		|| config.source_top + config.source_height > config.height
+@@ -1947,9 +1957,10 @@ MesonHdmi::_WaitForVerticalBlank()
+ 
+ 
+ /*!	Programs the video layer (VD1) for fOverlay: the read interface takes
+-	the visible part of the buffer through a canvas, the formatter expands
+-	4:2:2 to 4:4:4, the VPP scaler scales it to the visible part of the
+-	window, and the postblender puts it under OSD1.
++	the visible part of the buffer through a canvas (NV12: one for each
++	plane), the formatter expands 4:2:2 or 4:2:0 to 4:4:4, the VPP scaler
++	scales it to the visible part of the window, and the postblender puts it
++	under OSD1. The NV12 facts are in docs/m26-vd1-nv12-facts.md.
+ 
+ 	The video shows where OSD1's alpha is 0. Normally OSD1 replaces every
+ 	pixel's alpha with 0xff; while the video layer is on, the frame buffer's
+@@ -1977,7 +1988,10 @@ MesonHdmi::_ApplyOverlay()
+ 		return;
+ 	}
+ 
+-	// the buffer part it shows; a 4:2:2 pair cannot be split
++	// the buffer part it shows; a chroma sample's pair of pixels cannot be
++	// split
++	bool nv12 = config.space == B_NV12;
++	uint32 rowPixels = nv12 ? config.bytes_per_row : config.bytes_per_row / 2;
+ 	uint32 hStart = config.source_left + (uint64)(left - config.left)
+ 		* config.source_width / config.window_width;
+ 	uint32 hEnd = config.source_left + ((uint64)(right + 1 - config.left)
+@@ -1989,7 +2003,7 @@ MesonHdmi::_ApplyOverlay()
+ 		* config.source_height + config.window_height - 1)
+ 		/ config.window_height - 1;
+ 	hStart &= ~1u;
+-	hEnd = min_c(hEnd | 1, config.bytes_per_row / 2 - 1);
++	hEnd = min_c(hEnd | 1, rowPixels - 1);
+ 	vEnd = min_c(vEnd, (uint32)config.height - 1);
+ 
+ 	uint32 inWidth = hEnd - hStart + 1;
+@@ -2003,16 +2017,27 @@ MesonHdmi::_ApplyOverlay()
+ 	uint32 canvas = kVideoCanvas[fOverlayCanvas];
+ 	_WriteCanvas(canvas, fOverlayPhysical, config.bytes_per_row,
+ 		config.height, fOverlayEndian);
++	uint32 chromaCanvas = canvas;
++	if (nv12) {
++		// the CbCr plane: half the lines, after the Y plane
++		chromaCanvas = kVideoChromaCanvas[fOverlayCanvas];
++		_WriteCanvas(chromaCanvas,
++			fOverlayPhysical + (phys_addr_t)config.bytes_per_row
++				* config.height,
++			config.bytes_per_row, (config.height + 1) / 2, fOverlayEndian);
++	}
+ 
+ 	_SetVpu(VD1_IF0_GEN_REG, VD_URGENT_CHROMA | VD_URGENT_LUMA
+-		| VD_HOLD_LINES(9) | VD_CHROMA_REPEAT_LAST_LINE | VD_BYTES_PER_PIXEL(1)
+-		| VD_ENABLE);
+-	_SetVpu(VD1_IF0_GEN_REG2, 0);
++		| VD_HOLD_LINES(9) | VD_CHROMA_REPEAT_LAST_LINE
++		| (nv12 ? VD_SEPARATE_PLANES : VD_BYTES_PER_PIXEL(1)) | VD_ENABLE);
++	_SetVpu(VD1_IF0_GEN_REG2, nv12 ? VD_COLOR_MAP_NV12 : 0);
++	// a chroma line for each line (4:2:2) or each other line (4:2:0); the
++	// step is 3.4 fixed point
+ 	_SetVpu(VIU_VD1_FMT_CTRL, VD_HORZ_Y_C_RATIO(1) | VD_HORZ_FORMAT
+ 		| VD_VERT_REPEAT_LINE0 | VD_VERT_INITIAL_PHASE(12)
+-		| VD_VERT_PHASE_STEP(16) | VD_VERT_FORMAT);
++		| VD_VERT_PHASE_STEP(nv12 ? 8 : 16) | VD_VERT_FORMAT);
+ 	_SetVpu(VIU_VD1_FMT_W, (inWidth << 16) | (hEnd / 2 - hStart / 2 + 1));
+-	uint32 canvases = canvas | (canvas << 8) | (canvas << 16);
++	uint32 canvases = canvas | (chromaCanvas << 8) | (chromaCanvas << 16);
+ 	_SetVpu(VD1_IF0_CANVAS0, canvases);
+ 	_SetVpu(VD1_IF0_CANVAS1, canvases);
+ 	uint32 lumaX = hStart | (hEnd << 16);
+@@ -2107,8 +2132,9 @@ MesonHdmi::DumpOverlay()
+ {
+ 	const meson_hdmi_overlay_config& config = fOverlay;
+ 	kprintf("meson_hdmi overlay: buffer %" B_PRId32 " (%#" B_PRIxPHYSADDR
+-		"), canvas %#" B_PRIx32 ", endian %" B_PRIu32 "\n", config.buffer,
+-		fOverlayPhysical, kVideoCanvas[fOverlayCanvas], fOverlayEndian);
++		"), %s, canvas %#" B_PRIx32 ", endian %" B_PRIu32 "\n", config.buffer,
++		fOverlayPhysical, config.space == B_NV12 ? "NV12" : "YCbCr422",
++		kVideoCanvas[fOverlayCanvas], fOverlayEndian);
+ 	kprintf("  %ux%u, %" B_PRIu32 " bytes per row; source %u,%u %ux%u; "
+ 		"window %" B_PRId32 ",%" B_PRId32 " %" B_PRIu32 "x%" B_PRIu32 "\n",
+ 		config.width, config.height, config.bytes_per_row, config.source_left,

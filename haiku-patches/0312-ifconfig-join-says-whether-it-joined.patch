@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 5 Nov 2026 21:21:00 -0500
+Subject: [PATCH 312/342] ifconfig: join says whether it joined
+
+"ifconfig <device> join <network>" printed nothing and returned 0 once the
+net_server had passed the request on to the wpa_supplicant, so a join that never
+happened looked like one that did. It now waits, up to 30 seconds, for the
+device to be on that access point (or that network), and says what it's on
+otherwise.
+
+Joined by an access point's address, the net_server takes the network's name
+and settings from the scan results, and those go stale while the device stays
+connected: after a while the request went out with no name, and nothing
+happened. ifconfig scans first now when the access point isn't in them, for up
+to 10 seconds (Scan() waiting for the end has no time limit, and connected, the
+end didn't come), and says so if it isn't in range.
+
+On the board with the RTL8812BU: an address that isn't there fails after 10 s
+with the link left alone; between the repeater and the router both ways, 0
+after 6 s each.
+
+Found by a review of +319 (odroid-c2-plus319-open-issues-report.pdf).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/bin/network/ifconfig/ifconfig.cpp | 70 ++++++++++++++++++++++++++-
+ 1 file changed, 68 insertions(+), 2 deletions(-)
+
+diff --git a/src/bin/network/ifconfig/ifconfig.cpp b/src/bin/network/ifconfig/ifconfig.cpp
+index 66e34ce48c..a06566594e 100644
+--- a/src/bin/network/ifconfig/ifconfig.cpp
++++ b/src/bin/network/ifconfig/ifconfig.cpp
+@@ -276,6 +276,36 @@ show_wireless_network(const wireless_network& network, bool verbose)
+ }
+ 
+ 
++static const int kJoinTimeout = 30;	// seconds
++static const int kScanTimeout = 10;	// seconds
++
++
++/*!	Waits for \a device to be on the access point at \a address, or with no
++	address, on any of the network called \a name. \a current gets the access
++	point it's on in the end.
++*/
++static bool
++wait_for_join(BNetworkDevice& device, const BNetworkAddress* address,
++	const char* name, BNetworkAddress& current)
++{
++	bigtime_t end = system_time() + kJoinTimeout * 1000000LL;
++	while (system_time() < end) {
++		uint32 cookie = 0;
++		wireless_network network;
++		if (device.HasLink()
++			&& device.GetNextAssociatedNetwork(cookie, network) == B_OK) {
++			current = network.address;
++			if (address != NULL ? network.address == *address
++					: strncmp(network.name, name, sizeof(network.name)) == 0) {
++				return true;
++			}
++		}
++		snooze(250000);
++	}
++	return false;
++}
++
++
+ bool
+ configure_wireless(const char* name, char* const* args, int32 argCount)
+ {
+@@ -395,16 +425,52 @@ configure_wireless(const char* name, char* const* args, int32 argCount)
+ 				password = args[1];
+ 
+ 			BNetworkAddress link;
++			bool byAddress = link.SetTo(AF_LINK, args[0]) == B_OK;
+ 			status_t status;
+-			if (link.SetTo(AF_LINK, args[0]) == B_OK)
++			if (byAddress) {
++				// The net_server finds the network's name and settings for an
++				// access point in the scan results, which go stale while the
++				// device stays connected: scan again if it isn't there.
++				wireless_network network;
++				if (device.GetNetwork(link, network) != B_OK) {
++					// Scan() waiting for the scan to end has no time limit,
++					// and connected, that end may not come: look for the
++					// access point in the results for a while instead.
++					device.Scan(false, false);
++					bigtime_t end = system_time() + kScanTimeout * 1000000LL;
++					while (device.GetNetwork(link, network) != B_OK) {
++						if (system_time() >= end) {
++							fprintf(stderr, "%s: No access point %s in range\n",
++								kProgramName, args[0]);
++							exit(1);
++						}
++						snooze(250000);
++					}
++				}
+ 				status = device.JoinNetwork(link, password);
+-			else
++			} else
+ 				status = device.JoinNetwork(args[0], password);
+ 			if (status != B_OK) {
+ 				fprintf(stderr, "%s: Joining network failed: %s\n",
+ 					kProgramName, strerror(status));
+ 				exit(1);
+ 			}
++
++			// That was the net_server handing the request on: the outcome is
++			// the device being on that network.
++			BNetworkAddress current;
++			if (!wait_for_join(device, byAddress ? &link : NULL, args[0],
++					current)) {
++				if (current.IsEmpty()) {
++					fprintf(stderr, "%s: Not on %s after %d seconds\n",
++						kProgramName, args[0], kJoinTimeout);
++				} else {
++					fprintf(stderr, "%s: Not on %s after %d seconds, on %s\n",
++						kProgramName, args[0], kJoinTimeout,
++						current.ToString().String());
++				}
++				exit(1);
++			}
+ 			break;
+ 		}
+ 

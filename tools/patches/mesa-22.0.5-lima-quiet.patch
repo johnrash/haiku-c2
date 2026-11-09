@@ -1,0 +1,28 @@
+--- a/src/gallium/drivers/lima/lima_draw.c	2026-10-31 22:56:39.288535033 -0400
++++ b/src/gallium/drivers/lima/lima_draw.c	2026-10-31 22:56:39.304697550 -0400
+@@ -50,6 +50,11 @@
+ 
+ #include <drm-uapi/lima_drm.h>
+ 
++#if defined(__HAIKU__) && !defined(DEBUG)
++/* Haiku's own debug_printf() writes to the kernel log and the serial port */
++#define debug_printf(...) do { } while (0)
++#endif
++
+ static void
+ lima_clip_scissor_to_viewport(struct lima_context *ctx)
+ {
+--- a/src/gallium/drivers/lima/lima_resource.c	2026-10-31 22:56:39.279109606 -0400
++++ b/src/gallium/drivers/lima/lima_resource.c	2026-10-31 22:56:39.304547636 -0400
+@@ -49,6 +49,11 @@
+ #include "pan_minmax_cache.h"
+ #include "pan_tiling.h"
+ 
++#if defined(__HAIKU__) && !defined(DEBUG)
++/* Haiku's own debug_printf() writes to the kernel log and the serial port */
++#define debug_printf(...) do { } while (0)
++#endif
++
+ static struct pipe_resource *
+ lima_resource_create_scanout(struct pipe_screen *pscreen,
+                              const struct pipe_resource *templat,

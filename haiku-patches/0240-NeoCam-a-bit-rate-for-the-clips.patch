@@ -1,0 +1,224 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 18:38:35 -0500
+Subject: [PATCH 240/342] NeoCam: a bit rate for the clips
+
+"Clip bit rate" in the Capture tab: Auto (the encoder's constant
+quality, as before) or 1, 2, 4, 8 or 16 Mbit/s, which VideoRecorder asks
+the video encoder for (encode_parameters' avg_field_size).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apps/codycam/VideoRecorder.cpp   | 12 ++++++++-
+ src/apps/codycam/VideoRecorder.h     |  3 ++-
+ src/apps/neocam/CameraConsumer.cpp   |  4 +--
+ src/apps/neocam/CameraConsumer.h     |  3 ++-
+ src/apps/neocam/CameraController.cpp |  3 ++-
+ src/apps/neocam/CameraController.h   |  3 ++-
+ src/apps/neocam/MainWindow.cpp       | 37 +++++++++++++++++++++++++---
+ src/apps/neocam/MainWindow.h         |  1 +
+ 8 files changed, 56 insertions(+), 10 deletions(-)
+
+diff --git a/src/apps/codycam/VideoRecorder.cpp b/src/apps/codycam/VideoRecorder.cpp
+index 75da0d42a3..d2fc5480a9 100644
+--- a/src/apps/codycam/VideoRecorder.cpp
++++ b/src/apps/codycam/VideoRecorder.cpp
+@@ -69,7 +69,8 @@ VideoRecorder::~VideoRecorder()
+ 
+ status_t
+ VideoRecorder::Start(const char* path, uint32 width, uint32 height,
+-	uint32 bytesPerRow, float frameRate, const media_multi_audio_format* audio)
++	uint32 bytesPerRow, float frameRate, const media_multi_audio_format* audio,
++	int32 bitRate)
+ {
+ 	if (fFile != NULL)
+ 		return EALREADY;
+@@ -138,6 +139,15 @@ VideoRecorder::Start(const char* path, uint32 width, uint32 height,
+ 		}
+ 		if (status == B_OK) {
+ 			fCodecName = codec.short_name;
++			if (bitRate > 0) {
++				// as bytes a picture
++				encode_parameters parameters;
++				memset(&parameters, 0, sizeof(parameters));
++				fTrack->GetEncodeParameters(&parameters);
++				parameters.avg_field_size
++					= (int32)(bitRate / 8 / frameRate);
++				fTrack->SetEncodeParameters(&parameters);
++			}
+ 			break;
+ 		}
+ 		delete fFile;
+diff --git a/src/apps/codycam/VideoRecorder.h b/src/apps/codycam/VideoRecorder.h
+index 511b24347e..3469d5ed10 100644
+--- a/src/apps/codycam/VideoRecorder.h
++++ b/src/apps/codycam/VideoRecorder.h
+@@ -37,7 +37,8 @@ public:
+ 									uint32 height, uint32 bytesPerRow,
+ 									float frameRate,
+ 									const media_multi_audio_format* audio
+-										= NULL);
++										= NULL,
++									int32 bitRate = 0);
+ 			void				AddFrame(const void* bits, bigtime_t when);
+ 			void				AddAudio(const void* data, size_t size);
+ 									// in the format Start() was given;
+diff --git a/src/apps/neocam/CameraConsumer.cpp b/src/apps/neocam/CameraConsumer.cpp
+index 40145f49be..01faf81061 100644
+--- a/src/apps/neocam/CameraConsumer.cpp
++++ b/src/apps/neocam/CameraConsumer.cpp
+@@ -85,7 +85,7 @@ CameraConsumer::TakeStill(const char* trigger)
+ 
+ status_t
+ CameraConsumer::StartRecording(const char* path, float frameRate,
+-	const media_multi_audio_format* audio)
++	const media_multi_audio_format* audio, int32 bitRate)
+ {
+ 	BAutolock _(fLock);
+ 	if (fRecorder != NULL)
+@@ -95,7 +95,7 @@ CameraConsumer::StartRecording(const char* path, float frameRate,
+ 
+ 	VideoRecorder* recorder = new VideoRecorder();
+ 	status_t status = recorder->Start(path, Width(), Height(),
+-		fBitmaps[0]->BytesPerRow(), frameRate, audio);
++		fBitmaps[0]->BytesPerRow(), frameRate, audio, bitRate);
+ 	if (status != B_OK) {
+ 		delete recorder;
+ 		return status;
+diff --git a/src/apps/neocam/CameraConsumer.h b/src/apps/neocam/CameraConsumer.h
+index ff55b0f8cb..6df6e781c0 100644
+--- a/src/apps/neocam/CameraConsumer.h
++++ b/src/apps/neocam/CameraConsumer.h
+@@ -38,7 +38,8 @@ public:
+ 			status_t			StartRecording(const char* path,
+ 									float frameRate,
+ 									const media_multi_audio_format* audio
+-										= NULL);
++										= NULL,
++									int32 bitRate = 0);
+ 			void				AddAudio(const void* data, size_t size);
+ 									// from the sound's thread
+ 			VideoRecorder*		DetachRecorder();
+diff --git a/src/apps/neocam/CameraController.cpp b/src/apps/neocam/CameraController.cpp
+index bf29383aca..19f4fd6f93 100644
+--- a/src/apps/neocam/CameraController.cpp
++++ b/src/apps/neocam/CameraController.cpp
+@@ -123,7 +123,8 @@ CameraController::MessageReceived(BMessage* message)
+ 				}
+ 				status = fConsumer->StartRecording(
+ 					message->GetString("path", ""),
+-					message->GetFloat("fps", 30), sound ? &audioFormat : NULL);
++					message->GetFloat("fps", 30), sound ? &audioFormat : NULL,
++					message->GetInt32("bit rate", 0));
+ 				if (status == B_OK) {
+ 					fClipTrigger = trigger;
+ 					if (sound)
+diff --git a/src/apps/neocam/CameraController.h b/src/apps/neocam/CameraController.h
+index 0ebe621b05..bef3b9ed9b 100644
+--- a/src/apps/neocam/CameraController.h
++++ b/src/apps/neocam/CameraController.h
+@@ -37,7 +37,8 @@ public:
+ 										// "quiet" (the sender waits)
+ 		kMsgGetWeb			= 'gweb',	// the window gets kMsgCameraWeb
+ 		kMsgTakeStill		= 'ctst',	// "trigger"
+-		kMsgStartRecording	= 'cstr',	// "path", "fps", "trigger", "sound";
++		kMsgStartRecording	= 'cstr',	// "path", "fps", "trigger", "sound",
++										// "bit rate";
+ 										// the window hears how it went
+ 		kMsgStopRecording	= 'cstp',	// the clip goes to the capture
+ 										// manager
+diff --git a/src/apps/neocam/MainWindow.cpp b/src/apps/neocam/MainWindow.cpp
+index 320a40e918..4753900f21 100644
+--- a/src/apps/neocam/MainWindow.cpp
++++ b/src/apps/neocam/MainWindow.cpp
+@@ -58,6 +58,8 @@ static const bigtime_t kPulseInterval = 250000;
+ // second (MPEG-4 on four Cortex-A53 cores: 1920x1080 at 15 frames a second)
+ static const float kEncodePixelsPerSecond = 32e6f;
+ static const float kClipRates[] = { 30, 25, 20, 15, 10, 5, 2, 1 };
++// Mbit/s; "Auto" is the encoder's own quality, whatever the size
++static const int32 kClipBitRates[] = { 1, 2, 4, 8, 16 };
+ 
+ 
+ enum {
+@@ -585,6 +587,23 @@ MainWindow::_CaptureTab()
+ 	BMenuField* rateField = new BMenuField("rate",
+ 		B_TRANSLATE("Clip frame rate:"), fClipRateMenu);
+ 
++	fClipBitRateMenu = new BPopUpMenu(B_TRANSLATE("Auto"));
++	BMessage* bitRate = new BMessage(kMsgSettingChanged);
++	bitRate->AddInt32("bit rate", 0);
++	fClipBitRateMenu->AddItem(new BMenuItem(
++		B_TRANSLATE("Auto (constant quality)"), bitRate));
++	for (size_t i = 0; i < B_COUNT_OF(kClipBitRates); i++) {
++		BString label;
++		label.SetToFormat(B_TRANSLATE("%" B_PRId32 " Mbit/s"),
++			kClipBitRates[i]);
++		bitRate = new BMessage(kMsgSettingChanged);
++		bitRate->AddInt32("bit rate", kClipBitRates[i] * 1000000);
++		fClipBitRateMenu->AddItem(new BMenuItem(label, bitRate));
++	}
++	fClipBitRateMenu->ItemAt(0)->SetMarked(true);
++	BMenuField* bitRateField = new BMenuField("bit rate",
++		B_TRANSLATE("Clip bit rate:"), fClipBitRateMenu);
++
+ 	fSoundBox = new BCheckBox("sound",
+ 		B_TRANSLATE("Record sound (from the audio input)"),
+ 		new BMessage(kMsgSettingChanged));
+@@ -605,9 +624,10 @@ MainWindow::_CaptureTab()
+ 			.AddGlue()
+ 		.End()
+ 		.AddMenuField(rateField, 0, 2)
+-		.Add(fSoundBox, 1, 3)
+-		.Add(codec, 1, 4)
+-		.AddGlue(0, 5, 2);
++		.AddMenuField(bitRateField, 0, 3)
++		.Add(fSoundBox, 1, 4)
++		.Add(codec, 1, 5)
++		.AddGlue(0, 6, 2);
+ 	return view;
+ }
+ 
+@@ -820,6 +840,11 @@ MainWindow::_ApplySettings(const BMessage& settings)
+ 		if (item->Message()->GetFloat("fps", -1) == rate)
+ 			item->SetMarked(true);
+ 	}
++	int32 bitRate = settings.GetInt32("clip bit rate", 0);
++	for (int32 i = 0; BMenuItem* item = fClipBitRateMenu->ItemAt(i); i++) {
++		if (item->Message()->GetInt32("bit rate", -1) == bitRate)
++			item->SetMarked(true);
++	}
+ 
+ 	fScheduleBox->SetValue(settings.GetBool("schedule", false));
+ 	fScheduleEvery->SetValue(settings.GetInt32("schedule every", 5));
+@@ -868,6 +893,9 @@ MainWindow::GetSettings(BMessage& settings)
+ 	item = fClipRateMenu->FindMarked();
+ 	settings.AddFloat("clip fps",
+ 		item != NULL ? item->Message()->GetFloat("fps", 0) : 0);
++	item = fClipBitRateMenu->FindMarked();
++	settings.AddInt32("clip bit rate",
++		item != NULL ? item->Message()->GetInt32("bit rate", 0) : 0);
+ 
+ 	settings.AddBool("schedule", fScheduleBox->Value() == B_CONTROL_ON);
+ 	settings.AddInt32("schedule every", fScheduleEvery->Value());
+@@ -963,6 +991,9 @@ MainWindow::_StartClip(const char* trigger)
+ 	BMessage start(CameraController::kMsgStartRecording);
+ 	start.AddString("path", path);
+ 	start.AddFloat("fps", _ClipFrameRate());
++	BMenuItem* bitRateItem = fClipBitRateMenu->FindMarked();
++	start.AddInt32("bit rate", bitRateItem != NULL
++		? bitRateItem->Message()->GetInt32("bit rate", 0) : 0);
+ 	start.AddString("trigger", trigger);
+ 	start.AddBool("sound", fSoundBox->Value() == B_CONTROL_ON);
+ 	BMessenger(fController).SendMessage(&start);
+diff --git a/src/apps/neocam/MainWindow.h b/src/apps/neocam/MainWindow.h
+index 588cbfe178..dec7cc991e 100644
+--- a/src/apps/neocam/MainWindow.h
++++ b/src/apps/neocam/MainWindow.h
+@@ -82,6 +82,7 @@ private:
+ 			BPopUpMenu*			fStillFormatMenu;
+ 			BSpinner*			fClipLength;
+ 			BPopUpMenu*			fClipRateMenu;
++			BPopUpMenu*			fClipBitRateMenu;
+ 			BCheckBox*			fSoundBox;
+ 
+ 			BCheckBox*			fScheduleBox;

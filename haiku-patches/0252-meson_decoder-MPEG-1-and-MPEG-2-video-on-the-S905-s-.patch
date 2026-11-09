@@ -1,0 +1,452 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Mon, 2 Nov 2026 01:26:26 -0500
+Subject: [PATCH 252/342] meson_decoder: MPEG-1 and MPEG-2 video on the S905's
+ decoder
+
+The plugin takes what FFmpeg's reader calls MPEG-1 or MPEG-2 video too,
+4:2:0 up to 1920x1088, with linux-firmware's gxl_mpeg12.bin (in
+meson_vdec_firmware). The sequence header comes from the container's
+codec data (Matroska, MP4), or for MPEG program and transport streams,
+which have none, from the stream: the first one is kept and goes before
+every session's stream, after a seek too. 4:2:2 and larger pictures go
+to FFmpeg. Interlaced pictures come back as woven frames, as FFmpeg's.
+
+After the last chunk the plugin waits 100 ms for the firmware to finish
+before asking for the end of the stream (MPEG-1/2's end code goes in
+once the firmware is idle; meanwhile frames must be taken).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../media/plugins/meson_decoder/Jamfile       |   1 +
+ .../meson_decoder/MesonVdecDecoder.cpp        | 130 ++++++++++++++++--
+ .../plugins/meson_decoder/MesonVdecDecoder.h  |   4 +
+ .../plugins/meson_decoder/MesonVdecPlugin.cpp |   5 +-
+ .../media/plugins/meson_decoder/Mpeg12.cpp    |  89 ++++++++++++
+ .../media/plugins/meson_decoder/Mpeg12.h      |  41 ++++++
+ 6 files changed, 256 insertions(+), 14 deletions(-)
+ create mode 100644 src/add-ons/media/plugins/meson_decoder/Mpeg12.cpp
+ create mode 100644 src/add-ons/media/plugins/meson_decoder/Mpeg12.h
+
+diff --git a/src/add-ons/media/plugins/meson_decoder/Jamfile b/src/add-ons/media/plugins/meson_decoder/Jamfile
+index dc1f7f35ce..ae0328e115 100644
+--- a/src/add-ons/media/plugins/meson_decoder/Jamfile
++++ b/src/add-ons/media/plugins/meson_decoder/Jamfile
+@@ -6,6 +6,7 @@ local sources =
+ 	H264.cpp
+ 	H265.cpp
+ 	MesonVdecDecoder.cpp
++	Mpeg12.cpp
+ 	MesonVdecPlugin.cpp
+ 	nv12_neon.c
+ 	;
+diff --git a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
+index 5e81ca331a..a8de22c07b 100644
+--- a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
++++ b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
+@@ -2,10 +2,11 @@
+  * Copyright 2026, haiku-odroid-c2 port authors.
+  * Distributed under the terms of the MIT License.
+  *
+- * Decodes H.264 and HEVC with the S905's video decoder, through the
+- * meson_vdec driver (headers/private/drivers/meson_vdec.h): the chunks go
+- * to the driver as an Annex B stream, the decoded NV12 frames (8 bits, also
+- * for 10-bit HEVC) come back in display order and are written to the
++ * Decodes H.264, HEVC and MPEG-1/2 video with the S905's video decoder,
++ * through the meson_vdec driver (headers/private/drivers/meson_vdec.h): the
++ * chunks go to the driver as an Annex B stream (MPEG-1/2: as they are, with
++ * their start codes), the decoded NV12 frames (8 bits, also for 10-bit HEVC)
++ * come back in display order and are written to the
+  * caller's buffer as B_NV12 (a copy, for the video overlay), B_YCbCr422 (for
+  * an overlay without NV12) or B_RGB32. A reader that shows the buffer only
+  * through meson_hdmi's video overlay may ask for a reference to the frame
+@@ -16,6 +17,8 @@
+  * firmware is missing or the stream is one the hardware can't decode (more
+  * than 1920x1088 or 1088x1920, not 4:2:0; H.264: 10 bits, fields; HEVC:
+  * more than 10 bits): the Media Kit then takes the next decoder (FFmpeg's).
++ * MPEG-2's interlaced pictures come back as frames, both fields woven, as
++ * FFmpeg's decoder gives them.
+  * MESON_DECODER_DISABLE in the environment makes it fail always (to compare
+  * with FFmpeg); MESON_DECODER_NO_REFERENCES makes it copy every frame;
+  * MESON_DECODER_TRACE logs what it is asked to stderr.
+@@ -42,6 +45,7 @@ extern "C" {
+ #include "libswscale/swscale.h"
+ }
+ 
++#include "Mpeg12.h"
+ #include "nv12_neon.h"
+ 
+ 
+@@ -55,10 +59,15 @@ static bool sNoReferences = getenv("MESON_DECODER_NO_REFERENCES") != NULL;
+ 
+ static const char* kH264FirmwarePath = "firmware/meson/vdec/gxbb_h264.bin";
+ static const char* kHevcFirmwarePath = "firmware/meson/vdec/gxl_hevc.bin";
++static const char* kMpeg12FirmwarePath = "firmware/meson/vdec/gxl_mpeg12.bin";
+ 	// in the system data directory
+ static const uint32 kMaxInFlight = 24;
+ 	// chunks written ahead of the frames taken
+ static const bigtime_t kFrameTimeout = 1000000;
++static const bigtime_t kMpeg12QuietTimeout = 100000;
++	// MPEG-1/2, after the last chunk: no frame for that long, and the
++	// firmware has decoded what it could (the driver sends the end code
++	// only then, or waits for it)
+ static const bigtime_t kBusyWait = 1000000;
+ 	// how long Setup() waits for the decoder when another one has it
+ 
+@@ -79,6 +88,7 @@ MesonVdecDecoder::MesonVdecDecoder()
+ 	:
+ 	fDevice(-1),
+ 	fCodec(MESON_VDEC_H264),
++	fCodecId(AV_CODEC_ID_H264),
+ 	fFirmware(NULL),
+ 	fFirmwareSize(0),
+ 	fHeaders(NULL),
+@@ -131,12 +141,18 @@ MesonVdecDecoder::~MesonVdecDecoder()
+ void
+ MesonVdecDecoder::GetCodecInfo(media_codec_info* info)
+ {
+-	bool hevc = fCodec == MESON_VDEC_HEVC;
++	const char* name = "H.264 (Amlogic S905 video decoder)";
++	if (fCodec == MESON_VDEC_HEVC)
++		name = "HEVC (Amlogic S905 video decoder)";
++	else if (fCodec == MESON_VDEC_MPEG12) {
++		name = fCodecId == AV_CODEC_ID_MPEG1VIDEO
++			? "MPEG-1 video (Amlogic S905 video decoder)"
++			: "MPEG-2 video (Amlogic S905 video decoder)";
++	}
+ 	strlcpy(info->short_name, "meson_vdec", sizeof(info->short_name));
+-	strlcpy(info->pretty_name, hevc ? "HEVC (Amlogic S905 video decoder)"
+-		: "H.264 (Amlogic S905 video decoder)", sizeof(info->pretty_name));
++	strlcpy(info->pretty_name, name, sizeof(info->pretty_name));
+ 	info->id = 0;
+-	info->sub_id = hevc ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264;
++	info->sub_id = fCodecId;
+ }
+ 
+ 
+@@ -156,14 +172,28 @@ MesonVdecDecoder::Setup(media_format* ioEncodedFormat, const void* infoBuffer,
+ 			&description) != B_OK
+ 		|| description.u.misc.file_format != 'ffmp'
+ 		|| (description.u.misc.codec != AV_CODEC_ID_H264
+-			&& description.u.misc.codec != AV_CODEC_ID_HEVC)) {
++			&& description.u.misc.codec != AV_CODEC_ID_HEVC
++			&& description.u.misc.codec != AV_CODEC_ID_MPEG2VIDEO
++			&& description.u.misc.codec != AV_CODEC_ID_MPEG1VIDEO)) {
+ 		return B_MEDIA_BAD_FORMAT;
+ 	}
+-	bool hevc = description.u.misc.codec == AV_CODEC_ID_HEVC;
++	fCodecId = description.u.misc.codec;
++	bool hevc = fCodecId == AV_CODEC_ID_HEVC;
+ 	fCodec = hevc ? MESON_VDEC_HEVC : MESON_VDEC_H264;
++	if (fCodecId == AV_CODEC_ID_MPEG2VIDEO
++		|| fCodecId == AV_CODEC_ID_MPEG1VIDEO) {
++		fCodec = MESON_VDEC_MPEG12;
++	}
+ 	fInputFormat = *ioEncodedFormat;
+ 	fFieldRate = ioEncodedFormat->u.encoded_video.output.field_rate;
+ 
++	if (fCodec == MESON_VDEC_MPEG12) {
++		status_t status = _SetupMpeg12((const uint8*)infoBuffer, infoSize);
++		if (status != B_OK)
++			return status;
++		return _OpenDevice();
++	}
++
+ 	// the parameter sets: an avcC or hvcC record (MP4, Matroska) or Annex B
+ 	// (the stream itself has them then too)
+ 	const uint8* info = (const uint8*)infoBuffer;
+@@ -238,6 +268,59 @@ MesonVdecDecoder::Setup(media_format* ioEncodedFormat, const void* infoBuffer,
+ 		fHeight = sequence.height;
+ 	}
+ 
++	return _OpenDevice();
++}
++
++
++/*!	MPEG-1/2: the sequence header (with MPEG-2's extension) from the
++	container's codec data; a stream without (MPEG program and transport
++	streams) has it in its chunks, and the format's size has to do.
++*/
++status_t
++MesonVdecDecoder::_SetupMpeg12(const uint8* info, size_t infoSize)
++{
++	free(fHeaders);
++	fHeaders = (uint8*)malloc(infoSize > 0 ? infoSize : 1);
++	if (fHeaders == NULL)
++		return B_NO_MEMORY;
++	memcpy(fHeaders, info, infoSize);
++	fHeadersSize = infoSize;
++	fLengthSize = 0;
++
++	mpeg12_sequence sequence;
++	if (infoSize > 0 && mpeg12_parse_sequence(info, infoSize, sequence)) {
++		TRACE("MPEG-%d %" B_PRIu32 "x%" B_PRIu32 ", chroma %" B_PRIu32 ", %s"
++			"\n", sequence.mpeg2 ? 2 : 1, sequence.width, sequence.height,
++			sequence.chroma_format,
++			sequence.progressive ? "progressive" : "interlaced");
++		if (sequence.chroma_format != 1) {
++			TRACE("not for the hardware: not 4:2:0\n");
++			return B_MEDIA_BAD_FORMAT;
++		}
++		fWidth = sequence.width;
++		fHeight = sequence.height;
++	} else {
++		const media_raw_video_format& output
++			= fInputFormat.u.encoded_video.output;
++		fWidth = output.display.line_width;
++		fHeight = output.display.line_count;
++		TRACE("MPEG-1/2 %" B_PRIu32 "x%" B_PRIu32 " (no sequence header "
++			"before the stream)\n", fWidth, fHeight);
++	}
++	if (fWidth == 0 || fHeight == 0
++		|| !picture_fits((fWidth + 15) & ~15u, (fHeight + 15) & ~15u)) {
++		TRACE("not for the hardware: %" B_PRIu32 "x%" B_PRIu32 "\n", fWidth,
++			fHeight);
++		return B_MEDIA_BAD_FORMAT;
++	}
++	return B_OK;
++}
++
++
++/*!	The firmware, and the decoder if no one else has it. */
++status_t
++MesonVdecDecoder::_OpenDevice()
++{
+ 	status_t status = _LoadFirmware();
+ 	if (status != B_OK)
+ 		return status;
+@@ -269,8 +352,12 @@ MesonVdecDecoder::_LoadFirmware()
+ 		return B_ENTRY_NOT_FOUND;
+ 	}
+ 	strlcat(path, "/", sizeof(path));
+-	strlcat(path, fCodec == MESON_VDEC_HEVC ? kHevcFirmwarePath
+-		: kH264FirmwarePath, sizeof(path));
++	const char* firmware = kH264FirmwarePath;
++	if (fCodec == MESON_VDEC_HEVC)
++		firmware = kHevcFirmwarePath;
++	else if (fCodec == MESON_VDEC_MPEG12)
++		firmware = kMpeg12FirmwarePath;
++	strlcat(path, firmware, sizeof(path));
+ 
+ 	int fd = open(path, O_RDONLY | O_CLOEXEC);
+ 	if (fd < 0) {
+@@ -418,6 +505,23 @@ MesonVdecDecoder::_FeedChunk()
+ 	}
+ 	if (fSessionChunks++ == 0)
+ 		fSessionStart = header.start_time;
++	if (fCodec == MESON_VDEC_MPEG12 && fHeadersSize == 0) {
++		// a stream without codec data (an MPEG program or transport
++		// stream): its first sequence header goes before every session's
++		// stream, after a seek too
++		const uint8* sequence;
++		size_t sequenceSize = mpeg12_find_sequence((const uint8*)chunk,
++			size, &sequence);
++		uint8* headers = sequenceSize > 0
++			? (uint8*)realloc(fHeaders, sequenceSize) : NULL;
++		if (headers != NULL) {
++			memcpy(headers, sequence, sequenceSize);
++			fHeaders = headers;
++			fHeadersSize = sequenceSize;
++			// this session's stream has it already
++			fHeadersSent = true;
++		}
++	}
+ 
+ 	size_t headers = fHeadersSent ? 0 : fHeadersSize;
+ 	size_t capacity = headers + (fLengthSize > 0 ? 4 * size + 64 : size);
+@@ -474,6 +578,8 @@ MesonVdecDecoder::_NextFrame()
+ 		meson_vdec_frame frame;
+ 		memset(&frame, 0, sizeof(frame));
+ 		frame.timeout = fInputEnded || full ? kFrameTimeout : 0;
++		if (fInputEnded && !fEndSent && fCodec == MESON_VDEC_MPEG12)
++			frame.timeout = kMpeg12QuietTimeout;
+ 		if (ioctl(fDevice, MESON_VDEC_GET_FRAME, &frame, sizeof(frame))
+ 				== 0) {
+ 			if ((frame.flags & MESON_VDEC_FRAME_END_OF_STREAM) != 0) {
+diff --git a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h
+index 52a709a0a6..aac39ada98 100644
+--- a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h
++++ b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h
+@@ -35,6 +35,9 @@ public:
+ 									media_decode_info* info);
+ 
+ private:
++			status_t			_SetupMpeg12(const uint8* info,
++									size_t infoSize);
++			status_t			_OpenDevice();
+ 			status_t			_LoadFirmware();
+ 			status_t			_StartSession();
+ 			void				_StopSession();
+@@ -63,6 +66,7 @@ private:
+ private:
+ 			int					fDevice;
+ 			uint32				fCodec;			// MESON_VDEC_*
++			int32				fCodecId;		// FFmpeg's (AV_CODEC_ID_*)
+ 			uint8*				fFirmware;
+ 			size_t				fFirmwareSize;
+ 			media_format		fInputFormat;
+diff --git a/src/add-ons/media/plugins/meson_decoder/MesonVdecPlugin.cpp b/src/add-ons/media/plugins/meson_decoder/MesonVdecPlugin.cpp
+index 35416ba8a5..963d995744 100644
+--- a/src/add-ons/media/plugins/meson_decoder/MesonVdecPlugin.cpp
++++ b/src/add-ons/media/plugins/meson_decoder/MesonVdecPlugin.cpp
+@@ -28,7 +28,7 @@ public:
+ };
+ 
+ 
+-static media_format sFormats[2];
++static media_format sFormats[4];
+ 
+ 
+ Decoder*
+@@ -46,7 +46,8 @@ MesonVdecPlugin::GetSupportedFormats(media_format** _formats, size_t* _count)
+ 		return B_ERROR;
+ 
+ 	// as AVFormatReader describes them
+-	static const int kCodecs[] = { AV_CODEC_ID_H264, AV_CODEC_ID_HEVC };
++	static const int kCodecs[] = { AV_CODEC_ID_H264, AV_CODEC_ID_HEVC,
++		AV_CODEC_ID_MPEG2VIDEO, AV_CODEC_ID_MPEG1VIDEO };
+ 	for (size_t i = 0; i < B_COUNT_OF(kCodecs); i++) {
+ 		media_format_description description;
+ 		memset(&description, 0, sizeof(description));
+diff --git a/src/add-ons/media/plugins/meson_decoder/Mpeg12.cpp b/src/add-ons/media/plugins/meson_decoder/Mpeg12.cpp
+new file mode 100644
+index 0000000000..2f008d6049
+--- /dev/null
++++ b/src/add-ons/media/plugins/meson_decoder/Mpeg12.cpp
+@@ -0,0 +1,89 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "Mpeg12.h"
++
++
++static const uint8 kSequenceHeader = 0xb3;
++static const uint8 kExtension = 0xb5;
++static const uint8 kSequenceExtension = 1;
++	// extension_start_code_identifier
++
++
++/*!	The next start code's position (its 00 00 01) at or after \a from, or
++	\a size if there is none.
++*/
++static size_t
++next_start_code(const uint8* data, size_t size, size_t from)
++{
++	for (size_t i = from; i + 3 < size; i++) {
++		if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1)
++			return i;
++	}
++	return size;
++}
++
++
++size_t
++mpeg12_find_sequence(const uint8* data, size_t size, const uint8** _start)
++{
++	size_t at = 0;
++	while ((at = next_start_code(data, size, at)) < size
++		&& data[at + 3] != kSequenceHeader) {
++		at++;
++	}
++	if (at >= size)
++		return 0;
++	// extensions (b5) and user data (b2) go with it
++	size_t end = at + 4;
++	while ((end = next_start_code(data, size, end)) < size
++		&& (data[end + 3] == kExtension || data[end + 3] == 0xb2)) {
++		end += 4;
++	}
++	*_start = data + at;
++	return end - at;
++}
++
++
++bool
++mpeg12_parse_sequence(const uint8* data, size_t size,
++	mpeg12_sequence& sequence)
++{
++	size_t at = 0;
++	while ((at = next_start_code(data, size, at)) < size
++		&& data[at + 3] != kSequenceHeader) {
++		at++;
++	}
++	// the start code, then 12 bits of width, 12 of height
++	if (at + 7 > size)
++		return false;
++	const uint8* header = data + at + 4;
++	sequence.width = (header[0] << 4) | (header[1] >> 4);
++	sequence.height = ((header[1] & 0xf) << 8) | header[2];
++	sequence.mpeg2 = false;
++	sequence.chroma_format = 1;
++	sequence.progressive = true;
++
++	// MPEG-2's sequence extension comes next (after the quantizer matrices
++	// the header may carry: the next start code)
++	at = next_start_code(data, size, at + 4);
++	if (at + 4 + 6 > size || data[at + 3] != kExtension
++		|| (data[at + 4] >> 4) != kSequenceExtension) {
++		return sequence.width > 0 && sequence.height > 0;
++	}
++	const uint8* extension = data + at + 4;
++	sequence.mpeg2 = true;
++	// 4 bits identifier, 8 profile and level, 1 progressive_sequence,
++	// 2 chroma_format, 2 horizontal_size_extension, 2 vertical_size_extension
++	sequence.progressive = (extension[1] >> 3) & 1;
++	sequence.chroma_format = (extension[1] >> 1) & 3;
++	uint32 horizontalExtension = ((extension[1] & 1) << 1)
++		| (extension[2] >> 7);
++	uint32 verticalExtension = (extension[2] >> 5) & 3;
++	sequence.width |= horizontalExtension << 12;
++	sequence.height |= verticalExtension << 12;
++	return sequence.width > 0 && sequence.height > 0;
++}
+diff --git a/src/add-ons/media/plugins/meson_decoder/Mpeg12.h b/src/add-ons/media/plugins/meson_decoder/Mpeg12.h
+new file mode 100644
+index 0000000000..e73688279e
+--- /dev/null
++++ b/src/add-ons/media/plugins/meson_decoder/Mpeg12.h
+@@ -0,0 +1,41 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef MPEG12_H
++#define MPEG12_H
++
++
++#include <SupportDefs.h>
++
++
++/*!	What the decoder needs to know of an MPEG-1 or MPEG-2 video stream before
++	decoding it: from its sequence header, and MPEG-2's sequence extension
++	(ISO/IEC 13818-2, 6.2.2.1 and 6.2.2.3).
++*/
++struct mpeg12_sequence {
++	uint32	width;				// horizontal_size, with the extension's
++	uint32	height;				// vertical_size
++	bool	mpeg2;				// a sequence extension follows
++	uint32	chroma_format;		// 1: 4:2:0 (MPEG-1's only), 2: 4:2:2,
++								// 3: 4:4:4
++	bool	progressive;		// progressive_sequence (MPEG-1: true)
++};
++
++
++/*!	The first sequence header in \a data (start codes and all, as the
++	stream or a container's codec data has it), and its extension if one
++	follows. Returns false if there is none.
++*/
++bool	mpeg12_parse_sequence(const uint8* data, size_t size,
++			mpeg12_sequence& sequence);
++
++/*!	The first sequence header in \a data with what belongs to it (its
++	extensions and user data): from its start code to the next other start
++	code (a GOP's or a picture's). Returns its size, 0 if there is none.
++*/
++size_t	mpeg12_find_sequence(const uint8* data, size_t size,
++			const uint8** _start);
++
++
++#endif	// MPEG12_H

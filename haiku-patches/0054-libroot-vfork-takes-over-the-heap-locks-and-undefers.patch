@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 08:26:09 -0400
+Subject: [PATCH 054/342] libroot: vfork() takes over the heap locks and
+ undefers signals
+
+The "partial" vfork() is fork() without any of its preparation: no heap
+locking, no runtime loader reinit, and signals stay deferred in the child
+(_kern_fork() starts it so; fork() undefers them). But the child's exec()
+needs malloc() and the runtime loader. If another thread of the parent held
+a heap lock at the moment of the fork, the child waited for it forever, and
+with signals deferred, a pending signal made every one of those waits
+return at once: the child spun at full CPU, never reaching its exec().
+
+posix_spawn() takes this path for POSIX_SPAWN_SETSID, as net_server does
+for its services: net_server then blocked in posix_spawn() and never
+configured the interface it had just got a DHCP lease for, leaving the
+network down after some boots on a 4-core ODROID-C2.
+
+vfork() now does what fork() does except calling the atfork hooks (and
+reinitializing the passwd backend). A test that posix_spawn()s /bin/true
+while 8 threads use malloc() hung on its first spawn every time before;
+with the change, 6000 spawns went through.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/libroot/posix/unistd/fork.c | 39 +++++++++++++++++---------
+ 1 file changed, 25 insertions(+), 14 deletions(-)
+
+diff --git a/src/system/libroot/posix/unistd/fork.c b/src/system/libroot/posix/unistd/fork.c
+index 333b65bf64..b79c3dbab1 100644
+--- a/src/system/libroot/posix/unistd/fork.c
++++ b/src/system/libroot/posix/unistd/fork.c
+@@ -133,8 +133,15 @@ __register_atfork(void (*prepare)(void), void (*parent)(void), void (*child)(voi
+ }
+ 
+ 
+-pid_t
+-fork(void)
++/*!	fork(), and vfork() with \a callHooks false: a vfork()ed child may only
++	exec() or _exit(), so it does without the atfork hooks. But exec() needs
++	malloc() and the runtime loader, whose locks another thread may hold at
++	this moment, so the heap is always taken over as for fork(). The child
++	also always gets its signals back: _kern_fork() starts it with them
++	deferred, and a deferred signal would interrupt every wait it does.
++*/
++static pid_t
++fork_internal(bool callHooks)
+ {
+ 	thread_id thread;
+ 	status_t status;
+@@ -148,7 +155,8 @@ fork(void)
+ 	}
+ 
+ 	// call preparation hooks
+-	call_fork_hooks(sPrepareHooks);
++	if (callHooks)
++		call_fork_hooks(sPrepareHooks);
+ 	__heap_before_fork();
+ 
+ 	thread = _kern_fork();
+@@ -160,13 +168,15 @@ fork(void)
+ 		mutex_init(&sForkLock, FORK_LOCK_NAME);
+ 		__gRuntimeLoader->reinit_after_fork();
+ 		__heap_after_fork_child();
+-		__reinit_pwd_backend_after_fork();
+-
+-		call_fork_hooks(sChildHooks);
++		if (callHooks) {
++			__reinit_pwd_backend_after_fork();
++			call_fork_hooks(sChildHooks);
++		}
+ 	} else {
+ 		// we are the parent
+ 		__heap_after_fork_parent();
+-		call_fork_hooks(sParentHooks);
++		if (callHooks)
++			call_fork_hooks(sParentHooks);
+ 		mutex_unlock(&sForkLock);
+ 	}
+ 
+@@ -182,14 +192,15 @@ fork(void)
+ }
+ 
+ 
++pid_t
++fork(void)
++{
++	return fork_internal(true);
++}
++
++
+ pid_t
+ vfork(void)
+ {
+-	thread_id thread = _kern_fork();
+-	if (thread < 0) {
+-		// something went wrong
+-		__set_errno(thread);
+-		thread = -1;
+-	}
+-	return thread;
++	return fork_internal(false);
+ }

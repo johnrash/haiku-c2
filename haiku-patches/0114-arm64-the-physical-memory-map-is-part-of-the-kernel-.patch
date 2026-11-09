@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 15:53:25 -0400
+Subject: [PATCH 114/342] arm64: the physical memory map is part of the kernel
+ address space
+
+The kernel address space ended at 0xffff007fffffffff, the physical
+memory map starts at 0xffffff0000000000. So the "physical map area"
+could not be created (B_EXACT_ADDRESS outside the space, the error
+ignored), and addresses vm_get_physical_page() hands out were neither
+kernel nor user addresses: lock_memory() on one found no area and
+failed with B_BAD_ADDRESS.
+
+That broke file-backed disk images: a page of a file on a mounted
+image is written by mapping it with vm_get_physical_page() and writing
+the image file through the file cache, whose retry locks the buffer.
+Every single-page write of file data failed ("PageWriteWrapper: Failed
+to write page ...: Bad address"), the pages stayed dirty, and unmounting
+waited for them for ever.
+
+The kernel address space now reaches to the end of the map, as on
+x86_64, and Query() walks the map's level 1 and 2 block entries, which
+ProcessRange() doesn't descend into (as x86_64's walk handles its large
+pages there). A failure to create the area now panics.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../private/kernel/arch/arm64/arch_kernel.h   |  5 +-
+ .../arch/arm64/VMSAv8TranslationMap.cpp       | 72 +++++++++++--------
+ .../arch/arm64/arch_vm_translation_map.cpp    |  2 +
+ 3 files changed, 50 insertions(+), 29 deletions(-)
+
+diff --git a/headers/private/kernel/arch/arm64/arch_kernel.h b/headers/private/kernel/arch/arm64/arch_kernel.h
+index 6c90636a35..35a6e95ec7 100644
+--- a/headers/private/kernel/arch/arm64/arch_kernel.h
++++ b/headers/private/kernel/arch/arm64/arch_kernel.h
+@@ -10,8 +10,11 @@
+ 
+ 
+ // memory layout
++// The kernel address space reaches to the end of the physical memory map
++// below, as on x86_64: addresses vm_get_physical_page() hands out are kernel
++// addresses (IS_KERNEL_ADDRESS()), and the map is an area of the space.
+ #define KERNEL_BASE		0xffff000000000000
+-#define KERNEL_SIZE		0x8000000000
++#define KERNEL_SIZE		(KERNEL_PMAP_BASE + KERNEL_PMAP_SIZE - KERNEL_BASE)
+ #define KERNEL_TOP		(KERNEL_BASE + (KERNEL_SIZE - 1))
+ 
+ #define USER_BASE		0x1000
+diff --git a/src/system/kernel/arch/arm64/VMSAv8TranslationMap.cpp b/src/system/kernel/arch/arm64/VMSAv8TranslationMap.cpp
+index 5512b8e98e..afeb1a1bb3 100644
+--- a/src/system/kernel/arch/arm64/VMSAv8TranslationMap.cpp
++++ b/src/system/kernel/arch/arm64/VMSAv8TranslationMap.cpp
+@@ -766,36 +766,52 @@ VMSAv8TranslationMap::Query(addr_t va, phys_addr_t* pa, uint32* flags)
+ 	ThreadCPUPinner pinner(thread_get_current_thread());
+ 	ASSERT(ValidateVa(va));
+ 
+-	ProcessRange(fPageTable, fInitialLevel, va, B_PAGE_SIZE, nullptr,
+-		[=](uint64_t* ptePtr, uint64_t effectiveVa) {
+-			uint64_t pte = atomic_get64((int64_t*)ptePtr);
+-
+-			// Don't set flags for invalid entries
+-			if ((pte & kPteValidMask) == 0)
+-				return;
+-
+-			*pa = pte & kPteAddrMask;
+-			*flags |= PAGE_PRESENT | B_KERNEL_READ_AREA;
+-			if (is_pte_accessed(pte))
+-				*flags |= PAGE_ACCESSED;
+-			if (is_pte_dirty(pte))
+-				*flags |= PAGE_MODIFIED;
+-
+-			if ((pte & kAttrPXN) == 0)
+-				*flags |= B_KERNEL_EXECUTE_AREA;
++	// Walked here rather than with ProcessRange(): the physical memory map
++	// (KERNEL_PMAP_BASE) is made of level 1 and 2 blocks, which that doesn't
++	// descend into.
++	uint64_t vaMask = (1UL << fVaBits) - 1;
++	int tableBits = fPageBits - 3;
++	uint64_t tableMask = (1UL << tableBits) - 1;
++	phys_addr_t tablePa = fPageTable;
++	for (int level = fInitialLevel; level <= 3; level++) {
++		int shift = tableBits * (3 - level) + fPageBits;
++		uint64_t index = ((va & vaMask) >> shift) & tableMask;
++		uint64_t pte = atomic_get64((int64_t*)(TableFromPa(tablePa) + index));
++
++		// Don't set flags for invalid entries
++		if ((pte & kPteValidMask) == 0)
++			return B_OK;
++
++		if (level < 3 && (pte & kPteTypeMask) == kPteTypeL012Table) {
++			tablePa = pte & kPteAddrMask;
++			continue;
++		}
+ 
+-			if ((pte & kAttrAPUserAccess) != 0) {
+-				*flags |= B_READ_AREA;
+-				if ((pte & kAttrUXN) == 0)
+-					*flags |= B_EXECUTE_AREA;
+-			}
++		// a page, or a block
++		uint64_t offsetMask = (1UL << shift) - 1;
++		*pa = (pte & kPteAddrMask & ~offsetMask) + (va & offsetMask);
++		*flags |= PAGE_PRESENT | B_KERNEL_READ_AREA;
++		if (is_pte_accessed(pte))
++			*flags |= PAGE_ACCESSED;
++		if (is_pte_dirty(pte))
++			*flags |= PAGE_MODIFIED;
++
++		if ((pte & kAttrPXN) == 0)
++			*flags |= B_KERNEL_EXECUTE_AREA;
++
++		if ((pte & kAttrAPUserAccess) != 0) {
++			*flags |= B_READ_AREA;
++			if ((pte & kAttrUXN) == 0)
++				*flags |= B_EXECUTE_AREA;
++		}
+ 
+-			if ((pte & kAttrSWDBM) != 0) {
+-				*flags |= B_KERNEL_WRITE_AREA;
+-				if ((pte & kAttrAPUserAccess) != 0)
+-					*flags |= B_WRITE_AREA;
+-			}
+-		});
++		if ((pte & kAttrSWDBM) != 0) {
++			*flags |= B_KERNEL_WRITE_AREA;
++			if ((pte & kAttrAPUserAccess) != 0)
++				*flags |= B_WRITE_AREA;
++		}
++		break;
++	}
+ 
+ 	return B_OK;
+ }
+diff --git a/src/system/kernel/arch/arm64/arch_vm_translation_map.cpp b/src/system/kernel/arch/arm64/arch_vm_translation_map.cpp
+index 2c2d302b7f..3a00f5bd3a 100644
+--- a/src/system/kernel/arch/arm64/arch_vm_translation_map.cpp
++++ b/src/system/kernel/arch/arm64/arch_vm_translation_map.cpp
+@@ -100,6 +100,8 @@ arch_vm_translation_map_init_post_area(kernel_args* args)
+ 	void* address = (void*) KERNEL_PMAP_BASE;
+ 	area_id area = vm_create_null_area(VMAddressSpace::KernelID(), "physical map area", &address,
+ 		B_EXACT_ADDRESS, KERNEL_PMAP_SIZE, 0);
++	if (area < 0)
++		panic("arm64: no physical map area: %#" B_PRIx32, area);
+ 
+ 	if (args->arch_args.uart.kind[0] != 0) {
+ 		// debug uart is already mapped by the efi loader, in whole pages

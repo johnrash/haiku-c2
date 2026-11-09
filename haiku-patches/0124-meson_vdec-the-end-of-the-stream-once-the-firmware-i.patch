@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 17:35:00 -0400
+Subject: [PATCH 124/342] meson_vdec: the end of the stream once the firmware
+ is quiet; a power cycle at init
+
+The sequence end code made the firmware drop the picture it had not
+reported yet, the third from the end; it now goes once the firmware has
+been quiet for 40 ms. The first session after boot decoded the first
+picture's first macroblock wrongly, later sessions (after a power-down)
+didn't; the driver now powers the decoder up and down once at init.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../drivers/video/meson_vdec/meson_vdec.cpp   | 27 ++++++++++++++++++-
+ 1 file changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+index 1914ff9dfa..affadecad7 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+@@ -321,6 +321,7 @@ private:
+ 			uint32				fQueueCount;
+ 			uint32				fHeld;
+ 				// bit per frame: with the caller
++			bigtime_t			fLastReport;
+ 			bool				fFatal;
+ 
+ 			// the last events, for finding what the firmware does
+@@ -379,6 +380,7 @@ MesonVdec::MesonVdec(device_node* node)
+ 	fQueueHead(0),
+ 	fQueueCount(0),
+ 	fHeld(0),
++	fLastReport(0),
+ 	fFatal(false),
+ 	fTraceCount(0),
+ 	fVdecInterrupts(0),
+@@ -463,6 +465,13 @@ MesonVdec::Init(phys_addr_t dos, phys_addr_t parser, int32 vdecIrq,
+ 			&_ParserInterrupt, this, 0) == B_OK) {
+ 		fParserIrq = parserIrq;
+ 	}
++	// The first session after boot decoded the first picture's first
++	// macroblock wrongly (its top two blocks), the later ones didn't: they
++	// come after a power-down, whose resets the power-up doesn't do. One
++	// now, before any session.
++	_PowerUp();
++	_PowerDown();
++
+ 	INFO("DOS %#" B_PRIxPHYSADDR ", parser %#" B_PRIxPHYSADDR
+ 		", interrupts %" B_PRId32 " and %" B_PRId32 "\n", dos, parser,
+ 		fVdecIrq, fParserIrq);
+@@ -528,6 +537,7 @@ MesonVdec::_CheckDecoder()
+ 	uint32 report = _Dos(AV_SCRATCH_9);
+ 	if (report == 0)
+ 		return false;
++	fLastReport = system_time();
+ 	_Trace('R', report, _Dos(AV_SCRATCH_5), _Dos(AV_SCRATCH_D),
+ 		_Dos(AV_SCRATCH_E));
+ 	if ((report & BUFFEROUT_SKIP) == BUFFEROUT_SKIP) {
+@@ -837,6 +847,7 @@ MesonVdec::_Start(meson_vdec_start& start, const void* userFirmware)
+ 		fQueueCount = 0;
+ 		fHeld = 0;
+ 		fFatal = false;
++		fLastReport = 0;
+ 		fEndOfStream = false;
+ 	}
+ 	int32 count;
+@@ -1000,12 +1011,26 @@ MesonVdec::_Write(const uint8* userData, size_t size)
+ }
+ 
+ 
+-/*!	A sequence end code, for the firmware to put out the frames it holds. */
++/*!	A sequence end code, for the firmware to put out the frames it holds.
++	Sent while the firmware still decodes, it lost the picture it had not
++	reported yet (the third from the end), so it waits until the firmware
++	has been quiet for a while (the caller has to take frames meanwhile).
++*/
+ status_t
+ MesonVdec::_EndOfStream()
+ {
+ 	if (!fRunning)
+ 		return B_NOT_ALLOWED;
++	bigtime_t timeout = system_time() + 1000000;
++	while (system_time() < timeout) {
++		InterruptsSpinLocker locker(fStateLock);
++		_CheckDecoder();
++		bigtime_t quiet = system_time() - fLastReport;
++		locker.Unlock();
++		if (quiet > 40000)
++			break;
++		snooze(kPollInterval);
++	}
+ 	memset(fInput.address, 0, 1024);
+ 	fInput.address[2] = 0x01;
+ 	fInput.address[3] = 0xb7;

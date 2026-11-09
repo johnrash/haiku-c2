@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 4 Nov 2026 12:05:26 -0500
+Subject: [PATCH 289/342] freebsd_network: a USB device that comes later gets
+ its driver
+
+A USB driver scanned for its devices only once, when loaded. The C2's onboard hub
+often cuts its port power for about a second at a cold boot, so a device behind it
+could miss that moment and stay without a driver for the whole boot: the RTL8812BU
+on 2 of 3 boots. The USB stack now rescans the driver when a device arrives, as it
+does for the drivers that register with it. No hooks: a new device is only looked
+for as the driver loads, so a second one still needs the first one's driver to go.
+
+8 of 8 cold boots came up on Wi-Fi, most of them with the hub's over-current
+recovery.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/libs/compat/freebsd_network/usb.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/libs/compat/freebsd_network/usb.cpp b/src/libs/compat/freebsd_network/usb.cpp
+index 4362ddb372..16d17e5b16 100644
+--- a/src/libs/compat/freebsd_network/usb.cpp
++++ b/src/libs/compat/freebsd_network/usb.cpp
+@@ -206,6 +206,12 @@ _fbsd_init_hardware_uhub(driver_t* drivers[])
+ 	if (status != B_OK)
+ 		return status;
+ 
++	// The scan below only sees the devices there are now. Have the USB stack
++	// rescan this driver when one comes later: a device can be plugged in at
++	// any time, and a hub that cuts its port power at a cold boot (as the
++	// ODROID-C2's can) brings its devices back about a second later.
++	sUSB->register_driver(gDriverName, NULL, 0, NULL);
++
+ 	status = init_root_device(&root, BUS_uhub);
+ 	if (status != B_OK)
+ 		return status;

@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Tue, 3 Nov 2026 12:05:34 -0500
+Subject: [PATCH 263/342] Shutdown: turn the display off before powering off;
+ usb_hid: no repeats of a stuck button
+
+registrar: a machine that can't cut its own power (the ODROID-C2) went on
+showing the last picture after powering off, a blank desktop: DPMS off just
+before _kern_shutdown(), and on again if that fails, for the shutdown window.
+
+usb_hid: buttons with a bit each (headsets, USB audio adapters, 6387c5d7f7)
+repeated like keys. An adapter that reads "play" as held sent the key 25 times
+a second for ever, and each one reset the screen saver's idle time. Of these
+only volume up and down repeat now.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../hid_shared/KeyboardProtocolHandler.cpp     | 18 +++++++++++++++---
+ src/servers/registrar/ShutdownProcess.cpp      | 15 ++++++++++++++-
+ 2 files changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/input/hid_shared/KeyboardProtocolHandler.cpp b/src/add-ons/kernel/drivers/input/hid_shared/KeyboardProtocolHandler.cpp
+index 646082a7cb..fb589b5ef2 100644
+--- a/src/add-ons/kernel/drivers/input/hid_shared/KeyboardProtocolHandler.cpp
++++ b/src/add-ons/kernel/drivers/input/hid_shared/KeyboardProtocolHandler.cpp
+@@ -835,9 +835,21 @@ KeyboardProtocolHandler::_ReadReport(bigtime_t timeout, uint32 *cookie)
+ 			_WriteKey(key, keyDown);
+ 
+ 			if (keyDown) {
+-				// repeat handling
+-				fCurrentRepeatKey = key;
+-				fCurrentRepeatDelay = fRepeatDelay;
++				// repeat handling; of the buttons with a bit each (headsets,
++				// USB audio adapters) only volume up and down repeat: such a
++				// button can read as held for good (an adapter's "play"),
++				// and its repeats would count as input for ever, so the
++				// screen saver would never start
++				bool onOffControl = !fKeys[i]->Array()
++					&& fKeys[i]->UsagePage() != B_HID_USAGE_PAGE_KEYBOARD;
++				if (!onOffControl
++					|| key == ((B_HID_USAGE_PAGE_CONSUMER << 16)
++						| B_HID_UID_CON_VOLUME_INCREMENT)
++					|| key == ((B_HID_USAGE_PAGE_CONSUMER << 16)
++						| B_HID_UID_CON_VOLUME_DECREMENT)) {
++					fCurrentRepeatKey = key;
++					fCurrentRepeatDelay = fRepeatDelay;
++				}
+ 			} else {
+ 				// cancel the repeats if they are for this key
+ 				if (fCurrentRepeatKey == key) {
+diff --git a/src/servers/registrar/ShutdownProcess.cpp b/src/servers/registrar/ShutdownProcess.cpp
+index fadc960fa9..e7747de907 100644
+--- a/src/servers/registrar/ShutdownProcess.cpp
++++ b/src/servers/registrar/ShutdownProcess.cpp
+@@ -1197,7 +1197,20 @@ status_t
+ ShutdownProcess::_ShutDown()
+ {
+ 	PRINT("Invoking _kern_shutdown(%d)\n", fReboot);
+-	RETURN_ERROR(_kern_shutdown(fReboot));
++
++	// A machine that can't cut its own power (the ODROID-C2) goes on showing
++	// the last picture after powering off: turn the display off first.
++	if (fReboot || !fHasGUI)
++		RETURN_ERROR(_kern_shutdown(fReboot));
++
++	BScreen screen;
++	bool displayOff = screen.SetDPMS(B_DPMS_OFF) == B_OK;
++	status_t status = _kern_shutdown(fReboot);
++
++	// It failed: the shutdown window has something to say now.
++	if (displayOff)
++		screen.SetDPMS(B_DPMS_ON);
++	RETURN_ERROR(status);
+ }
+ 
+ 

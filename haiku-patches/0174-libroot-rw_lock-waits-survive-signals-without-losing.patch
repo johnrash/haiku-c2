@@ -1,0 +1,119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 14:56:36 -0400
+Subject: [PATCH 174/342] libroot: rw_lock waits survive signals, without
+ losing their wake-up
+
+A signal to a thread waiting for an rw_lock made _kern_block_thread()
+return B_INTERRUPTED, and the kernel kept that as the thread's wait
+status. rw_lock_wait() blocked again, which returned at once (the wait
+status wasn't positive): it spun. And when the lock was handed to it,
+_kern_unblock_thread() did nothing (it only wakes a thread whose wait
+status is positive), while rw_lock_unblock() had already counted the
+waiter as a reader or made it the holder: the thread spun forever and
+the lock was never free again. BLooperList's lock is one: a MediaPlayer
+whose menu window was being deleted spun in ~BWindow and every thread
+needing the looper list waited for good.
+
+Waiters now say whether the lock was handed to them (under the lock's
+mutex); after an interruption a waiter that wasn't re-arms its wait
+status and blocks again. pthread_rwlock didn't lose the hand-over (its
+waiters have that flag already) but spun while interrupted: it re-arms
+too. tools/probes/rwlocksignal.cpp in the project shows both.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/libroot/os/locks/rw_lock.cpp       | 27 ++++++++++++++++++-
+ .../libroot/posix/pthread/pthread_rwlock.cpp  |  5 ++++
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/src/system/libroot/os/locks/rw_lock.cpp b/src/system/libroot/os/locks/rw_lock.cpp
+index bc8c6fc7b3..30a2c5b021 100644
+--- a/src/system/libroot/os/locks/rw_lock.cpp
++++ b/src/system/libroot/os/locks/rw_lock.cpp
+@@ -16,6 +16,10 @@ typedef struct rw_lock_waiter {
+ 	rw_lock_waiter *	next;
+ 	thread_id			thread;
+ 	bool				writer;
++	bool				queued;
++		// false once the lock is handed over (or destroyed): under the
++		// lock's mutex, it says whether the thread was woken
++	status_t			status;
+ } rw_lock_waiter;
+ 
+ 
+@@ -26,6 +30,8 @@ rw_lock_wait(rw_lock *lock, bool writer)
+ 	waiter.thread = find_thread(NULL);
+ 	waiter.next = NULL;
+ 	waiter.writer = writer;
++	waiter.queued = true;
++	waiter.status = B_OK;
+ 
+ 	if (lock->waiters != NULL)
+ 		lock->last_waiter->next = &waiter;
+@@ -41,6 +47,19 @@ rw_lock_wait(rw_lock *lock, bool writer)
+ 	status_t result;
+ 	do {
+ 		result = _kern_block_thread(0, 0);
++		if (result == B_INTERRUPTED) {
++			// A signal: the kernel left B_INTERRUPTED as our wait status,
++			// and it only wakes a thread whose wait status is positive, so
++			// a wake-up from now on would be lost (and we'd spin here
++			// forever, counted as the lock's holder). Unless the lock was
++			// handed to us meanwhile, wait again.
++			mutex_lock(&lock->lock);
++			if (!waiter.queued)
++				return waiter.status;
++					// locked, as below
++			get_user_thread()->wait_status = 1;
++			mutex_unlock(&lock->lock);
++		}
+ 	} while (result == B_INTERRUPTED);
+ 
+ 	// and lock it again before returning
+@@ -66,6 +85,7 @@ rw_lock_unblock(rw_lock *lock)
+ 
+ 		lock->waiters = waiter->next;
+ 		lock->holder = waiter->thread;
++		waiter->queued = false;
+ 		_kern_unblock_thread(waiter->thread, B_OK);
+ 		return;
+ 	}
+@@ -73,6 +93,7 @@ rw_lock_unblock(rw_lock *lock)
+ 	while (waiter != NULL && !waiter->writer) {
+ 		lock->reader_count++;
+ 		lock->waiters = waiter->next;
++		waiter->queued = false;
+ 		_kern_unblock_thread(waiter->thread, B_OK);
+ 		waiter = lock->waiters;
+ 	}
+@@ -105,8 +126,12 @@ __rw_lock_destroy(rw_lock *lock)
+ 
+ 	rw_lock_waiter *waiter = lock->waiters;
+ 	while (waiter != NULL) {
++		rw_lock_waiter *next = waiter->next;
++			// the waiter may go once it's woken
++		waiter->status = B_ERROR;
++		waiter->queued = false;
+ 		_kern_unblock_thread(waiter->thread, B_ERROR);
+-		waiter = waiter->next;
++		waiter = next;
+ 	}
+ 
+ 	mutex_destroy(&lock->lock);
+diff --git a/src/system/libroot/posix/pthread/pthread_rwlock.cpp b/src/system/libroot/posix/pthread/pthread_rwlock.cpp
+index c7db457137..81d4e3c5a1 100644
+--- a/src/system/libroot/posix/pthread/pthread_rwlock.cpp
++++ b/src/system/libroot/posix/pthread/pthread_rwlock.cpp
+@@ -217,6 +217,11 @@ private:
+ 
+ 			if (!waiter.queued)
+ 				return waiter.status;
++
++			// a signal left B_INTERRUPTED as the wait status: blocking again
++			// would return at once, and spin until we're unqueued
++			if (status == B_INTERRUPTED)
++				waiter.userThread->wait_status = 1;
+ 		} while (status == B_INTERRUPTED);
+ 
+ 		// we're still queued, which means an error (timeout, interrupt)

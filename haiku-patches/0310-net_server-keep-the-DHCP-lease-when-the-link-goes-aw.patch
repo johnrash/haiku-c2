@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 5 Nov 2026 19:39:50 -0500
+Subject: [PATCH 310/342] net_server: keep the DHCP lease when the link goes
+ away
+
+The DHCP client released its lease whenever it was deleted, and the
+autoconfiguration deletes it when the link goes down. A wireless device that
+joined another access point, or a cable moved, gave its address back for a
+moment, and the server handed out another one when the link was back: the
+board's address changed that way. The next client asks
+for the old address first (INIT-REBOOT), but it had just been released.
+
+The lease stays ours after a link loss now; deleting the client otherwise
+(the interface going down, the net_server quitting) still releases it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/servers/net/AutoconfigClient.h   |  2 ++
+ src/servers/net/AutoconfigLooper.cpp |  8 ++++++--
+ src/servers/net/AutoconfigLooper.h   |  2 +-
+ src/servers/net/DHCPClient.cpp       | 16 ++++++++++++++--
+ src/servers/net/DHCPClient.h         |  2 ++
+ 5 files changed, 25 insertions(+), 5 deletions(-)
+
+diff --git a/src/servers/net/AutoconfigClient.h b/src/servers/net/AutoconfigClient.h
+index abfdf528e4..37fbe5eff7 100644
+--- a/src/servers/net/AutoconfigClient.h
++++ b/src/servers/net/AutoconfigClient.h
+@@ -21,6 +21,8 @@ public:
+ 	virtual						~AutoconfigClient();
+ 
+ 	virtual	status_t			Start();
++	virtual	void				KeepLease() {}
++										// on deletion, after the link went away
+ 
+ 			const BMessenger&	Target() const { return fTarget; }
+ 			const char*			Device() const { return fDevice.String(); }
+diff --git a/src/servers/net/AutoconfigLooper.cpp b/src/servers/net/AutoconfigLooper.cpp
+index 9b2a1f1961..7e5e019023 100644
+--- a/src/servers/net/AutoconfigLooper.cpp
++++ b/src/servers/net/AutoconfigLooper.cpp
+@@ -62,11 +62,13 @@ AutoconfigLooper::~AutoconfigLooper()
+ 
+ 
+ void
+-AutoconfigLooper::_RemoveClient()
++AutoconfigLooper::_RemoveClient(bool keepLease)
+ {
+ 	if (fCurrentClient == NULL)
+ 		return;
+ 
++	if (keepLease)
++		fCurrentClient->KeepLease();
+ 	delete fCurrentClient;
+ 	fCurrentClient = NULL;
+ }
+@@ -225,7 +227,9 @@ AutoconfigLooper::_NetworkMonitorNotification(BMessage* message)
+ 				//_ConfigureIPv6();	// TODO: router advertisement and dhcpv6
+ 				fAutoJoinAttempts = 0;
+ 			} else if ((media & IFM_ACTIVE) == 0) {
+-				_RemoveClient();
++				// keep the address for when the link is back: a wireless
++				// device joining another access point, a cable moved
++				_RemoveClient(true);
+ 				if ((fLastMediaStatus & IFM_ACTIVE) != 0) {
+ 					// leave the wpa_supplicant some time to get the link
+ 					// back on its own
+diff --git a/src/servers/net/AutoconfigLooper.h b/src/servers/net/AutoconfigLooper.h
+index 335a485463..47b1f330de 100644
+--- a/src/servers/net/AutoconfigLooper.h
++++ b/src/servers/net/AutoconfigLooper.h
+@@ -28,7 +28,7 @@ public:
+ 			BMessenger			Target() const { return fTarget; }
+ 
+ private:
+-			void				_RemoveClient();
++			void				_RemoveClient(bool keepLease = false);
+ 			void				_ConfigureIPv4();
+ 			void				_ConfigureIPv4Failed();
+ 			void				_ReadyToRun();
+diff --git a/src/servers/net/DHCPClient.cpp b/src/servers/net/DHCPClient.cpp
+index c1e0e97b28..a4a1a488fd 100644
+--- a/src/servers/net/DHCPClient.cpp
++++ b/src/servers/net/DHCPClient.cpp
+@@ -490,7 +490,8 @@ DHCPClient::DHCPClient(BMessenger target, const char* device)
+ 	fRequestTime(0),
+ 	fRenewalTime(0),
+ 	fRebindingTime(0),
+-	fLeaseTime(0)
++	fLeaseTime(0),
++	fKeepLease(false)
+ {
+ 	fTransactionID = (uint32)system_time() ^ rand();
+ 
+@@ -538,7 +539,7 @@ DHCPClient::~DHCPClient()
+ 
+ 	delete fRunner;
+ 
+-	if (fStatus != B_OK)
++	if (fStatus != B_OK || fKeepLease)
+ 		return;
+ 
+ 	int socket = ::socket(AF_INET, SOCK_DGRAM, 0);
+@@ -1079,6 +1080,17 @@ DHCPClient::_CurrentState() const
+ }
+ 
+ 
++/*!	The link went away: the lease stays ours. A DHCP client created when it's
++	back asks for the same address (INIT-REBOOT), which the server still has
++	for us, rather than for any address after this one released it.
++*/
++void
++DHCPClient::KeepLease()
++{
++	fKeepLease = true;
++}
++
++
+ void
+ DHCPClient::MessageReceived(BMessage* message)
+ {
+diff --git a/src/servers/net/DHCPClient.h b/src/servers/net/DHCPClient.h
+index e5351000ce..b666bf9310 100644
+--- a/src/servers/net/DHCPClient.h
++++ b/src/servers/net/DHCPClient.h
+@@ -40,6 +40,7 @@ public:
+ 	virtual						~DHCPClient();
+ 
+ 	virtual	status_t			Start();
++	virtual	void				KeepLease();
+ 
+ 	virtual	void				MessageReceived(BMessage* message);
+ 
+@@ -80,6 +81,7 @@ private:
+ 			bigtime_t			fRebindingTime;
+ 			bigtime_t			fLeaseTime;
+ 			status_t			fStatus;
++			bool				fKeepLease;
+ };
+ 
+ #endif	// DHCP_CLIENT_H

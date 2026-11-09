@@ -1,0 +1,375 @@
+# The Haiku patches by area
+
+The 342 patches in [`haiku-patches/`](../haiku-patches) are the port's
+commits on top of upstream Haiku a12d4cd1a5 (hrev60299+6), in order;
+`tools/haiku-setup.sh` applies them. Each one is a `git format-patch`
+file with its full commit message: what was wrong, how it was found,
+and how it was tested. Most are specific to the ODROID-C2 (Amlogic
+S905) or to arm64; many fix bugs in Haiku's common code that any
+platform can hit. This list is made by `tools/haiku-patches-index.py`.
+
+## Boot, kernel and system (55)
+
+- [0001](../haiku-patches/0001-efi-arm64-accept-PSCI-0.2-firmware-not-only-arm-psci.patch) efi/arm64: accept PSCI 0.2 firmware, not only "arm,psci-1.0"
+- [0002](../haiku-patches/0002-arm64-map-debug-UART-registers-that-do-not-start-on-.patch) arm64: map debug UART registers that do not start on a page boundary
+- [0003](../haiku-patches/0003-efi-arm64-drop-to-EL1-before-programming-the-EL1-MMU.patch) efi/arm64: drop to EL1 before programming the EL1 MMU registers
+- [0004](../haiku-patches/0004-arm64-add-Amlogic-Meson-GX-debug-UART.patch) arm64: add Amlogic Meson GX debug UART
+- [0005](../haiku-patches/0005-vfs_boot-wait-up-to-10-s-for-an-asynchronously-publi.patch) vfs_boot: wait up to 10 s for an asynchronously published boot device
+- [0013](../haiku-patches/0013-arm64-reboot-and-power-off-through-PSCI.patch) arm64: reboot and power off through PSCI
+- [0014](../haiku-patches/0014-efi-keep-the-firmware-frame-buffer-out-of-the-free-p.patch) efi: keep the firmware frame buffer out of the free page pool
+- [0016](../haiku-patches/0016-device_manager-probe-busses-usb-for-generic-device-t.patch) device_manager: probe busses/usb for generic (device tree) nodes
+- [0019](../haiku-patches/0019-arm64-invalidate-the-whole-instruction-cache-when-it.patch) arm64: invalidate the whole instruction cache when it is VIPT
+- [0022](../haiku-patches/0022-power-meson_scpi-CPU-temperature-and-clock-on-the-Am.patch) power: meson_scpi, CPU temperature and clock on the Amlogic GXBB
+- [0024](../haiku-patches/0024-autologin-launch_daemon-say-why-the-user-session-did.patch) autologin, launch_daemon: say why the user session did not start
+- [0025](../haiku-patches/0025-arm64-deliver-SIGILL-for-undefined-instructions-from.patch) arm64: deliver SIGILL for undefined instructions from userland
+- [0026](../haiku-patches/0026-registrar-sync-the-user-DB-files-survive-losing-them.patch) registrar: sync the user DB files, survive losing them
+- [0028](../haiku-patches/0028-arm64-CPU-clock-from-the-PMU-cycle-counter.patch) arm64: CPU clock from the PMU cycle counter
+- [0030](../haiku-patches/0030-arm64-Cortex-A53-errata-835769-and-843419-workaround.patch) arm64: Cortex-A53 errata 835769 and 843419 workarounds
+- [0032](../haiku-patches/0032-build-regular-images-for-architectures-with-only-boo.patch) build: regular images for architectures with only bootstrap packages
+- [0033](../haiku-patches/0033-libroot-arm64-fix-__swap_float-and-__swap_double.patch) libroot/arm64: fix __swap_float and __swap_double
+- [0035](../haiku-patches/0035-arm64-userland-debugging-breakpoints-watchpoints-sin.patch) arm64: userland debugging: breakpoints, watchpoints, single step
+- [0036](../haiku-patches/0036-arm64-VMSAv8TranslationMap-no-page-table-to-free-for.patch) arm64: VMSAv8TranslationMap: no page table to free for an unused map
+- [0037](../haiku-patches/0037-Debugger-arm64-support.patch) Debugger: arm64 support
+- [0038](../haiku-patches/0038-Debugger-CLI-unlock-the-team-while-waiting-for-a-sta.patch) Debugger CLI: unlock the team while waiting for a stack trace
+- [0040](../haiku-patches/0040-kernel-Ctrl-K-on-the-serial-console-enters-KDL-seria.patch) kernel: Ctrl-K on the serial console enters KDL (serial_kdl_key)
+- [0041](../haiku-patches/0041-libroot-kernel-arm64-memcpy-memmove-and-memset-from-.patch) libroot, kernel: arm64 memcpy, memmove and memset from Arm Optimized Routines
+- [0042](../haiku-patches/0042-kernel-arm64-implement-arch_get_stack_trace.patch) kernel/arm64: implement arch_get_stack_trace()
+- [0043](../haiku-patches/0043-Debugger-kernel-arm64-FP-and-SIMD-registers.patch) Debugger, kernel: arm64 FP and SIMD registers
+- [0049](../haiku-patches/0049-build-HaikuDepot-SoftwareUpdater-and-Repositories-on.patch) build: HaikuDepot, SoftwareUpdater and Repositories on arm64 again
+- [0054](../haiku-patches/0054-libroot-vfork-takes-over-the-heap-locks-and-undefers.patch) libroot: vfork() takes over the heap locks and undefers signals
+- [0061](../haiku-patches/0061-debugger-arm64-unwinding-no-longer-crashes-on-the-ve.patch) debugger: arm64 unwinding no longer crashes on the vector registers
+- [0078](../haiku-patches/0078-arm64-count-user-time-as-user-time.patch) arm64: count user time as user time
+- [0083](../haiku-patches/0083-build-HAIKU_IMAGE_GROW_LIMIT-a-BFS-grow-limit-for-th.patch) build: HAIKU_IMAGE_GROW_LIMIT, a BFS grow limit for the image
+- [0090](../haiku-patches/0090-arm64-an-I2C-clock-chip-keeps-the-time-ODROID-C2-RTC.patch) arm64: an I2C clock chip keeps the time (ODROID-C2 RTC shield)
+- [0098](../haiku-patches/0098-arm64-KDL-stack-traces-of-threads-on-other-CPUs-and-.patch) arm64 KDL: stack traces of threads on other CPUs, and "iframe"
+- [0099](../haiku-patches/0099-arm64-KDL-say-that-an-interrupt-s-iframe-has-a-stale.patch) arm64 KDL: say that an interrupt's iframe has a stale ESR and FAR
+- [0103](../haiku-patches/0103-kernel-debug-level-1-measuring-to-keep-or-revert.patch) kernel debug level 1 (measuring; to keep or revert)
+- [0104](../haiku-patches/0104-kernel-build-without-KDEBUG-on-arm64-a-signal-frame-.patch) kernel: build without KDEBUG on arm64; a signal frame bug it hid
+- [0105](../haiku-patches/0105-fdt-calls-that-have-to-happen-go-in-ASSERT_ALWAYS-no.patch) fdt: calls that have to happen go in ASSERT_ALWAYS(), not ASSERT()
+- [0107](../haiku-patches/0107-kernel-debug-level-2-again-level-1-panics-at-boot-on.patch) kernel debug level 2 again: level 1 panics at boot on arm64
+- [0109](../haiku-patches/0109-scheduler-wake-a-thread-on-an-idle-core-when-its-own.patch) scheduler: wake a thread on an idle core when its own core is busy
+- [0110](../haiku-patches/0110-scheduler-a-CPU-about-to-idle-takes-a-thread-waiting.patch) scheduler: a CPU about to idle takes a thread waiting on a busy core
+- [0111](../haiku-patches/0111-TEMPORARY-scheduler-tracing-on-to-trace-a-wakeup-del.patch) TEMPORARY: scheduler tracing on, to trace a wakeup delay (reverted next)
+- [0112](../haiku-patches/0112-scheduler-no-thread-waits-on-a-busy-core-while-anoth.patch) scheduler: no thread waits on a busy core while another core idles
+- [0114](../haiku-patches/0114-arm64-the-physical-memory-map-is-part-of-the-kernel-.patch) arm64: the physical memory map is part of the kernel address space
+- [0116](../haiku-patches/0116-arm64-the-physical-map-area-replaces-the-loader-s-re.patch) arm64: the physical map area replaces the loader's reservations
+- [0119](../haiku-patches/0119-kernel-write-every-page-of-a-new-kernel-stack-once.patch) kernel: write every page of a new kernel stack once
+- [0120](../haiku-patches/0120-kernel-debug-level-1.patch) kernel debug level 1
+- [0127](../haiku-patches/0127-arm64-edge-triggered-interrupts-on-the-GICv2.patch) arm64: edge-triggered interrupts on the GICv2
+- [0152](../haiku-patches/0152-tty-a-non-canonical-read-with-VMIN-0-waits-up-to-VTI.patch) tty: a non-canonical read with VMIN 0 waits up to VTIME
+- [0159](../haiku-patches/0159-scheduler-give-up-on-interrupts-that-can-t-move-to-a.patch) scheduler: give up on interrupts that can't move to another CPU
+- [0174](../haiku-patches/0174-libroot-rw_lock-waits-survive-signals-without-losing.patch) libroot: rw_lock waits survive signals, without losing their wake-up
+- [0190](../haiku-patches/0190-arm64-a-cache-maintenance-fault-is-a-read.patch) arm64: a cache maintenance fault is a read
+- [0207](../haiku-patches/0207-kernel-vm-the-page-writer-writes-a-small-queue-after.patch) kernel/vm: the page writer writes a small queue after its idle wait
+- [0263](../haiku-patches/0263-Shutdown-turn-the-display-off-before-powering-off-us.patch) Shutdown: turn the display off before powering off; usb_hid: no repeats of a stuck button
+- [0320](../haiku-patches/0320-kernel-arm64-free-page-tables-that-unmapping-empties.patch) kernel/arm64: free page tables that unmapping empties
+- [0338](../haiku-patches/0338-kernel-arm64-flush-the-TLB-when-ClearFlags-clears-on.patch) kernel/arm64: flush the TLB when ClearFlags() clears only the access flag
+- [0339](../haiku-patches/0339-kernel-elf-reserve-a-user-image-s-whole-span-before-.patch) kernel/elf: reserve a user image's whole span before mapping its segments
+
+## Storage and packages (21)
+
+- [0006](../haiku-patches/0006-mmc_disk-attach-to-MMC-eMMC-cards.patch) mmc_disk: attach to MMC/eMMC cards
+- [0007](../haiku-patches/0007-mmc-add-Amlogic-Meson-GX-SD-eMMC-host-controller-dri.patch) mmc: add Amlogic Meson GX SD/eMMC host controller driver
+- [0008](../haiku-patches/0008-meson_gx_mmc-complete-commands-on-the-controller-int.patch) meson_gx_mmc: complete commands on the controller interrupt
+- [0009](../haiku-patches/0009-mmc-read-EXT_CSD-for-the-size-of-eMMC-cards.patch) mmc: read EXT_CSD for the size of eMMC cards
+- [0010](../haiku-patches/0010-mmc_disk-switch-eMMC-to-8-bit-bus-and-52-MHz-high-sp.patch) mmc_disk: switch eMMC to 8-bit bus and 52 MHz high speed
+- [0011](../haiku-patches/0011-meson_gx_mmc-use-the-SD-slot-read-only.patch) meson_gx_mmc: use the SD slot read-only
+- [0012](../haiku-patches/0012-mmc_bus-mmc_disk-turn-off-call-tracing.patch) mmc_bus, mmc_disk: turn off call tracing
+- [0027](../haiku-patches/0027-meson_gx_mmc-writable-microSD-on-request-its-first-4.patch) meson_gx_mmc: writable microSD on request, its first 4 MiB never
+- [0048](../haiku-patches/0048-package-kit-repositories-may-hold-packages-of-other-.patch) package kit: repositories may hold packages of other vendors
+- [0051](../haiku-patches/0051-mmc-large-transfers-eMMC-DDR52-and-SD-high-speed-on-.patch) mmc: large transfers, eMMC DDR52 and SD high speed on the Meson GX
+- [0052](../haiku-patches/0052-mmc-verify-fast-modes-with-multi-block-reads-fall-ba.patch) mmc: verify fast modes with multi-block reads, fall back on errors
+- [0053](../haiku-patches/0053-bfs-growing-a-volume-works.patch) bfs: growing a volume works
+- [0082](../haiku-patches/0082-bfs-grow-volumes-in-place-clear-the-new-bitmap-in-pi.patch) bfs: grow volumes in place; clear the new bitmap in pieces
+- [0087](../haiku-patches/0087-block_cache-start-a-sub-transaction-with-the-blocks-.patch) block_cache: start a sub transaction with the blocks changed since
+- [0088](../haiku-patches/0088-block_cache-sub-transaction-check-off.patch) block_cache: sub transaction check off
+- [0115](../haiku-patches/0115-disk-device-manager-don-t-unregister-a-file-device-t.patch) disk device manager: don't unregister a file device that is mounted
+- [0176](../haiku-patches/0176-package-tools-zlib-stays-the-default-compression-wit.patch) package tools: zlib stays the default compression with zstd enabled
+- [0177](../haiku-patches/0177-mmc_bus-an-empty-slot-ends-the-scan-instead-of-probi.patch) mmc_bus: an empty slot ends the scan instead of probing forever
+- [0185](../haiku-patches/0185-mmc-SD-cards-put-in-or-taken-out-while-running.patch) mmc: SD cards put in or taken out while running
+- [0220](../haiku-patches/0220-mmc_disk-a-card-taken-out-leaves-dev-and-its-number-.patch) mmc_disk: a card taken out leaves /dev, and its number is free again
+- [0261](../haiku-patches/0261-bfs-resize-the-block-cache-of-a-mounted-volume-in-pl.patch) bfs: resize the block cache of a mounted volume in place
+
+## USB (36)
+
+- [0017](../haiku-patches/0017-usb-add-DWC2-host-controller-driver-for-the-Amlogic-.patch) usb: add DWC2 host controller driver for the Amlogic Meson GXBB
+- [0018](../haiku-patches/0018-dwc2-split-transactions-for-low-full-speed-devices-b.patch) dwc2: split transactions for low/full speed devices behind a hub
+- [0020](../haiku-patches/0020-dwc2-bulk-transfers-from-vectors-physical-vectors-an.patch) dwc2: bulk transfers from vectors, physical vectors, any length
+- [0021](../haiku-patches/0021-dwc2-a-separate-host-channel-for-interrupt-endpoints.patch) dwc2: a separate host channel for interrupt endpoints
+- [0031](../haiku-patches/0031-dwc2-let-slow-devices-NAK-bulk-transfers-for-as-long.patch) dwc2: let slow devices NAK bulk transfers for as long as they need
+- [0055](../haiku-patches/0055-dwc2-isochronous-transfers-for-full-speed-devices-be.patch) dwc2: isochronous transfers for full speed devices behind the hub
+- [0056](../haiku-patches/0056-dwc2-isochronous-slots-by-packet-size-worker-at-real.patch) dwc2: isochronous slots by packet size, worker at real-time priority
+- [0058](../haiku-patches/0058-dwc2-power-the-USB-ports-anew-at-every-start.patch) dwc2: power the USB ports anew at every start
+- [0079](../haiku-patches/0079-usb_hid-wait-10-ms-before-retrying-after-a-report-er.patch) usb_hid: wait 10 ms before retrying after a report error
+- [0084](../haiku-patches/0084-usb_hid-buttons-of-USB-audio-adapters-and-headsets.patch) usb_hid: buttons of USB audio adapters and headsets
+- [0136](../haiku-patches/0136-dwc2-usb_hid-a-mouse-s-receiver-missing-at-boot.patch) dwc2, usb_hid: a mouse's receiver missing at boot
+- [0154](../haiku-patches/0154-BSerialPort-NumCharsAvailable-says-how-many.patch) BSerialPort: NumCharsAvailable() says how many
+- [0192](../haiku-patches/0192-dwc2-a-canceled-transfer-is-gone-when-CancelQueuedTr.patch) dwc2: a canceled transfer is gone when CancelQueuedTransfers() returns
+- [0193](../haiku-patches/0193-dwc2-high-speed-isochronous-IN-one-packet-a-microfra.patch) dwc2: high speed isochronous IN, one packet a microframe (M45, testing)
+- [0194](../haiku-patches/0194-usb-a-hub-s-ports-that-lost-their-power-get-it-back.patch) usb: a hub's ports that lost their power get it back
+- [0195](../haiku-patches/0195-dwc2-an-isochronous-stream-is-released-with-its-pipe.patch) dwc2: an isochronous stream is released with its pipe
+- [0196](../haiku-patches/0196-usb_raw-USB-Kit-isochronous-transfers-in-flight-toge.patch) usb_raw, USB Kit: isochronous transfers in flight together
+- [0203](../haiku-patches/0203-usb_raw-closing-a-file-cancels-only-its-own-isochron.patch) usb_raw: closing a file cancels only its own isochronous requests (M45)
+- [0221](../haiku-patches/0221-dwc2-high-speed-isochronous-IN-at-any-service-interv.patch) dwc2: high speed isochronous IN at any service interval, two streams
+- [0222](../haiku-patches/0222-dwc2-a-high-speed-isochronous-packet-is-armed-only-i.patch) dwc2: a high speed isochronous packet is armed only in the microframe before its own
+- [0250](../haiku-patches/0250-usb_raw-control-requests-without-data-may-come-witho.patch) usb_raw: control requests without data may come without a buffer
+- [0264](../haiku-patches/0264-usb_hid-no-repeats-of-any-media-key-but-volume-up-an.patch) usb_hid: no repeats of any media key but volume up and down
+- [0265](../haiku-patches/0265-usb_hid-leave-the-AB13X-headset-adapter-s-phantom-bu.patch) usb_hid: leave the AB13X headset adapter's phantom buttons alone
+- [0266](../haiku-patches/0266-dwc2-bulk-transfers-on-a-lane-of-their-own-a-waiting.patch) dwc2: bulk transfers on a lane of their own; a waiting bulk IN gives way
+- [0268](../haiku-patches/0268-dwc2-two-isochronous-OUT-streams-behind-a-hub.patch) dwc2: two isochronous OUT streams behind a hub
+- [0269](../haiku-patches/0269-dwc2-split-parts-in-the-microframe-after-the-one-bef.patch) dwc2: split parts in the microframe after the one before
+- [0270](../haiku-patches/0270-dwc2-an-idle-bulk-IN-holds-back-while-split-audio-ru.patch) dwc2: an idle bulk IN holds back while split audio runs
+- [0271](../haiku-patches/0271-dwc2-report-the-split-gaps-of-isochronous-IN-streams.patch) dwc2: report the split gaps of isochronous IN streams, too
+- [0274](../haiku-patches/0274-dwc2-a-shorter-pause-for-a-bulk-IN-with-traffic-8-kH.patch) dwc2: a shorter pause for a bulk IN with traffic, 8 kHz audio buffers
+- [0277](../haiku-patches/0277-dwc2-wait-for-a-channel-to-really-halt.patch) dwc2: wait for a channel to really halt
+- [0286](../haiku-patches/0286-dwc2-a-bulk-lane-for-each-direction.patch) dwc2: a bulk lane for each direction
+- [0321](../haiku-patches/0321-usb_hid-bound-the-retries-of-a-failing-device-and-do.patch) usb_hid: bound the retries of a failing device, and don't lose its transfer
+- [0324](../haiku-patches/0324-dwc2-report-how-long-split-parts-took-and-what-the-f.patch) dwc2: report how long split parts took, and what the first gaps looked like
+- [0325](../haiku-patches/0325-dwc2-keep-split-IN-complete-splits-within-their-fram.patch) dwc2: keep split IN complete-splits within their frame
+- [0328](../haiku-patches/0328-usb-read-a-configuration-again-when-its-descriptors-.patch) usb: read a configuration again when its descriptors come back broken
+- [0330](../haiku-patches/0330-usb-print-an-invalid-descriptor-s-length-and-configu.patch) usb: print an invalid descriptor's length and configuration the right way round
+
+## Network and Wi-Fi (56)
+
+- [0015](../haiku-patches/0015-network-add-Amlogic-Meson-GXBB-Ethernet-driver-meson.patch) network: add Amlogic Meson GXBB Ethernet driver (meson_dwmac)
+- [0060](../haiku-patches/0060-net-notifications-stay-loaded-fixing-a-deadlock-at-b.patch) net notifications: stay loaded, fixing a deadlock at boot
+- [0075](../haiku-patches/0075-tcp-_Spawn-resets-local-address.patch) tcp: _Spawn() resets local address
+- [0095](../haiku-patches/0095-Time-set-the-clock-from-NTP-to-the-microsecond.patch) Time: set the clock from NTP to the microsecond
+- [0102](../haiku-patches/0102-meson_dwmac-a-transmit-interrupt-every-16-frames-lar.patch) meson_dwmac: a transmit interrupt every 16 frames, larger rings
+- [0171](../haiku-patches/0171-network-multicasts-and-broadcasts-do-not-go-to-the-g.patch) network: multicasts and broadcasts do not go to the gateway
+- [0256](../haiku-patches/0256-realtekwifi-RTL8822BU-phase-1-bring-up-and-scanning.patch) realtekwifi: RTL8822BU, phase 1 (bring-up and scanning)
+- [0257](../haiku-patches/0257-realtekwifi-RTL8822BU-phase-2-association-and-WPA2.patch) realtekwifi: RTL8822BU, phase 2 (association and WPA2)
+- [0262](../haiku-patches/0262-Wi-Fi-one-menu-entry-per-network-join-saved-networks.patch) Wi-Fi: one menu entry per network; join saved networks again
+- [0273](../haiku-patches/0273-realtekwifi-RTL8822BU-Rx-aggregation-on.patch) realtekwifi: RTL8822BU Rx aggregation on
+- [0276](../haiku-patches/0276-net_server-a-join-by-address-alone-asks-for-that-acc.patch) net_server: a join by address alone asks for that access point
+- [0278](../haiku-patches/0278-realtekwifi-restart-an-RTL8822BU-that-has-stopped-re.patch) realtekwifi: restart an RTL8822BU that has stopped receiving
+- [0279](../haiku-patches/0279-net_server-an-automatic-join-after-a-second-scan-wit.patch) net_server: an automatic join after a second scan, without a dialog
+- [0280](../haiku-patches/0280-net_server-no-second-scan-before-an-automatic-join.patch) net_server: no second scan before an automatic join
+- [0281](../haiku-patches/0281-realtekwifi-RTL8822B-false-alarm-counters-and-receiv.patch) realtekwifi: RTL8822B false alarm counters and receive gain control
+- [0282](../haiku-patches/0282-freebsd_network-don-t-release-the-PCI-module-twice.patch) freebsd_network: don't release the PCI module twice
+- [0283](../haiku-patches/0283-net_server-a-join-by-address-finds-the-saved-network.patch) net_server: a join by address finds the saved network
+- [0284](../haiku-patches/0284-libbnetapi-a-Wi-Fi-scan-gives-each-channel-some-time.patch) libbnetapi: a Wi-Fi scan gives each channel some time
+- [0285](../haiku-patches/0285-Revert-libbnetapi-a-Wi-Fi-scan-gives-each-channel-so.patch) Revert "libbnetapi: a Wi-Fi scan gives each channel some time"
+- [0287](../haiku-patches/0287-freebsd_network-a-zero-length-packet-ends-a-full-bul.patch) freebsd_network: a zero length packet ends a full bulk OUT transfer
+- [0288](../haiku-patches/0288-realtekwifi-STBC-and-LDPC-in-the-Tx-descriptor-are-o.patch) realtekwifi: STBC and LDPC in the Tx descriptor are on or off
+- [0289](../haiku-patches/0289-freebsd_network-a-USB-device-that-comes-later-gets-i.patch) freebsd_network: a USB device that comes later gets its driver
+- [0290](../haiku-patches/0290-realtekwifi-A-MPDU-spacing-of-2-us-on-the-RTL8822B.patch) realtekwifi: A-MPDU spacing of 2 us on the RTL8822B
+- [0291](../haiku-patches/0291-realtekwifi-the-receive-watchdog-leaves-scans-alone.patch) realtekwifi: the receive watchdog leaves scans alone
+- [0292](../haiku-patches/0292-realtekwifi-USB-Tx-aggregation-and-a-longer-send-que.patch) realtekwifi: USB Tx aggregation and a longer send queue on the RTL8822B
+- [0293](../haiku-patches/0293-realtekwifi-the-receive-watchdog-only-watches-a-link.patch) realtekwifi: the receive watchdog only watches a link that is up
+- [0294](../haiku-patches/0294-realtekwifi-signal-strength-in-the-units-net80211-co.patch) realtekwifi: signal strength in the units net80211 counts in
+- [0295](../haiku-patches/0295-realtekwifi-goes-on-with-its-USB-device-when-it-come.patch) realtekwifi: goes on with its USB device when it comes back
+- [0296](../haiku-patches/0296-meson_dwmac-survives-a-restart-and-no-EEE-at-gigabit.patch) meson_dwmac: survives a restart, and no EEE at gigabit
+- [0297](../haiku-patches/0297-meson_dwmac-a-transmit-engine-suspended-with-frames-.patch) meson_dwmac: a transmit engine suspended with frames waiting
+- [0298](../haiku-patches/0298-meson_dwmac-operate-on-second-frame-and-repair-a-stu.patch) meson_dwmac: operate on second frame, and repair a stuck ring
+- [0299](../haiku-patches/0299-meson_dwmac-the-stall-s-explanation-is-an-inference-.patch) meson_dwmac: the stall's explanation is an inference, and OSF cured it
+- [0300](../haiku-patches/0300-meson_dwmac-the-transmit-repair-works-on-a-full-ring.patch) meson_dwmac: the transmit repair works on a full ring
+- [0301](../haiku-patches/0301-meson_dwmac-a-sender-that-waited-takes-the-slot-free.patch) meson_dwmac: a sender that waited takes the slot free by then
+- [0302](../haiku-patches/0302-meson_dwmac-no-more-second_frame-setting.patch) meson_dwmac: no more "second_frame" setting
+- [0303](../haiku-patches/0303-freebsd_network-m_free-deletes-the-tags-of-all-packe.patch) freebsd_network: m_free() deletes the tags of all packet headers
+- [0304](../haiku-patches/0304-net_socket-socket_acquire-doesn-t-bring-a-socket-bac.patch) net_socket: socket_acquire() doesn't bring a socket back from no references
+- [0305](../haiku-patches/0305-tcp-the-endpoint-s-destructor-doesn-t-hold-its-lock-.patch) tcp: the endpoint's destructor doesn't hold its lock while waiting for timers
+- [0306](../haiku-patches/0306-net_socket-a-child-checks-it-s-still-its-parent-s-af.patch) net_socket: a child checks it's still its parent's after taking the lock
+- [0307](../haiku-patches/0307-tcp-the-reference-Free-takes-on-the-socket-is-releas.patch) tcp: the reference Free() takes on the socket is released once
+- [0308](../haiku-patches/0308-arp-announce-the-local-addresses-when-the-link-comes.patch) arp: announce the local addresses when the link comes back
+- [0309](../haiku-patches/0309-arp-the-link-up-announcements-wait-for-a-DHCP-client.patch) arp: the link-up announcements wait for a DHCP client to finish
+- [0310](../haiku-patches/0310-net_server-keep-the-DHCP-lease-when-the-link-goes-aw.patch) net_server: keep the DHCP lease when the link goes away
+- [0311](../haiku-patches/0311-net_server-a-DHCP-client-that-asks-for-its-old-addre.patch) net_server: a DHCP client that asks for its old address configures it
+- [0312](../haiku-patches/0312-ifconfig-join-says-whether-it-joined.patch) ifconfig: join says whether it joined
+- [0313](../haiku-patches/0313-freebsd_wlan-with-WPA-the-link-is-up-once-the-pairwi.patch) freebsd_wlan: with WPA, the link is up once the pairwise key is in
+- [0314](../haiku-patches/0314-net_server-a-device-asked-to-leave-its-network-stays.patch) net_server: a device asked to leave its network stays off
+- [0315](../haiku-patches/0315-arp-look-four-times-a-second-for-a-DHCP-client-to-fi.patch) arp: look four times a second for a DHCP client to finish
+- [0316](../haiku-patches/0316-net_server-DHCP-never-waits-past-the-end-of-a-state.patch) net_server: DHCP never waits past the end of a state
+- [0317](../haiku-patches/0317-net_server-renew-DHCP-leases-from-the-leased-address.patch) net_server: renew DHCP leases from the leased address
+- [0318](../haiku-patches/0318-tcp-reset-on-data-that-arrives-after-the-socket-was-.patch) tcp: reset on data that arrives after the socket was closed
+- [0319](../haiku-patches/0319-arp-follow-a-host-that-moves-and-learn-nothing-from-.patch) arp: follow a host that moves, and learn nothing from probes
+- [0322](../haiku-patches/0322-arp-a-host-that-talks-is-no-longer-kept-rejected.patch) arp: a host that talks is no longer kept rejected
+- [0323](../haiku-patches/0323-DHCPClient-take-an-answer-to-a-request-only-from-the.patch) DHCPClient: take an answer to a request only from the server it names
+- [0327](../haiku-patches/0327-DHCPClient-ask-for-broadcast-answers-while-there-is-.patch) DHCPClient: ask for broadcast answers while there is no lease
+- [0331](../haiku-patches/0331-freebsd_wlan-no-routine-debug-output-it-makes-USB-au.patch) freebsd_wlan: no routine debug output, it makes USB audio skip
+
+## Audio, video and cameras (97)
+
+- [0034](../haiku-patches/0034-WebPTranslator-identify-WebP-files-shorter-than-256-.patch) WebPTranslator: identify WebP files shorter than 256 bytes
+- [0047](../haiku-patches/0047-MediaPlayer-ffmpeg-decode-to-B_YCbCr422-for-overlays.patch) MediaPlayer, ffmpeg: decode to B_YCbCr422 for overlays that need it
+- [0057](../haiku-patches/0057-usb_audio-survive-unplugging-and-replugging-while-in.patch) usb_audio: survive unplugging and replugging while in use
+- [0063](../haiku-patches/0063-MediaPlayer-lock-the-window-when-the-controller-disa.patch) MediaPlayer: lock the window when the controller disables the overlay
+- [0066](../haiku-patches/0066-media-BTimeSource-converts-long-time-spans-instead-o.patch) media: BTimeSource converts long time spans instead of stopping
+- [0067](../haiku-patches/0067-usb_audio-keep-time-when-the-device-stops-answering.patch) usb_audio: keep time when the device stops answering
+- [0070](../haiku-patches/0070-MediaPlayer-black-between-files-is-black-in-YCbCr-to.patch) MediaPlayer: black between files is black in YCbCr too
+- [0071](../haiku-patches/0071-MediaPlayer-peak-notifications-go-through-a-messenge.patch) MediaPlayer: peak notifications go through a messenger
+- [0072](../haiku-patches/0072-MediaPlayer-go-back-to-the-frame-after-switching-the.patch) MediaPlayer: go back to the frame after switching the decoded format
+- [0080](../haiku-patches/0080-ffmpeg-plugin-decode-video-with-at-least-8-frame-thr.patch) ffmpeg plugin: decode video with at least 8 frame threads
+- [0081](../haiku-patches/0081-usb_audio-play-44.1-kHz-at-44.1-kHz.patch) usb_audio: play 44.1 kHz at 44.1 kHz
+- [0085](../haiku-patches/0085-ffmpeg-plugin-packet-times-in-microseconds-for-the-d.patch) ffmpeg plugin: packet times in microseconds for the decoder
+- [0086](../haiku-patches/0086-ffmpeg-plugin-Advanced-SIMD-4-2-0-to-B_YCbCr422-on-a.patch) ffmpeg plugin: Advanced SIMD 4:2:0 to B_YCbCr422 on arm64
+- [0121](../haiku-patches/0121-meson_vdec-the-S905-s-video-decoder-VDEC_1-MPEG-1-2-.patch) meson_vdec: the S905's video decoder (VDEC_1), MPEG-1/2 bring-up
+- [0122](../haiku-patches/0122-meson_vdec-the-frames-area-is-user-writable-too.patch) meson_vdec: the frames area is user writable too
+- [0123](../haiku-patches/0123-meson_vdec-an-event-trace-the-end-of-the-stream-shor.patch) meson_vdec: an event trace; the end of the stream shortens a waiting GET_FRAME
+- [0124](../haiku-patches/0124-meson_vdec-the-end-of-the-stream-once-the-firmware-i.patch) meson_vdec: the end of the stream once the firmware is quiet; a power cycle at init
+- [0125](../haiku-patches/0125-meson_vdec-canvases-before-the-reset-the-end-of-the-.patch) meson_vdec: canvases before the reset; the end of the stream not while the firmware waits for a frame
+- [0126](../haiku-patches/0126-meson_vdec-the-end-of-the-stream-once-the-firmware-h.patch) meson_vdec: the end of the stream once the firmware has frames to decode into
+- [0128](../haiku-patches/0128-meson_canvas-the-S905-s-canvas-table-under-one-lock.patch) meson_canvas: the S905's canvas table under one lock
+- [0129](../haiku-patches/0129-media-decoder-priorities-the-next-decoder-when-one-c.patch) media: decoder priorities; the next decoder when one can't set up
+- [0130](../haiku-patches/0130-meson_vdec-H.264-edge-triggered-interrupts-the-canva.patch) meson_vdec: H.264; edge-triggered interrupts; the canvas module
+- [0131](../haiku-patches/0131-meson_decoder-H.264-with-the-S905-s-video-decoder.patch) meson_decoder: H.264 with the S905's video decoder
+- [0132](../haiku-patches/0132-media-a-format-made-again-for-a-known-description-is.patch) media: a format made again for a known description is the known one
+- [0133](../haiku-patches/0133-meson_vdec-H.264-as-tested-aligned-buffers-a-warm-up.patch) meson_vdec: H.264 as tested: aligned buffers, a warm-up, the end, seeks
+- [0134](../haiku-patches/0134-meson_decoder-seeks-to-where-a-session-started-traci.patch) meson_decoder: seeks to where a session started; tracing, disabling
+- [0135](../haiku-patches/0135-meson_vdec-the-warm-up-decodes-its-picture-for-sure.patch) meson_vdec: the warm-up decodes its picture for sure
+- [0137](../haiku-patches/0137-meson_vdec-HEVC-a-feasibility-test-experimental.patch) meson_vdec: HEVC, a feasibility test (experimental)
+- [0138](../haiku-patches/0138-meson_vdec-HEVC-P-and-B-pictures-10-bits-the-interru.patch) meson_vdec: HEVC, P and B pictures, 10 bits, the interrupt
+- [0139](../haiku-patches/0139-meson_decoder-HEVC.patch) meson_decoder: HEVC
+- [0140](../haiku-patches/0140-meson_vdec-no-vendor-microcode-mode.patch) meson_vdec: no vendor microcode mode
+- [0143](../haiku-patches/0143-meson_decoder-ffmpeg-B_NV12-output.patch) meson_decoder, ffmpeg: B_NV12 output
+- [0144](../haiku-patches/0144-MediaPlayer-NV12-overlays-decoded-into-the-overlay-b.patch) MediaPlayer: NV12 overlays, decoded into the overlay bitmaps
+- [0161](../haiku-patches/0161-meson_vdec-meson_hdmi-MediaPlayer-show-the-decoder-s.patch) meson_vdec, meson_hdmi, MediaPlayer: show the decoder's frames without a copy
+- [0162](../haiku-patches/0162-MediaPlayer-B_NV12-also-for-video-without-a-color-sp.patch) MediaPlayer: B_NV12 also for video without a color space of its own
+- [0178](../haiku-patches/0178-meson_vdec-meson_decoder-portrait-video-1088x1920-on.patch) meson_vdec, meson_decoder: portrait video (1088x1920) on the hardware
+- [0179](../haiku-patches/0179-meson_decoder-wait-a-moment-for-a-busy-decoder.patch) meson_decoder: wait a moment for a busy decoder
+- [0180](../haiku-patches/0180-ffmpeg-plugin-pictures-whose-size-changed-fit-into-t.patch) ffmpeg plugin: pictures whose size changed fit into the negotiated output
+- [0181](../haiku-patches/0181-meson_vdec-meson_decoder-streams-whose-picture-size-.patch) meson_vdec, meson_decoder: streams whose picture size changes
+- [0182](../haiku-patches/0182-meson_vdec-forget-hand-backs-from-before-the-firmwar.patch) meson_vdec: forget hand-backs from before the firmware got its frames
+- [0197](../haiku-patches/0197-usb_webcam-the-UVC-add-on-built-and-working-M45.patch) usb_webcam: the UVC add-on, built and working (M45)
+- [0198](../haiku-patches/0198-media_server-a-saved-default-of-one-type-no-longer-b.patch) media_server: a saved default of one type no longer blocks the others (M45)
+- [0199](../haiku-patches/0199-usb_webcam-frame-sizes-as-asked-MJPEG-through-libjpe.patch) usb_webcam: frame sizes as asked, MJPEG through libjpeg-turbo (M45)
+- [0200](../haiku-patches/0200-usb_webcam-YUY2-with-NEON-unplug-and-replug-killed-c.patch) usb_webcam: YUY2 with NEON, unplug and replug, killed consumers (M45)
+- [0201](../haiku-patches/0201-usb_webcam-a-Constant-frame-rate-parameter-for-UVC-c.patch) usb_webcam: a "Constant frame rate" parameter for UVC cameras (M45)
+- [0202](../haiku-patches/0202-media_addon_server-later-flavors-nodes-without-askin.patch) media_addon_server: later flavors' nodes without asking itself (M45)
+- [0204](../haiku-patches/0204-usb_webcam-UVC-parameters-are-remembered-per-camera-.patch) usb_webcam: UVC parameters are remembered per camera model (M45)
+- [0205](../haiku-patches/0205-CodyCam-images-saved-as-the-format-chosen-locally-wh.patch) CodyCam: images saved as the format chosen, locally where asked (M45)
+- [0206](../haiku-patches/0206-CodyCam-record-video-files-M45.patch) CodyCam: record video files (M45)
+- [0208](../haiku-patches/0208-ffmpeg-plugin-encoding-on-all-cores-B_RGB32-to-YUV42.patch) ffmpeg plugin: encoding on all cores, B_RGB32 to YUV420P in NEON
+- [0209](../haiku-patches/0209-usb_webcam-applications-can-ask-for-the-frame-sizes.patch) usb_webcam: applications can ask for the frame sizes
+- [0210](../haiku-patches/0210-CodyCam-a-recorder-whose-encoder-is-too-slow-leaves-.patch) CodyCam: a recorder whose encoder is too slow leaves time out
+- [0211](../haiku-patches/0211-NeoCam-a-camera-application-for-stills-clips-schedul.patch) NeoCam: a camera application for stills, clips, schedules and motion
+- [0212](../haiku-patches/0212-NeoCam-fixes-from-the-tests-on-the-board.patch) NeoCam: fixes from the tests on the board
+- [0213](../haiku-patches/0213-NeoCam-the-camera-settings-window-shows-all-the-cont.patch) NeoCam: the camera settings window shows all the controls
+- [0214](../haiku-patches/0214-meson_vdec-the-H.264-encoder-HCODEC-as-dev-video-mes.patch) meson_vdec: the H.264 encoder (HCODEC) as /dev/video/meson_venc/0
+- [0215](../haiku-patches/0215-ffmpeg-plugin-H.264-from-other-encoders-gets-its-par.patch) ffmpeg plugin: H.264 from other encoders gets its parameter sets
+- [0216](../haiku-patches/0216-meson_encoder-H.264-from-the-S905-s-encoder-for-the-.patch) meson_encoder: H.264 from the S905's encoder for the Media Kit
+- [0217](../haiku-patches/0217-NeoCam-CodyCam-clips-in-H.264-from-the-hardware-enco.patch) NeoCam, CodyCam: clips in H.264 from the hardware encoder
+- [0218](../haiku-patches/0218-meson_encoder-with-the-input-reader-s-noise-reductio.patch) meson_encoder: with the input reader's noise reduction
+- [0219](../haiku-patches/0219-meson_venc-the-encoder-at-667-MHz-fclk-3.patch) meson_venc: the encoder at 667 MHz (fclk/3)
+- [0223](../haiku-patches/0223-ffmpeg-plugin-video-and-sound-interleaved-in-the-fil.patch) ffmpeg plugin: video and sound interleaved in the files it writes
+- [0224](../haiku-patches/0224-NeoCam-clips-with-sound-from-the-audio-input.patch) NeoCam: clips with sound from the audio input
+- [0225](../haiku-patches/0225-multi_audio-sound-devices-published-after-the-add-on.patch) multi_audio: sound devices published after the add-on started
+- [0226](../haiku-patches/0226-NeoCam-a-shutdown-is-not-cancelled-by-NeoCam.patch) NeoCam: a shutdown is not cancelled by NeoCam
+- [0227](../haiku-patches/0227-media-kit-BMediaRecorder-starts-a-sound-card-s-node-.patch) media kit: BMediaRecorder starts a sound card's node as a node too
+- [0228](../haiku-patches/0228-ffmpeg-plugin-AAC-sound-tracks-with-their-configurat.patch) ffmpeg plugin: AAC sound tracks, with their configuration
+- [0229](../haiku-patches/0229-ffmpeg-plugin-an-audio-track-whose-codec-takes-other.patch) ffmpeg plugin: an audio track whose codec takes other samples is made
+- [0230](../haiku-patches/0230-meson_vdec-MJPEG-with-linux-firmware-s-gxl_mjpeg.bin.patch) meson_vdec: MJPEG, with linux-firmware's gxl_mjpeg.bin
+- [0231](../haiku-patches/0231-usb_webcam-MJPEG-decoded-by-the-S905-s-decoder.patch) usb_webcam: MJPEG decoded by the S905's decoder
+- [0232](../haiku-patches/0232-usb_webcam-what-became-of-the-pictures-the-S905-deco.patch) usb_webcam: what became of the pictures the S905 decoded, in the log
+- [0233](../haiku-patches/0233-usb_webcam-the-first-skipped-pictures-ends-in-the-lo.patch) usb_webcam: the first skipped pictures' ends, in the log (for the test)
+- [0234](../haiku-patches/0234-usb_webcam-a-picture-with-bytes-after-its-EOI-goes-t.patch) usb_webcam: a picture with bytes after its EOI goes to the S905 too
+- [0235](../haiku-patches/0235-usb_webcam-a-consumer-whose-team-ended-with-all-the-.patch) usb_webcam: a consumer whose team ended with all the buffers
+- [0236](../haiku-patches/0236-VideoRecorder-the-sound-starts-with-the-first-pictur.patch) VideoRecorder: the sound starts with the first picture
+- [0237](../haiku-patches/0237-multi_audio-at-least-four-buffers-for-an-output.patch) multi_audio: at least four buffers for an output
+- [0238](../haiku-patches/0238-VideoRecorder-the-sound-written-by-the-recorder-s-th.patch) VideoRecorder: the sound written by the recorder's thread, the pictures to the stop
+- [0239](../haiku-patches/0239-meson_encoder-a-bit-rate-by-a-rate-control-of-its-ow.patch) meson_encoder: a bit rate, by a rate control of its own
+- [0240](../haiku-patches/0240-NeoCam-a-bit-rate-for-the-clips.patch) NeoCam: a bit rate for the clips
+- [0249](../haiku-patches/0249-usb_audio-recorded-buffers-in-order-four-of-them.patch) usb_audio: recorded buffers in order, four of them
+- [0251](../haiku-patches/0251-usb_audio-a-device-replugged-while-open-records-agai.patch) usb_audio: a device replugged while open records again
+- [0252](../haiku-patches/0252-meson_decoder-MPEG-1-and-MPEG-2-video-on-the-S905-s-.patch) meson_decoder: MPEG-1 and MPEG-2 video on the S905's decoder
+- [0253](../haiku-patches/0253-meson_decoder-a-seek-after-the-end-of-the-stream-dec.patch) meson_decoder: a seek after the end of the stream decodes again
+- [0254](../haiku-patches/0254-meson_decoder-interlaced-H.264-on-the-S905-s-decoder.patch) meson_decoder: interlaced H.264 on the S905's decoder
+- [0259](../haiku-patches/0259-MediaPlayer-a-seek-forward-no-longer-goes-back-to-an.patch) MediaPlayer: a seek forward no longer goes back to an earlier keyframe
+- [0260](../haiku-patches/0260-MediaPlayer-Ctrl-right-and-Ctrl-left-wind-10-seconds.patch) MediaPlayer: Ctrl+right and Ctrl+left wind 10 seconds
+- [0267](../haiku-patches/0267-usb_audio-dwc2-several-full-speed-audio-adapters-at-.patch) usb_audio, dwc2: several full speed audio adapters at once
+- [0272](../haiku-patches/0272-usb_audio-a-device-goes-by-its-own-name.patch) usb_audio: a device goes by its own name
+- [0275](../haiku-patches/0275-usb_audio-a-device-s-name-ends-at-its-first-NUL.patch) usb_audio: a device's name ends at its first NUL
+- [0326](../haiku-patches/0326-usb_audio-don-t-take-a-replugged-device-whose-config.patch) usb_audio: don't take a replugged device whose configuration lacks a stream's interface
+- [0329](../haiku-patches/0329-usb_audio-ignore-an-alternate-without-an-endpoint.patch) usb_audio: ignore an alternate without an endpoint
+- [0332](../haiku-patches/0332-media-log-lost-audio-to-the-syslog-not-to-an-unread-.patch) media: log lost audio to the syslog, not to an unread stderr
+- [0333](../haiku-patches/0333-multi_audio-queue-the-producer-s-buffers-instead-of-.patch) multi_audio: queue the producer's buffers instead of dropping one that comes early
+- [0334](../haiku-patches/0334-mixer-log-an-input-whose-data-came-too-late-and-the-.patch) mixer: log an input whose data came too late, and the late notices sent
+- [0335](../haiku-patches/0335-usb_audio-multi_audio-log-playback-buffers-that-went.patch) usb_audio, multi_audio: log playback buffers that went out again
+- [0336](../haiku-patches/0336-usb_audio-change-the-current-buffer-before-waking-th.patch) usb_audio: change the current buffer before waking the exchange
+- [0337](../haiku-patches/0337-mixer-no-step-in-the-resampled-sound-at-a-wrap-of-th.patch) mixer: no step in the resampled sound at a wrap of the input ring
+
+## Display, graphics and the desktop (44)
+
+- [0023](../haiku-patches/0023-graphics-meson_hdmi-driver-and-accelerant-for-the-Am.patch) graphics: meson_hdmi driver and accelerant for the Amlogic GXBB
+- [0029](../haiku-patches/0029-AboutSystem-spell-out-the-uptime-without-ICU-locale-.patch) AboutSystem: spell out the uptime without ICU locale data
+- [0039](../haiku-patches/0039-Tracker-drop-items-from-list-views-where-the-mouse-i.patch) Tracker: drop items from list views where the mouse is
+- [0044](../haiku-patches/0044-app_server-Advanced-SIMD-bilinear-scaling-on-arm64.patch) app_server: Advanced SIMD bilinear scaling on arm64
+- [0045](../haiku-patches/0045-meson_hdmi-video-overlay-on-the-VPU-s-VD1-layer.patch) meson_hdmi: video overlay on the VPU's VD1 layer
+- [0046](../haiku-patches/0046-app_server-kernel-console-write-an-alpha-into-32-bit.patch) app_server, kernel console: write an alpha into 32 bit frame buffers
+- [0050](../haiku-patches/0050-app_server-separable-bilinear-scaling-on-arm64-when-.patch) app_server: separable bilinear scaling on arm64 when scaling up
+- [0059](../haiku-patches/0059-meson_hdmi-HDMI-audio-48-kHz-16-bit-stereo-as-a-mult.patch) meson_hdmi: HDMI audio, 48 kHz 16-bit stereo, as a multi_audio device
+- [0062](../haiku-patches/0062-meson_hdmi-switch-overlay-buffers-in-the-vertical-bl.patch) meson_hdmi: switch overlay buffers in the vertical blank
+- [0064](../haiku-patches/0064-app_server-don-t-draw-a-bitmap-whose-color-space-can.patch) app_server: don't draw a bitmap whose color space can't be converted
+- [0065](../haiku-patches/0065-app_server-blend_line32-writes-an-opaque-alpha.patch) app_server: blend_line32() writes an opaque alpha
+- [0068](../haiku-patches/0068-meson_hdmi-sleep-again-when-the-vertical-blank-was-m.patch) meson_hdmi: sleep again when the vertical blank was missed
+- [0069](../haiku-patches/0069-app_server-B_RGB32-bitmaps-are-drawn-opaque.patch) app_server: B_RGB32 bitmaps are drawn opaque
+- [0073](../haiku-patches/0073-Tracker-breadcrumb-buttons-above-the-Navigator-s-loc.patch) Tracker: breadcrumb buttons above the Navigator's location field
+- [0074](../haiku-patches/0074-Tracker-a-Refresh-button-in-the-Navigator-next-to-Up.patch) Tracker: a Refresh button in the Navigator, next to Up
+- [0076](../haiku-patches/0076-Tracker-names-wrap-onto-two-lines-in-icon-view-like-.patch) Tracker: names wrap onto two lines in icon view, like the Finder
+- [0077](../haiku-patches/0077-Tracker-names-in-mini-icon-view-no-longer-cover-thei.patch) Tracker: names in mini icon view no longer cover their neighbors
+- [0089](../haiku-patches/0089-meson_hdmi-DPMS-and-720p50-1080p24-1080p25-and-1080p.patch) meson_hdmi: DPMS, and 720p50, 1080p24, 1080p25 and 1080p50
+- [0100](../haiku-patches/0100-meson_hdmi-HDMI-audio-at-32-44.1-48-88.2-96-176.4-an.patch) meson_hdmi: HDMI audio at 32, 44.1, 48, 88.2, 96, 176.4 and 192 kHz
+- [0106](../haiku-patches/0106-meson_hdmi-include-ByteOrder.h-which-only-debug-buil.patch) meson_hdmi: include ByteOrder.h, which only debug builds brought in
+- [0108](../haiku-patches/0108-meson_hdmi-modes-at-any-pixel-clock-the-HDMI-PLL-can.patch) meson_hdmi: modes at any pixel clock the HDMI PLL can make
+- [0117](../haiku-patches/0117-meson_hdmi-meson_hdmi-regs-dumps-every-display-regis.patch) meson_hdmi: "meson_hdmi regs" dumps every display register
+- [0118](../haiku-patches/0118-meson_hdmi-hot-plug-also-of-a-display-that-wasn-t-th.patch) meson_hdmi: hot-plug, also of a display that wasn't there at boot
+- [0141](../haiku-patches/0141-interface-kit-app_server-B_NV12.patch) interface kit, app_server: B_NV12
+- [0142](../haiku-patches/0142-meson_hdmi-B_NV12-overlays.patch) meson_hdmi: B_NV12 overlays
+- [0148](../haiku-patches/0148-ScreenSaver-preferences-room-for-a-screen-saver-s-se.patch) ScreenSaver preferences: room for a screen saver's settings
+- [0158](../haiku-patches/0158-app_server-meson_hdmi-a-mode-for-a-display-connected.patch) app_server, meson_hdmi: a mode for a display connected after boot
+- [0175](../haiku-patches/0175-BListView-RemoveItems-keeps-the-selection-right.patch) BListView: RemoveItems() keeps the selection right
+- [0186](../haiku-patches/0186-meson_mali-bring-up-driver-for-the-ODROID-C2-s-Mali-.patch) meson_mali: bring-up driver for the ODROID-C2's Mali-450 MP3
+- [0187](../haiku-patches/0187-meson_mali-buffers-the-GPU-s-address-space-lima-s-io.patch) meson_mali: buffers, the GPU's address space, lima's ioctls, jobs
+- [0188](../haiku-patches/0188-meson_mali-growable-tile-heaps.patch) meson_mali: growable tile heaps
+- [0189](../haiku-patches/0189-meson_mali-meson_hdmi-write-back-the-last-line-of-an.patch) meson_mali, meson_hdmi: write back the last line of an unaligned range
+- [0191](../haiku-patches/0191-meson_mali-the-job-thread-s-time-per-job-in-the-KDL-.patch) meson_mali: the job thread's time per job in the KDL "mali" command
+- [0241](../haiku-patches/0241-meson_hdmi-4K-at-up-to-30-Hz.patch) meson_hdmi: 4K at up to 30 Hz
+- [0242](../haiku-patches/0242-app_server-B_RGB32-bitmaps-drawn-four-pixels-at-a-ti.patch) app_server: B_RGB32 bitmaps drawn four pixels at a time
+- [0243](../haiku-patches/0243-app_server-B_RGB32-bitmaps-copied-with-memcpy-then-m.patch) app_server: B_RGB32 bitmaps copied with memcpy, then made opaque
+- [0244](../haiku-patches/0244-app_server-B_RGB32-bitmaps-made-opaque-four-pixels-a.patch) app_server: B_RGB32 bitmaps made opaque four pixels at a time, aligned
+- [0245](../haiku-patches/0245-meson_mali-cache-cleaning-only-for-the-buffers-a-cli.patch) meson_mali: cache cleaning only for the buffers a client maps
+- [0246](../haiku-patches/0246-app_server-colour-emoji-fonts-with-colour-pictures.patch) app_server: colour emoji (fonts with colour pictures)
+- [0247](../haiku-patches/0247-Terminal-characters-from-U-10000-on-four-byte-UTF-8.patch) Terminal: characters from U+10000 on (four-byte UTF-8)
+- [0248](../haiku-patches/0248-app_server-the-font-cache-evicts-no-entry-in-use.patch) app_server: the font cache evicts no entry in use
+- [0255](../haiku-patches/0255-app_server-emoji-sequences-drawn-as-one-emoji.patch) app_server: emoji sequences drawn as one emoji
+- [0341](../haiku-patches/0341-Terminal-a-setting-to-turn-antialiased-text-off.patch) Terminal: a setting to turn antialiased text off
+- [0342](../haiku-patches/0342-app_server-text-without-antialiasing-from-FreeType-s.patch) app_server: text without antialiasing from FreeType's monochrome glyphs
+
+## The 40-pin header, sensors and remotes (32)
+
+- [0091](../haiku-patches/0091-meson_i2c-translate-the-register-address-through-the.patch) meson_i2c: translate the register address through the bus ranges
+- [0092](../haiku-patches/0092-meson_i2c-probe-the-RTC-shield-again-if-the-first-tr.patch) meson_i2c: probe the RTC shield again if the first transfer fails
+- [0093](../haiku-patches/0093-pcf8563-the-measured-delay-to-the-first-tick-and-the.patch) pcf8563: the measured delay to the first tick, and the clock's drift
+- [0094](../haiku-patches/0094-pcf8563-measure-the-drift-at-the-clock-s-tick.patch) pcf8563: measure the drift at the clock's tick
+- [0096](../haiku-patches/0096-meson_i2c-a-stop-after-setup-and-a-10-ms-transfer-ti.patch) meson_i2c: a stop after setup, and a 10 ms transfer timeout
+- [0097](../haiku-patches/0097-meson_i2c-the-stop-after-setup-times-out-every-boot-.patch) meson_i2c: the stop after setup times out every boot, don't log it
+- [0101](../haiku-patches/0101-meson_gpio-and-gpio-the-ODROID-C2-s-header-pins-as-G.patch) meson_gpio and gpio: the ODROID-C2's header pins as GPIO
+- [0145](../haiku-patches/0145-meson_gpio-claims-and-ioctls-for-programs-PWM-on-pin.patch) meson_gpio: claims and ioctls for programs, PWM on pins 11 and 19
+- [0146](../haiku-patches/0146-meson_saradc-the-S905-s-SAR-ADC-the-ODROID-C2-s-anal.patch) meson_saradc: the S905's SAR ADC, the ODROID-C2's analog inputs
+- [0147](../haiku-patches/0147-libdevice-BDigitalPort-BA2D-and-BD2A-on-the-ODROID-C.patch) libdevice: BDigitalPort, BA2D and BD2A on the ODROID-C2
+- [0149](../haiku-patches/0149-meson_header-the-ODROID-C2-header-s-pins-who-has-the.patch) meson_header: the ODROID-C2 header's pins, who has them, their mux
+- [0150](../haiku-patches/0150-meson_gpio-the-header-s-pins-through-meson_header-pe.patch) meson_gpio: the header's pins through meson_header; periods, edges
+- [0151](../haiku-patches/0151-meson_i2c-header-pins-through-meson_header-I2C-B-for.patch) meson_i2c: header pins through meson_header; I2C B for programs
+- [0153](../haiku-patches/0153-meson_uart-the-ODROID-C2-header-s-UART-A-as-dev-port.patch) meson_uart: the ODROID-C2 header's UART A as /dev/ports/header
+- [0155](../haiku-patches/0155-libdevice-CountDevices-and-GetDeviceName-for-the-BeB.patch) libdevice: CountDevices() and GetDeviceName() for the BeBox classes
+- [0156](../haiku-patches/0156-libdevice-BDigitalPin-BPWM-and-BGeekPort-the-rest-of.patch) libdevice: BDigitalPin, BPWM and BGeekPort, the rest of the header
+- [0157](../haiku-patches/0157-libdevice-BI2CDevice-a-device-on-the-header-s-I2C-bu.patch) libdevice: BI2CDevice, a device on the header's I2C bus
+- [0160](../haiku-patches/0160-meson_scpi-the-clock-follows-the-load-by-default-and.patch) meson_scpi: the clock follows the load by default, and the scheduler mode
+- [0163](../haiku-patches/0163-meson_ir-Remote-Control-infrared-remotes-as-keystrok.patch) meson_ir, Remote Control: infrared remotes as keystrokes
+- [0164](../haiku-patches/0164-meson_ir-the-board-s-node-lists-amlogic-meson-gx-ir-.patch) meson_ir: the board's node lists "amlogic,meson-gx-ir" first
+- [0165](../haiku-patches/0165-Remote-Control-add-on-receivers-published-after-the-.patch) Remote Control add-on: receivers published after the input_server starts
+- [0166](../haiku-patches/0166-Remote-Control-profiles-for-the-ODROID-remote-and-th.patch) Remote Control: profiles for the ODROID remote and the JVC RM-RK52
+- [0167](../haiku-patches/0167-Remote-Control-add-on-held-buttons-repeat-at-most-fi.patch) Remote Control add-on: held buttons repeat at most five times a second
+- [0168](../haiku-patches/0168-Remote-Control-preferences-wider-columns-the-button-.patch) Remote Control preferences: wider columns; the button received stays shown
+- [0169](../haiku-patches/0169-Remote-Control-preferences-an-icon-modifiers-and-eve.patch) Remote Control preferences: an icon; modifiers and every key by mouse
+- [0170](../haiku-patches/0170-Remote-Control-preferences-a-music-player-s-fast-for.patch) Remote Control preferences: a music player's fast forward and rewind
+- [0172](../haiku-patches/0172-Remote-Control-a-profile-can-send-to-one-application.patch) Remote Control: a profile can send to one application, active or not
+- [0173](../haiku-patches/0173-Remote-Control-preferences-a-duplicate-s-changes-go-.patch) Remote Control preferences: a duplicate's changes go to the duplicate
+- [0183](../haiku-patches/0183-Remote-Control-profiles-for-one-application.patch) Remote Control: profiles for one application
+- [0184](../haiku-patches/0184-Remote-Control-room-for-a-profile-s-application-in-t.patch) Remote Control: room for a profile's application in the list
+- [0258](../haiku-patches/0258-meson_gpio-Hardkernel-s-16x2-LCD-IO-Shield-as-dev-mi.patch) meson_gpio: Hardkernel's 16x2 LCD + IO Shield as /dev/misc/shield
+- [0340](../haiku-patches/0340-meson_gpio-the-LCD-shield-s-D5-and-D7-were-on-each-o.patch) meson_gpio: the LCD shield's D5 and D7 were on each other's pins
+
+## Other (1)
+
+- [0113](../haiku-patches/0113-Revert-the-temporary-scheduler-tracing.patch) Revert the temporary scheduler tracing

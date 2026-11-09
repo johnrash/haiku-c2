@@ -1,0 +1,3 @@
+#!/bin/sh
+# Haiku's xres, the build's host tool (see cc)
+exec "$HAIKU_HOST_TOOLS/xres" "$@"

@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 00:20:14 -0400
+Subject: [PATCH 005/342] vfs_boot: wait up to 10 s for an asynchronously
+ published boot device
+
+MMC (and USB) disks are published by their bus manager's worker thread,
+possibly after vfs_mount_boot_file_system() scanned /dev/disk once, which
+then panicked with "did not find any boot partitions". Rescan every 250 ms
+for up to 10 s before giving up.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/kernel/fs/vfs_boot.cpp | 20 +++++++++++++++++---
+ 1 file changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/src/system/kernel/fs/vfs_boot.cpp b/src/system/kernel/fs/vfs_boot.cpp
+index 45e7fb785a..b0cd9b091b 100644
+--- a/src/system/kernel/fs/vfs_boot.cpp
++++ b/src/system/kernel/fs/vfs_boot.cpp
+@@ -472,10 +472,24 @@ vfs_mount_boot_file_system(kernel_args* args)
+ 	KMessage bootVolume;
+ 	bootVolume.SetTo(args->boot_volume, args->boot_volume_size);
+ 
++	// Some boot devices (MMC, USB) are published asynchronously by their bus
++	// manager's worker thread, possibly after the first scan: keep rescanning
++	// for a while before giving up.
++	static const int32 kBootDeviceWaitTries = 40;
++	static const bigtime_t kBootDeviceWaitInterval = 250000;
++
+ 	PartitionStack partitions;
+-	status_t status = get_boot_partitions(bootVolume, partitions);
+-	if (status < B_OK) {
+-		panic("get_boot_partitions failed!");
++	status_t status;
++	for (int32 i = 0; ; i++) {
++		status = get_boot_partitions(bootVolume, partitions);
++		if (status < B_OK) {
++			panic("get_boot_partitions failed!");
++		}
++		if (!partitions.IsEmpty() || i == kBootDeviceWaitTries)
++			break;
++		if (i == 0)
++			dprintf("vfs_boot: boot partition not found yet, waiting for devices\n");
++		snooze(kBootDeviceWaitInterval);
+ 	}
+ 	if (partitions.IsEmpty()) {
+ 		panic("did not find any boot partitions! @! syslog | tail 15");

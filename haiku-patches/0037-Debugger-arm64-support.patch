@@ -1,0 +1,1451 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 20:44:45 -0400
+Subject: [PATCH 037/342] Debugger: arm64 support
+
+ArchitectureARM64 and CpuStateARM64 for the arm64 debug CPU state (x0-x30,
+sp, pc, cpsr), with DWARF register numbers as register indices:
+- the call frame information's return address column is the link
+  register, so an unwound CPU state has no pc and the caller continues
+  at its lr;
+- frames without call frame information come from the frame records;
+- PLT entries (adrp/ldr x17/br) are followed for stepping into calls;
+- four watchpoints of up to eight bytes, reads and/or writes.
+
+DisassemblerARM64 decodes branches itself and gets the text from
+Capstone, which the capstone build feature provides (only arm64 builds
+include the architecture). Core files of arm64 teams can be loaded.
+
+Architecture::CreateStackTrace() now stops when unwinding returns the
+same CPU state: a loop there (as with a register order bug while porting)
+grew the Debugger until the system ran out of memory.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kits/debugger/Jamfile                     |  22 +
+ src/kits/debugger/arch/Architecture.cpp       |  11 +-
+ .../arch/arm64/ARM64AssemblyLanguage.cpp      |  24 +
+ .../arch/arm64/ARM64AssemblyLanguage.h        |  21 +
+ .../debugger/arch/arm64/ArchitectureARM64.cpp | 570 ++++++++++++++++++
+ .../debugger/arch/arm64/ArchitectureARM64.h   |  96 +++
+ .../debugger/arch/arm64/CpuStateARM64.cpp     | 169 ++++++
+ src/kits/debugger/arch/arm64/CpuStateARM64.h  |  65 ++
+ .../arch/arm64/disasm/DisassemblerARM64.cpp   | 180 ++++++
+ .../arch/arm64/disasm/DisassemblerARM64.h     |  60 ++
+ src/kits/debugger/arch/arm64/disasm/Jamfile   |  23 +
+ .../core/CoreFileDebuggerInterface.cpp        |   8 +
+ .../local/LocalDebuggerInterface.cpp          |   5 +
+ 13 files changed, 1253 insertions(+), 1 deletion(-)
+ create mode 100644 src/kits/debugger/arch/arm64/ARM64AssemblyLanguage.cpp
+ create mode 100644 src/kits/debugger/arch/arm64/ARM64AssemblyLanguage.h
+ create mode 100644 src/kits/debugger/arch/arm64/ArchitectureARM64.cpp
+ create mode 100644 src/kits/debugger/arch/arm64/ArchitectureARM64.h
+ create mode 100644 src/kits/debugger/arch/arm64/CpuStateARM64.cpp
+ create mode 100644 src/kits/debugger/arch/arm64/CpuStateARM64.h
+ create mode 100644 src/kits/debugger/arch/arm64/disasm/DisassemblerARM64.cpp
+ create mode 100644 src/kits/debugger/arch/arm64/disasm/DisassemblerARM64.h
+ create mode 100644 src/kits/debugger/arch/arm64/disasm/Jamfile
+
+diff --git a/src/kits/debugger/Jamfile b/src/kits/debugger/Jamfile
+index 1809143f45..8f0650ee9f 100644
+--- a/src/kits/debugger/Jamfile
++++ b/src/kits/debugger/Jamfile
+@@ -37,6 +37,7 @@ LINKFLAGS += -Wl,--exclude-libs,ALL ;
+ SEARCH_SOURCE += [ FDirName $(SUBDIR) arch ] ;
+ SEARCH_SOURCE += [ FDirName $(SUBDIR) arch x86 ] ;
+ SEARCH_SOURCE += [ FDirName $(SUBDIR) arch x86_64 ] ;
++SEARCH_SOURCE += [ FDirName $(SUBDIR) arch arm64 ] ;
+ SEARCH_SOURCE += [ FDirName $(SUBDIR) controllers ] ;
+ SEARCH_SOURCE += [ FDirName $(SUBDIR) debug_info ] ;
+ SEARCH_SOURCE += [ FDirName $(SUBDIR) debug_info loading_state_handlers ] ;
+@@ -82,6 +83,22 @@ SourceHdrs
+ 	: [ FDirName $(SUBDIR) dwarf ]
+ ;
+ 
++# arch/arm64: the native architecture on arm64, whose disassembler needs
++# Capstone (the capstone build feature)
++local archARM64Sources ;
++local archARM64Objects ;
++local archARM64Libraries ;
++if $(TARGET_PACKAGING_ARCH) = arm64 && [ FIsBuildFeatureEnabled capstone ] {
++	archARM64Sources =
++		ArchitectureARM64.cpp
++		ARM64AssemblyLanguage.cpp
++		CpuStateARM64.cpp
++		;
++	archARM64Objects = <nogrist>Debugger_disasm_arm64.o ;
++	archARM64Libraries = [ BuildFeatureAttribute capstone : library ] ;
++	DEFINES += DEBUGGER_ARCH_ARM64 ;
++}
++
+ local sources =
+ 	DebuggerGlobals.cpp
+ 
+@@ -100,6 +117,8 @@ local sources =
+ 	ArchitectureX8664.cpp
+ 	CpuStateX8664.cpp
+ 
++	$(archARM64Sources)
++
+ 	# controllers
+ 	DebugReportGenerator.cpp
+ 	TeamDebugger.cpp
+@@ -344,9 +363,11 @@ SharedLibrary libdebugger.so :
+ 	<nogrist>Debugger_demangler.o
+ 	<nogrist>Debugger_disasm_x86.o
+ 	<nogrist>Debugger_disasm_x86_64.o
++	$(archARM64Objects)
+ 	<nogrist>Debugger_dwarf.o
+ 
+ 	libzydis.a
++	$(archARM64Libraries)
+ 	<bin>debug_utils.a
+ 	shared
+ 
+@@ -356,5 +377,6 @@ SharedLibrary libdebugger.so :
+ 
+ HaikuSubInclude arch x86 disasm ;
+ HaikuSubInclude arch x86_64 disasm ;
++HaikuSubInclude arch arm64 disasm ;
+ HaikuSubInclude demangler ;
+ HaikuSubInclude dwarf ;
+diff --git a/src/kits/debugger/arch/Architecture.cpp b/src/kits/debugger/arch/Architecture.cpp
+index df7b2d51ac..dc3d828414 100644
+--- a/src/kits/debugger/arch/Architecture.cpp
++++ b/src/kits/debugger/arch/Architecture.cpp
+@@ -180,6 +180,15 @@ Architecture::CreateStackTrace(Team* team,
+ 				break;
+ 		}
+ 
++		// Unwinding that does not get anywhere (wrong call frame information,
++		// a corrupt stack) would go on until memory runs out.
++		bool stuck = previousCpuState != NULL
++			&& previousCpuState->InstructionPointer()
++				== cpuState->InstructionPointer()
++			&& previousCpuState->StackPointer() == cpuState->StackPointer()
++			&& previousCpuState->StackFramePointer()
++				== cpuState->StackFramePointer();
++
+ 		cpuStateReference.SetTo(previousCpuState, true);
+ 
+ 		frame->SetImage(image);
+@@ -192,7 +201,7 @@ Architecture::CreateStackTrace(Team* team,
+ 
+ 		nextFrame = frame;
+ 		cpuState = previousCpuState;
+-		if (--maxStackDepth == 0)
++		if (--maxStackDepth == 0 || stuck)
+ 			break;
+ 	}
+ 
+diff --git a/src/kits/debugger/arch/arm64/ARM64AssemblyLanguage.cpp b/src/kits/debugger/arch/arm64/ARM64AssemblyLanguage.cpp
+new file mode 100644
+index 0000000000..3a8df91853
+--- /dev/null
++++ b/src/kits/debugger/arch/arm64/ARM64AssemblyLanguage.cpp
+@@ -0,0 +1,24 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "ARM64AssemblyLanguage.h"
++
++
++ARM64AssemblyLanguage::ARM64AssemblyLanguage()
++{
++}
++
++
++ARM64AssemblyLanguage::~ARM64AssemblyLanguage()
++{
++}
++
++
++const char*
++ARM64AssemblyLanguage::Name() const
++{
++	return "ARM64 assembly";
++}
+diff --git a/src/kits/debugger/arch/arm64/ARM64AssemblyLanguage.h b/src/kits/debugger/arch/arm64/ARM64AssemblyLanguage.h
+new file mode 100644
+index 0000000000..205b22d46b
+--- /dev/null
++++ b/src/kits/debugger/arch/arm64/ARM64AssemblyLanguage.h
+@@ -0,0 +1,21 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef ARM64_ASSEMBLY_LANGUAGE_H
++#define ARM64_ASSEMBLY_LANGUAGE_H
++
++
++#include "SourceLanguage.h"
++
++
++class ARM64AssemblyLanguage : public SourceLanguage {
++public:
++								ARM64AssemblyLanguage();
++	virtual						~ARM64AssemblyLanguage();
++
++	virtual	const char*			Name() const;
++};
++
++
++#endif	// ARM64_ASSEMBLY_LANGUAGE_H
+diff --git a/src/kits/debugger/arch/arm64/ArchitectureARM64.cpp b/src/kits/debugger/arch/arm64/ArchitectureARM64.cpp
+new file mode 100644
+index 0000000000..b8cdcb0aa4
+--- /dev/null
++++ b/src/kits/debugger/arch/arm64/ArchitectureARM64.cpp
+@@ -0,0 +1,570 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "ArchitectureARM64.h"
++
++#include <new>
++
++#include <String.h>
++
++#include "ARM64AssemblyLanguage.h"
++#include "CpuStateARM64.h"
++#include "DisassembledCode.h"
++#include "FunctionDebugInfo.h"
++#include "InstructionInfo.h"
++#include "NoOpStackFrameDebugInfo.h"
++#include "RegisterMap.h"
++#include "StackFrame.h"
++#include "Statement.h"
++#include "TeamMemory.h"
++#include "ValueLocation.h"
++
++#include "disasm/DisassemblerARM64.h"
++
++
++// DWARF register numbers: x0-x30 are 0-30 and sp is 31, as our indices.
++// The program counter has none in call frame information (the return address
++// column is x30), so the unwound CPU states leave it unset (CpuStateARM64).
++static const int32 kDwarfRegisterCount = 32;
++
++// stp x29, x30, [sp, #-N]!  and  mov x29, sp
++static const uint32 kPushFrameRecordMask = 0xffc07fff;
++static const uint32 kPushFrameRecord = 0xa9807bfd;
++static const uint32 kSetFramePointer = 0x910003fd;
++static const uint32 kReturn = 0xd65f03c0;
++
++
++// #pragma mark - ToDwarfRegisterMap
++
++
++struct ArchitectureARM64::ToDwarfRegisterMap : RegisterMap {
++	virtual int32 CountRegisters() const
++	{
++		return ARM64_REGISTER_COUNT;
++	}
++
++	virtual int32 MapRegisterIndex(int32 index) const
++	{
++		return index >= 0 && index < kDwarfRegisterCount ? index : -1;
++	}
++};
++
++
++// #pragma mark - FromDwarfRegisterMap
++
++
++struct ArchitectureARM64::FromDwarfRegisterMap : RegisterMap {
++	virtual int32 CountRegisters() const
++	{
++		return kDwarfRegisterCount;
++	}
++
++	virtual int32 MapRegisterIndex(int32 index) const
++	{
++		return index >= 0 && index < kDwarfRegisterCount ? index : -1;
++	}
++};
++
++
++// #pragma mark - ArchitectureARM64
++
++
++ArchitectureARM64::ArchitectureARM64(TeamMemory* teamMemory)
++	:
++	Architecture(teamMemory, 8, sizeof(arm64_debug_cpu_state), false),
++	fAssemblyLanguage(NULL),
++	fToDwarfRegisterMap(NULL),
++	fFromDwarfRegisterMap(NULL)
++{
++}
++
++
++ArchitectureARM64::~ArchitectureARM64()
++{
++	if (fToDwarfRegisterMap != NULL)
++		fToDwarfRegisterMap->ReleaseReference();
++	if (fFromDwarfRegisterMap != NULL)
++		fFromDwarfRegisterMap->ReleaseReference();
++	if (fAssemblyLanguage != NULL)
++		fAssemblyLanguage->ReleaseReference();
++}
++
++
++status_t
++ArchitectureARM64::Init()
++{
++	fAssemblyLanguage = new(std::nothrow) ARM64AssemblyLanguage;
++	if (fAssemblyLanguage == NULL)
++		return B_NO_MEMORY;
++
++	try {
++		// in index order: DwarfImageDebugInfo looks them up by index
++		static const char* const kNames[] = {
++			"x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10",
++			"x11", "x12", "x13", "x14", "x15", "x16", "x17", "x18", "x19",
++			"x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28"
++		};
++		for (int32 i = 0; i <= 28; i++) {
++			// x19-x28 are callee-saved (AAPCS64)
++			_AddIntegerRegister(ARM64_REGISTER_X0 + i, kNames[i],
++				REGISTER_TYPE_GENERAL_PURPOSE, i >= 19);
++		}
++		_AddIntegerRegister(ARM64_REGISTER_FP, "fp",
++			REGISTER_TYPE_GENERAL_PURPOSE, true);
++		_AddIntegerRegister(ARM64_REGISTER_LR, "lr",
++			REGISTER_TYPE_GENERAL_PURPOSE, false);
++		_AddIntegerRegister(ARM64_REGISTER_SP, "sp",
++			REGISTER_TYPE_STACK_POINTER, true);
++		_AddIntegerRegister(ARM64_REGISTER_PC, "pc",
++			REGISTER_TYPE_INSTRUCTION_POINTER, false);
++		if (!fRegisters.Add(Register(ARM64_REGISTER_CPSR, "cpsr", 32,
++				B_UINT32_TYPE, REGISTER_TYPE_SPECIAL_PURPOSE, true))) {
++			throw std::bad_alloc();
++		}
++	} catch (std::bad_alloc&) {
++		return B_NO_MEMORY;
++	}
++
++	fToDwarfRegisterMap = new(std::nothrow) ToDwarfRegisterMap;
++	fFromDwarfRegisterMap = new(std::nothrow) FromDwarfRegisterMap;
++	if (fToDwarfRegisterMap == NULL || fFromDwarfRegisterMap == NULL)
++		return B_NO_MEMORY;
++
++	return B_OK;
++}
++
++
++int32
++ArchitectureARM64::StackGrowthDirection() const
++{
++	return STACK_GROWTH_DIRECTION_NEGATIVE;
++}
++
++
++int32
++ArchitectureARM64::CountRegisters() const
++{
++	return fRegisters.Count();
++}
++
++
++const Register*
++ArchitectureARM64::Registers() const
++{
++	return fRegisters.Elements();
++}
++
++
++status_t
++ArchitectureARM64::GetDwarfRegisterMaps(RegisterMap** _toDwarf,
++	RegisterMap** _fromDwarf) const
++{
++	if (_toDwarf != NULL) {
++		*_toDwarf = fToDwarfRegisterMap;
++		fToDwarfRegisterMap->AcquireReference();
++	}
++
++	if (_fromDwarf != NULL) {
++		*_fromDwarf = fFromDwarfRegisterMap;
++		fFromDwarfRegisterMap->AcquireReference();
++	}
++
++	return B_OK;
++}
++
++
++status_t
++ArchitectureARM64::GetCpuFeatures(uint32& flags)
++{
++	flags = 0;
++	return B_OK;
++}
++
++
++status_t
++ArchitectureARM64::CreateCpuState(CpuState*& _state)
++{
++	CpuStateARM64* state = new(std::nothrow) CpuStateARM64;
++	if (state == NULL)
++		return B_NO_MEMORY;
++
++	_state = state;
++	return B_OK;
++}
++
++
++status_t
++ArchitectureARM64::CreateCpuState(const void* cpuStateData, size_t size,
++	CpuState*& _state)
++{
++	if (size != sizeof(arm64_debug_cpu_state))
++		return B_BAD_VALUE;
++
++	CpuStateARM64* state = new(std::nothrow) CpuStateARM64(
++		*(const arm64_debug_cpu_state*)cpuStateData);
++	if (state == NULL)
++		return B_NO_MEMORY;
++
++	_state = state;
++	return B_OK;
++}
++
++
++/*!	Creates a frame without call frame information, from the frame record
++	(x29 pointing to the saved x29 and x30) that GCC's prologues push.
++*/
++status_t
++ArchitectureARM64::CreateStackFrame(Image* image, FunctionDebugInfo* function,
++	CpuState* _cpuState, bool isTopFrame, StackFrame*& _frame,
++	CpuState*& _previousCpuState)
++{
++	CpuStateARM64* cpuState = dynamic_cast<CpuStateARM64*>(_cpuState);
++	if (cpuState == NULL)
++		return B_BAD_VALUE;
++
++	uint64 framePointer = cpuState->IntRegisterValue(ARM64_REGISTER_FP);
++	uint64 pc = cpuState->InstructionPointer();
++
++	bool readFrameRecord = true;
++	uint64 previousFramePointer = 0;
++	uint64 returnAddress = 0;
++	stack_frame_type frameType = STACK_FRAME_TYPE_STANDARD;
++
++	if (isTopFrame) {
++		// Until the prologue has set the frame pointer, after the epilogue
++		// has restored it, and in functions without a frame record (leaf
++		// functions, the syscall stubs), the return address is still in the
++		// link register.
++		bool useLinkRegister = true;
++		if (_HasFunctionPrologue(function)
++			&& pc >= function->Address() + 8) {
++			uint32 instruction;
++			useLinkRegister = fTeamMemory->ReadMemory(pc, &instruction, 4) == 4
++				&& instruction == kReturn;
++		}
++		if (useLinkRegister
++			&& cpuState->IsRegisterSet(ARM64_REGISTER_LR)) {
++			returnAddress = cpuState->IntRegisterValue(ARM64_REGISTER_LR);
++			previousFramePointer = framePointer;
++			framePointer = 0;
++			readFrameRecord = false;
++			frameType = STACK_FRAME_TYPE_FRAMELESS;
++		}
++	}
++
++	StackFrameDebugInfo* stackFrameDebugInfo
++		= new(std::nothrow) NoOpStackFrameDebugInfo;
++	if (stackFrameDebugInfo == NULL)
++		return B_NO_MEMORY;
++	BReference<StackFrameDebugInfo> stackFrameDebugInfoReference(
++		stackFrameDebugInfo, true);
++
++	StackFrame* frame = new(std::nothrow) StackFrame(frameType, cpuState,
++		framePointer, pc, stackFrameDebugInfo);
++	if (frame == NULL)
++		return B_NO_MEMORY;
++	BReference<StackFrame> frameReference(frame, true);
++
++	status_t error = frame->Init();
++	if (error != B_OK)
++		return error;
++
++	if (readFrameRecord) {
++		uint64 frameData[2];
++		if (framePointer != 0
++			&& fTeamMemory->ReadMemory(framePointer, frameData, 16) == 16) {
++			previousFramePointer = frameData[0];
++			returnAddress = frameData[1];
++		}
++	}
++
++	CpuStateARM64* previousCpuState = NULL;
++	if (returnAddress != 0) {
++		previousCpuState = new(std::nothrow) CpuStateARM64;
++		if (previousCpuState == NULL)
++			return B_NO_MEMORY;
++
++		previousCpuState->SetIntRegister(ARM64_REGISTER_FP,
++			previousFramePointer);
++		previousCpuState->SetIntRegister(ARM64_REGISTER_PC, returnAddress);
++		frame->SetPreviousCpuState(previousCpuState);
++	}
++
++	frame->SetReturnAddress(returnAddress);
++
++	_frame = frameReference.Detach();
++	_previousCpuState = previousCpuState;
++	return B_OK;
++}
++
++
++void
++ArchitectureARM64::UpdateStackFrameCpuState(const StackFrame* frame,
++	Image* previousImage, FunctionDebugInfo* previousFunction,
++	CpuState* previousCpuState)
++{
++	// Not a top frame: point at the call (a BL or BLR, four bytes) instead of
++	// the instruction after it.
++	CpuStateARM64* cpuState = dynamic_cast<CpuStateARM64*>(previousCpuState);
++	if (cpuState == NULL)
++		return;
++
++	uint64 pc = cpuState->InstructionPointer();
++	if (previousFunction == NULL || pc <= previousFunction->Address())
++		return;
++
++	cpuState->SetIntRegister(ARM64_REGISTER_PC, pc - 4);
++}
++
++
++status_t
++ArchitectureARM64::ReadValueFromMemory(target_addr_t address, uint32 valueType,
++	BVariant& _value) const
++{
++	uint8 buffer[64];
++	size_t size = BVariant::SizeOfType(valueType);
++	if (size == 0 || size > sizeof(buffer))
++		return B_BAD_VALUE;
++
++	ssize_t bytesRead = fTeamMemory->ReadMemory(address, buffer, size);
++	if (bytesRead < 0)
++		return bytesRead;
++	if ((size_t)bytesRead != size)
++		return B_ERROR;
++
++	switch (valueType) {
++		case B_INT8_TYPE:
++			_value.SetTo(*(int8*)buffer);
++			return B_OK;
++		case B_UINT8_TYPE:
++			_value.SetTo(*(uint8*)buffer);
++			return B_OK;
++		case B_INT16_TYPE:
++			_value.SetTo(*(int16*)buffer);
++			return B_OK;
++		case B_UINT16_TYPE:
++			_value.SetTo(*(uint16*)buffer);
++			return B_OK;
++		case B_INT32_TYPE:
++			_value.SetTo(*(int32*)buffer);
++			return B_OK;
++		case B_UINT32_TYPE:
++			_value.SetTo(*(uint32*)buffer);
++			return B_OK;
++		case B_INT64_TYPE:
++			_value.SetTo(*(int64*)buffer);
++			return B_OK;
++		case B_UINT64_TYPE:
++			_value.SetTo(*(uint64*)buffer);
++			return B_OK;
++		case B_FLOAT_TYPE:
++			_value.SetTo(*(float*)buffer);
++			return B_OK;
++		case B_DOUBLE_TYPE:
++			_value.SetTo(*(double*)buffer);
++			return B_OK;
++		default:
++			return B_BAD_VALUE;
++	}
++}
++
++
++status_t
++ArchitectureARM64::ReadValueFromMemory(target_addr_t addressSpace,
++	target_addr_t address, uint32 valueType, BVariant& _value) const
++{
++	// n/a on this architecture
++	return B_BAD_VALUE;
++}
++
++
++status_t
++ArchitectureARM64::DisassembleCode(FunctionDebugInfo* function,
++	const void* buffer, size_t bufferSize, DisassembledCode*& _sourceCode)
++{
++	DisassembledCode* source = new(std::nothrow) DisassembledCode(
++		fAssemblyLanguage);
++	if (source == NULL)
++		return B_NO_MEMORY;
++	BReference<DisassembledCode> sourceReference(source, true);
++
++	DisassemblerARM64 disassembler;
++	status_t error = disassembler.Init(function->Address(), buffer, bufferSize);
++	if (error != B_OK)
++		return error;
++
++	BString functionName(function->PrettyName());
++	if (!source->AddCommentLine((functionName << ':').String()))
++		return B_NO_MEMORY;
++
++	BString line;
++	target_addr_t instructionAddress;
++	target_size_t instructionSize;
++	bool breakpointAllowed;
++	while (disassembler.GetNextInstruction(line, instructionAddress,
++				instructionSize, breakpointAllowed) == B_OK) {
++		if (!source->AddInstructionLine(line, instructionAddress,
++				instructionSize)) {
++			return B_NO_MEMORY;
++		}
++	}
++
++	_sourceCode = sourceReference.Detach();
++	return B_OK;
++}
++
++
++status_t
++ArchitectureARM64::GetStatement(FunctionDebugInfo* function,
++	target_addr_t address, Statement*& _statement)
++{
++	InstructionInfo info;
++	status_t error = GetInstructionInfo(address, info, NULL);
++	if (error != B_OK)
++		return error;
++
++	ContiguousStatement* statement = new(std::nothrow) ContiguousStatement(
++		SourceLocation(-1), TargetAddressRange(info.Address(), info.Size()));
++	if (statement == NULL)
++		return B_NO_MEMORY;
++
++	_statement = statement;
++	return B_OK;
++}
++
++
++status_t
++ArchitectureARM64::GetInstructionInfo(target_addr_t address,
++	InstructionInfo& _info, CpuState* state)
++{
++	uint32 instruction;
++	ssize_t bytesRead = fTeamMemory->ReadMemory(address, &instruction, 4);
++	if (bytesRead < 0)
++		return bytesRead;
++	if (bytesRead != 4)
++		return B_BAD_ADDRESS;
++
++	DisassemblerARM64 disassembler;
++	status_t error = disassembler.Init(address, &instruction, 4);
++	if (error != B_OK)
++		return error;
++
++	return disassembler.GetNextInstructionInfo(_info, state);
++}
++
++
++/*!	Follows a PLT entry to the function it calls. GNU ld's AArch64 PLT
++	entries begin with "adrp x16, <GOT page>; ldr x17, [x16, #<offset>]",
++	then branch to x17.
++*/
++status_t
++ArchitectureARM64::ResolvePICFunctionAddress(target_addr_t instructionAddress,
++	CpuState* state, target_addr_t& _targetAddress)
++{
++	uint32 code[2];
++	if (fTeamMemory->ReadMemory(instructionAddress, code, sizeof(code))
++			!= sizeof(code)) {
++		return B_BAD_VALUE;
++	}
++
++	// adrp: 1 immlo:2 10000 immhi:19 Rd:5
++	if ((code[0] & 0x9f000000) != 0x90000000)
++		return B_BAD_VALUE;
++	uint32 adrpRegister = code[0] & 0x1f;
++	int64 pages = (int64)(((uint64)((code[0] >> 5) & 0x7ffff) << 2
++		| ((code[0] >> 29) & 3)) << 43) >> 43;
++	target_addr_t page = (instructionAddress & ~(target_addr_t)0xfff)
++		+ pages * 4096;
++
++	// ldr x<t>, [x<n>, #imm12 * 8]
++	if ((code[1] & 0xffc00000) != 0xf9400000
++		|| ((code[1] >> 5) & 0x1f) != adrpRegister) {
++		return B_BAD_VALUE;
++	}
++	target_addr_t gotEntry = page + ((code[1] >> 10) & 0xfff) * 8;
++
++	target_addr_t function;
++	if (fTeamMemory->ReadMemory(gotEntry, &function, 8) != 8)
++		return B_BAD_VALUE;
++
++	_targetAddress = function;
++	return B_OK;
++}
++
++
++status_t
++ArchitectureARM64::GetWatchpointDebugCapabilities(int32& _maxRegisterCount,
++	int32& _maxBytesPerRegister, uint8& _watchpointCapabilityFlags)
++{
++	// the Cortex-A53's four, each watching up to eight aligned bytes
++	_maxRegisterCount = 4;
++	_maxBytesPerRegister = 8;
++	_watchpointCapabilityFlags = WATCHPOINT_CAPABILITY_FLAG_READ
++		| WATCHPOINT_CAPABILITY_FLAG_WRITE
++		| WATCHPOINT_CAPABILITY_FLAG_READ_WRITE;
++	return B_OK;
++}
++
++
++status_t
++ArchitectureARM64::GetReturnAddressLocation(StackFrame* frame,
++	target_size_t valueSize, ValueLocation*& _location)
++{
++	// AAPCS64: values of up to 16 bytes come back in x0 and x1. Larger ones
++	// go to memory at x8, which the callee need not preserve.
++	if (valueSize > 16)
++		return B_NOT_SUPPORTED;
++
++	ValueLocation* location = new(std::nothrow) ValueLocation(IsBigEndian());
++	if (location == NULL)
++		return B_NO_MEMORY;
++	BReference<ValueLocation> locationReference(location, true);
++
++	ValuePieceLocation piece;
++	piece.SetSize(valueSize > 8 ? 8 : valueSize);
++	piece.SetToRegister(ARM64_REGISTER_X0);
++	if (!location->AddPiece(piece))
++		return B_NO_MEMORY;
++
++	if (valueSize > 8) {
++		ValuePieceLocation secondPiece;
++		secondPiece.SetSize(valueSize - 8);
++		secondPiece.SetToRegister(ARM64_REGISTER_X0 + 1);
++		if (!location->AddPiece(secondPiece))
++			return B_NO_MEMORY;
++	}
++
++	_location = locationReference.Detach();
++	return B_OK;
++}
++
++
++void
++ArchitectureARM64::_AddIntegerRegister(int32 index, const char* name,
++	register_type type, bool calleePreserved)
++{
++	if (!fRegisters.Add(Register(index, name, 64, B_UINT64_TYPE, type,
++			calleePreserved))) {
++		throw std::bad_alloc();
++	}
++}
++
++
++bool
++ArchitectureARM64::_HasFunctionPrologue(FunctionDebugInfo* function) const
++{
++	if (function == NULL || function->Size() < 8)
++		return false;
++
++	uint32 code[2];
++	if (fTeamMemory->ReadMemory(function->Address(), code, sizeof(code))
++			!= sizeof(code)) {
++		return false;
++	}
++
++	return (code[0] & kPushFrameRecordMask) == kPushFrameRecord
++		&& code[1] == kSetFramePointer;
++}
+diff --git a/src/kits/debugger/arch/arm64/ArchitectureARM64.h b/src/kits/debugger/arch/arm64/ArchitectureARM64.h
+new file mode 100644
+index 0000000000..0dfb03a2b7
+--- /dev/null
++++ b/src/kits/debugger/arch/arm64/ArchitectureARM64.h
+@@ -0,0 +1,96 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef ARCHITECTURE_ARM64_H
++#define ARCHITECTURE_ARM64_H
++
++
++#include <Array.h>
++
++#include "Architecture.h"
++#include "Register.h"
++
++
++class SourceLanguage;
++
++
++class ArchitectureARM64 : public Architecture {
++public:
++								ArchitectureARM64(TeamMemory* teamMemory);
++	virtual						~ArchitectureARM64();
++
++	virtual	status_t			Init();
++
++	virtual int32				StackGrowthDirection() const;
++
++	virtual	int32				CountRegisters() const;
++	virtual	const Register*		Registers() const;
++
++	virtual	status_t			GetDwarfRegisterMaps(RegisterMap** _toDwarf,
++									RegisterMap** _fromDwarf) const;
++
++	virtual	status_t			GetCpuFeatures(uint32& flags);
++
++	virtual	status_t			CreateCpuState(CpuState*& _state);
++	virtual	status_t			CreateCpuState(const void* cpuStateData,
++									size_t size, CpuState*& _state);
++	virtual	status_t			CreateStackFrame(Image* image,
++									FunctionDebugInfo* function,
++									CpuState* cpuState, bool isTopFrame,
++									StackFrame*& _frame,
++									CpuState*& _previousCpuState);
++	virtual	void				UpdateStackFrameCpuState(
++									const StackFrame* frame,
++									Image* previousImage,
++									FunctionDebugInfo* previousFunction,
++									CpuState* previousCpuState);
++
++	virtual	status_t			ReadValueFromMemory(target_addr_t address,
++									uint32 valueType, BVariant& _value) const;
++	virtual	status_t			ReadValueFromMemory(target_addr_t addressSpace,
++									target_addr_t address, uint32 valueType,
++									BVariant& _value) const;
++
++	virtual	status_t			DisassembleCode(FunctionDebugInfo* function,
++									const void* buffer, size_t bufferSize,
++									DisassembledCode*& _sourceCode);
++	virtual	status_t			GetStatement(FunctionDebugInfo* function,
++									target_addr_t address,
++									Statement*& _statement);
++	virtual	status_t			GetInstructionInfo(target_addr_t address,
++									InstructionInfo& _info, CpuState* state);
++	virtual	status_t			ResolvePICFunctionAddress(target_addr_t
++									instructionAddress,
++									CpuState* state,
++									target_addr_t& _targetAddress);
++
++	virtual	status_t			GetWatchpointDebugCapabilities(
++									int32& _maxRegisterCount,
++									int32& _maxBytesPerRegister,
++									uint8& _watchpointCapabilityFlags);
++
++	virtual	status_t			GetReturnAddressLocation(
++									StackFrame* frame, target_size_t valueSize,
++									ValueLocation*& _location);
++
++private:
++			struct ToDwarfRegisterMap;
++			struct FromDwarfRegisterMap;
++
++private:
++			void				_AddIntegerRegister(int32 index,
++									const char* name, register_type type,
++									bool calleePreserved);
++			bool				_HasFunctionPrologue(
++									FunctionDebugInfo* function) const;
++
++private:
++			Array<Register>		fRegisters;
++			SourceLanguage*		fAssemblyLanguage;
++			ToDwarfRegisterMap*	fToDwarfRegisterMap;
++			FromDwarfRegisterMap* fFromDwarfRegisterMap;
++};
++
++
++#endif	// ARCHITECTURE_ARM64_H
+diff --git a/src/kits/debugger/arch/arm64/CpuStateARM64.cpp b/src/kits/debugger/arch/arm64/CpuStateARM64.cpp
+new file mode 100644
+index 0000000000..58c87ebc8d
+--- /dev/null
++++ b/src/kits/debugger/arch/arm64/CpuStateARM64.cpp
+@@ -0,0 +1,169 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "CpuStateARM64.h"
++
++#include <new>
++
++#include <string.h>
++
++#include "Register.h"
++
++
++CpuStateARM64::CpuStateARM64()
++	:
++	fSetRegisters()
++{
++	memset(fRegisters, 0, sizeof(fRegisters));
++}
++
++
++CpuStateARM64::CpuStateARM64(const arm64_debug_cpu_state& state)
++	:
++	fSetRegisters()
++{
++	for (int32 i = 0; i < 30; i++)
++		SetIntRegister(ARM64_REGISTER_X0 + i, state.x[i]);
++	SetIntRegister(ARM64_REGISTER_LR, state.lr);
++	SetIntRegister(ARM64_REGISTER_SP, state.sp);
++	SetIntRegister(ARM64_REGISTER_PC, state.elr);
++	SetIntRegister(ARM64_REGISTER_CPSR, state.spsr);
++}
++
++
++CpuStateARM64::~CpuStateARM64()
++{
++}
++
++
++status_t
++CpuStateARM64::Clone(CpuState*& _clone) const
++{
++	CpuStateARM64* newState = new(std::nothrow) CpuStateARM64();
++	if (newState == NULL)
++		return B_NO_MEMORY;
++
++	memcpy(newState->fRegisters, fRegisters, sizeof(fRegisters));
++	newState->fSetRegisters = fSetRegisters;
++
++	_clone = newState;
++	return B_OK;
++}
++
++
++status_t
++CpuStateARM64::UpdateDebugState(void* state, size_t size) const
++{
++	if (size != sizeof(arm64_debug_cpu_state))
++		return B_BAD_VALUE;
++
++	arm64_debug_cpu_state* arm64State = (arm64_debug_cpu_state*)state;
++
++	for (int32 i = 0; i < 30; i++)
++		arm64State->x[i] = IntRegisterValue(ARM64_REGISTER_X0 + i);
++	arm64State->lr = IntRegisterValue(ARM64_REGISTER_LR);
++	arm64State->sp = IntRegisterValue(ARM64_REGISTER_SP);
++	arm64State->elr = IntRegisterValue(ARM64_REGISTER_PC);
++	arm64State->spsr = IntRegisterValue(ARM64_REGISTER_CPSR);
++
++	return B_OK;
++}
++
++
++target_addr_t
++CpuStateARM64::InstructionPointer() const
++{
++	if (IsRegisterSet(ARM64_REGISTER_PC))
++		return IntRegisterValue(ARM64_REGISTER_PC);
++
++	// A state unwound with DWARF call frame information: the return address
++	// column is the link register, and the caller continues there.
++	return IntRegisterValue(ARM64_REGISTER_LR);
++}
++
++
++void
++CpuStateARM64::SetInstructionPointer(target_addr_t address)
++{
++	SetIntRegister(ARM64_REGISTER_PC, address);
++}
++
++
++target_addr_t
++CpuStateARM64::StackFramePointer() const
++{
++	return IntRegisterValue(ARM64_REGISTER_FP);
++}
++
++
++target_addr_t
++CpuStateARM64::StackPointer() const
++{
++	return IntRegisterValue(ARM64_REGISTER_SP);
++}
++
++
++bool
++CpuStateARM64::GetRegisterValue(const Register* reg, BVariant& _value) const
++{
++	int32 index = reg->Index();
++	if (index == ARM64_REGISTER_PC) {
++		target_addr_t address = InstructionPointer();
++		if (address == 0)
++			return false;
++		_value.SetTo((uint64)address);
++		return true;
++	}
++
++	if (!IsRegisterSet(index))
++		return false;
++
++	if (reg->BitSize() == 32)
++		_value.SetTo((uint32)fRegisters[index]);
++	else
++		_value.SetTo(fRegisters[index]);
++	return true;
++}
++
++
++bool
++CpuStateARM64::SetRegisterValue(const Register* reg, const BVariant& value)
++{
++	int32 index = reg->Index();
++	if (index < 0 || index >= ARM64_REGISTER_COUNT)
++		return false;
++
++	SetIntRegister(index, value.ToUInt64());
++	return true;
++}
++
++
++bool
++CpuStateARM64::IsRegisterSet(int32 index) const
++{
++	return index >= 0 && index < ARM64_REGISTER_COUNT && fSetRegisters[index];
++}
++
++
++uint64
++CpuStateARM64::IntRegisterValue(int32 index) const
++{
++	if (!IsRegisterSet(index))
++		return 0;
++
++	return fRegisters[index];
++}
++
++
++void
++CpuStateARM64::SetIntRegister(int32 index, uint64 value)
++{
++	if (index < 0 || index >= ARM64_REGISTER_COUNT)
++		return;
++
++	fRegisters[index] = value;
++	fSetRegisters[index] = 1;
++}
+diff --git a/src/kits/debugger/arch/arm64/CpuStateARM64.h b/src/kits/debugger/arch/arm64/CpuStateARM64.h
+new file mode 100644
+index 0000000000..2ae3ca0340
+--- /dev/null
++++ b/src/kits/debugger/arch/arm64/CpuStateARM64.h
+@@ -0,0 +1,65 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef CPU_STATE_ARM64_H
++#define CPU_STATE_ARM64_H
++
++#include <bitset>
++
++#include <debugger.h>
++
++#include "CpuState.h"
++
++
++// The register indices are the DWARF register numbers for x0 to sp.
++enum {
++	ARM64_REGISTER_X0 = 0,
++	ARM64_REGISTER_X28 = 28,
++	ARM64_REGISTER_FP = 29,		// x29
++	ARM64_REGISTER_LR = 30,		// x30
++	ARM64_REGISTER_SP = 31,
++	ARM64_REGISTER_PC,
++	ARM64_REGISTER_CPSR,
++
++	ARM64_REGISTER_COUNT
++};
++
++
++class CpuStateARM64 : public CpuState {
++public:
++								CpuStateARM64();
++								CpuStateARM64(
++									const arm64_debug_cpu_state& state);
++	virtual						~CpuStateARM64();
++
++	virtual	status_t			Clone(CpuState*& _clone) const;
++
++	virtual	status_t			UpdateDebugState(void* state, size_t size)
++									const;
++
++	virtual	target_addr_t		InstructionPointer() const;
++	virtual	void				SetInstructionPointer(target_addr_t address);
++
++	virtual	target_addr_t		StackFramePointer() const;
++	virtual	target_addr_t		StackPointer() const;
++
++	virtual	bool				GetRegisterValue(const Register* reg,
++									BVariant& _value) const;
++	virtual	bool				SetRegisterValue(const Register* reg,
++									const BVariant& value);
++
++			bool				IsRegisterSet(int32 index) const;
++			uint64				IntRegisterValue(int32 index) const;
++			void				SetIntRegister(int32 index, uint64 value);
++
++private:
++	typedef std::bitset<ARM64_REGISTER_COUNT> RegisterBitSet;
++
++private:
++			uint64				fRegisters[ARM64_REGISTER_COUNT];
++			RegisterBitSet		fSetRegisters;
++};
++
++
++#endif	// CPU_STATE_ARM64_H
+diff --git a/src/kits/debugger/arch/arm64/disasm/DisassemblerARM64.cpp b/src/kits/debugger/arch/arm64/disasm/DisassemblerARM64.cpp
+new file mode 100644
+index 0000000000..004cc27779
+--- /dev/null
++++ b/src/kits/debugger/arch/arm64/disasm/DisassemblerARM64.cpp
+@@ -0,0 +1,180 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "DisassemblerARM64.h"
++
++#include <new>
++
++#include <string.h>
++
++#include <capstone/capstone.h>
++
++#include "CpuStateARM64.h"
++
++
++struct DisassemblerARM64::CapstoneData {
++	csh			handle;
++	cs_insn*	instruction;
++};
++
++
++DisassemblerARM64::DisassemblerARM64()
++	:
++	fAddress(0),
++	fCode(NULL),
++	fCodeSize(0),
++	fOffset(0),
++	fCapstoneData(NULL)
++{
++}
++
++
++DisassemblerARM64::~DisassemblerARM64()
++{
++	if (fCapstoneData != NULL) {
++		if (fCapstoneData->instruction != NULL)
++			cs_free(fCapstoneData->instruction, 1);
++		cs_close(&fCapstoneData->handle);
++		delete fCapstoneData;
++	}
++}
++
++
++status_t
++DisassemblerARM64::Init(target_addr_t address, const void* code,
++	size_t codeSize)
++{
++	fAddress = address;
++	fCode = (const uint8*)code;
++	fCodeSize = codeSize & ~(size_t)3;
++	fOffset = 0;
++
++	if (fCapstoneData == NULL) {
++		fCapstoneData = new(std::nothrow) CapstoneData;
++		if (fCapstoneData == NULL)
++			return B_NO_MEMORY;
++		if (cs_open(CS_ARCH_ARM64, CS_MODE_ARM, &fCapstoneData->handle)
++				!= CS_ERR_OK) {
++			delete fCapstoneData;
++			fCapstoneData = NULL;
++			return B_ERROR;
++		}
++		fCapstoneData->instruction = cs_malloc(fCapstoneData->handle);
++		if (fCapstoneData->instruction == NULL)
++			return B_NO_MEMORY;
++	}
++
++	return B_OK;
++}
++
++
++status_t
++DisassemblerARM64::GetNextInstruction(BString& line, target_addr_t& _address,
++	target_size_t& _size, bool& _breakpointAllowed)
++{
++	if (fOffset + 4 > fCodeSize)
++		return B_ENTRY_NOT_FOUND;
++
++	uint32 instruction;
++	memcpy(&instruction, fCode + fOffset, 4);
++	target_addr_t address = fAddress + fOffset;
++	fOffset += 4;
++
++	_Format(instruction, address, line);
++	_address = address;
++	_size = 4;
++	_breakpointAllowed = true;
++	return B_OK;
++}
++
++
++status_t
++DisassemblerARM64::GetPreviousInstruction(target_addr_t nextAddress,
++	target_addr_t& _address, target_size_t& _size)
++{
++	if (nextAddress < fAddress + 4 || nextAddress > fAddress + fCodeSize)
++		return B_BAD_VALUE;
++
++	_address = (nextAddress & ~(target_addr_t)3) - 4;
++	_size = 4;
++	return B_OK;
++}
++
++
++status_t
++DisassemblerARM64::GetNextInstructionInfo(InstructionInfo& _info,
++	CpuState* state)
++{
++	if (fOffset + 4 > fCodeSize)
++		return B_ENTRY_NOT_FOUND;
++
++	uint32 instruction;
++	memcpy(&instruction, fCode + fOffset, 4);
++	target_addr_t address = fAddress + fOffset;
++	fOffset += 4;
++
++	target_addr_t target = 0;
++	instruction_type type = DecodeBranch(instruction, address, state, target);
++
++	BString line;
++	_Format(instruction, address, line);
++	if (!_info.SetTo(address, target, 4, type, true, line))
++		return B_NO_MEMORY;
++	return B_OK;
++}
++
++
++/*!	Calls (BL, BLR) and unconditional jumps (B, BR), as the x86 disassemblers
++	classify them; conditional branches and returns are "other". The target
++	of a register branch is only known with a CPU state.
++*/
++/*static*/ instruction_type
++DisassemblerARM64::DecodeBranch(uint32 instruction, target_addr_t address,
++	CpuState* state, target_addr_t& _target)
++{
++	_target = 0;
++
++	// B, BL: imm26, a word offset
++	if ((instruction & 0x7c000000) == 0x14000000) {
++		int64 offset = (int64)((uint64)(instruction & 0x03ffffff) << 38) >> 36;
++		_target = address + offset;
++		return (instruction & 0x80000000) != 0
++			? INSTRUCTION_TYPE_SUBROUTINE_CALL : INSTRUCTION_TYPE_JUMP;
++	}
++
++	// BR, BLR: Rn
++	uint32 opcode = instruction & 0xfffffc1f;
++	if (opcode == 0xd61f0000 || opcode == 0xd63f0000) {
++		CpuStateARM64* arm64State = dynamic_cast<CpuStateARM64*>(state);
++		int32 reg = (instruction >> 5) & 0x1f;
++		if (arm64State != NULL && arm64State->IsRegisterSet(reg))
++			_target = arm64State->IntRegisterValue(reg);
++		return opcode == 0xd63f0000
++			? INSTRUCTION_TYPE_SUBROUTINE_CALL : INSTRUCTION_TYPE_JUMP;
++	}
++
++	return INSTRUCTION_TYPE_OTHER;
++}
++
++
++void
++DisassemblerARM64::_Format(uint32 instruction, target_addr_t address,
++	BString& line)
++{
++	const uint8* code = (const uint8*)&instruction;
++	size_t size = 4;
++	uint64 capstoneAddress = address;
++	cs_insn* decoded = fCapstoneData->instruction;
++	if (cs_disasm_iter(fCapstoneData->handle, &code, &size, &capstoneAddress,
++			decoded)) {
++		line.SetToFormat("0x%016" B_PRIx64 ": %08" B_PRIx32 "  %-7s %s",
++			address, instruction, decoded->mnemonic, decoded->op_str);
++	} else {
++		// data in the code, or something Capstone does not know
++		line.SetToFormat("0x%016" B_PRIx64 ": %08" B_PRIx32 "  .inst   0x%08"
++			B_PRIx32, address, instruction, instruction);
++	}
++}
+diff --git a/src/kits/debugger/arch/arm64/disasm/DisassemblerARM64.h b/src/kits/debugger/arch/arm64/disasm/DisassemblerARM64.h
+new file mode 100644
+index 0000000000..bccc40e06d
+--- /dev/null
++++ b/src/kits/debugger/arch/arm64/disasm/DisassemblerARM64.h
+@@ -0,0 +1,60 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef DISASSEMBLER_ARM64_H
++#define DISASSEMBLER_ARM64_H
++
++#include <String.h>
++
++#include "InstructionInfo.h"
++#include "Types.h"
++
++
++class CpuState;
++
++
++/*!	AArch64 instructions are four bytes each, so walking the code is trivial;
++	the text comes from Capstone. Branch types and targets are decoded here.
++*/
++class DisassemblerARM64 {
++public:
++								DisassemblerARM64();
++								~DisassemblerARM64();
++
++			status_t			Init(target_addr_t address, const void* code,
++									size_t codeSize);
++
++			status_t			GetNextInstruction(BString& line,
++									target_addr_t& _address,
++									target_size_t& _size,
++									bool& _breakpointAllowed);
++			status_t			GetPreviousInstruction(
++									target_addr_t nextAddress,
++									target_addr_t& _address,
++									target_size_t& _size);
++			status_t			GetNextInstructionInfo(
++									InstructionInfo& _info,
++									CpuState* state);
++
++	static	instruction_type	DecodeBranch(uint32 instruction,
++									target_addr_t address, CpuState* state,
++									target_addr_t& _target);
++
++private:
++			struct CapstoneData;
++
++private:
++			void				_Format(uint32 instruction,
++									target_addr_t address, BString& line);
++
++private:
++			target_addr_t		fAddress;
++			const uint8*		fCode;
++			size_t				fCodeSize;
++			size_t				fOffset;
++			CapstoneData*		fCapstoneData;
++};
++
++
++#endif	// DISASSEMBLER_ARM64_H
+diff --git a/src/kits/debugger/arch/arm64/disasm/Jamfile b/src/kits/debugger/arch/arm64/disasm/Jamfile
+new file mode 100644
+index 0000000000..2a0a757792
+--- /dev/null
++++ b/src/kits/debugger/arch/arm64/disasm/Jamfile
+@@ -0,0 +1,23 @@
++SubDir HAIKU_TOP src kits debugger arch arm64 disasm ;
++
++if $(TARGET_PACKAGING_ARCH) = arm64 && [ FIsBuildFeatureEnabled capstone ] {
++
++UsePrivateHeaders shared ;
++
++UsePrivateHeaders [ FDirName debugger arch ] ;
++UsePrivateHeaders [ FDirName debugger types ] ;
++
++UseBuildFeatureHeaders capstone ;
++
++SubDirHdrs [ FDirName $(SUBDIR) $(DOTDOT) ] ;
++SubDirHdrs [ FDirName $(SUBDIR) $(DOTDOT) $(DOTDOT) ] ;
++
++Includes [ FGristFiles DisassemblerARM64.cpp ]
++	: [ BuildFeatureAttribute capstone : headers ] ;
++
++MergeObject Debugger_disasm_arm64.o
++	:
++	DisassemblerARM64.cpp
++;
++
++}
+diff --git a/src/kits/debugger/debugger_interface/core/CoreFileDebuggerInterface.cpp b/src/kits/debugger/debugger_interface/core/CoreFileDebuggerInterface.cpp
+index 3f3f3916ec..3212479ee5 100644
+--- a/src/kits/debugger/debugger_interface/core/CoreFileDebuggerInterface.cpp
++++ b/src/kits/debugger/debugger_interface/core/CoreFileDebuggerInterface.cpp
+@@ -15,6 +15,9 @@
+ 
+ #include "ArchitectureX86.h"
+ #include "ArchitectureX8664.h"
++#ifdef DEBUGGER_ARCH_ARM64
++#	include "ArchitectureARM64.h"
++#endif
+ #include "CoreFile.h"
+ #include "ElfSymbolLookup.h"
+ #include "ImageInfo.h"
+@@ -52,6 +55,11 @@ CoreFileDebuggerInterface::Init()
+ 		case EM_X86_64:
+ 			fArchitecture = new(std::nothrow) ArchitectureX8664(this);
+ 			break;
++#ifdef DEBUGGER_ARCH_ARM64
++		case EM_AARCH64:
++			fArchitecture = new(std::nothrow) ArchitectureARM64(this);
++			break;
++#endif
+ 		default:
+ 			WARNING("Unsupported core file machine (%u)\n", machine);
+ 			return B_UNSUPPORTED;
+diff --git a/src/kits/debugger/debugger_interface/local/LocalDebuggerInterface.cpp b/src/kits/debugger/debugger_interface/local/LocalDebuggerInterface.cpp
+index 4f31df0c19..796bc86ebc 100644
+--- a/src/kits/debugger/debugger_interface/local/LocalDebuggerInterface.cpp
++++ b/src/kits/debugger/debugger_interface/local/LocalDebuggerInterface.cpp
+@@ -23,6 +23,9 @@
+ 
+ #include "ArchitectureX86.h"
+ #include "ArchitectureX8664.h"
++#ifdef DEBUGGER_ARCH_ARM64
++#	include "ArchitectureARM64.h"
++#endif
+ #include "AreaInfo.h"
+ #include "AutoDeleter.h"
+ #include "CpuState.h"
+@@ -266,6 +269,8 @@ LocalDebuggerInterface::Init()
+ 	fArchitecture = new(std::nothrow) ArchitectureX86(this);
+ #elif defined(ARCH_x86_64)
+ 	fArchitecture = new(std::nothrow) ArchitectureX8664(this);
++#elif defined(ARCH_arm64) && defined(DEBUGGER_ARCH_ARM64)
++	fArchitecture = new(std::nothrow) ArchitectureARM64(this);
+ #else
+ 	return B_UNSUPPORTED;
+ #endif

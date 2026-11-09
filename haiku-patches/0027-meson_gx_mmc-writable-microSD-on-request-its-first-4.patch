@@ -1,0 +1,167 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 11:43:07 -0400
+Subject: [PATCH 027/342] meson_gx_mmc: writable microSD on request, its first
+ 4 MiB never
+
+An image that runs from the microSD needs to write it. With
+"sd_writable true" in the driver settings (~/config/settings/kernel/
+drivers/meson_gx_mmc, which the boot loader passes on) removable cards
+are writable; without it they stay read-only as before. Either way the
+first 4 MiB of a removable card, where the MBR and U-Boot live, refuse
+writes and erases, and write protection, CSD programming and locking
+are refused on removable cards.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/busses/mmc/meson_gx_mmc.cpp        | 65 ++++++++++++++++---
+ 1 file changed, 55 insertions(+), 10 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp b/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
+index 7b5313501b..8e63b1b664 100644
+--- a/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
++++ b/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
+@@ -19,7 +19,9 @@
+  *   (U-Boot) set them up;
+  * - removable cards (the SD slot, which holds the firmware on the
+  *   ODROID-C2) are read-only: data writes and every command that can
+- *   change the card are refused.
++ *   change the card are refused. With "sd_writable true" in the driver
++ *   settings (an image that runs from the card) they are writable beyond
++ *   their first 4 MiB, which hold the MBR and U-Boot.
+  */
+ 
+ 
+@@ -30,6 +32,7 @@
+ 
+ #include <ByteOrder.h>
+ #include <KernelExport.h>
++#include <driver_settings.h>
+ #include <device_manager.h>
+ #include <drivers/bus/FDT.h>
+ 
+@@ -171,7 +174,7 @@ class MesonMmc {
+ public:
+ 								MesonMmc(area_id area, volatile uint32* registers,
+ 									phys_addr_t physicalBase, int32 irq,
+-									bool readOnly);
++									bool readOnly, uint32 protectedBlocks);
+ 								~MesonMmc();
+ 
+ 			void				Init();
+@@ -217,6 +220,7 @@ private:
+ 			int32				fIrqStatus;
+ 				// status bits collected by the interrupt handler
+ 			bool				fReadOnly;
++			uint32				fProtectedBlocks;	// never written
+ 			area_id				fBounceArea;
+ 			void*				fBounceBuffer;
+ 			phys_addr_t			fBouncePhysical;
+@@ -229,7 +233,8 @@ private:
+ 
+ 
+ MesonMmc::MesonMmc(area_id area, volatile uint32* registers,
+-	phys_addr_t physicalBase, int32 irq, bool readOnly)
++	phys_addr_t physicalBase, int32 irq, bool readOnly,
++	uint32 protectedBlocks)
+ 	:
+ 	fArea(area),
+ 	fRegisters(registers),
+@@ -238,6 +243,7 @@ MesonMmc::MesonMmc(area_id area, volatile uint32* registers,
+ 	fUseInterrupts(false),
+ 	fIrqStatus(0),
+ 	fReadOnly(readOnly),
++	fProtectedBlocks(protectedBlocks),
+ 	fBounceArea(-1),
+ 	fBounceBuffer(NULL),
+ 	fBouncePhysical(0),
+@@ -612,9 +618,22 @@ modifies_card(uint8 command)
+ status_t
+ MesonMmc::ExecuteCommand(uint8 command, uint32 argument, uint32* result)
+ {
+-	if (fReadOnly && !fAppCommand && modifies_card(command)) {
+-		ERROR("CMD%u refused: read-only card\n", command);
+-		return B_READ_ONLY_DEVICE;
++	if (!fAppCommand && modifies_card(command)) {
++		// a writable removable card: erases only beyond the protected start;
++		// write protection, CSD and lock commands never
++		bool refused = fReadOnly;
++		if (fProtectedBlocks > 0) {
++			if (command == SD_ERASE_WR_BLK_START
++				|| command == SD_ERASE_WR_BLK_END) {
++				refused |= argument < fProtectedBlocks;
++			} else if (command != SD_ERASE)
++				refused = true;
++		}
++		if (refused) {
++			ERROR("CMD%u refused: read-only card or protected area\n",
++				command);
++			return B_READ_ONLY_DEVICE;
++		}
+ 	}
+ 
+ 	MutexLocker locker(fLock);
+@@ -626,10 +645,12 @@ status_t
+ MesonMmc::DoIO(uint8 command, IOOperation* operation, bool offsetAsSectors)
+ {
+ 	bool write = operation->IsWrite();
+-	if (write && fReadOnly)
++	off_t offset = operation->Offset();
++	if (write && (fReadOnly
++			|| offset < (off_t)fProtectedBlocks * kBlockSize)) {
+ 		return B_READ_ONLY_DEVICE;
++	}
+ 
+-	off_t offset = operation->Offset();
+ 	generic_size_t length = operation->Length();
+ 	if (offset % kBlockSize != 0 || length % kBlockSize != 0)
+ 		return B_BAD_VALUE;
+@@ -877,6 +898,28 @@ supports_device(device_node* parent)
+ }
+ 
+ 
++/*!	Removable cards (the microSD slot) are read-only unless the driver
++	settings (~/config/settings/kernel/drivers/meson_gx_mmc, passed on by the
++	boot loader) say "sd_writable true", as an image that runs from the
++	microSD needs. Their first 4 MiB, where the MBR and U-Boot are, stay
++	unwritable either way.
++*/
++static bool
++sd_writable()
++{
++	void* settings = load_driver_settings("meson_gx_mmc");
++	if (settings == NULL)
++		return false;
++	bool writable = get_driver_boolean_parameter(settings, "sd_writable",
++		false, true);
++	unload_driver_settings(settings);
++	return writable;
++}
++
++
++static const uint32 kProtectedRemovableBlocks = 4 * 1024 * 1024 / kBlockSize;
++
++
+ static status_t
+ register_device(device_node* parent)
+ {
+@@ -889,7 +932,7 @@ register_device(device_node* parent)
+ 			(void**)&fdtDevice) == B_OK) {
+ 		busWidth = get_cell_count(fdtModule, fdtDevice, "bus-width", 4);
+ 		readOnly = fdtModule->get_prop(fdtDevice, "non-removable", NULL)
+-			== NULL;
++			== NULL && !sd_writable();
+ 	}
+ 
+ 	device_attr attrs[] = {
+@@ -963,7 +1006,9 @@ init_driver(device_node* node, void** _cookie)
+ #endif
+ 
+ 	MesonMmc* controller = new(std::nothrow) MesonMmc(area,
+-		(volatile uint32*)mapped, registers, (int32)irq, removable);
++		(volatile uint32*)mapped, registers, (int32)irq,
++		removable && !sd_writable(),
++		removable ? kProtectedRemovableBlocks : 0);
+ 	if (controller == NULL) {
+ 		delete_area(area);
+ 		return B_NO_MEMORY;

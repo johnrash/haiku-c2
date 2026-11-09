@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 14:36:00 -0500
+Subject: [PATCH 226/342] NeoCam: a shutdown is not cancelled by NeoCam
+
+The window answered the first quit request with "not yet" while the
+camera was let go, and quit later by itself: a shutdown takes that for a
+refusal and is aborted. The application now lets the camera go first,
+waiting for the controller with the window unlocked (the camera's node
+locks it to go), and the window then quits when asked.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apps/neocam/CameraController.cpp |  3 ++-
+ src/apps/neocam/CameraController.h   |  3 ++-
+ src/apps/neocam/MainWindow.cpp       | 35 ++++++++++++++++++++++++++++
+ src/apps/neocam/MainWindow.h         |  1 +
+ src/apps/neocam/NeoCam.cpp           | 16 +++++++++++++
+ 5 files changed, 56 insertions(+), 2 deletions(-)
+
+diff --git a/src/apps/neocam/CameraController.cpp b/src/apps/neocam/CameraController.cpp
+index 18ffdf0c48..bf29383aca 100644
+--- a/src/apps/neocam/CameraController.cpp
++++ b/src/apps/neocam/CameraController.cpp
+@@ -87,7 +87,8 @@ CameraController::MessageReceived(BMessage* message)
+ 				fRoster->StopWatching(BMessenger(this));
+ 				fWatching = false;
+ 			}
+-			fWindow.SendMessage(kMsgCameraReleased);
++			if (!message->GetBool("quiet", false))
++				fWindow.SendMessage(kMsgCameraReleased);
+ 			break;
+ 
+ 		case kMsgGetWeb:
+diff --git a/src/apps/neocam/CameraController.h b/src/apps/neocam/CameraController.h
+index 7cb95df48f..0ebe621b05 100644
+--- a/src/apps/neocam/CameraController.h
++++ b/src/apps/neocam/CameraController.h
+@@ -33,7 +33,8 @@ public:
+ 	enum {
+ 		kMsgConnect			= 'ccon',	// "width", "height"
+ 		kMsgDisconnect		= 'cdis',	// the window hears
+-										// kMsgCameraReleased
++										// kMsgCameraReleased, unless
++										// "quiet" (the sender waits)
+ 		kMsgGetWeb			= 'gweb',	// the window gets kMsgCameraWeb
+ 		kMsgTakeStill		= 'ctst',	// "trigger"
+ 		kMsgStartRecording	= 'cstr',	// "path", "fps", "trigger", "sound";
+diff --git a/src/apps/neocam/MainWindow.cpp b/src/apps/neocam/MainWindow.cpp
+index b9d85e76ed..320a40e918 100644
+--- a/src/apps/neocam/MainWindow.cpp
++++ b/src/apps/neocam/MainWindow.cpp
+@@ -332,6 +332,41 @@ MainWindow::QuitRequested()
+ }
+ 
+ 
++/*!	For the application's QuitRequested(), with the window unlocked (the
++	camera's node locks it to go): the camera is let go and the controller
++	quit, and the window then quits when it is asked. A shutdown takes a
++	window's "not yet" for a refusal.
++*/
++void
++MainWindow::ReleaseCamera()
++{
++	if (!Lock())
++		return;
++	CameraController* controller = fController;
++	if (controller != NULL) {
++		// nothing new starts meanwhile
++		fQuitting = true;
++		fRecording = false;
++		fRecordingPending = false;
++	}
++	Unlock();
++	if (controller == NULL)
++		return;
++
++	BMessage disconnect(CameraController::kMsgDisconnect);
++	disconnect.AddBool("quiet", true);
++	BMessage reply;
++	BMessenger(controller).SendMessage(&disconnect, &reply);
++
++	if (!Lock())
++		return;
++	fController = NULL;
++	Unlock();
++	if (controller->Lock())
++		controller->Quit();
++}
++
++
+ void
+ MainWindow::MessageReceived(BMessage* message)
+ {
+diff --git a/src/apps/neocam/MainWindow.h b/src/apps/neocam/MainWindow.h
+index 6b981e5c6c..588cbfe178 100644
+--- a/src/apps/neocam/MainWindow.h
++++ b/src/apps/neocam/MainWindow.h
+@@ -40,6 +40,7 @@ public:
+ 	virtual	void				MessageReceived(BMessage* message);
+ 
+ 			void				Start();
++			void				ReleaseCamera();
+ 									// in the window's thread (kMsgStart)
+ 			void				GetSettings(BMessage& settings);
+ 
+diff --git a/src/apps/neocam/NeoCam.cpp b/src/apps/neocam/NeoCam.cpp
+index 90634f961b..c52369b19d 100644
+--- a/src/apps/neocam/NeoCam.cpp
++++ b/src/apps/neocam/NeoCam.cpp
+@@ -79,10 +79,25 @@ public:
+ 		MainWindow* window = new MainWindow(settings, fCaptureManager);
+ 		fCaptureManager->SetWindow(BMessenger(window));
+ 		fCaptureManager->Run();
++		fWindow = BMessenger(window);
+ 		window->Show();
+ 		window->PostMessage(kMsgStart);
+ 	}
+ 
++	/*!	The camera is let go before the windows are asked: the window then
++		agrees right away, which a shutdown needs (it takes a "not yet" for a
++		refusal).
++	*/
++	virtual bool QuitRequested()
++	{
++		BLooper* looper = NULL;
++		fWindow.Target(&looper);
++		MainWindow* window = dynamic_cast<MainWindow*>(looper);
++		if (window != NULL)
++			window->ReleaseCamera();
++		return BApplication::QuitRequested();
++	}
++
+ 	/*!	What is still being saved or uploaded is finished first. */
+ 	void FinishCaptures()
+ 	{
+@@ -97,6 +112,7 @@ public:
+ 
+ private:
+ 	CaptureManager*		fCaptureManager;
++	BMessenger			fWindow;
+ };
+ 
+ 

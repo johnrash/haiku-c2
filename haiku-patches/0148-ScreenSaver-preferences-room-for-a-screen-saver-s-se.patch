@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 23:35:53 -0400
+Subject: [PATCH 148/342] ScreenSaver preferences: room for a screen saver's
+ settings
+
+The window's least size was fixed (the top view's explicit minimum), so
+a screen saver whose settings needed more height than that got them cut
+off at the bottom, and the Test button pushed out of the window with them
+(a screen saver's on the ODROID-C2). Once a screen saver's settings are
+built, the least size now grows to what the layout needs, and the window
+with it if it is smaller; for the next screen saver it comes back down,
+and the window keeps its size.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../screensaver/ScreenSaverWindow.cpp         | 34 ++++++++++++++++++-
+ .../screensaver/ScreenSaverWindow.h           |  4 +++
+ 2 files changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/src/preferences/screensaver/ScreenSaverWindow.cpp b/src/preferences/screensaver/ScreenSaverWindow.cpp
+index 5663e16a82..1678498b6e 100644
+--- a/src/preferences/screensaver/ScreenSaverWindow.cpp
++++ b/src/preferences/screensaver/ScreenSaverWindow.cpp
+@@ -919,6 +919,10 @@ ModulesView::_OpenSaver()
+ 		fPreviewView->HideNoPreview();
+ 	}
+ 
++	// its settings may need more room than the window has
++	if (Window() != NULL)
++		Window()->PostMessage(kMsgFitContent);
++
+ 	if (fSettingsView->ChildAt(0) == NULL) {
+ 		// There are no settings at all, we add the module name here to
+ 		// let it look a bit better at least.
+@@ -1059,7 +1063,7 @@ ScreenSaverWindow::ScreenSaverWindow()
+ 	fTabView->AddTab(fModulesView);
+ 
+ 	// Create the topmost background view
+-	BView* topView = new BView("topView", B_WILL_DRAW);
++	BView* topView = fTopView = new BView("topView", B_WILL_DRAW);
+ 	topView->SetViewUIColor(B_PANEL_BACKGROUND_COLOR);
+ 	topView->SetExplicitAlignment(BAlignment(B_ALIGN_USE_FULL_WIDTH,
+ 		B_ALIGN_USE_FULL_HEIGHT));
+@@ -1115,6 +1119,10 @@ ScreenSaverWindow::MessageReceived(BMessage* message)
+ 			fModulesView->PopulateScreenSaverList();
+ 			break;
+ 
++		case kMsgFitContent:
++			_FitContent();
++			break;
++
+ 		default:
+ 			BWindow::MessageReceived(message);
+ 	}
+@@ -1128,6 +1136,30 @@ ScreenSaverWindow::ScreenChanged(BRect frame, color_space colorSpace)
+ }
+ 
+ 
++/*!	A screen saver's settings may need more room than the window's least
++	size: the least size grows to fit them, and the window with it if it is
++	smaller. For the next screen saver it comes back down; the window keeps
++	its size.
++*/
++void
++ScreenSaverWindow::_FitContent()
++{
++	// the layout's own least size (MinSize() gives the view's explicit one)
++	BAbstractLayout* layout
++		= dynamic_cast<BAbstractLayout*>(fTopView->GetLayout());
++	if (layout == NULL)
++		return;
++	BSize content = layout->BaseMinSize();
++	BSize minSize(std::max(fMinWidth, content.width),
++		std::max(fMinHeight, content.height));
++	fTopView->SetExplicitMinSize(minSize);
++	float width = std::max(Bounds().Width(), minSize.width);
++	float height = std::max(Bounds().Height(), minSize.height);
++	if (width > Bounds().Width() || height > Bounds().Height())
++		ResizeTo(width, height);
++}
++
++
+ bool
+ ScreenSaverWindow::QuitRequested()
+ {
+diff --git a/src/preferences/screensaver/ScreenSaverWindow.h b/src/preferences/screensaver/ScreenSaverWindow.h
+index e1f8834246..dd83631f5e 100644
+--- a/src/preferences/screensaver/ScreenSaverWindow.h
++++ b/src/preferences/screensaver/ScreenSaverWindow.h
+@@ -38,6 +38,8 @@ public:
+ 			void				LoadSettings();
+ 
+ private:
++			void				_FitContent();
++
+ 			float				fMinWidth;
+ 			float				fMinHeight;
+ 			ScreenSaverSettings	fSettings;
+@@ -46,10 +48,12 @@ private:
+ 			FadeView*			fFadeView;
+ 			ModulesView*		fModulesView;
+ 			TabView*			fTabView;
++			BView*				fTopView;
+ };
+ 
+ 
+ static const int32 kMsgUpdateList = 'UPDL';
++static const int32 kMsgFitContent = 'FITC';
+ 
+ 
+ #endif	// SCREEN_SAVER_WINDOW_H

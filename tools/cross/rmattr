@@ -1,0 +1,14 @@
+#!/bin/bash
+# rmattr <attribute> <file>...: Haiku's rmattr for this host's emulated
+# attributes (generated.arm64/attributes/<inode>/<name>, the name escaped as
+# the build's fs_attr_generic.cpp does: "_" first, "_" doubled, "/" as "_s")
+. "$HAIKU_PROJECT/tools/haiku-arm64-env.sh"
+attr=$1
+shift
+name=_$(printf '%s' "$attr" | sed 's/_/__/g; s|/|_s|g')
+status=0
+for f in "$@"; do
+	a=$HAIKU_ATTRIBUTES/$(stat -L -c %i "$f")/$name
+	if [ -e "$a" ]; then rm -f "$a"; else status=1; fi
+done
+exit $status

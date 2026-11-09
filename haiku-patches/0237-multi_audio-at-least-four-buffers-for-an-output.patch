@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 16:08:54 -0500
+Subject: [PATCH 237/342] multi_audio: at least four buffers for an output
+
+The buffers were as many as the consumer's latency spans, plus two;
+BMediaRecorder's node says it has none, so a microphone recorded into
+two buffers of 128 ms: when the recording was late now and then (NeoCam
+at 1920x1080), the next buffer couldn't be had in time and its sound was
+lost (0.25 to 0.6 s in a 10 s clip). Four now at least.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../media/media-add-ons/multi_audio/MultiAudioNode.cpp     | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp b/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp
+index 7cb3ec8ef1..8e0ba06921 100644
+--- a/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp
++++ b/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp
+@@ -2074,9 +2074,14 @@ MultiAudioNode::_AllocateBuffers(node_output &channel)
+ {
+ 	CALLED();
+ 
+-	// allocate enough buffers to span our downstream latency, plus one
++	// allocate enough buffers to span our downstream latency, plus one; at
++	// least four: a consumer that says it has no latency (BMediaRecorder)
++	// may still be late now and then, and with two buffers that lost
++	// sound (a buffer not given back in time is one not recorded)
+ 	size_t size = channel.fOutput.format.u.raw_audio.buffer_size;
+ 	int32 count = int32(fLatency / BufferDuration() + 1 + 1);
++	if (count < 4)
++		count = 4;
+ 
+ 	PRINT(("\tlatency = %" B_PRIdBIGTIME ", buffer duration = %" B_PRIdBIGTIME
+ 			"\n", fLatency, BufferDuration()));

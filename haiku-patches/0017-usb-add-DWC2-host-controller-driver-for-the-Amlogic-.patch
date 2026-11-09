@@ -1,0 +1,1695 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 02:40:25 -0400
+Subject: [PATCH 017/342] usb: add DWC2 host controller driver for the Amlogic
+ Meson GXBB
+
+Synopsys DesignWare DWC2 (DWC_otg 3.10a on the S905/ODROID-C2) in host
+mode with buffer DMA, attached through the device tree
+("amlogic,meson-gxbb-usb"), loaded as a boot module:
+
+- platform bring-up the firmware does not do when booting over the
+  network: clock gates, USB reset, VBUS (GPIOAO_5) and the onboard hub's
+  reset (GPIOAO_4, read-modify-write so GPIOAO_3, the SD card's I/O
+  voltage, is untouched), PHY power-on reset with the 24 MHz reference
+- core reset, forced host mode, 16-bit UTMI+, FIFO sizing, then the
+  interrupt handler is installed with everything masked except channel
+  halts
+- emulated one-port root hub mapped onto HPRT (written from a masked copy
+  so its write-1-to-clear bits are not hit)
+- a worker thread runs transfers one at a time on channel 0 through a
+  64 KB bounce buffer with cache maintenance: control transfers stage by
+  stage, bulk in one go, interrupt IN retried every 10 ms on NAK
+- split transactions (low/full speed devices behind a high speed hub) are
+  not implemented yet and refused with B_NOT_SUPPORTED
+
+Tested on the ODROID-C2: the GL852G hub is enumerated
+(listusb: 05e3:0610 "Genesys Logic, Inc." "Hub").
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/jam/packages/Haiku               |    2 +
+ src/add-ons/kernel/busses/usb/Jamfile  |    7 +
+ src/add-ons/kernel/busses/usb/dwc2.cpp | 1483 ++++++++++++++++++++++++
+ src/add-ons/kernel/busses/usb/dwc2.h   |  127 ++
+ 4 files changed, 1619 insertions(+)
+ create mode 100644 src/add-ons/kernel/busses/usb/dwc2.cpp
+ create mode 100644 src/add-ons/kernel/busses/usb/dwc2.h
+
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index 42ccd4bc46..75b72dfcc5 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -63,6 +63,7 @@ AddFilesToPackage add-ons kernel busses usb :
+ 	<usb>ohci
+ 	<usb>ehci
+ 	<usb>xhci
++	<usb>dwc2@arm64
+ 	;
+ AddFilesToPackage add-ons kernel busses virtio :
+ 	virtio_mmio@riscv64,arm,arm64
+@@ -361,6 +362,7 @@ AddBootModuleSymlinksToPackage
+ 	<usb>ohci
+ 	<usb>uhci
+ 	<usb>xhci
++	<usb>dwc2@arm64
+ 	virtio
+ 	virtio_block@arm,arm64,riscv64
+ 	virtio_mmio@arm,arm64,riscv64
+diff --git a/src/add-ons/kernel/busses/usb/Jamfile b/src/add-ons/kernel/busses/usb/Jamfile
+index fb71288dd3..56dfbe9b47 100644
+--- a/src/add-ons/kernel/busses/usb/Jamfile
++++ b/src/add-ons/kernel/busses/usb/Jamfile
+@@ -33,3 +33,10 @@ KernelAddon <usb>xhci :
+ 	: xhci.rdef
+ 	;
+ 
++if $(TARGET_ARCH) = arm64 {
++	KernelAddon <usb>dwc2 :
++		dwc2.cpp
++		: libusb.a
++		;
++}
++
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.cpp b/src/add-ons/kernel/busses/usb/dwc2.cpp
+new file mode 100644
+index 0000000000..b4b9e98e2c
+--- /dev/null
++++ b/src/add-ons/kernel/busses/usb/dwc2.cpp
+@@ -0,0 +1,1483 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * Synopsys DesignWare "DWC2" (DWC_otg) USB 2.0 controller in host mode, as
++ * the host port of the Amlogic Meson GXBB (S905, ODROID-C2).
++ *
++ * Programming model after FreeBSD's dwc_otg.c (BSD-2-Clause) and Plan 9's
++ * usbdwc.c (MIT); the GXBB PHY, clock gate, reset and GPIO details after
++ * NetBSD's meson_usbphy.c and friends (BSD-2-Clause). No code was taken from
++ * them. Design notes: docs/m5-usb-dwc2-design.md in the port's repository.
++ *
++ * This first version:
++ * - brings up the platform itself (U-Boot does not touch USB when booting
++ *   over the network): clock gates, reset, VBUS, PHY, hub reset;
++ * - uses buffer DMA through one bounce buffer with explicit cache
++ *   maintenance (the DMA does not snoop the CPU caches);
++ * - runs transfers one at a time on host channel 0 from a worker thread:
++ *   control transfers stage by stage, bulk in one go, interrupt IN as one
++ *   attempt that is retried every 10 ms while the device NAKs;
++ * - does not do split transactions yet, so low/full speed devices behind a
++ *   high speed hub (keyboards and mice behind the ODROID-C2's GL852G hub)
++ *   are refused with B_NOT_SUPPORTED.
++ */
++
++
++#include "dwc2.h"
++
++#include <new>
++#include <stdio.h>
++#include <string.h>
++
++#include <ByteOrder.h>
++#include <KernelExport.h>
++#include <device_manager.h>
++#include <drivers/bus/FDT.h>
++
++#include <AutoDeleterDrivers.h>
++#include <arch/arm64/arch_kernel.h>
++#include <util/AutoLock.h>
++
++
++#define DWC2_DRIVER_MODULE_NAME	"busses/usb/dwc2/driver_v1"
++#define DWC2_BUS_MODULE_NAME	"busses/usb/dwc2/device_v1"
++
++#define INFO(x...)				dprintf("dwc2: " x)
++#define ERROR(x...)				dprintf("dwc2: " x)
++
++
++// core registers
++enum {
++	kGahbCfg	= 0x008,
++	kGusbCfg	= 0x00c,
++	kGrstCtl	= 0x010,
++	kGintSts	= 0x014,
++	kGintMsk	= 0x018,
++	kGrxFSiz	= 0x024,
++	kGnpTxFSiz	= 0x028,
++	kGsnpsId	= 0x040,
++	kGhwCfg2	= 0x048,
++	kGhwCfg3	= 0x04c,
++	kGhwCfg4	= 0x050,
++	kHptxFSiz	= 0x100,
++	kHcfg		= 0x400,
++	kHfnum		= 0x408,
++	kHaint		= 0x414,
++	kHaintMsk	= 0x418,
++	kHprt		= 0x440,
++	kPcgcCtl	= 0xe00,
++};
++
++#define HC_CHAR(n)				(0x500 + (n) * 0x20)
++#define HC_SPLT(n)				(0x504 + (n) * 0x20)
++#define HC_INT(n)				(0x508 + (n) * 0x20)
++#define HC_INTMSK(n)			(0x50c + (n) * 0x20)
++#define HC_TSIZ(n)				(0x510 + (n) * 0x20)
++#define HC_DMA(n)				(0x514 + (n) * 0x20)
++
++#define GAHBCFG_GLBLINTRMSK		(1 << 0)
++#define GAHBCFG_HBSTLEN_INCR8	(5 << 1)
++#define GAHBCFG_DMAEN			(1 << 5)
++
++#define GUSBCFG_PHYIF			(1 << 3)	// 16-bit UTMI+
++#define GUSBCFG_ULPI_UTMI_SEL	(1 << 4)
++#define GUSBCFG_PHYSEL			(1 << 6)
++#define GUSBCFG_TRDTIM_SHIFT	10
++#define GUSBCFG_TRDTIM_MASK		(0xf << GUSBCFG_TRDTIM_SHIFT)
++#define GUSBCFG_FORCEHOSTMODE	(1 << 29)
++#define GUSBCFG_FORCEDEVMODE	(1 << 30)
++
++#define GRSTCTL_CSFTRST			(1 << 0)
++#define GRSTCTL_RXFFLSH			(1 << 4)
++#define GRSTCTL_TXFFLSH			(1 << 5)
++#define GRSTCTL_TXFNUM_ALL		(0x10 << 6)
++#define GRSTCTL_AHBIDLE			(1u << 31)
++
++#define GINTSTS_CURMOD			(1 << 0)	// 1: host mode
++#define GINTSTS_HCHINT			(1 << 25)
++
++#define HPRT_CONNSTS			(1 << 0)
++#define HPRT_CONNDET			(1 << 1)	// write 1 to clear
++#define HPRT_ENA				(1 << 2)	// write 1 to clear: disables!
++#define HPRT_ENCHNG				(1 << 3)	// write 1 to clear
++#define HPRT_OVRCURRACT			(1 << 4)
++#define HPRT_OVRCURRCHNG		(1 << 5)	// write 1 to clear
++#define HPRT_SUSP				(1 << 7)
++#define HPRT_RST				(1 << 8)
++#define HPRT_PWR				(1 << 12)
++#define HPRT_SPD_SHIFT			17
++#define HPRT_SPD_HIGH			0
++#define HPRT_SPD_LOW			2
++#define HPRT_W1C_MASK			(HPRT_CONNDET | HPRT_ENA | HPRT_ENCHNG \
++	| HPRT_OVRCURRCHNG)
++
++#define HCCHAR_EPNUM_SHIFT		11
++#define HCCHAR_EPDIR_IN			(1 << 15)
++#define HCCHAR_LSPDDEV			(1 << 17)
++#define HCCHAR_EPTYPE_SHIFT		18
++#define HCCHAR_MC_SHIFT			20
++#define HCCHAR_DEVADDR_SHIFT	22
++#define HCCHAR_ODDFRM			(1 << 29)
++#define HCCHAR_CHDIS			(1 << 30)
++#define HCCHAR_CHENA			(1u << 31)
++
++#define EPTYPE_CONTROL			0
++#define EPTYPE_BULK				2
++#define EPTYPE_INTERRUPT		3
++
++#define HCINT_XFERCOMPL			(1 << 0)
++#define HCINT_CHHLTD			(1 << 1)
++#define HCINT_AHBERR			(1 << 2)
++#define HCINT_STALL				(1 << 3)
++#define HCINT_NAK				(1 << 4)
++#define HCINT_XACTERR			(1 << 7)
++#define HCINT_BBLERR			(1 << 8)
++#define HCINT_FRMOVRUN			(1 << 9)
++#define HCINT_DATATGLERR		(1 << 10)
++#define HCINT_ALL				0x7ff
++
++#define HCTSIZ_PKTCNT_SHIFT		19
++#define HCTSIZ_PID_SHIFT		29
++#define HCTSIZ_XFERSIZE_MASK	0x7ffff
++
++#define PID_DATA0				0
++#define PID_DATA1				2
++#define PID_SETUP				3
++
++// Amlogic GXBB platform registers (pages mapped while bringing up)
++static const phys_addr_t kHhiPage = 0xc883c000;
++static const uint32 kHhiGclkMpeg1 = 0x144;
++static const uint32 kHhiGclkMpeg2 = 0x148;
++static const uint32 kGateUsbGeneral = 1 << 26;	// MPEG1
++static const uint32 kGateUsb1 = 1 << 22;		// MPEG1
++static const uint32 kGateUsb1DdrBridge = 1 << 8;	// MPEG2
++static const phys_addr_t kResetPage = 0xc1104000;
++static const uint32 kResetLevel1 = 0x484;
++static const uint32 kResetUsbOtg = 1 << 2;		// reset 34, 1 = released
++static const phys_addr_t kAoPage = 0xc8100000;
++static const uint32 kAoPinMux = 0x014;
++static const uint32 kAoPinMuxGpioAo45 = (1 << 25) | (1 << 24) | (1 << 6)
++	| (1 << 5);	// UART_AO_B and I2C_AO functions of GPIOAO_4/5
++static const uint32 kAoGpioOutput = 0x024;		// bits 0-9 OEN (low active),
++												// bits 16-25 output level
++static const uint32 kGpioAoHubReset = 4;		// active low
++static const uint32 kGpioAoVbus = 5;			// active high
++static const phys_addr_t kPhyPage = 0xc0000000;
++static const uint32 kPhy1 = 0x20;				// usb1_phy
++static const uint32 kPhyConfig = 0x00;
++static const uint32 kPhyControl = 0x04;
++static const uint32 kPhyAdpBc = 0x0c;
++#define PHY_CONFIG_CLK_32K_ALT_SEL	(1 << 15)
++#define PHY_CONTROL_POR				(1 << 15)
++#define PHY_CONTROL_CLK_DETECTED	(1 << 8)
++#define PHY_CONTROL_FSEL_SHIFT		22
++#define PHY_CONTROL_FSEL_MASK		(7 << PHY_CONTROL_FSEL_SHIFT)
++#define PHY_CONTROL_FSEL_24MHZ		5
++#define PHY_ADP_BC_ACA_ENABLE		(1 << 16)
++#define PHY_ADP_BC_ACA_FLOATING		(1 << 26)
++
++static const size_t kBounceSize = 64 * 1024;
++static const uint32 kDataOffset = 64;		// control data after the SETUP
++static const bigtime_t kInterruptRetryDelay = 10000;
++
++
++device_manager_info* gDeviceManager;
++static usb_for_controller_interface* gUSB;
++
++
++static void
++dcache_maintain(phys_addr_t physical, size_t length, bool invalidate)
++{
++	// all RAM is mapped at KERNEL_PMAP_BASE as normal write-back memory
++	if (length == 0)
++		return;
++	uint64 ctr;
++	asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
++	const addr_t lineSize = 4 << ((ctr >> 16) & 0xf);
++
++	addr_t start = (KERNEL_PMAP_BASE + physical) & ~(lineSize - 1);
++	addr_t end = KERNEL_PMAP_BASE + physical + length;
++	for (addr_t address = start; address < end; address += lineSize) {
++		if (invalidate)
++			asm volatile("dc civac, %0" : : "r"(address) : "memory");
++		else
++			asm volatile("dc cvac, %0" : : "r"(address) : "memory");
++	}
++	asm volatile("dsb sy" : : : "memory");
++}
++
++
++/*!	Maps one page of platform registers for the duration of a scope. */
++class PlatformPage {
++public:
++	PlatformPage(phys_addr_t page)
++	{
++		void* address;
++		fArea = map_physical_memory("dwc2 platform", page, B_PAGE_SIZE,
++			B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++			&address);
++		fRegisters = (volatile uint32*)address;
++	}
++
++	~PlatformPage()
++	{
++		if (fArea >= 0)
++			delete_area(fArea);
++	}
++
++	bool IsValid() const { return fArea >= 0; }
++	uint32 Read(uint32 offset) { return fRegisters[offset / 4]; }
++	void Write(uint32 offset, uint32 value) { fRegisters[offset / 4] = value; }
++	void Set(uint32 offset, uint32 bits) { Write(offset, Read(offset) | bits); }
++	void Clear(uint32 offset, uint32 bits)
++		{ Write(offset, Read(offset) & ~bits); }
++
++private:
++	area_id				fArea;
++	volatile uint32*	fRegisters;
++};
++
++
++//	#pragma mark - DWC2
++
++
++DWC2::DWC2(Stack* stack, device_node* node, phys_addr_t registers,
++	size_t length, int32 irq)
++	:
++	BusManager(stack, node),
++	fRegisterArea(-1),
++	fRegisters(NULL),
++	fPhysicalBase(registers),
++	fIrq(irq),
++	fInterruptInstalled(false),
++	fBounceArea(-1),
++	fBounce(NULL),
++	fBouncePhysical(0),
++	fChannelCount(0),
++	fRootHubAddress(0),
++	fRootHub(NULL),
++	fPortResetChange(0),
++	fWorkSemaphore(-1),
++	fWorkerThread(-1),
++	fStopWorker(false),
++	fCurrent(NULL),
++	fChannelStatus(0),
++	fWarnedSplit(false)
++{
++	mutex_init(&fQueueLock, "dwc2 queue");
++	fChannelHalted.Init(this, "dwc2 channel");
++
++	if (!fInitOK)
++		return;
++	fInitOK = false;
++
++	void* mapped;
++	fRegisterArea = map_physical_memory("dwc2 registers", registers, length,
++		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++		&mapped);
++	if (fRegisterArea < 0)
++		return;
++	fRegisters = (volatile uint32*)mapped;
++
++	fBounceArea = create_area("dwc2 bounce", (void**)&fBounce,
++		B_ANY_KERNEL_ADDRESS, kBounceSize, B_32_BIT_CONTIGUOUS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
++	if (fBounceArea < 0)
++		return;
++	physical_entry entry;
++	get_memory_map(fBounce, B_PAGE_SIZE, &entry, 1);
++	fBouncePhysical = entry.address;
++
++	fWorkSemaphore = create_sem(0, "dwc2 work");
++	if (fWorkSemaphore < 0)
++		return;
++
++	if (_InitPlatform() != B_OK || _InitCore() != B_OK)
++		return;
++
++	fInitOK = true;
++}
++
++
++DWC2::~DWC2()
++{
++	fStopWorker = true;
++	if (fWorkSemaphore >= 0)
++		delete_sem(fWorkSemaphore);
++	if (fWorkerThread >= 0) {
++		status_t result;
++		wait_for_thread(fWorkerThread, &result);
++	}
++	if (fRegisters != NULL) {
++		_Write(kGahbCfg, 0);
++		_Write(kGintMsk, 0);
++	}
++	if (fInterruptInstalled)
++		remove_io_interrupt_handler(fIrq, _InterruptHandler, this);
++	if (fBounceArea >= 0)
++		delete_area(fBounceArea);
++	if (fRegisterArea >= 0)
++		delete_area(fRegisterArea);
++	mutex_destroy(&fQueueLock);
++}
++
++
++status_t
++DWC2::InitCheck()
++{
++	return fInitOK ? B_OK : B_ERROR;
++}
++
++
++/*!	Clock gates, reset, VBUS, PHY and the onboard hub's reset: U-Boot leaves
++	all of them alone unless it used USB itself.
++*/
++status_t
++DWC2::_InitPlatform()
++{
++	PlatformPage hhi(kHhiPage);
++	PlatformPage reset(kResetPage);
++	PlatformPage ao(kAoPage);
++	PlatformPage phy(kPhyPage);
++	if (!hhi.IsValid() || !reset.IsValid() || !ao.IsValid() || !phy.IsValid())
++		return B_NO_MEMORY;
++
++	INFO("platform before: MPEG1 %#" B_PRIx32 ", MPEG2 %#" B_PRIx32
++		", reset level1 %#" B_PRIx32 ", AO gpio %#" B_PRIx32 "\n",
++		hhi.Read(kHhiGclkMpeg1), hhi.Read(kHhiGclkMpeg2),
++		reset.Read(kResetLevel1), ao.Read(kAoGpioOutput));
++
++	// clocks for the PHY and the controller's bus bridge, then release the
++	// shared USB reset
++	hhi.Set(kHhiGclkMpeg1, kGateUsbGeneral | kGateUsb1);
++	hhi.Set(kHhiGclkMpeg2, kGateUsb1DdrBridge);
++	reset.Set(kResetLevel1, kResetUsbOtg);
++	snooze(1000);
++
++	// GPIOAO_4 (hub reset) and GPIOAO_5 (VBUS) as plain outputs: hub held
++	// in reset, VBUS on. Only these two bits are touched: GPIOAO_3 in the
++	// same register selects the SD card's I/O voltage.
++	ao.Clear(kAoPinMux, kAoPinMuxGpioAo45);
++	uint32 gpio = ao.Read(kAoGpioOutput);
++	gpio &= ~((1 << kGpioAoHubReset) | (1 << kGpioAoVbus));
++	gpio &= ~(1 << (16 + kGpioAoHubReset));
++	gpio |= 1 << (16 + kGpioAoVbus);
++	ao.Write(kAoGpioOutput, gpio);
++	snooze(1000);
++
++	// PHY power-on reset with the 24 MHz reference
++	phy.Set(kPhy1 + kPhyConfig, PHY_CONFIG_CLK_32K_ALT_SEL);
++	uint32 control = phy.Read(kPhy1 + kPhyControl);
++	control &= ~PHY_CONTROL_FSEL_MASK;
++	control |= (PHY_CONTROL_FSEL_24MHZ << PHY_CONTROL_FSEL_SHIFT)
++		| PHY_CONTROL_POR;
++	phy.Write(kPhy1 + kPhyControl, control);
++	snooze(1000);
++	phy.Clear(kPhy1 + kPhyControl, PHY_CONTROL_POR);
++	snooze(50000);
++	bool clockDetected
++		= (phy.Read(kPhy1 + kPhyControl) & PHY_CONTROL_CLK_DETECTED) != 0;
++
++	// host mode: enable the ACA detector, it must not report "floating"
++	phy.Set(kPhy1 + kPhyAdpBc, PHY_ADP_BC_ACA_ENABLE);
++	snooze(1000);
++	bool floating
++		= (phy.Read(kPhy1 + kPhyAdpBc) & PHY_ADP_BC_ACA_FLOATING) != 0;
++
++	// release the hub from reset
++	ao.Set(kAoGpioOutput, 1 << (16 + kGpioAoHubReset));
++	snooze(20000);
++
++	INFO("PHY clock %s, ACA %s; platform after: MPEG1 %#" B_PRIx32
++		", MPEG2 %#" B_PRIx32 ", reset level1 %#" B_PRIx32 ", AO gpio %#"
++		B_PRIx32 "\n", clockDetected ? "detected" : "MISSING",
++		floating ? "FLOATING" : "ok", hhi.Read(kHhiGclkMpeg1),
++		hhi.Read(kHhiGclkMpeg2), reset.Read(kResetLevel1),
++		ao.Read(kAoGpioOutput));
++	return clockDetected ? B_OK : B_ERROR;
++}
++
++
++status_t
++DWC2::_WaitForReset(uint32 bits)
++{
++	bigtime_t deadline = system_time() + 100000;
++	while ((_Read(kGrstCtl) & bits) != 0) {
++		if (system_time() > deadline)
++			return B_TIMED_OUT;
++		spin(10);
++	}
++	return B_OK;
++}
++
++
++status_t
++DWC2::_InitCore()
++{
++	uint32 id = _Read(kGsnpsId);
++	uint32 hwcfg2 = _Read(kGhwCfg2);
++	uint32 hwcfg3 = _Read(kGhwCfg3);
++	uint32 hwcfg4 = _Read(kGhwCfg4);
++	fChannelCount = ((hwcfg2 >> 14) & 0xf) + 1;
++	uint32 fifoDepth = hwcfg3 >> 16;
++	bool phy16Bit = ((hwcfg4 >> 14) & 3) == 1;
++	INFO("core %#" B_PRIx32 ", hwcfg2 %#" B_PRIx32 ", hwcfg3 %#" B_PRIx32
++		", hwcfg4 %#" B_PRIx32 ": %" B_PRIu32 " channels, %" B_PRIu32
++		" FIFO words, %s UTMI+, %s\n", id, hwcfg2, hwcfg3, hwcfg4,
++		fChannelCount, fifoDepth, phy16Bit ? "16-bit" : "8-bit",
++		((hwcfg2 >> 3) & 3) == 2 ? "internal DMA" : "NO internal DMA");
++	if ((id & 0xffff0000) != 0x4f540000 || ((hwcfg2 >> 3) & 3) != 2)
++		return B_ERROR;
++
++	// quiet, then core soft reset
++	_Write(kGahbCfg, 0);
++	_Write(kGintMsk, 0);
++	if (_WaitForReset(0) != B_OK || (_Read(kGrstCtl) & GRSTCTL_AHBIDLE) == 0)
++		snooze(10000);
++	_Write(kGrstCtl, GRSTCTL_CSFTRST);
++	if (_WaitForReset(GRSTCTL_CSFTRST) != B_OK) {
++		ERROR("core reset timed out\n");
++		return B_TIMED_OUT;
++	}
++	snooze(10000);
++
++	uint32 usbcfg = _Read(kGusbCfg);
++	usbcfg &= ~(GUSBCFG_PHYSEL | GUSBCFG_ULPI_UTMI_SEL | GUSBCFG_FORCEDEVMODE
++		| GUSBCFG_PHYIF | GUSBCFG_TRDTIM_MASK);
++	if (phy16Bit)
++		usbcfg |= GUSBCFG_PHYIF | (5 << GUSBCFG_TRDTIM_SHIFT);
++	else
++		usbcfg |= 9 << GUSBCFG_TRDTIM_SHIFT;
++	usbcfg |= GUSBCFG_FORCEHOSTMODE;
++	_Write(kGusbCfg, usbcfg);
++
++	bigtime_t deadline = system_time() + 200000;
++	while ((_Read(kGintSts) & GINTSTS_CURMOD) == 0) {
++		if (system_time() > deadline) {
++			ERROR("core did not switch to host mode\n");
++			return B_TIMED_OUT;
++		}
++		snooze(1000);
++	}
++	_Write(kPcgcCtl, 0);
++
++	uint32 rx = 512, nonPeriodicTx = 500, periodicTx = 500;
++	if (fifoDepth < rx + nonPeriodicTx + periodicTx) {
++		rx = fifoDepth / 2;
++		nonPeriodicTx = fifoDepth / 4;
++		periodicTx = fifoDepth / 4;
++	}
++	_Write(kGrxFSiz, rx);
++	_Write(kGnpTxFSiz, (nonPeriodicTx << 16) | rx);
++	_Write(kHptxFSiz, (periodicTx << 16) | (rx + nonPeriodicTx));
++	_Write(kGrstCtl, GRSTCTL_TXFFLSH | GRSTCTL_TXFNUM_ALL);
++	_WaitForReset(GRSTCTL_TXFFLSH);
++	_Write(kGrstCtl, GRSTCTL_RXFFLSH);
++	_WaitForReset(GRSTCTL_RXFFLSH);
++
++	// high speed PHY: 30/60 MHz PHY clock
++	_Write(kHcfg, _Read(kHcfg) & ~3);
++
++	for (uint32 channel = 0; channel < fChannelCount; channel++) {
++		_Write(HC_INTMSK(channel), 0);
++		_Write(HC_INT(channel), HCINT_ALL);
++	}
++
++	// all interrupt sources masked before the handler is installed; then
++	// only channel 0 halts are signalled
++	_Write(kGintSts, 0xffffffff);
++	_Write(kHaintMsk, 1);
++	if (fIrq > 0 && install_io_interrupt_handler(fIrq, _InterruptHandler, this,
++			0) == B_OK) {
++		fInterruptInstalled = true;
++	} else {
++		ERROR("cannot install interrupt handler for IRQ %" B_PRId32 "\n", fIrq);
++		return B_ERROR;
++	}
++	_Write(kGintMsk, GINTSTS_HCHINT);
++	_Write(kGahbCfg, GAHBCFG_GLBLINTRMSK | GAHBCFG_HBSTLEN_INCR8
++		| GAHBCFG_DMAEN);
++
++	// power the root port
++	_Write(kHprt, _PortBits() | HPRT_PWR);
++	snooze(100000);
++	INFO("port after power on: %#" B_PRIx32 "\n", _Read(kHprt));
++	return B_OK;
++}
++
++
++status_t
++DWC2::Start()
++{
++	fWorkerThread = spawn_kernel_thread(_WorkerThread, "dwc2 worker",
++		B_URGENT_DISPLAY_PRIORITY, this);
++	if (fWorkerThread < 0)
++		return fWorkerThread;
++	resume_thread(fWorkerThread);
++
++	fRootHubAddress = AllocateAddress();
++	fRootHub = new(std::nothrow) DWC2RootHub(RootObject(), fRootHubAddress);
++	if (fRootHub == NULL)
++		return B_NO_MEMORY;
++	if (fRootHub->InitCheck() != B_OK)
++		return fRootHub->InitCheck();
++
++	SetRootHub(fRootHub);
++	fRootHub->RegisterNode(Node());
++
++	return BusManager::Start();
++}
++
++
++//	#pragma mark - root port
++
++
++/*!	HPRT value to write back without touching its write-1-to-clear bits
++	(writing back ENA would disable the port).
++*/
++uint32
++DWC2::_PortBits()
++{
++	return _Read(kHprt) & ~HPRT_W1C_MASK;
++}
++
++
++status_t
++DWC2::_ResetPort()
++{
++	_Write(kHprt, _PortBits() | HPRT_RST);
++	snooze(60000);
++	_Write(kHprt, _PortBits() & ~HPRT_RST);
++	snooze(20000);
++	fPortResetChange = 1;
++
++	uint32 port = _Read(kHprt);
++	INFO("port reset: %#" B_PRIx32 " (%s, %s speed)\n", port,
++		(port & HPRT_ENA) != 0 ? "enabled" : "NOT enabled",
++		((port >> HPRT_SPD_SHIFT) & 3) == HPRT_SPD_HIGH ? "high"
++			: ((port >> HPRT_SPD_SHIFT) & 3) == HPRT_SPD_LOW ? "low" : "full");
++	return B_OK;
++}
++
++
++status_t
++DWC2::GetPortStatus(uint8 index, usb_port_status* status)
++{
++	if (index >= PortCount())
++		return B_BAD_INDEX;
++
++	uint32 port = _Read(kHprt);
++	status->status = status->change = 0;
++	if ((port & HPRT_CONNSTS) != 0)
++		status->status |= PORT_STATUS_CONNECTION;
++	if ((port & HPRT_ENA) != 0)
++		status->status |= PORT_STATUS_ENABLE;
++	if ((port & HPRT_OVRCURRACT) != 0)
++		status->status |= PORT_STATUS_OVER_CURRENT;
++	if ((port & HPRT_RST) != 0)
++		status->status |= PORT_STATUS_RESET;
++	if ((port & HPRT_PWR) != 0)
++		status->status |= PORT_STATUS_POWER;
++	if ((port & HPRT_SUSP) != 0)
++		status->status |= PORT_STATUS_SUSPEND;
++	uint32 speed = (port >> HPRT_SPD_SHIFT) & 3;
++	if (speed == HPRT_SPD_HIGH)
++		status->status |= PORT_STATUS_HIGH_SPEED;
++	else if (speed == HPRT_SPD_LOW)
++		status->status |= PORT_STATUS_LOW_SPEED;
++
++	if ((port & HPRT_CONNDET) != 0)
++		status->change |= PORT_STATUS_CONNECTION;
++	if ((port & HPRT_ENCHNG) != 0)
++		status->change |= PORT_STATUS_ENABLE;
++	if ((port & HPRT_OVRCURRCHNG) != 0)
++		status->change |= PORT_STATUS_OVER_CURRENT;
++	if (fPortResetChange != 0)
++		status->change |= PORT_STATUS_RESET;
++	return B_OK;
++}
++
++
++status_t
++DWC2::SetPortFeature(uint8 index, uint16 feature)
++{
++	if (index >= PortCount())
++		return B_BAD_INDEX;
++
++	switch (feature) {
++		case PORT_RESET:
++			return _ResetPort();
++		case PORT_POWER:
++			_Write(kHprt, _PortBits() | HPRT_PWR);
++			return B_OK;
++		case PORT_SUSPEND:
++			return B_OK;
++	}
++	return B_BAD_VALUE;
++}
++
++
++status_t
++DWC2::ClearPortFeature(uint8 index, uint16 feature)
++{
++	if (index >= PortCount())
++		return B_BAD_INDEX;
++
++	switch (feature) {
++		case PORT_ENABLE:
++			_Write(kHprt, _PortBits() | HPRT_ENA);
++			return B_OK;
++		case PORT_POWER:
++			_Write(kHprt, _PortBits() & ~HPRT_PWR);
++			return B_OK;
++		case C_PORT_CONNECTION:
++			_Write(kHprt, _PortBits() | HPRT_CONNDET);
++			return B_OK;
++		case C_PORT_ENABLE:
++			_Write(kHprt, _PortBits() | HPRT_ENCHNG);
++			return B_OK;
++		case C_PORT_OVER_CURRENT:
++			_Write(kHprt, _PortBits() | HPRT_OVRCURRCHNG);
++			return B_OK;
++		case C_PORT_RESET:
++			fPortResetChange = 0;
++			return B_OK;
++		case C_PORT_SUSPEND:
++			return B_OK;
++	}
++	return B_BAD_VALUE;
++}
++
++
++//	#pragma mark - transfers
++
++
++status_t
++DWC2::SubmitTransfer(Transfer* transfer)
++{
++	Pipe* pipe = transfer->TransferPipe();
++	if (pipe->DeviceAddress() == fRootHubAddress)
++		return DWC2RootHub::ProcessTransfer(this, transfer);
++
++	if ((pipe->Type() & USB_OBJECT_ISO_PIPE) != 0)
++		return B_NOT_SUPPORTED;
++
++	if (pipe->Speed() != USB_SPEED_HIGHSPEED
++		&& pipe->HubAddress() != fRootHubAddress) {
++		if (!fWarnedSplit) {
++			ERROR("device %d behind hub %d needs split transactions, which"
++				" are not implemented yet\n", pipe->DeviceAddress(),
++				pipe->HubAddress());
++			fWarnedSplit = true;
++		}
++		return B_NOT_SUPPORTED;
++	}
++
++	if (transfer->DataLength() > kBounceSize - kDataOffset)
++		return B_NOT_SUPPORTED;
++
++	status_t status = transfer->InitKernelAccess();
++	if (status != B_OK)
++		return status;
++
++	dwc2_transfer* entry = new(std::nothrow) dwc2_transfer;
++	if (entry == NULL)
++		return B_NO_MEMORY;
++	entry->transfer = transfer;
++	entry->due = 0;
++	entry->canceled = false;
++
++	MutexLocker locker(fQueueLock);
++	fQueue.Add(entry);
++	locker.Unlock();
++	release_sem_etc(fWorkSemaphore, 1, B_DO_NOT_RESCHEDULE);
++	return B_OK;
++}
++
++
++status_t
++DWC2::CancelQueuedTransfers(Pipe* pipe, bool force)
++{
++	dwc2_transfer_list canceled;
++
++	MutexLocker locker(fQueueLock);
++	dwc2_transfer* entry = fQueue.First();
++	while (entry != NULL) {
++		dwc2_transfer* next = fQueue.GetNext(entry);
++		if (entry->transfer->TransferPipe() == pipe) {
++			fQueue.Remove(entry);
++			canceled.Add(entry);
++		}
++		entry = next;
++	}
++	if (fCurrent != NULL && fCurrent->transfer->TransferPipe() == pipe)
++		fCurrent->canceled = true;
++	locker.Unlock();
++
++	while ((entry = canceled.RemoveHead()) != NULL) {
++		if (!force)
++			entry->transfer->Finished(B_CANCELED, 0);
++		delete entry->transfer;
++		delete entry;
++	}
++	return B_OK;
++}
++
++
++status_t
++DWC2::NotifyPipeChange(Pipe* pipe, usb_change change)
++{
++	if (change == USB_CHANGE_DESTROYED)
++		CancelQueuedTransfers(pipe, true);
++	return B_OK;
++}
++
++
++/*static*/ status_t
++DWC2::_WorkerThread(void* data)
++{
++	((DWC2*)data)->_Worker();
++	return B_OK;
++}
++
++
++void
++DWC2::_Worker()
++{
++	while (!fStopWorker) {
++		bigtime_t now = system_time();
++		bigtime_t nextDue = now + 1000000;
++
++		MutexLocker locker(fQueueLock);
++		dwc2_transfer* entry = NULL;
++		for (dwc2_transfer* candidate = fQueue.First(); candidate != NULL;
++				candidate = fQueue.GetNext(candidate)) {
++			if (candidate->due <= now) {
++				entry = candidate;
++				break;
++			}
++			nextDue = min_c(nextDue, candidate->due);
++		}
++		if (entry == NULL) {
++			locker.Unlock();
++			if (acquire_sem_etc(fWorkSemaphore, 1, B_ABSOLUTE_TIMEOUT, nextDue)
++					== B_BAD_SEM_ID) {
++				return;
++			}
++			continue;
++		}
++		fQueue.Remove(entry);
++		fCurrent = entry;
++		locker.Unlock();
++
++		bool retry = false;
++		size_t actual = 0;
++		Transfer* transfer = entry->transfer;
++		status_t status = transfer->PrepareKernelAccess();
++		if (status == B_OK) {
++			Pipe* pipe = transfer->TransferPipe();
++			if ((pipe->Type() & USB_OBJECT_CONTROL_PIPE) != 0)
++				status = _ControlTransfer(transfer, &actual);
++			else {
++				bool nak = false;
++				status = _DataTransfer(transfer, pipe->Direction() == Pipe::In,
++					&actual, &nak);
++				retry = status == B_OK && nak;
++			}
++		}
++
++		locker.Lock();
++		fCurrent = NULL;
++		if (entry->canceled) {
++			retry = false;
++			status = B_CANCELED;
++			actual = 0;
++		}
++		if (retry) {
++			entry->due = system_time() + kInterruptRetryDelay;
++			fQueue.Add(entry);
++			continue;
++		}
++		locker.Unlock();
++
++		transfer->Finished(status, actual);
++		delete transfer;
++		delete entry;
++	}
++}
++
++
++status_t
++DWC2::_ControlTransfer(Transfer* transfer, size_t* _actual)
++{
++	Pipe* pipe = transfer->TransferPipe();
++	usb_request_data* request = transfer->RequestData();
++	bool in = (request->RequestType & USB_REQTYPE_DEVICE_IN) != 0;
++	size_t length = min_c((size_t)request->Length, transfer->DataLength());
++
++	uint32 nextPid;
++	size_t actual = 0;
++	bool nak;
++
++	memcpy(fBounce, request, sizeof(usb_request_data));
++	status_t status = _Transaction(pipe, PID_SETUP, false, 0,
++		sizeof(usb_request_data), &nextPid, &actual, &nak);
++	if (status != B_OK)
++		return status;
++
++	size_t dataActual = 0;
++	if (length > 0) {
++		if (!in) {
++			status = _CopyToBounce(transfer, kDataOffset, length);
++			if (status != B_OK)
++				return status;
++		}
++		for (int32 tries = 0; ; tries++) {
++			nak = false;
++			status = _Transaction(pipe, PID_DATA1, in, kDataOffset, length,
++				&nextPid, &dataActual, &nak);
++			if (status != B_OK || !nak)
++				break;
++			if (tries > 1000)
++				return B_DEV_TIMEOUT;
++			snooze(1000);
++		}
++		if (status != B_OK)
++			return status;
++		if (in) {
++			dataActual = min_c(dataActual, length);
++			status = _CopyFromBounce(transfer, kDataOffset, dataActual);
++			if (status != B_OK)
++				return status;
++		}
++	}
++
++	// status stage: zero-length DATA1 in the other direction (IN if there
++	// was no data stage)
++	bool statusIn = length == 0 || !in;
++	for (int32 tries = 0; ; tries++) {
++		nak = false;
++		status = _Transaction(pipe, PID_DATA1, statusIn, kDataOffset, 0,
++			&nextPid, &actual, &nak);
++		if (status != B_OK || !nak)
++			break;
++		if (tries > 1000)
++			return B_DEV_TIMEOUT;
++		snooze(1000);
++	}
++	if (status != B_OK)
++		return status;
++
++	*_actual = dataActual;
++	return B_OK;
++}
++
++
++status_t
++DWC2::_DataTransfer(Transfer* transfer, bool in, size_t* _actual, bool* _nak)
++{
++	Pipe* pipe = transfer->TransferPipe();
++	size_t length = transfer->DataLength();
++	if (!in) {
++		status_t status = _CopyToBounce(transfer, kDataOffset, length);
++		if (status != B_OK)
++			return status;
++	}
++
++	uint32 pid = pipe->DataToggle() ? PID_DATA1 : PID_DATA0;
++	uint32 nextPid = pid;
++	size_t actual = 0;
++	bool nak = false;
++	status_t status = _Transaction(pipe, pid, in, kDataOffset, length,
++		&nextPid, &actual, &nak);
++	if (status != B_OK)
++		return status;
++	if (nak) {
++		*_nak = true;
++		return B_OK;
++	}
++	pipe->SetDataToggle(nextPid == PID_DATA1);
++
++	if (in) {
++		actual = min_c(actual, length);
++		status = _CopyFromBounce(transfer, kDataOffset, actual);
++		if (status != B_OK)
++			return status;
++	}
++	*_actual = actual;
++	return B_OK;
++}
++
++
++/*!	One transfer on host channel 0: \a length bytes (whole packets for IN)
++	at \a offset in the bounce buffer. Returns with \a nak set if the device
++	NAKed and nothing was transferred.
++*/
++status_t
++DWC2::_Transaction(Pipe* pipe, uint32 pid, bool in, uint32 offset,
++	uint32 length, uint32* _nextPid, size_t* _actual, bool* _nak)
++{
++	uint32 maxPacket = pipe->MaxPacketSize();
++	if (maxPacket == 0)
++		maxPacket = 8;
++	uint32 packets = length == 0 ? 1 : (length + maxPacket - 1) / maxPacket;
++	uint32 size = in ? packets * maxPacket : length;
++	if (offset + size > kBounceSize)
++		return B_BAD_VALUE;
++
++	uint32 type = EPTYPE_BULK;
++	if ((pipe->Type() & USB_OBJECT_CONTROL_PIPE) != 0)
++		type = EPTYPE_CONTROL;
++	else if ((pipe->Type() & USB_OBJECT_INTERRUPT_PIPE) != 0)
++		type = EPTYPE_INTERRUPT;
++
++	uint32 character = maxPacket
++		| ((pipe->EndpointAddress() & 0xf) << HCCHAR_EPNUM_SHIFT)
++		| (in ? HCCHAR_EPDIR_IN : 0)
++		| (type << HCCHAR_EPTYPE_SHIFT)
++		| (1 << HCCHAR_MC_SHIFT)
++		| ((uint32)pipe->DeviceAddress() << HCCHAR_DEVADDR_SHIFT);
++	if (pipe->Speed() == USB_SPEED_LOWSPEED)
++		character |= HCCHAR_LSPDDEV;
++	if (type == EPTYPE_INTERRUPT && ((_Read(kHfnum) + 1) & 1) != 0)
++		character |= HCCHAR_ODDFRM;
++
++	phys_addr_t physical = fBouncePhysical + offset;
++	dcache_maintain(physical, size, in);
++
++	ConditionVariableEntry entry;
++	atomic_set(&fChannelStatus, 0);
++	fChannelHalted.Add(&entry);
++
++	_Write(HC_SPLT(0), 0);
++	_Write(HC_INT(0), HCINT_ALL);
++	_Write(HC_INTMSK(0), HCINT_CHHLTD);
++	_Write(HC_TSIZ(0), size | (packets << HCTSIZ_PKTCNT_SHIFT)
++		| (pid << HCTSIZ_PID_SHIFT));
++	_Write(HC_DMA(0), (uint32)physical);
++	asm volatile("dsb sy" : : : "memory");
++	_Write(HC_CHAR(0), character | HCCHAR_CHENA);
++
++	entry.Wait(B_RELATIVE_TIMEOUT, 2000000);
++	uint32 status = atomic_get(&fChannelStatus);
++	if ((status & HCINT_CHHLTD) == 0) {
++		_HaltChannel();
++		ERROR("device %d endpoint %d: no response\n", pipe->DeviceAddress(),
++			pipe->EndpointAddress() & 0xf);
++		return B_DEV_TIMEOUT;
++	}
++
++	if (in)
++		dcache_maintain(physical, size, true);
++
++	uint32 transferSize = _Read(HC_TSIZ(0));
++	*_nextPid = (transferSize >> HCTSIZ_PID_SHIFT) & 3;
++
++	if ((status & HCINT_STALL) != 0)
++		return B_DEV_STALLED;
++	if ((status & HCINT_BBLERR) != 0)
++		return B_DEV_DATA_OVERRUN;
++	if ((status & (HCINT_XACTERR | HCINT_AHBERR | HCINT_DATATGLERR
++			| HCINT_FRMOVRUN)) != 0) {
++		return B_DEV_CRC_ERROR;
++	}
++	if ((status & HCINT_XFERCOMPL) == 0) {
++		if ((status & HCINT_NAK) != 0) {
++			*_nak = true;
++			return B_OK;
++		}
++		return B_ERROR;
++	}
++
++	*_actual = in ? size - (transferSize & HCTSIZ_XFERSIZE_MASK) : length;
++	return B_OK;
++}
++
++
++void
++DWC2::_HaltChannel()
++{
++	ConditionVariableEntry entry;
++	fChannelHalted.Add(&entry);
++	_Write(HC_CHAR(0), _Read(HC_CHAR(0)) | HCCHAR_CHDIS | HCCHAR_CHENA);
++	entry.Wait(B_RELATIVE_TIMEOUT, 100000);
++}
++
++
++status_t
++DWC2::_CopyToBounce(Transfer* transfer, uint32 offset, size_t length)
++{
++	generic_io_vec* vector = transfer->Vector();
++	size_t done = 0;
++	for (size_t i = 0; i < transfer->VectorCount() && done < length; i++) {
++		size_t chunk = min_c((size_t)vector[i].length, length - done);
++		memcpy(fBounce + offset + done, (void*)(addr_t)vector[i].base, chunk);
++		done += chunk;
++	}
++	return done == length ? B_OK : B_BAD_VALUE;
++}
++
++
++status_t
++DWC2::_CopyFromBounce(Transfer* transfer, uint32 offset, size_t length)
++{
++	generic_io_vec* vector = transfer->Vector();
++	size_t done = 0;
++	for (size_t i = 0; i < transfer->VectorCount() && done < length; i++) {
++		size_t chunk = min_c((size_t)vector[i].length, length - done);
++		memcpy((void*)(addr_t)vector[i].base, fBounce + offset + done, chunk);
++		done += chunk;
++	}
++	return B_OK;
++}
++
++
++/*static*/ int32
++DWC2::_InterruptHandler(void* data)
++{
++	DWC2* self = (DWC2*)data;
++	uint32 status = self->_Read(kGintSts) & self->_Read(kGintMsk);
++	if (status == 0)
++		return B_UNHANDLED_INTERRUPT;
++
++	if ((status & GINTSTS_HCHINT) != 0) {
++		uint32 channels = self->_Read(kHaint);
++		for (uint32 channel = 0; channel < self->fChannelCount; channel++) {
++			if ((channels & (1 << channel)) == 0)
++				continue;
++			uint32 channelStatus = self->_Read(HC_INT(channel));
++			self->_Write(HC_INT(channel), channelStatus);
++			if (channel == 0) {
++				atomic_or(&self->fChannelStatus, channelStatus);
++				if ((channelStatus & HCINT_CHHLTD) != 0)
++					self->fChannelHalted.NotifyAll();
++			}
++		}
++	}
++	// HCHINT clears with the channel bits; nothing else is unmasked
++	self->_Write(kGintSts, status & ~GINTSTS_HCHINT);
++	return B_INVOKE_SCHEDULER;
++}
++
++
++//	#pragma mark - root hub
++
++
++static usb_device_descriptor sDWC2RootHubDevice = {
++	18,								// Descriptor length
++	USB_DESCRIPTOR_DEVICE,			// Descriptor type
++	0x200,							// USB 2.0
++	0x09,							// Class (9 = Hub)
++	0,								// Subclass
++	0,								// Protocol
++	64,								// Max packet size on endpoint 0
++	0,								// Vendor ID
++	0,								// Product ID
++	0x200,							// Version
++	1,								// Index of manufacturer string
++	2,								// Index of product string
++	0,								// Index of serial number string
++	1								// Number of configurations
++};
++
++
++struct dwc2_root_hub_configuration {
++	usb_configuration_descriptor	configuration;
++	usb_interface_descriptor		interface;
++	usb_endpoint_descriptor			endpoint;
++	usb_hub_descriptor				hub;
++} _PACKED;
++
++
++static dwc2_root_hub_configuration sDWC2RootHubConfig = {
++	{ // configuration descriptor
++		9,								// Descriptor length
++		USB_DESCRIPTOR_CONFIGURATION,	// Descriptor type
++		34,								// Total length of configuration
++		1,								// Number of interfaces
++		1,								// Value of this configuration
++		0,								// Index of configuration string
++		0x40,							// Attributes (0x40 = self powered)
++		0								// Max power (0, since self powered)
++	},
++
++	{ // interface descriptor
++		9,								// Descriptor length
++		USB_DESCRIPTOR_INTERFACE,		// Descriptor type
++		0,								// Interface number
++		0,								// Alternate setting
++		1,								// Number of endpoints
++		0x09,							// Interface class (9 = Hub)
++		0,								// Interface subclass
++		0,								// Interface protocol
++		0								// Index of interface string
++	},
++
++	{ // endpoint descriptor
++		7,								// Descriptor length
++		USB_DESCRIPTOR_ENDPOINT,		// Descriptor type
++		USB_REQTYPE_DEVICE_IN | 1,		// Endpoint address (first in IN endpoint)
++		0x03,							// Attributes (0x03 = interrupt endpoint)
++		8,								// Max packet size
++		0xff							// Interval
++	},
++
++	{ // hub descriptor
++		9,								// Descriptor length
++		USB_DESCRIPTOR_HUB,				// Descriptor type
++		1,								// Number of ports
++		0x0000,							// Hub characteristics
++		0,								// Power on to power good (in 2ms units)
++		0,								// Maximum current (in mA)
++		0x00,							// All ports are removable
++		0xff							// Depricated power control mask
++	}
++};
++
++
++struct dwc2_root_hub_string {
++	uint8	length;
++	uint8	descriptor_type;
++	uint16	unicode_string[12];
++} _PACKED;
++
++
++static dwc2_root_hub_string sDWC2RootHubStrings[3] = {
++	{
++		4,								// Descriptor length
++		USB_DESCRIPTOR_STRING,			// Descriptor type
++		{
++			0x0409						// Supported language IDs (English US)
++		}
++	},
++
++	{
++		22,								// Descriptor length
++		USB_DESCRIPTOR_STRING,			// Descriptor type
++		{
++			'H', 'A', 'I', 'K', 'U',	// Characters
++			' ', 'I', 'n', 'c', '.'
++		}
++	},
++
++	{
++		26,								// Descriptor length
++		USB_DESCRIPTOR_STRING,			// Descriptor type
++		{
++			'D', 'W', 'C', '2', ' ',	// Characters
++			'R', 'o', 'o', 't', 'H',
++			'u', 'b'
++		}
++	}
++};
++
++
++DWC2RootHub::DWC2RootHub(Object* rootObject, int8 deviceAddress)
++	:
++	Hub(rootObject, 0, rootObject->GetStack()->IndexOfBusManager(
++			rootObject->GetBusManager()),
++		sDWC2RootHubDevice, deviceAddress, USB_SPEED_HIGHSPEED, 0)
++{
++}
++
++
++/*static*/ status_t
++DWC2RootHub::ProcessTransfer(DWC2* dwc2, Transfer* transfer)
++{
++	if ((transfer->TransferPipe()->Type() & USB_OBJECT_CONTROL_PIPE) == 0)
++		return B_ERROR;
++
++	usb_request_data* request = transfer->RequestData();
++	status_t status = B_TIMED_OUT;
++	size_t actualLength = 0;
++	switch (request->Request) {
++		case USB_REQUEST_GET_STATUS:
++		{
++			if (request->Index == 0) {
++				actualLength = min_c(sizeof(usb_port_status),
++					transfer->DataLength());
++				memset(transfer->Data(), 0, actualLength);
++				status = B_OK;
++				break;
++			}
++
++			usb_port_status portStatus;
++			if (dwc2->GetPortStatus(request->Index - 1, &portStatus) == B_OK) {
++				actualLength = min_c(sizeof(usb_port_status),
++					transfer->DataLength());
++				memcpy(transfer->Data(), &portStatus, actualLength);
++				status = B_OK;
++			}
++			break;
++		}
++
++		case USB_REQUEST_SET_ADDRESS:
++			status = request->Value < 128 ? B_OK : B_TIMED_OUT;
++			break;
++
++		case USB_REQUEST_GET_DESCRIPTOR:
++			switch (request->Value >> 8) {
++				case USB_DESCRIPTOR_DEVICE:
++					actualLength = min_c(sizeof(usb_device_descriptor),
++						transfer->DataLength());
++					memcpy(transfer->Data(), &sDWC2RootHubDevice, actualLength);
++					status = B_OK;
++					break;
++
++				case USB_DESCRIPTOR_CONFIGURATION:
++					actualLength = min_c(sizeof(dwc2_root_hub_configuration),
++						transfer->DataLength());
++					memcpy(transfer->Data(), &sDWC2RootHubConfig, actualLength);
++					status = B_OK;
++					break;
++
++				case USB_DESCRIPTOR_STRING:
++				{
++					uint8 index = request->Value & 0x00ff;
++					if (index > 2)
++						break;
++					actualLength = min_c(sDWC2RootHubStrings[index].length,
++						transfer->DataLength());
++					memcpy(transfer->Data(), &sDWC2RootHubStrings[index],
++						actualLength);
++					status = B_OK;
++					break;
++				}
++
++				case USB_DESCRIPTOR_HUB:
++					actualLength = min_c(sizeof(usb_hub_descriptor),
++						transfer->DataLength());
++					memcpy(transfer->Data(), &sDWC2RootHubConfig.hub,
++						actualLength);
++					status = B_OK;
++					break;
++			}
++			break;
++
++		case USB_REQUEST_SET_CONFIGURATION:
++			status = B_OK;
++			break;
++
++		case USB_REQUEST_CLEAR_FEATURE:
++			if (request->Index == 0)
++				break;
++			if (dwc2->ClearPortFeature(request->Index - 1, request->Value)
++					== B_OK) {
++				status = B_OK;
++			}
++			break;
++
++		case USB_REQUEST_SET_FEATURE:
++			if (request->Index == 0)
++				break;
++			if (dwc2->SetPortFeature(request->Index - 1, request->Value)
++					== B_OK) {
++				status = B_OK;
++			}
++			break;
++	}
++
++	transfer->Finished(status, actualLength);
++	delete transfer;
++	return B_OK;
++}
++
++
++//	#pragma mark - modules
++
++
++typedef struct {
++	device_node*	node;
++	uint64			registers;
++	uint64			length;
++	uint64			irq;
++} dwc2_fdt_info;
++
++
++static bool
++fdt_device_enabled(fdt_device_module_info* module, fdt_device* device)
++{
++	int length;
++	const char* status = (const char*)module->get_prop(device, "status",
++		&length);
++	return status == NULL || strcmp(status, "okay") == 0
++		|| strcmp(status, "ok") == 0;
++}
++
++
++static float
++supports_device(device_node* parent)
++{
++	const char* bus;
++	if (gDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false)
++			!= B_OK || strcmp(bus, "fdt") != 0) {
++		return 0.0f;
++	}
++
++	const char* compatible;
++	if (gDeviceManager->get_attr_string(parent, "fdt/compatible", &compatible,
++			false) != B_OK
++		|| strcmp(compatible, "amlogic,meson-gxbb-usb") != 0) {
++		return 0.0f;
++	}
++
++	fdt_device_module_info* fdtModule;
++	fdt_device* fdtDevice;
++	if (gDeviceManager->get_driver(parent, (driver_module_info**)&fdtModule,
++			(void**)&fdtDevice) == B_OK
++		&& !fdt_device_enabled(fdtModule, fdtDevice)) {
++		return 0.0f;
++	}
++
++	return 0.8f;
++}
++
++
++static status_t
++register_device(device_node* parent)
++{
++	device_attr attrs[] = {
++		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE,
++			{ .string = "DWC2 USB Host Controller" } },
++		{ NULL }
++	};
++	return gDeviceManager->register_node(parent, DWC2_DRIVER_MODULE_NAME,
++		attrs, NULL, NULL);
++}
++
++
++static status_t
++init_device(device_node* node, void** _cookie)
++{
++	DeviceNodePutter<&gDeviceManager> fdtNode(
++		gDeviceManager->get_parent_node(node));
++
++	fdt_device_module_info* fdtModule;
++	fdt_device* fdtDevice;
++	if (gDeviceManager->get_driver(fdtNode.Get(),
++			(driver_module_info**)&fdtModule, (void**)&fdtDevice) != B_OK) {
++		return B_ERROR;
++	}
++	if (!fdt_device_enabled(fdtModule, fdtDevice))
++		return B_DEVICE_NOT_FOUND;
++
++	dwc2_fdt_info* info = new(std::nothrow) dwc2_fdt_info;
++	if (info == NULL)
++		return B_NO_MEMORY;
++	info->node = node;
++	// the controller sits directly in "soc" (identity "ranges")
++	if (!fdtModule->get_reg(fdtDevice, 0, &info->registers, &info->length)
++		|| !fdtModule->get_interrupt(fdtDevice, 0, NULL, &info->irq)) {
++		delete info;
++		return B_ERROR;
++	}
++
++	*_cookie = info;
++	return B_OK;
++}
++
++
++static void
++uninit_device(void* cookie)
++{
++	delete (dwc2_fdt_info*)cookie;
++}
++
++
++static status_t
++register_child_devices(void* cookie)
++{
++	dwc2_fdt_info* info = (dwc2_fdt_info*)cookie;
++	device_attr attrs[] = {
++		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE,
++			{ .string = "DWC2 USB Host Controller" } },
++		{ B_DEVICE_FIXED_CHILD, B_STRING_TYPE,
++			{ .string = USB_FOR_CONTROLLER_MODULE_NAME } },
++		{ NULL }
++	};
++	return gDeviceManager->register_node(info->node, DWC2_BUS_MODULE_NAME,
++		attrs, NULL, NULL);
++}
++
++
++static status_t
++init_bus(device_node* node, void** _cookie)
++{
++	DeviceNodePutter<&gDeviceManager> parent(
++		gDeviceManager->get_parent_node(node));
++	driver_module_info* driver;
++	dwc2_fdt_info* info;
++	gDeviceManager->get_driver(parent.Get(), &driver, (void**)&info);
++
++	Stack* stack;
++	if (gUSB->get_stack((void**)&stack) != B_OK)
++		return B_ERROR;
++
++	DWC2* dwc2 = new(std::nothrow) DWC2(stack, node, info->registers,
++		info->length, (int32)info->irq);
++	if (dwc2 == NULL)
++		return B_NO_MEMORY;
++	if (dwc2->InitCheck() != B_OK || dwc2->Start() != B_OK) {
++		delete dwc2;
++		return B_ERROR;
++	}
++
++	*_cookie = dwc2;
++	return B_OK;
++}
++
++
++static void
++uninit_bus(void* cookie)
++{
++	delete (DWC2*)cookie;
++}
++
++
++module_dependency module_dependencies[] = {
++	{ USB_FOR_CONTROLLER_MODULE_NAME, (module_info**)&gUSB },
++	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&gDeviceManager },
++	{}
++};
++
++
++static usb_bus_interface gDWC2BusModule = {
++	{
++		{
++			DWC2_BUS_MODULE_NAME,
++			0,
++			NULL
++		},
++		NULL,	// supports device
++		NULL,	// register device
++		init_bus,
++		uninit_bus,
++		NULL,	// register child devices
++		NULL,	// rescan
++		NULL,	// device removed
++	},
++};
++
++
++static driver_module_info gDWC2DriverModule = {
++	{
++		DWC2_DRIVER_MODULE_NAME,
++		0,
++		NULL
++	},
++	supports_device,
++	register_device,
++	init_device,
++	uninit_device,
++	register_child_devices,
++	NULL,	// rescan
++	NULL,	// device removed
++};
++
++
++module_info* modules[] = {
++	(module_info*)&gDWC2DriverModule,
++	(module_info*)&gDWC2BusModule,
++	NULL
++};
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.h b/src/add-ons/kernel/busses/usb/dwc2.h
+new file mode 100644
+index 0000000000..f2b75aeba1
+--- /dev/null
++++ b/src/add-ons/kernel/busses/usb/dwc2.h
+@@ -0,0 +1,127 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef DWC2_H
++#define DWC2_H
++
++
++#include "usb_private.h"
++
++#include <condition_variable.h>
++#include <lock.h>
++#include <util/DoublyLinkedList.h>
++
++
++class DWC2RootHub;
++
++
++struct dwc2_transfer : DoublyLinkedListLinkImpl<dwc2_transfer> {
++	Transfer*		transfer;
++	bigtime_t		due;			// interrupt transfers: next attempt
++	bool			canceled;
++};
++
++typedef DoublyLinkedList<dwc2_transfer> dwc2_transfer_list;
++
++
++/*!	Synopsys DesignWare "DWC2" USB 2.0 host controller as found on the
++	Amlogic Meson GXBB (S905, ODROID-C2), in buffer DMA mode.
++*/
++class DWC2 : public BusManager {
++public:
++								DWC2(Stack* stack, device_node* node,
++									phys_addr_t registers, size_t length,
++									int32 irq);
++								~DWC2();
++
++	virtual	status_t			InitCheck();
++	virtual	status_t			Start();
++
++	virtual	status_t			SubmitTransfer(Transfer* transfer);
++	virtual	status_t			CancelQueuedTransfers(Pipe* pipe, bool force);
++	virtual	status_t			NotifyPipeChange(Pipe* pipe,
++									usb_change change);
++
++	virtual	const char*			TypeName() const { return "dwc2"; }
++
++			// root hub
++			uint8				PortCount() const { return 1; }
++			status_t			GetPortStatus(uint8 index,
++									usb_port_status* status);
++			status_t			SetPortFeature(uint8 index, uint16 feature);
++			status_t			ClearPortFeature(uint8 index, uint16 feature);
++
++private:
++			uint32				_Read(uint32 offset)
++									{ return fRegisters[offset / 4]; }
++			void				_Write(uint32 offset, uint32 value)
++									{ fRegisters[offset / 4] = value; }
++
++			status_t			_InitPlatform();
++			status_t			_InitPhy();
++			status_t			_InitCore();
++			status_t			_WaitForReset(uint32 bits);
++			uint32				_PortBits();
++			status_t			_ResetPort();
++
++			status_t			_Process(dwc2_transfer* entry, bool* retry);
++			status_t			_ControlTransfer(Transfer* transfer,
++									size_t* actual);
++			status_t			_DataTransfer(Transfer* transfer, bool in,
++									size_t* actual, bool* nak);
++			status_t			_Transaction(Pipe* pipe, uint32 pid, bool in,
++									uint32 offset, uint32 length,
++									uint32* nextPid, size_t* actual,
++									bool* nak);
++			void				_HaltChannel();
++
++			status_t			_CopyToBounce(Transfer* transfer, uint32 offset,
++									size_t length);
++			status_t			_CopyFromBounce(Transfer* transfer,
++									uint32 offset, size_t length);
++
++	static	int32				_InterruptHandler(void* data);
++	static	status_t			_WorkerThread(void* data);
++			void				_Worker();
++
++private:
++			area_id				fRegisterArea;
++			volatile uint32*	fRegisters;
++			phys_addr_t			fPhysicalBase;
++			int32				fIrq;
++			bool				fInterruptInstalled;
++
++			area_id				fBounceArea;
++			uint8*				fBounce;
++			phys_addr_t			fBouncePhysical;
++
++			uint32				fChannelCount;
++			int8				fRootHubAddress;
++			DWC2RootHub*		fRootHub;
++			uint8				fPortResetChange;
++
++			mutex				fQueueLock;
++			dwc2_transfer_list	fQueue;
++			sem_id				fWorkSemaphore;
++			thread_id			fWorkerThread;
++			bool				fStopWorker;
++			dwc2_transfer*		fCurrent;
++
++			ConditionVariable	fChannelHalted;
++			int32				fChannelStatus;
++			bool				fWarnedSplit;
++};
++
++
++class DWC2RootHub : public Hub {
++public:
++								DWC2RootHub(Object* rootObject,
++									int8 deviceAddress);
++
++	static	status_t			ProcessTransfer(DWC2* dwc2,
++									Transfer* transfer);
++};
++
++
++#endif	// DWC2_H

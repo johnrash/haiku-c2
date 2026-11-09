@@ -1,0 +1,265 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 07:46:35 -0400
+Subject: [PATCH 020/342] dwc2: bulk transfers from vectors, physical vectors,
+ any length
+
+Transfer::DataLength() only covers SetData(); usb_disk queues its bulk
+transfers with queue_bulk_v() and queue_bulk_v_physical(), for which it
+is not set, so they were refused ("Operation not supported"). Take the
+length from the vectors, copy physical vectors with
+vm_memcpy_{from,to}_physical(), and move bulk and interrupt data through
+the bounce buffer in pieces of whole packets, ending on a short packet.
+
+Tested on the ODROID-C2 with a Samsung FIT flash drive behind the
+onboard hub: 40.7 MB/s raw read; the same 16 MiB hash for 4 KiB, 192 KiB
+and 1 MiB reads.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/busses/usb/dwc2.cpp | 141 +++++++++++++++++--------
+ src/add-ons/kernel/busses/usb/dwc2.h   |  15 ++-
+ 2 files changed, 109 insertions(+), 47 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.cpp b/src/add-ons/kernel/busses/usb/dwc2.cpp
+index 0ca5a2ab75..dd8dc838e4 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2.cpp
+@@ -41,6 +41,7 @@
+ #include <AutoDeleterDrivers.h>
+ #include <arch/arm64/arch_kernel.h>
+ #include <util/AutoLock.h>
++#include <vm/vm.h>
+ 
+ 
+ #define DWC2_DRIVER_MODULE_NAME	"busses/usb/dwc2/driver_v1"
+@@ -662,6 +663,20 @@ DWC2::ClearPortFeature(uint8 index, uint16 feature)
+ //	#pragma mark - transfers
+ 
+ 
++/*!	The transfer's data length. Transfer::DataLength() only covers
++	SetData(); bulk transfers (usb_disk) come as virtual or physical vectors.
++*/
++static size_t
++transfer_length(Transfer* transfer)
++{
++	generic_io_vec* vector = transfer->Vector();
++	size_t length = 0;
++	for (size_t i = 0; i < transfer->VectorCount(); i++)
++		length += vector[i].length;
++	return length;
++}
++
++
+ status_t
+ DWC2::SubmitTransfer(Transfer* transfer)
+ {
+@@ -680,8 +695,12 @@ DWC2::SubmitTransfer(Transfer* transfer)
+ 		fWarnedSplit = true;
+ 	}
+ 
+-	if (transfer->DataLength() > kBounceSize - kDataOffset)
++	// bulk and interrupt data goes through the bounce buffer in pieces,
++	// control data has to fit at once
++	if ((pipe->Type() & USB_OBJECT_CONTROL_PIPE) != 0
++		&& transfer_length(transfer) > kBounceSize - kDataOffset) {
+ 		return B_NOT_SUPPORTED;
++	}
+ 
+ 	status_t status = transfer->InitKernelAccess();
+ 	if (status != B_OK)
+@@ -820,7 +839,7 @@ DWC2::_ControlTransfer(Transfer* transfer, size_t* _actual)
+ 	Pipe* pipe = transfer->TransferPipe();
+ 	usb_request_data* request = transfer->RequestData();
+ 	bool in = (request->RequestType & USB_REQTYPE_DEVICE_IN) != 0;
+-	size_t length = min_c((size_t)request->Length, transfer->DataLength());
++	size_t length = min_c((size_t)request->Length, transfer_length(transfer));
+ 
+ 	uint32 nextPid;
+ 	size_t actual = 0;
+@@ -835,7 +854,7 @@ DWC2::_ControlTransfer(Transfer* transfer, size_t* _actual)
+ 	size_t dataActual = 0;
+ 	if (length > 0) {
+ 		if (!in) {
+-			status = _CopyToBounce(transfer, kDataOffset, length);
++			status = _CopyToBounce(transfer, 0, kDataOffset, length);
+ 			if (status != B_OK)
+ 				return status;
+ 		}
+@@ -853,7 +872,7 @@ DWC2::_ControlTransfer(Transfer* transfer, size_t* _actual)
+ 			return status;
+ 		if (in) {
+ 			dataActual = min_c(dataActual, length);
+-			status = _CopyFromBounce(transfer, kDataOffset, dataActual);
++			status = _CopyFromBounce(transfer, 0, kDataOffset, dataActual);
+ 			if (status != B_OK)
+ 				return status;
+ 		}
+@@ -884,34 +903,55 @@ status_t
+ DWC2::_DataTransfer(Transfer* transfer, bool in, size_t* _actual, bool* _nak)
+ {
+ 	Pipe* pipe = transfer->TransferPipe();
+-	size_t length = transfer->DataLength();
+-	if (!in) {
+-		status_t status = _CopyToBounce(transfer, kDataOffset, length);
+-		if (status != B_OK)
+-			return status;
+-	}
++	size_t length = transfer_length(transfer);
++	uint32 maxPacket = pipe->MaxPacketSize();
++	if (maxPacket == 0)
++		maxPacket = 8;
++	// whole packets per piece, so only the last one can be short
++	size_t pieceSize = (kBounceSize - kDataOffset) / maxPacket * maxPacket;
+ 
+ 	uint32 pid = pipe->DataToggle() ? PID_DATA1 : PID_DATA0;
+-	uint32 nextPid = pid;
+-	size_t actual = 0;
+-	bool nak = false;
+-	status_t status = _Transaction(pipe, pid, in, kDataOffset, length,
+-		&nextPid, &actual, &nak);
+-	if (status != B_OK)
+-		return status;
+-	if (nak) {
+-		*_nak = true;
+-		return B_OK;
+-	}
+-	pipe->SetDataToggle(nextPid == PID_DATA1);
++	size_t done = 0;
++	do {
++		size_t piece = min_c(length - done, pieceSize);
++		if (!in) {
++			status_t status = _CopyToBounce(transfer, done, kDataOffset,
++				piece);
++			if (status != B_OK)
++				return status;
++		}
+ 
+-	if (in) {
+-		actual = min_c(actual, length);
+-		status = _CopyFromBounce(transfer, kDataOffset, actual);
++		uint32 nextPid = pid;
++		size_t actual = 0;
++		bool nak = false;
++		status_t status = _Transaction(pipe, pid, in, kDataOffset, piece,
++			&nextPid, &actual, &nak);
+ 		if (status != B_OK)
+ 			return status;
+-	}
+-	*_actual = actual;
++		if (nak) {
++			// only interrupt endpoints come back with a NAK (bulk NAKs are
++			// retried by the core or the split code); nothing was moved
++			if (done == 0) {
++				*_nak = true;
++				return B_OK;
++			}
++			break;
++		}
++		pid = nextPid;
++
++		if (in) {
++			actual = min_c(actual, piece);
++			status = _CopyFromBounce(transfer, done, kDataOffset, actual);
++			if (status != B_OK)
++				return status;
++		}
++		done += actual;
++		if (actual < piece)
++			break;
++	} while (done < length);
++
++	pipe->SetDataToggle(pid == PID_DATA1);
++	*_actual = done;
+ 	return B_OK;
+ }
+ 
+@@ -1171,31 +1211,44 @@ DWC2::_HaltChannel()
+ }
+ 
+ 
++/*!	Copies \a length bytes between the transfer's data, starting
++	\a dataOffset bytes in, and the bounce buffer at \a bounceOffset. The
++	vectors are either kernel addresses or physical (queue_bulk_v_physical).
++*/
+ status_t
+-DWC2::_CopyToBounce(Transfer* transfer, uint32 offset, size_t length)
++DWC2::_CopyBounce(Transfer* transfer, size_t dataOffset, uint32 bounceOffset,
++	size_t length, bool toBounce)
+ {
+ 	generic_io_vec* vector = transfer->Vector();
++	size_t position = 0;
+ 	size_t done = 0;
+ 	for (size_t i = 0; i < transfer->VectorCount() && done < length; i++) {
+-		size_t chunk = min_c((size_t)vector[i].length, length - done);
+-		memcpy(fBounce + offset + done, (void*)(addr_t)vector[i].base, chunk);
+-		done += chunk;
+-	}
+-	return done == length ? B_OK : B_BAD_VALUE;
+-}
+-
++		size_t vectorLength = vector[i].length;
++		if (position + vectorLength <= dataOffset) {
++			position += vectorLength;
++			continue;
++		}
++		size_t skip = dataOffset > position ? dataOffset - position : 0;
++		size_t chunk = min_c(vectorLength - skip, length - done);
++		generic_addr_t address = vector[i].base + skip;
++		uint8* bounce = fBounce + bounceOffset + done;
++
++		status_t status = B_OK;
++		if (transfer->IsPhysical()) {
++			status = toBounce
++				? vm_memcpy_from_physical(bounce, address, chunk, false)
++				: vm_memcpy_to_physical(address, bounce, chunk, false);
++		} else if (toBounce)
++			memcpy(bounce, (void*)(addr_t)address, chunk);
++		else
++			memcpy((void*)(addr_t)address, bounce, chunk);
++		if (status != B_OK)
++			return status;
+ 
+-status_t
+-DWC2::_CopyFromBounce(Transfer* transfer, uint32 offset, size_t length)
+-{
+-	generic_io_vec* vector = transfer->Vector();
+-	size_t done = 0;
+-	for (size_t i = 0; i < transfer->VectorCount() && done < length; i++) {
+-		size_t chunk = min_c((size_t)vector[i].length, length - done);
+-		memcpy((void*)(addr_t)vector[i].base, fBounce + offset + done, chunk);
+ 		done += chunk;
++		position += vectorLength;
+ 	}
+-	return B_OK;
++	return done == length ? B_OK : B_BAD_VALUE;
+ }
+ 
+ 
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.h b/src/add-ons/kernel/busses/usb/dwc2.h
+index 7400e43190..b23ec2711d 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.h
++++ b/src/add-ons/kernel/busses/usb/dwc2.h
+@@ -87,10 +87,19 @@ private:
+ 									uint32* transferSize);
+ 			void				_HaltChannel();
+ 
+-			status_t			_CopyToBounce(Transfer* transfer, uint32 offset,
+-									size_t length);
++			status_t			_CopyBounce(Transfer* transfer,
++									size_t dataOffset, uint32 bounceOffset,
++									size_t length, bool toBounce);
++			status_t			_CopyToBounce(Transfer* transfer,
++									size_t dataOffset, uint32 bounceOffset,
++									size_t length)
++								{ return _CopyBounce(transfer, dataOffset,
++									bounceOffset, length, true); }
+ 			status_t			_CopyFromBounce(Transfer* transfer,
+-									uint32 offset, size_t length);
++									size_t dataOffset, uint32 bounceOffset,
++									size_t length)
++								{ return _CopyBounce(transfer, dataOffset,
++									bounceOffset, length, false); }
+ 
+ 	static	int32				_InterruptHandler(void* data);
+ 	static	status_t			_WorkerThread(void* data);

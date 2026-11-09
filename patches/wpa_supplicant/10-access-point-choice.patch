@@ -1,0 +1,60 @@
+--- a/src/drivers/driver_bsd.c
++++ b/src/drivers/driver_bsd.c
+@@ -1454,6 +1454,9 @@
+ 	 * the reported noise floor. see ieee80211_node.h for details.
+ 	 */
+ 	result->level = sr->isr_rssi / 2 + sr->isr_noise;
++	/* That's dBm: without this flag the sorting of the results takes the
++	 * level for an SNR, a negative one, and an SNR rule can never hold. */
++	result->flags |= WPA_SCAN_LEVEL_DBM;
+ #else
+ 	result->level = sr->isr_rssi;
+ #endif
+--- a/wpa_supplicant/scan.c
++++ b/wpa_supplicant/scan.c
+@@ -2451,6 +2451,14 @@
+ 			return 1;
+ 	}
+ 
++	/* A 5 GHz access point with a usable signal beats 2.4 GHz, however much
++	 * stronger that one is: the driver here reads no throughput estimate
++	 * from it, and raw signal strength favors 2.4 GHz by nature. */
++	if (IS_5GHZ(wa->freq) ^ IS_5GHZ(wb->freq)) {
++		if ((IS_5GHZ(wa->freq) ? snr_a_full : snr_b_full) >= 20)
++			return IS_5GHZ(wa->freq) ? -1 : 1;
++	}
++
+ 	/* If SNR is close, decide by max rate or frequency band. For cases
+ 	 * involving the 6 GHz band, use the throughput estimate irrespective
+ 	 * of the SNR difference since the LPI/VLP rules may result in
+--- a/wpa_supplicant/wpa_gui-haiku/main_haiku.cpp
++++ b/wpa_supplicant/wpa_gui-haiku/main_haiku.cpp
+@@ -502,6 +502,17 @@
+ 	if (result == 0)
+ 		result = wpa_config_set(network, "scan_ssid", "1", 1);
+ 
++	// Asked for one access point by its address
++	const uint8* bssid;
++	ssize_t bssidSize;
++	if (result == 0 && message->FindData("bssid", B_RAW_TYPE,
++			(const void**)&bssid, &bssidSize) == B_OK && bssidSize == 6) {
++		char address[18];
++		snprintf(address, sizeof(address), "%02x:%02x:%02x:%02x:%02x:%02x",
++			bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
++		result = wpa_config_set(network, "bssid", address, 11);
++	}
++
+ 	if (authMode >= B_NETWORK_AUTHENTICATION_WPA) {
+ 		// Nothing to do here.
+ 	} else {
+@@ -833,6 +844,10 @@
+ 	leaveRequest.what = kMsgWPALeaveNetwork;
+ 	be_app->PostMessage(&leaveRequest);
+ 
++	// the net_server tries an automatic join again by itself
++	if (joinRequest.GetBool("automatic", false))
++		return;
++
+ 	BMessage newJoinRequest = joinRequest;
+ 	newJoinRequest.AddString("error",
+ 		B_TRANSLATE("Failed to join network. (Incorrect password?)"));

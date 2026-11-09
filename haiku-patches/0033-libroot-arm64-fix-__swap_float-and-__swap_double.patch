@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 18:26:59 -0400
+Subject: [PATCH 033/342] libroot/arm64: fix __swap_float and __swap_double
+
+The fmov operands were reversed: AArch64's fmov takes the destination
+first, so "fmov s0, w0" copied the integer register into the float
+argument instead of the other way around. Both functions returned
+whatever was in w0/x0, so every B_SWAP_FLOAT, B_HOST_TO_BENDIAN_FLOAT
+and their double variants gave garbage on arm64.
+
+Found through the JPEG translator: it writes its TranslatorBitmap header
+bounds with B_HOST_TO_BENDIAN_FLOAT, so BBitmapStream got a bitmap one
+row high and the translator wrote the image past it into app_server's
+shared memory until it faulted (ShowImage, BTranslationUtils::GetBitmap).
+
+Tested on the ODROID-C2: float and double swaps of several values match
+a byte-wise swap and swap back; JPEGs up to 1920x1080 open in ShowImage
+and another image viewer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/libroot/os/arch/arm64/byteorder.S | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/system/libroot/os/arch/arm64/byteorder.S b/src/system/libroot/os/arch/arm64/byteorder.S
+index dc5ad70a94..77d0aa13c6 100644
+--- a/src/system/libroot/os/arch/arm64/byteorder.S
++++ b/src/system/libroot/os/arch/arm64/byteorder.S
+@@ -10,17 +10,17 @@
+ 
+ /* float __swap_float(float value) */
+ FUNCTION(__swap_float):
+-		fmov s0, w0	// Bitcopy float to general register
++		fmov w0, s0	// Bitcopy float to general register
+ 		rev w0, w0	// GCC8.3 does this for __builtin_bswap32
+-		fmov w0, s0	// and back
++		fmov s0, w0	// and back
+ 		ret
+ FUNCTION_END(__swap_float)
+ 
+ 
+ /* double __swap_double(double value) */
+ FUNCTION(__swap_double):
+-		fmov d0, x0	// Bitcopy double to general register
++		fmov x0, d0	// Bitcopy double to general register
+ 		rev x0, x0	// GCC8.3 does this for __builtin_bswap64
+-		fmov x0, d0	// and back
++		fmov d0, x0	// and back
+ 		ret
+ FUNCTION_END(__swap_double)

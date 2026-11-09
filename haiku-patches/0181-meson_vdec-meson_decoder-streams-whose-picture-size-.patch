@@ -1,0 +1,421 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 19:25:42 -0400
+Subject: [PATCH 181/342] meson_vdec, meson_decoder: streams whose picture size
+ changes
+
+H.264: the driver set up the frames for a new size as soon as the firmware
+asked, while frames of the old size were still queued, so GET_FRAME gave
+them the new size (and the firmware took frames the reader still held as
+free). Now every setup waits until the reader has taken and given back all
+frames; GET_FRAME tells a reader that holds frames to give them back
+(MESON_VDEC_FRAME_GIVE_BACK).
+
+HEVC: frames were set up only for a session's first picture, so a new
+size went on with the old one. Now a picture of another size, CTB size or
+bit depth hands out the pictures so far, waits for all frames back and
+sets up new ones.
+
+meson_decoder gives back what it holds when asked (as before a seek), shows
+frames in place only when they have the negotiated size, and scales others
+to fit in it, black around them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/drivers/meson_vdec.h          |  3 +
+ .../drivers/video/meson_vdec/meson_vdec.cpp   | 67 +++++++++++-----
+ .../video/meson_vdec/meson_vdec_hevc.cpp      | 57 ++++++++++++-
+ .../video/meson_vdec/meson_vdec_private.h     |  6 ++
+ .../meson_decoder/MesonVdecDecoder.cpp        | 79 ++++++++++++++++++-
+ .../plugins/meson_decoder/MesonVdecDecoder.h  |  2 +
+ 6 files changed, 189 insertions(+), 25 deletions(-)
+
+diff --git a/headers/private/drivers/meson_vdec.h b/headers/private/drivers/meson_vdec.h
+index b6766fd783..ef9e5b7536 100644
+--- a/headers/private/drivers/meson_vdec.h
++++ b/headers/private/drivers/meson_vdec.h
+@@ -67,6 +67,9 @@ struct meson_vdec_write {
+ 	// no frame: the stream ended and every frame was handed out
+ #define MESON_VDEC_FRAME_DAMAGED		0x2
+ 	// decoded, but the stream had errors
++#define MESON_VDEC_FRAME_GIVE_BACK		0x4
++	// no frame: the stream's pictures change (their size): the decoder
++	// goes on once every frame handed out came back (RECYCLE_FRAME)
+ 
+ struct meson_vdec_frame {
+ 	bigtime_t		timeout;		// in: relative
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+index 34596a6733..cb19cd193c 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp
+@@ -66,6 +66,7 @@ MesonVdec::MesonVdec(device_node* node)
+ 	fSetupThread(-1),
+ 	fSetupSem(-1),
+ 	fSetupPending(false),
++	fWaitingForFrames(false),
+ 	fEndReached(false),
+ 	fLastSetupInfo(0),
+ 	fHevcPicture(-1),
+@@ -80,6 +81,7 @@ MesonVdec::MesonVdec(device_node* node)
+ 	fHevcEnded(false),
+ 	fHevcLastStatus(0),
+ 	fHevcLastChange(0),
++	fHevcResizeStart(0),
+ 	fHevcReports(0),
+ 	fHevcSlices(0),
+ 	fHevcSkipped(0),
+@@ -833,6 +835,7 @@ MesonVdec::_StartSession(meson_vdec_start& start, const void* userFirmware)
+ 		fEndOffset = 0;
+ 		fFrameCount = h264 ? 0 : kFrameCount;
+ 		fSetupPending = false;
++		fWaitingForFrames = false;
+ 		fEndReached = false;
+ 		fDecodeErrors = 0;
+ 		fBadPictures = 0;
+@@ -978,6 +981,10 @@ MesonVdec::_SetupH264Frames(const uint32* info)
+ 			mbWidth, mbHeight);
+ 		return B_BAD_VALUE;
+ 	}
++	status_t status = _WaitForFramesBack();
++	if (status != B_OK)
++		return status;
++
+ 	// the references, the picture being decoded, the output queue, and
+ 	// the frames a reader holds: 3 more when they are shown in place
+ 	// (references in overlay buffers, see VideoFrameReference.h)
+@@ -988,26 +995,12 @@ MesonVdec::_SetupH264Frames(const uint32* info)
+ 	size_t frameSize = ROUNDUP(lumaSize + lumaSize / 2, B_PAGE_SIZE);
+ 
+ 	if (fFrameBuffersAllocated < count || fFrameSize < frameSize) {
+-		if (fFrameBuffersAllocated > 0) {
+-			// the caller has the old frames to give back first
+-			bigtime_t timeout = system_time() + 5000000;
+-			while (true) {
+-				InterruptsSpinLocker locker(fStateLock);
+-				bool done = fHeld == 0 && fQueueCount == 0;
+-				locker.Unlock();
+-				if (done)
+-					break;
+-				if (system_time() > timeout || !fRunning)
+-					return B_TIMED_OUT;
+-				snooze(5000);
+-			}
+-			_FreeH264Frames();
+-		}
++		_FreeH264Frames();
+ 		for (uint32 i = 0; i < count; i++) {
+ 			char name[32];
+ 			snprintf(name, sizeof(name), "meson_vdec frame %" B_PRIu32, i);
+-			status_t status = _AllocateBuffer(name, frameSize,
+-				fFrameBuffers[i], true);
++			status = _AllocateBuffer(name, frameSize, fFrameBuffers[i],
++				true);
+ 			if (status != B_OK) {
+ 				INFO("no memory for frame %" B_PRIu32 " of %" B_PRIu32 ", %"
+ 					B_PRIuSIZE " bytes\n", i, count, frameSize);
+@@ -1032,7 +1025,7 @@ MesonVdec::_SetupH264Frames(const uint32* info)
+ 
+ 	size_t motionVectors = (size_t)align_up(mbWidth, 4)
+ 		* align_up(mbHeight, 4) * kMotionVectorBytes * maxReferences;
+-	status_t status = _KeepBuffer("meson_vdec motion vectors",
++	status = _KeepBuffer("meson_vdec motion vectors",
+ 		motionVectors, fMotionVectors, false, true);
+ 	if (status != B_OK)
+ 		return status;
+@@ -1063,6 +1056,34 @@ MesonVdec::_SetupH264Frames(const uint32* info)
+ }
+ 
+ 
++/*!	Waits until the reader gave back every frame it took and took every
++	frame decoded. A setup for new pictures (a new size: the stream changed)
++	does so first: the firmware takes all frames as free once it has them,
++	and a frame's size is the session's when the reader takes it. Meanwhile
++	GET_FRAME tells a reader that holds frames to give them back
++	(MESON_VDEC_FRAME_GIVE_BACK).
++*/
++status_t
++MesonVdec::_WaitForFramesBack()
++{
++	bigtime_t timeout = system_time() + 5000000;
++	InterruptsSpinLocker locker(fStateLock);
++	fWaitingForFrames = true;
++	while (fHeld != 0 || fQueueCount != 0) {
++		locker.Unlock();
++		if (system_time() > timeout || !fRunning) {
++			locker.Lock();
++			fWaitingForFrames = false;
++			return B_TIMED_OUT;
++		}
++		snooze(2000);
++		locker.Lock();
++	}
++	fWaitingForFrames = false;
++	return B_OK;
++}
++
++
+ void
+ MesonVdec::_FreeH264Frames()
+ {
+@@ -1314,6 +1335,16 @@ MesonVdec::_GetFrame(meson_vdec_frame& frame)
+ 			endOfStream = true;
+ 			timeout = min_c(timeout, system_time() + endPause);
+ 		}
++		{
++			InterruptsSpinLocker locker(fStateLock);
++			if (fWaitingForFrames && fQueueCount == 0 && fHeld != 0) {
++				// the next frames wait for the ones the reader holds
++				locker.Unlock();
++				memset(&frame, 0, sizeof(frame));
++				frame.flags = MESON_VDEC_FRAME_GIVE_BACK;
++				return B_OK;
++			}
++		}
+ 		if (_IsHevc()) {
+ 			InterruptsSpinLocker locker(fStateLock);
+ 			bool ended = fHevcEnded && fQueueCount == 0;
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp
+index 062ff97ff7..248162e621 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_hevc.cpp
+@@ -478,6 +478,7 @@ MesonVdec::_StartHevc(meson_vdec_start& start, const void* userFirmware)
+ 	fHevcPreviousPoc = 0;
+ 	fHevcPoc = 0;
+ 	fHevcEnded = false;
++	fWaitingForFrames = false;
+ 	fHevcLastStatus = 0;
+ 	fHevcLastChange = system_time();
+ 	fHevcSlices = 0;
+@@ -741,6 +742,48 @@ MesonVdec::_FinishHevcPicture()
+ }
+ 
+ 
++/*!	Whether the picture whose first slice header is in fRpm has another
++	size (or CTB size, or bit depth) than the frames: a new sequence.
++*/
++bool
++MesonVdec::_HevcPicturesChange()
++{
++	uint32 log2Ctb = _Rpm(RPM_LOG2_MIN_CB) + 3 + _Rpm(RPM_LOG2_DIFF_CB);
++	return _Rpm(RPM_WIDTH) != fHevcCodedWidth
++		|| _Rpm(RPM_HEIGHT) != fHevcCodedHeight || log2Ctb != fHevcLog2Ctb
++		|| (_Rpm(RPM_BIT_DEPTH) != 0) != fHevcCompressed;
++}
++
++
++/*!	Before frames for a new sequence's pictures (_SetupHevcFrames()): the
++	pictures so far are handed out, and every frame comes back from the
++	reader (GET_FRAME asks it to, MESON_VDEC_FRAME_GIVE_BACK). Returns false
++	while it has some; the session's thread asks again.
++*/
++bool
++MesonVdec::_HevcFramesBack()
++{
++	if (!fWaitingForFrames) {
++		_FinishHevcPicture();
++		InterruptsSpinLocker locker(fStateLock);
++		_BumpHevcFrames(0);
++		for (uint32 i = 0; i < fFrameCount; i++)
++			fHevcFrames[i].referenced = false;
++		fWaitingForFrames = true;
++		fHevcResizeStart = system_time();
++	}
++	InterruptsSpinLocker locker(fStateLock);
++	if (fHeld != 0 || fQueueCount != 0) {
++		if (system_time() - fHevcResizeStart < 5000000)
++			return false;
++		INFO("HEVC: the frames didn't come back for the new pictures\n");
++	}
++	fWaitingForFrames = false;
++	fFrameCount = 0;
++	return true;
++}
++
++
+ /*!	A frame for a new picture: not a reference, not waiting to be handed
+ 	out, not with the caller or waiting for it.
+ */
+@@ -961,10 +1004,16 @@ MesonVdec::_HevcSlice()
+ 	uint32 nalType = _Rpm(RPM_NAL_TYPE);
+ 
+ 	if (!fHevcPendingPicture) {
+-		fHevcReports++;
+-		_Trace('H', sliceType | (nalType << 8) | (address << 16),
+-			_Rpm(RPM_POC_LSB), _Dos(HEVC_SHIFT_BYTE_COUNT),
+-			_Rpm(RPM_NUM_REF_L0) | (_Rpm(RPM_NUM_REF_L1) << 8));
++		if (!fWaitingForFrames) {
++			fHevcReports++;
++			_Trace('H', sliceType | (nalType << 8) | (address << 16),
++				_Rpm(RPM_POC_LSB), _Dos(HEVC_SHIFT_BYTE_COUNT),
++				_Rpm(RPM_NUM_REF_L0) | (_Rpm(RPM_NUM_REF_L1) << 8));
++		}
++		if (fFrameCount > 0 && newPicture && _HevcPicturesChange()
++			&& !_HevcFramesBack()) {
++			return false;
++		}
+ 		if (fFrameCount == 0 && newPicture && _SetupHevcFrames() != B_OK) {
+ 			fFatal = true;
+ 			release_sem_etc(fFrameSem, 1, 0);
+diff --git a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
+index 67c7a996c0..8126663200 100644
+--- a/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
++++ b/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec_private.h
+@@ -326,6 +326,7 @@ private:
+ 	static	status_t			_SetupThread(void* data);
+ 			status_t			_SetupH264Frames(const uint32* info);
+ 			void				_FreeH264Frames();
++			status_t			_WaitForFramesBack();
+ 
+ 			// HEVC (meson_vdec_hevc.cpp)
+ 			bool				_IsHevc() const
+@@ -342,6 +343,8 @@ private:
+ 			bool				_HevcInterrupt();
+ 			bool				_HevcSlice();
+ 			status_t			_SetupHevcFrames();
++			bool				_HevcPicturesChange();
++			bool				_HevcFramesBack();
+ 			void				_FinishHevcPicture();
+ 			int32				_FreeHevcFrame();
+ 			int32				_HevcFrameForPoc(int32 poc);
+@@ -426,6 +429,8 @@ private:
+ 			thread_id			fSetupThread;
+ 			sem_id				fSetupSem;
+ 			bool				fSetupPending;
++			bool				fWaitingForFrames;
++				// a setup for new pictures waits for the old ones back
+ 				// its command 1 waits for the setup thread
+ 			bool				fEndReached;
+ 				// the command 1 is the end of the stream's picture's: the
+@@ -450,6 +455,7 @@ private:
+ 			bool				fHevcEnded;
+ 			uint32				fHevcLastStatus;
+ 			bigtime_t			fHevcLastChange;
++			bigtime_t			fHevcResizeStart;
+ 			uint32				fHevcReports;
+ 			uint32				fHevcSlices;
+ 			uint32				fHevcSkipped;
+diff --git a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
+index d261c52e8d..5e81ca331a 100644
+--- a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
++++ b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.cpp
+@@ -480,6 +480,16 @@ MesonVdecDecoder::_NextFrame()
+ 				fOutputEnded = true;
+ 				return B_LAST_BUFFER_ERROR;
+ 			}
++			if ((frame.flags & MESON_VDEC_FRAME_GIVE_BACK) != 0) {
++				// The stream's pictures change: the decoder goes on once it
++				// has every frame back, the ones the overlay shows too (as
++				// before a seek). The size may be another one from now on.
++				TRACE("giving back %" B_PRIu32 " frames\n", fReferenceCount);
++				if (fReferenceCount == 0)
++					snooze(2000);
++				_ReleaseReferences();
++				continue;
++			}
+ 			if (_MapFrames(frame.frames) == NULL)
+ 				return B_NO_MEMORY;
+ 			fFrame = frame;
+@@ -535,8 +545,9 @@ MesonVdecDecoder::_ReleaseFrame()
+ bool
+ MesonVdecDecoder::_WriteReference(void* buffer)
+ {
++	// the overlay shows the negotiated size of the frame
+ 	if (fReferenceCount == kMaxReferences || fFrame.frames < 0
+-		|| fFrame.width < fWidth || fFrame.height < fHeight) {
++		|| fFrame.width != fWidth || fFrame.height != fHeight) {
+ 		return false;
+ 	}
+ 	meson_vdec_frame_reference reference;
+@@ -731,8 +742,10 @@ MesonVdecDecoder::_Convert(void* buffer)
+ 	base += fFrame.offset;
+ 	const uint8* luma = base;
+ 	const uint8* chroma = base + fFrame.chroma_offset;
+-	uint32 width = min_c(fFrame.width, fWidth);
+-	uint32 height = min_c(fFrame.height, fHeight);
++	if (fFrame.width != fWidth || fFrame.height != fHeight)
++		return _ConvertFitted(buffer, luma, chroma);
++	uint32 width = fWidth;
++	uint32 height = fHeight;
+ 
+ 	if (fOutputColorSpace == B_NV12) {
+ 		// the planes as they are: the Y plane, then the CbCr plane
+@@ -768,6 +781,66 @@ MesonVdecDecoder::_Convert(void* buffer)
+ }
+ 
+ 
++/*!	A picture of another size than the negotiated one (the stream changed
++	its size): scaled to fit, its aspect kept, with black around it.
++*/
++status_t
++MesonVdecDecoder::_ConvertFitted(void* buffer, const uint8* luma,
++	const uint8* chroma)
++{
++	uint32 fitWidth = fWidth;
++	uint32 fitHeight = fHeight;
++	if ((uint64)fFrame.width * fHeight > (uint64)fFrame.height * fWidth)
++		fitHeight = (uint64)fFrame.height * fWidth / fFrame.width;
++	else
++		fitWidth = (uint64)fFrame.width * fHeight / fFrame.height;
++	fitWidth = max_c(fitWidth & ~1u, 2u);
++	fitHeight = max_c(fitHeight & ~1u, 2u);
++	uint32 left = ((fWidth - fitWidth) / 2) & ~1u;
++	uint32 top = ((fHeight - fitHeight) / 2) & ~1u;
++
++	uint8* target = (uint8*)buffer;
++	size_t bytesPerRow = fOutputBytesPerRow;
++	uint8* targetPlanes[4] = { NULL, NULL, NULL, NULL };
++	int targetStrides[4] = { (int)bytesPerRow, 0, 0, 0 };
++	AVPixelFormat format;
++	if (fOutputColorSpace == B_NV12) {
++		uint8* chromaTarget = target + bytesPerRow * fHeight;
++		memset(target, 16, bytesPerRow * fHeight);
++		memset(chromaTarget, 128, bytesPerRow * ((fHeight + 1) / 2));
++		targetPlanes[0] = target + top * bytesPerRow + left;
++		targetPlanes[1] = chromaTarget + top / 2 * bytesPerRow + left;
++		targetStrides[1] = (int)bytesPerRow;
++		format = AV_PIX_FMT_NV12;
++	} else if (fOutputColorSpace == B_YCbCr422) {
++		static const uint8 kBlack[4] = { 16, 128, 16, 128 };
++		for (uint32 y = 0; y < fHeight; y++) {
++			uint8* row = target + y * bytesPerRow;
++			for (uint32 x = 0; x + 4 <= 2 * fWidth; x += 4)
++				memcpy(row + x, kBlack, 4);
++		}
++		targetPlanes[0] = target + top * bytesPerRow + 2 * left;
++		format = AV_PIX_FMT_YUYV422;
++	} else {
++		memset(target, 0, bytesPerRow * fHeight);
++		targetPlanes[0] = target + top * bytesPerRow + 4 * left;
++		format = AV_PIX_FMT_BGRA;
++	}
++
++	fSwsContext = sws_getCachedContext(fSwsContext, fFrame.width,
++		fFrame.height, AV_PIX_FMT_NV12, fitWidth, fitHeight, format,
++		SWS_FAST_BILINEAR, NULL, NULL, NULL);
++	if (fSwsContext == NULL)
++		return B_NO_MEMORY;
++	const uint8* sourcePlanes[4] = { luma, chroma, NULL, NULL };
++	int sourceStrides[4] = { (int)fFrame.bytes_per_row,
++		(int)fFrame.bytes_per_row, 0, 0 };
++	sws_scale(fSwsContext, sourcePlanes, sourceStrides, 0, fFrame.height,
++		targetPlanes, targetStrides);
++	return B_OK;
++}
++
++
+ /*static*/ void
+ MesonVdecDecoder::_CopyPlane(const uint8* source, uint32 sourceBytesPerRow,
+ 	uint8* target, uint32 targetBytesPerRow, uint32 width, uint32 rows)
+diff --git a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h
+index c8e1965643..52a709a0a6 100644
+--- a/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h
++++ b/src/add-ons/media/plugins/meson_decoder/MesonVdecDecoder.h
+@@ -46,6 +46,8 @@ private:
+ 			void				_UnmapFrames();
+ 			void				_ReleaseFrame();
+ 			status_t			_Convert(void* buffer);
++			status_t			_ConvertFitted(void* buffer,
++									const uint8* luma, const uint8* chroma);
+ 			bool				_WriteReference(void* buffer);
+ 			void				_ReleaseReference(const void* buffer);
+ 			void				_ReleaseReferences();

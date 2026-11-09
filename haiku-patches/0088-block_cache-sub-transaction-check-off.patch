@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 10:05:03 -0400
+Subject: [PATCH 088/342] block_cache: sub transaction check off
+
+The check of 7b8753c601 ran on the ODROID-C2 for over 120000
+cache_start_sub_transaction() calls without finding a block that needed
+the walk: fsbench, creating and deleting up to 8000 small files, a 24 MB
+RAM disk filled to the last block in three rounds (aborted sub
+transactions, checkfs clean), and three power cuts while files were
+being created and deleted (the log replayed, no blocks lost or set
+twice).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/kernel/cache/block_cache.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/system/kernel/cache/block_cache.cpp b/src/system/kernel/cache/block_cache.cpp
+index 0a515f3f01..8961c14a10 100644
+--- a/src/system/kernel/cache/block_cache.cpp
++++ b/src/system/kernel/cache/block_cache.cpp
+@@ -58,7 +58,7 @@
+ 
+ // Checks at every cache_start_sub_transaction() that the blocks it leaves out
+ // need nothing done (check_sub_transaction_list()); walks all blocks.
+-#define BLOCK_CACHE_DEBUG_SUB_TRANSACTIONS 1
++#define BLOCK_CACHE_DEBUG_SUB_TRANSACTIONS 0
+ 
+ static const bigtime_t kTransactionIdleTime = 2000000LL;
+ 	// a transaction is considered idle after 2 seconds of inactivity

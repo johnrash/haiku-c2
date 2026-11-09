@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 15:50:36 -0400
+Subject: [PATCH 175/342] BListView: RemoveItems() keeps the selection right
+
+RemoveItems() removed the items but kept the first and last selected
+index: CurrentSelection() then named an item that wasn't selected, or
+one past the end of the list, which CurrentSelection(1) dereferenced
+(NULL). The Remote Control preferences, which emptied and refilled their
+list, changed the original profile of a duplicate.
+
+Now, as RemoveItem() does for one item, the removed items lose their
+selection, the selected indices after them move up, the anchor follows,
+the scroll bar is fixed up, and SelectionChanged() and the selection
+message come when selected items went. Upstream has the same code.
+tools/probes/listselect.cpp in the project checks it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kits/interface/ListView.cpp | 47 +++++++++++++++++++++++++++++++--
+ 1 file changed, 45 insertions(+), 2 deletions(-)
+
+diff --git a/src/kits/interface/ListView.cpp b/src/kits/interface/ListView.cpp
+index 29a3b7252a..0350a7f74f 100644
+--- a/src/kits/interface/ListView.cpp
++++ b/src/kits/interface/ListView.cpp
+@@ -1030,14 +1030,57 @@ BListView::RemoveItems(int32 index, int32 count)
+ 	if (index < 0)
+ 		return false;
+ 
+-	if (fAnchorIndex != -1 && index < fAnchorIndex)
+-		fAnchorIndex = index;
++	count = std::max((int32)0, std::min(count, fList.CountItems() - index));
++	int32 end = index + count;
++		// the first index after the removed items
++
++	// The removed items take their selection with them, and the selection
++	// after them moves up, as with RemoveItem(). The first and last
++	// selected index used to stay as they were: CurrentSelection() then
++	// named an item that wasn't selected, or one past the end of the list
++	// (and CurrentSelection(1) dereferenced it).
++	bool selectionChanged = false;
++	if (fFirstSelected != -1 && fFirstSelected < end
++		&& fLastSelected >= index) {
++		for (int32 i = std::max(index, fFirstSelected);
++				i < std::min(end, fLastSelected + 1); i++) {
++			BListItem* item = ItemAt(i);
++			if (item != NULL && item->IsSelected()) {
++				item->Deselect();
++				selectionChanged = true;
++			}
++		}
++	}
++
++	if (fAnchorIndex != -1 && index <= fAnchorIndex)
++		fAnchorIndex = fAnchorIndex >= end ? fAnchorIndex - count : index;
+ 
+ 	fList.RemoveItems(index, count);
++
++	if (fFirstSelected != -1) {
++		int32 first = fFirstSelected < index ? fFirstSelected
++			: fFirstSelected >= end ? fFirstSelected - count
++			: _CalcFirstSelected(index);
++		int32 last = fLastSelected < index ? fLastSelected
++			: fLastSelected >= end ? fLastSelected - count
++			: _CalcLastSelected(index - 1);
++		if (first == -1 || last == -1 || first > last)
++			first = last = -1;
++		fFirstSelected = first;
++		fLastSelected = last;
++	}
++	if (fAnchorIndex >= fList.CountItems())
++		fAnchorIndex = -1;
++
+ 	if (index < fList.CountItems())
+ 		_RecalcItemTops(index);
++	_FixupScrollBar();
+ 
+ 	Invalidate();
++	if (selectionChanged) {
++		SelectionChanged();
++		InvokeNotify(fSelectMessage, B_CONTROL_MODIFIED);
++	}
+ 	return true;
+ }
+ 

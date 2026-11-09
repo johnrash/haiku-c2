@@ -1,0 +1,249 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 12:58:19 -0500
+Subject: [PATCH 217/342] NeoCam, CodyCam: clips in H.264 from the hardware
+ encoder
+
+The recorder takes the first codec that sets up: the S905's H.264
+encoder, else MPEG-4. With the hardware encoder, NeoCam's Auto frame
+rate is the camera's at every size (1080p at 30); its Capture tab says
+which encoder its clips get.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apps/codycam/VideoRecorder.cpp | 91 +++++++++++++++++++++++-------
+ src/apps/codycam/VideoRecorder.h   | 15 +++--
+ src/apps/neocam/MainWindow.cpp     | 15 ++++-
+ src/apps/neocam/MainWindow.h       |  2 +
+ 4 files changed, 95 insertions(+), 28 deletions(-)
+
+diff --git a/src/apps/codycam/VideoRecorder.cpp b/src/apps/codycam/VideoRecorder.cpp
+index 10d3283dc9..b7ab3af994 100644
+--- a/src/apps/codycam/VideoRecorder.cpp
++++ b/src/apps/codycam/VideoRecorder.cpp
+@@ -19,7 +19,8 @@
+ 
+ 
+ static const char* kFileType = "video/x-matroska";
+-static const char* kCodecName = "mpeg4";
++// the S905's H.264 encoder (meson_encoder) where there is one, else FFmpeg's
++static const char* kCodecNames[] = { "h264", "mpeg4" };
+ 
+ 
+ VideoRecorder::VideoRecorder()
+@@ -83,31 +84,47 @@ VideoRecorder::Start(const char* path, uint32 width, uint32 height,
+ 	inFormat.u.raw_video.display.line_count = height;
+ 	inFormat.u.raw_video.display.bytes_per_row = bytesPerRow;
+ 
+-	media_format outFormat;
+-	media_codec_info codec;
+-	cookie = 0;
+-	found = false;
+-	while (get_next_encoder(&cookie, &fileFormat, &inFormat, &outFormat,
+-			&codec) == B_OK) {
+-		if (strcmp(codec.short_name, kCodecName) == 0) {
+-			found = true;
+-			break;
+-		}
+-	}
+-	if (!found)
+-		return B_MEDIA_BAD_FORMAT;
+-
+ 	entry_ref ref;
+ 	status_t status = get_ref_for_path(path, &ref);
+ 	if (status != B_OK)
+ 		return status;
+ 
+-	fFile = new BMediaFile(&ref, &fileFormat);
+-	status = fFile->InitCheck();
+-	if (status == B_OK) {
+-		fTrack = fFile->CreateTrack(&inFormat, &codec);
+-		if (fTrack == NULL)
+-			status = B_MEDIA_BAD_FORMAT;
++	// the first codec that sets up (the hardware's may be busy, or have no
++	// microcode)
++	status = B_MEDIA_BAD_FORMAT;
++	for (size_t i = 0; i < sizeof(kCodecNames) / sizeof(kCodecNames[0]);
++			i++) {
++		media_format outFormat;
++		media_codec_info codec;
++		cookie = 0;
++		found = false;
++		while (get_next_encoder(&cookie, &fileFormat, &inFormat, &outFormat,
++				&codec) == B_OK) {
++			if (strcmp(codec.short_name, kCodecNames[i]) == 0) {
++				found = true;
++				break;
++			}
++		}
++		if (!found)
++			continue;
++
++		fFile = new BMediaFile(&ref, &fileFormat);
++		status = fFile->InitCheck();
++		if (status == B_OK) {
++			fTrack = fFile->CreateTrack(&inFormat, &codec);
++			if (fTrack == NULL)
++				status = B_MEDIA_BAD_FORMAT;
++			else if ((status = fTrack->InitCheck()) != B_OK) {
++				fFile->ReleaseTrack(fTrack);
++				fTrack = NULL;
++			}
++		}
++		if (status == B_OK) {
++			fCodecName = codec.short_name;
++			break;
++		}
++		delete fFile;
++		fFile = NULL;
+ 	}
+ 	if (status == B_OK)
+ 		status = fFile->CommitHeader();
+@@ -252,6 +269,38 @@ VideoRecorder::_Thread()
+ }
+ 
+ 
++/*!	Whether there is a hardware H.264 encoder to use: the device, and the
++	encoder plugin (which needs its microcode to set up).
++*/
++/*static*/ bool
++VideoRecorder::CanEncodeInHardware()
++{
++	if (!BEntry("/dev/video/meson_venc/0").Exists())
++		return false;
++	media_file_format fileFormat;
++	media_format inFormat;
++	inFormat.type = B_MEDIA_RAW_VIDEO;
++	inFormat.u.raw_video = media_raw_video_format::wildcard;
++	media_format outFormat;
++	media_codec_info codec;
++	int32 cookie = 0;
++	while (get_next_file_format(&cookie, &fileFormat) == B_OK) {
++		if ((fileFormat.capabilities & media_file_format::B_WRITABLE) == 0
++			|| strcmp(fileFormat.mime_type, kFileType) != 0) {
++			continue;
++		}
++		int32 encoderCookie = 0;
++		while (get_next_encoder(&encoderCookie, &fileFormat, &inFormat,
++				&outFormat, &codec) == B_OK) {
++			if (strcmp(codec.short_name, kCodecNames[0]) == 0)
++				return true;
++		}
++		break;
++	}
++	return false;
++}
++
++
+ void
+ VideoRecorder::_Cleanup()
+ {
+diff --git a/src/apps/codycam/VideoRecorder.h b/src/apps/codycam/VideoRecorder.h
+index 4c764f07ee..ef2a1f76be 100644
+--- a/src/apps/codycam/VideoRecorder.h
++++ b/src/apps/codycam/VideoRecorder.h
+@@ -15,12 +15,13 @@ class BMediaFile;
+ class BMediaTrack;
+ 
+ 
+-/*!	Writes the frames it is given (B_RGB32) into a Matroska file as MPEG-4
+-	video at a constant frame rate: a frame that came late is written again
++/*!	Writes the frames it is given (B_RGB32) into a Matroska file at a
++	constant frame rate: a frame that came late is written again
+ 	for the frames it missed, one that came early is left out, so that the
+ 	video plays at the speed it was taken, also when the camera lowers its
+-	rate in low light. Encoding runs in a thread of its own; AddFrame() only
+-	copies the frame. An encoder that can't keep up leaves time out of the
++	rate in low light. The video is H.264 where the S905's encoder can take
++	it (meson_encoder), else MPEG-4. Encoding runs in a thread of its own;
++	AddFrame() only copies the frame. An encoder that can't keep up leaves time out of the
+ 	video rather than falling ever further behind.
+ */
+ class VideoRecorder {
+@@ -36,6 +37,11 @@ public:
+ 
+ 			bool				IsRecording() const { return fFile != NULL; }
+ 			const char*			Path() const { return fPath.String(); }
++			const char*			CodecName() const
++									{ return fCodecName.String(); }
++
++	static	bool				CanEncodeInHardware();
++									// H.264 by the S905's encoder
+ 			bigtime_t			Duration() const;
+ 
+ private:
+@@ -46,6 +52,7 @@ private:
+ 			BMediaFile*			fFile;
+ 			BMediaTrack*		fTrack;
+ 			BString				fPath;
++			BString				fCodecName;
+ 			size_t				fFrameSize;
+ 			float				fFrameRate;
+ 
+diff --git a/src/apps/neocam/MainWindow.cpp b/src/apps/neocam/MainWindow.cpp
+index 1b20c46486..9db8804b5b 100644
+--- a/src/apps/neocam/MainWindow.cpp
++++ b/src/apps/neocam/MainWindow.cpp
+@@ -46,6 +46,7 @@
+ #include "CaptureManager.h"
+ #include "NeoCam.h"
+ #include "PreviewView.h"
++#include "VideoRecorder.h"
+ 
+ 
+ #undef B_TRANSLATION_CONTEXT
+@@ -200,7 +201,8 @@ MainWindow::MainWindow(const BMessage& settings,
+ 	fNextSchedule(0),
+ 	fNextMotionCapture(0),
+ 	fMotionNow(false),
+-	fQuitting(false)
++	fQuitting(false),
++	fHardwareEncoding(VideoRecorder::CanEncodeInHardware())
+ {
+ 	// the menus
+ 	BMenuBar* menuBar = new BMenuBar("menu");
+@@ -548,6 +550,10 @@ MainWindow::_CaptureTab()
+ 	BMenuField* rateField = new BMenuField("rate",
+ 		B_TRANSLATE("Clip frame rate:"), fClipRateMenu);
+ 
++	BStringView* codec = new BStringView("codec", fHardwareEncoding
++		? B_TRANSLATE("Clips are H.264, encoded by the S905's encoder.")
++		: B_TRANSLATE("Clips are MPEG-4, encoded by the CPU."));
++
+ 	BView* view = new BView(B_TRANSLATE("Capture"), 0);
+ 	BLayoutBuilder::Grid<>(view, B_USE_DEFAULT_SPACING, B_USE_SMALL_SPACING)
+ 		.SetInsets(B_USE_WINDOW_SPACING)
+@@ -559,7 +565,8 @@ MainWindow::_CaptureTab()
+ 			.AddGlue()
+ 		.End()
+ 		.AddMenuField(rateField, 0, 2)
+-		.AddGlue(0, 3, 2);
++		.Add(codec, 1, 3)
++		.AddGlue(0, 4, 2);
+ 	return view;
+ }
+ 
+@@ -1142,7 +1149,9 @@ MainWindow::_AutoClipFrameRate() const
+ 		}
+ 	}
+ 
+-	float budget = kEncodePixelsPerSecond / pixels;
++	// the hardware encoder keeps up with any camera (1920x1080 in 19 ms)
++	float budget = fHardwareEncoding ? 1000
++		: kEncodePixelsPerSecond / pixels;
+ 	for (size_t i = 0; i < sizeof(kClipRates) / sizeof(kClipRates[0]); i++) {
+ 		if (kClipRates[i] <= budget && kClipRates[i] <= cameraRate + 0.5f)
+ 			return kClipRates[i];
+diff --git a/src/apps/neocam/MainWindow.h b/src/apps/neocam/MainWindow.h
+index c64c153c81..4362e37e37 100644
+--- a/src/apps/neocam/MainWindow.h
++++ b/src/apps/neocam/MainWindow.h
+@@ -133,6 +133,8 @@ private:
+ 			bigtime_t			fNextMotionCapture;
+ 			bool				fMotionNow;
+ 			bool				fQuitting;
++			bool				fHardwareEncoding;
++				// clips are H.264 from the S905's encoder
+ };
+ 
+ 

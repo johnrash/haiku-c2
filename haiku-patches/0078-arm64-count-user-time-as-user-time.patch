@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 01:46:20 -0400
+Subject: [PATCH 078/342] arm64: count user time as user time
+
+The kernel recorded the entry from user mode (thread_at_kernel_entry())
+only for syscalls, but charged the time since then as kernel time at
+every return to user mode. A thread interrupted by the timer or a page
+fault got its user time booked as kernel time: `time` on a loop without
+syscalls showed 0 s user and 3.7 s system. Record the entry for every
+exception taken from EL0, as x86 does in its entry code.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/kernel/arch/arm64/arch_int.cpp | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/system/kernel/arch/arm64/arch_int.cpp b/src/system/kernel/arch/arm64/arch_int.cpp
+index 095eae5865..53ccfb20f5 100644
+--- a/src/system/kernel/arch/arm64/arch_int.cpp
++++ b/src/system/kernel/arch/arm64/arch_int.cpp
+@@ -211,8 +211,13 @@ public:
+ 		fThread = thread_get_current_thread();
+ 		if (fThread) {
+ 			arm64_push_iframe(&fThread->arch_info.iframes, iframe);
+-			if ((iframe->spsr & PSR_M_MASK) == PSR_M_EL0t)
++			if ((iframe->spsr & PSR_M_MASK) == PSR_M_EL0t) {
++				// whatever brought the thread into the kernel (an interrupt,
++				// a fault, a syscall), the time until now was user time; the
++				// exit charges the time in here as kernel time
++				thread_at_kernel_entry(system_time());
+ 				arm64_user_debug_at_kernel_entry();
++			}
+ 		} else
+ 			arm64_push_iframe(&gBootFrameStack, iframe);
+ 	}
+@@ -402,7 +407,6 @@ do_sync_handler(iframe * frame)
+ 				}
+ 			}
+ 
+-			thread_at_kernel_entry(system_time());
+ 			thread_get_current_thread()->arch_info.old_x0 = frame->x[0];
+ 
+ 			enable_interrupts();

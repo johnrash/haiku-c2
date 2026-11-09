@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 01:07:53 -0400
+Subject: [PATCH 012/342] mmc_bus, mmc_disk: turn off call tracing
+
+Both printed a line per command or I/O request to the serial debug
+output, which at 115200 baud costs milliseconds per request.
+
+mmc_disk's disabled TRACE() expanded to a bare ";", which broke the
+if/else chain in mmc_disk_supports_device(); it is now do {} while (0).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/bus_managers/mmc/mmc_bus.h    | 2 +-
+ src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/add-ons/kernel/bus_managers/mmc/mmc_bus.h b/src/add-ons/kernel/bus_managers/mmc/mmc_bus.h
+index f8859421d8..8827a3db81 100644
+--- a/src/add-ons/kernel/bus_managers/mmc/mmc_bus.h
++++ b/src/add-ons/kernel/bus_managers/mmc/mmc_bus.h
+@@ -18,7 +18,7 @@
+ #include "mmc.h"
+ 
+ 
+-#define MMCBUS_TRACE
++//#define MMCBUS_TRACE
+ #ifdef MMCBUS_TRACE
+ #	define TRACE(x...)		dprintf("\33[33mmmc_bus:\33[0m " x)
+ #else
+diff --git a/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp b/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
+index e594230b30..c055c9ac68 100644
+--- a/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
++++ b/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
+@@ -32,7 +32,7 @@
+ #ifdef TRACE_MMC_DISK
+ #	define TRACE(x...) dprintf("\33[33mmmc_disk:\33[0m " x)
+ #else
+-#	define TRACE(x...) ;
++#	define TRACE(x...) do {} while (0)
+ #endif
+ #define ERROR(x...)			dprintf("\33[33mmmc_disk:\33[0m " x)
+ #define INFO(x...)			dprintf("\33[33mmmc_disk:\33[0m " x)

@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 01:52:26 -0400
+Subject: [PATCH 079/342] usb_hid: wait 10 ms before retrying after a report
+ error
+
+When an input device's transfers failed at once (on the ODROID-C2, a
+keyboard behind a hub that stopped answering: "Device check-sum error"),
+the protocol handlers asked for the next report immediately, about
+38000 times a second, which kept input_server's watcher thread and the
+USB host's interrupt thread at 0.7 cores between them. They now wait
+10 ms after an error other than a timeout.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../drivers/input/hid_shared/JoystickProtocolHandler.cpp    | 1 +
+ .../drivers/input/hid_shared/KeyboardProtocolHandler.cpp    | 1 +
+ .../drivers/input/hid_shared/MouseProtocolHandler.cpp       | 1 +
+ .../kernel/drivers/input/hid_shared/ProtocolHandler.h       | 6 ++++++
+ .../drivers/input/hid_shared/TabletProtocolHandler.cpp      | 1 +
+ 5 files changed, 10 insertions(+)
+
+diff --git a/src/add-ons/kernel/drivers/input/hid_shared/JoystickProtocolHandler.cpp b/src/add-ons/kernel/drivers/input/hid_shared/JoystickProtocolHandler.cpp
+index 99af7d5d8a..680854c11d 100644
+--- a/src/add-ons/kernel/drivers/input/hid_shared/JoystickProtocolHandler.cpp
++++ b/src/add-ons/kernel/drivers/input/hid_shared/JoystickProtocolHandler.cpp
+@@ -362,6 +362,7 @@ JoystickProtocolHandler::_Update()
+ 		if (result != B_BUSY) {
+ 			// "busy" happens when other reports come in on the same input as ours
+ 			TRACE_ALWAYS("error waiting for report: %s\n", strerror(result));
++			snooze(kReportErrorRetryDelay);
+ 		}
+ 
+ 		// signal that we simply want to try again
+diff --git a/src/add-ons/kernel/drivers/input/hid_shared/KeyboardProtocolHandler.cpp b/src/add-ons/kernel/drivers/input/hid_shared/KeyboardProtocolHandler.cpp
+index 76a16dc43e..32969edb90 100644
+--- a/src/add-ons/kernel/drivers/input/hid_shared/KeyboardProtocolHandler.cpp
++++ b/src/add-ons/kernel/drivers/input/hid_shared/KeyboardProtocolHandler.cpp
+@@ -523,6 +523,7 @@ KeyboardProtocolHandler::_ReadReport(bigtime_t timeout, uint32 *cookie)
+ 			// we expect timeouts as we do repeat key handling this way,
+ 			// "busy" happens when other reports come in on the same endpoint
+ 			TRACE_ALWAYS("error waiting for report: %s\n", strerror(result));
++			snooze(kReportErrorRetryDelay);
+ 		}
+ 
+ 		// signal that we simply want to try again
+diff --git a/src/add-ons/kernel/drivers/input/hid_shared/MouseProtocolHandler.cpp b/src/add-ons/kernel/drivers/input/hid_shared/MouseProtocolHandler.cpp
+index ee9b471f26..a915c5cb4f 100644
+--- a/src/add-ons/kernel/drivers/input/hid_shared/MouseProtocolHandler.cpp
++++ b/src/add-ons/kernel/drivers/input/hid_shared/MouseProtocolHandler.cpp
+@@ -202,6 +202,7 @@ MouseProtocolHandler::_ReadReport(void *buffer, uint32 *cookie)
+ 		if (result != B_BUSY) {
+ 			// "busy" happens when other reports come in on the same input as ours
+ 			TRACE_ALWAYS("error waiting for report: %s\n", strerror(result));
++			snooze(kReportErrorRetryDelay);
+ 		}
+ 
+ 		// signal that we simply want to try again
+diff --git a/src/add-ons/kernel/drivers/input/hid_shared/ProtocolHandler.h b/src/add-ons/kernel/drivers/input/hid_shared/ProtocolHandler.h
+index 8f1b1f20ee..307f963764 100644
+--- a/src/add-ons/kernel/drivers/input/hid_shared/ProtocolHandler.h
++++ b/src/add-ons/kernel/drivers/input/hid_shared/ProtocolHandler.h
+@@ -16,6 +16,12 @@ class HIDDevice;
+ class HIDReport;
+ 
+ 
++// After an error other than a timeout, a protocol handler waits this long
++// before asking for the next report: a device whose transfers fail at once
++// would otherwise be polled in a tight loop.
++const bigtime_t kReportErrorRetryDelay = 10000;
++
++
+ class ProtocolHandler {
+ public:
+ 								ProtocolHandler(HIDDevice *device,
+diff --git a/src/add-ons/kernel/drivers/input/hid_shared/TabletProtocolHandler.cpp b/src/add-ons/kernel/drivers/input/hid_shared/TabletProtocolHandler.cpp
+index 35dd040b45..3630c6eb1e 100644
+--- a/src/add-ons/kernel/drivers/input/hid_shared/TabletProtocolHandler.cpp
++++ b/src/add-ons/kernel/drivers/input/hid_shared/TabletProtocolHandler.cpp
+@@ -253,6 +253,7 @@ TabletProtocolHandler::_ReadReport(void *buffer, uint32 *cookie)
+ 		if (result != B_BUSY) {
+ 			// "busy" happens when other reports come in on the same input as ours
+ 			TRACE_ALWAYS("error waiting for report: %s\n", strerror(result));
++			snooze(kReportErrorRetryDelay);
+ 		}
+ 
+ 		// signal that we simply want to try again

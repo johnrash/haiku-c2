@@ -1,0 +1,285 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 13:49:22 -0400
+Subject: [PATCH 100/342] meson_hdmi: HDMI audio at 32, 44.1, 48, 88.2, 96,
+ 176.4 and 192 kHz
+
+The multi_audio device took only 48 kHz. Each rate now has its MPLL2
+setting (294.912 MHz for the 48 kHz family, 270.951 MHz for 44.1 kHz,
+196.608 MHz for 32 kHz) and cts_amclk divider (24, 12 or 6, 256 fs),
+CEA-861's N, and the IEC 60958 channel status bytes for the rate and 16
+bits. A new rate (B_MULTI_SET_GLOBAL_FORMAT) stops playing; the next
+buffer exchange starts at it. The CTS check expects pixel clock * N /
+(128 * rate).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../graphics/meson_hdmi/meson_hdmi_audio.cpp  | 142 +++++++++++++-----
+ .../graphics/meson_hdmi/meson_hdmi_audio.h    |   2 +
+ 2 files changed, 106 insertions(+), 38 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi_audio.cpp b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi_audio.cpp
+index b868304c9e..bf0fa0e5fb 100644
+--- a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi_audio.cpp
++++ b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi_audio.cpp
+@@ -3,21 +3,24 @@
+  * Distributed under the terms of the MIT License.
+  */
+ 
+-/*!	HDMI audio on the Amlogic Meson GXBB (S905, ODROID-C2): 48 kHz, 16-bit
+-	stereo PCM, published as a multi_audio device next to the display.
++/*!	HDMI audio on the Amlogic Meson GXBB (S905, ODROID-C2): 16-bit stereo
++	PCM at 32, 44.1, 48, 88.2, 96, 176.4 or 192 kHz, published as a
++	multi_audio device next to the display.
+ 
+ 	The path: a ring buffer in memory, read by the AIU's I2S DMA
+ 	(AIU_MEM_I2S_*), the AIU's I2S encoder, the HDMI TX's I2S input
+ 	(AIU_HDMI_CLK_DATA_CTRL), the DesignWare controller's audio sampler and
+ 	frame composer, which send the samples in audio sample packets.
+ 
+-	Clocks: MPLL2, fed by the 2 GHz fixed PLL, runs at 294.912 MHz;
+-	cts_amclk is that /24, 12.288 MHz (256 fs); the I2S bit clock aoclk is
+-	cts_amclk /4 (64 fs, 32 bits per channel), which the controller also
+-	gets as its audio master clock (it measured CTS 148501 for 148.5 MHz
+-	with "64 fs", twice that with "128 fs"). The controller measures CTS
+-	itself against the TMDS clock; N is 6144, as for every 48 kHz mode with
+-	a whole kHz pixel clock (CEA-861: 74.25 and 148.5 MHz).
++	Clocks: MPLL2, fed by the 2 GHz fixed PLL, runs at 294.912 MHz for the
++	48 kHz rates (270.951 for 44.1 kHz, 196.608 for 32 kHz); cts_amclk is
++	that /24, /12 or /6, 256 fs (12.288 MHz at 48 kHz); the I2S bit clock
++	aoclk is cts_amclk /4 (64 fs, 32 bits per channel), which the
++	controller also gets as its audio master clock (it measured CTS 148501
++	for 148.5 MHz with "64 fs", twice that with "128 fs"). The controller
++	measures CTS itself against the TMDS clock; N is CEA-861's for the rate
++	(6144 at 48 kHz, 6272 at 44.1 kHz ...), and the channel status says the
++	rate and the word length (IEC 60958-3).
+ 
+ 	Found on the board with an HDMI capture stick (tools/hdmi-audio-check.py
+ 	in the port's project folder): the I2S core encodes 24-bit samples, and
+@@ -159,9 +162,34 @@ enum {
+ #define MC_CLKDIS_AUDCLK			(1 << 3)
+ #define MC_SWRSTZ_I2S				(1 << 3)	// active low
+ 
+-static const uint32 kN = 6144;
++#define DW_FC_AUDSCHNLS7			0x106e	// channel status byte 3
++#define DW_FC_AUDSCHNLS8			0x106f	// channel status byte 4
+ 
+-static const uint32 kRate = 48000;
++/*!	A sample rate: MPLL2 = 2 GHz / (n + sdm / 16384), cts_amclk = MPLL2 /
++	divider (256 fs), the HDMI N (CEA-861), and the channel status codes for
++	the rate and the "original" rate (IEC 60958-3 bytes 3 and 4).
++*/
++struct audio_rate {
++	uint32	rate;
++	uint32	multiRate;		// B_SR_*
++	uint32	mpllN;
++	uint32	mpllSdm;
++	uint32	divider;
++	uint32	n;
++	uint8	statusRate;
++	uint8	statusOriginal;
++};
++
++static const audio_rate kRates[] = {
++	{ 32000, B_SR_32000, 10, 2827, 24, 4096, 0x3, 0xc },
++	{ 44100, B_SR_44100, 7, 6249, 24, 6272, 0x0, 0xf },
++	{ 48000, B_SR_48000, 6, 12807, 24, 6144, 0x2, 0xd },
++	{ 88200, B_SR_88200, 7, 6249, 12, 12544, 0x8, 0x7 },
++	{ 96000, B_SR_96000, 6, 12807, 12, 12288, 0xa, 0x5 },
++	{ 176400, B_SR_176400, 7, 6249, 6, 25088, 0xc, 0x3 },
++	{ 192000, B_SR_192000, 6, 12807, 6, 24576, 0xe, 0x1 },
++};
++static const audio_rate* const kDefaultRate = &kRates[2];
+ static const uint32 kFrameSize = 4;			// 16-bit stereo
+ static const uint32 kBufferFrames = 1024;
+ static const uint32 kBufferCount = 2;
+@@ -212,7 +240,8 @@ MesonHdmiAudio::MesonHdmiAudio(MesonHdmiRegisters* registers)
+ 	fRunning(false),
+ 	fPlaying(0),
+ 	fFramesPlayed(0),
+-	fBufferTime(0)
++	fBufferTime(0),
++	fRate(kDefaultRate)
+ {
+ 	mutex_init(&fLock, "meson_hdmi audio");
+ 	B_INITIALIZE_SPINLOCK(&fStateLock);
+@@ -298,10 +327,11 @@ MesonHdmiAudio::Init()
+ void
+ MesonHdmiAudio::_SetupClocks()
+ {
+-	const uint32 mpll = MPLL_N(6) | MPLL_SDM_EN | MPLL_EN_DDS | MPLL_SDM(12807);
++	const uint32 mpll = MPLL_N(fRate->mpllN) | MPLL_SDM_EN | MPLL_EN_DDS
++		| MPLL_SDM(fRate->mpllSdm);
+ 	uint32 audio = fRegisters->HhiRead(HHI_AUD_CLK_CNTL);
+-	uint32 wanted = (audio & ~0x7ffu) | AUD_CLK_SRC_MPLL2 | AUD_CLK_DIV(24)
+-		| AUD_CLK_EN;
++	uint32 wanted = (audio & ~0x7ffu) | AUD_CLK_SRC_MPLL2
++		| AUD_CLK_DIV(fRate->divider) | AUD_CLK_EN;
+ 	if (fRegisters->HhiRead(HHI_MPLL_CNTL9) == mpll && audio == wanted)
+ 		return;
+ 
+@@ -344,11 +374,12 @@ MesonHdmiAudio::_SetupAiu()
+ 
+ 
+ /*!	The controller's audio sampler: I2S input 0, 16 bits, master clock
+-	64 fs; N = 6144 with CTS measured; the audio infoframe says 2 channels.
+-	The I2S part is reset after the I2S clock has run for a while (50 ms;
+-	about 130 ms worked when tried by hand, the first 40 did not), and again
+-	if the CTS it then measures does not match the pixel clock (for N = 6144
+-	at 48 kHz, CTS is the pixel clock in kHz).
++	64 fs; the rate's N with CTS measured; the audio infoframe says 2
++	channels, the channel status the rate and 16 bits. The I2S part is reset
++	after the I2S clock has run for a while (50 ms; about 130 ms worked when
++	tried by hand, the first 40 did not), and again if the CTS it then
++	measures does not match the pixel clock: CTS = pixel clock * N /
++	(128 * rate), the pixel clock in kHz at 48 kHz.
+ */
+ void
+ MesonHdmiAudio::_SetupHdmi(bool debugger)
+@@ -366,9 +397,13 @@ MesonHdmiAudio::_SetupHdmi(bool debugger)
+ 	fRegisters->DwWrite(DW_AUD_CTS1, 0);
+ 	fRegisters->DwWrite(DW_AUD_CTS2, 0);
+ 	fRegisters->DwWrite(DW_AUD_CTS3, 0);
+-	fRegisters->DwWrite(DW_AUD_N1, kN & 0xff);
+-	fRegisters->DwWrite(DW_AUD_N2, (kN >> 8) & 0xff);
+-	fRegisters->DwWrite(DW_AUD_N3, (kN >> 16) & 0xff);
++	fRegisters->DwWrite(DW_AUD_N1, fRate->n & 0xff);
++	fRegisters->DwWrite(DW_AUD_N2, (fRate->n >> 8) & 0xff);
++	fRegisters->DwWrite(DW_AUD_N3, (fRate->n >> 16) & 0xff);
++
++	// 16 bits (of at most 20), the rate
++	fRegisters->DwWrite(DW_FC_AUDSCHNLS7, fRate->statusRate);
++	fRegisters->DwWrite(DW_FC_AUDSCHNLS8, (fRate->statusOriginal << 4) | 0x2);
+ 
+ 	fRegisters->DwWrite(DW_FC_AUDSCONF, 0);		// layout 0: 2 channels
+ 	fRegisters->DwWrite(DW_FC_AUDICONF0, FC_AUDICONF0_2CH);
+@@ -378,7 +413,8 @@ MesonHdmiAudio::_SetupHdmi(bool debugger)
+ 
+ 	// the measurement takes a while to settle after a reset; an unknown
+ 	// pixel clock (no mode set yet) accepts the second one
+-	uint32 expected = fRegisters->PixelClock();
++	uint32 expected = (uint32)((uint64)fRegisters->PixelClock() * 1000
++		* fRate->n / (128 * fRate->rate));
+ 	uint32 cts = 0;
+ 	int32 resets = 0;
+ 	if (debugger)
+@@ -402,12 +438,13 @@ MesonHdmiAudio::_SetupHdmi(bool debugger)
+ 		}
+ 	}
+ 	if (debugger) {
+-		kprintf("meson_hdmi: audio: CTS %" B_PRIu32 " for a %" B_PRIu32
+-			" kHz pixel clock (%" B_PRId32 " sampler reset(s))\n", cts,
+-			expected, resets);
++		kprintf("meson_hdmi: audio: %" B_PRIu32 " Hz, CTS %" B_PRIu32
++			" (expected %" B_PRIu32 ", %" B_PRId32 " sampler reset(s))\n",
++			fRate->rate, cts, expected, resets);
+ 	} else {
+-		INFO("started: CTS %" B_PRIu32 " for a %" B_PRIu32 " kHz pixel clock"
+-			" (%" B_PRId32 " sampler reset(s))\n", cts, expected, resets);
++		INFO("started at %" B_PRIu32 " Hz: CTS %" B_PRIu32 " (expected %"
++			B_PRIu32 ", %" B_PRId32 " sampler reset(s))\n", fRate->rate, cts,
++			expected, resets);
+ 	}
+ }
+ 
+@@ -522,7 +559,8 @@ MesonHdmiAudio::_Poll(timer* timer)
+ 	self->fPlaying = playing;
+ 	self->fFramesPlayed += kBufferFrames;
+ 	self->fBufferTime = system_time()
+-		- (bigtime_t)(offset % kBufferSize) / kFrameSize * 1000000 / kRate;
++		- (bigtime_t)(offset % kBufferSize) / kFrameSize * 1000000
++			/ self->fRate->rate;
+ 	locker.Unlock();
+ 	release_sem_etc(self->fBufferSem, 1, B_DO_NOT_RESCHEDULE);
+ 	return B_INVOKE_SCHEDULER;
+@@ -598,8 +636,11 @@ MesonHdmiAudio::GetDescription(multi_description* data)
+ 	if (data->request_channel_count >= (int32)B_COUNT_OF(sChannels))
+ 		memcpy(data->channels, sChannels, sizeof(sChannels));
+ 
+-	data->output_rates = B_SR_48000;
+-	data->input_rates = B_SR_48000;
++	uint32 rates = 0;
++	for (size_t i = 0; i < B_COUNT_OF(kRates); i++)
++		rates |= kRates[i].multiRate;
++	data->output_rates = rates;
++	data->input_rates = rates;
+ 	data->max_cvsr_rate = 0;
+ 	data->min_cvsr_rate = 0;
+ 	data->output_formats = B_FMT_16BIT;
+@@ -629,16 +670,42 @@ MesonHdmiAudio::GetGlobalFormat(multi_format_info* data)
+ 	data->output_latency = 0;
+ 	data->input_latency = 0;
+ 	data->timecode_kind = 0;
+-	data->output.rate = B_SR_48000;
+-	data->output.cvsr = kRate;
++	MutexLocker locker(fLock);
++	data->output.rate = fRate->multiRate;
++	data->output.cvsr = fRate->rate;
+ 	data->output.format = B_FMT_16BIT;
+-	data->input.rate = B_SR_48000;
+-	data->input.cvsr = kRate;
++	data->input.rate = fRate->multiRate;
++	data->input.cvsr = fRate->rate;
+ 	data->input.format = B_FMT_16BIT;
+ 	return B_OK;
+ }
+ 
+ 
++/*!	A new rate stops playing: the next buffer exchange starts at it. */
++status_t
++MesonHdmiAudio::SetGlobalFormat(multi_format_info* data)
++{
++	if (data->output.format != B_FMT_16BIT)
++		return B_BAD_VALUE;
++	const audio_rate* rate = NULL;
++	for (size_t i = 0; i < B_COUNT_OF(kRates); i++) {
++		if (kRates[i].multiRate == data->output.rate)
++			rate = &kRates[i];
++	}
++	if (rate == NULL)
++		return B_BAD_VALUE;
++
++	MutexLocker locker(fLock);
++	if (rate == fRate)
++		return B_OK;
++	if (fRunning)
++		_Stop();
++	fRate = rate;
++	INFO("rate %" B_PRIu32 " Hz\n", rate->rate);
++	return B_OK;
++}
++
++
+ /*!	The buffers are the ring itself, mapped into the caller (the opener). */
+ status_t
+ MesonHdmiAudio::GetBuffers(multi_buffer_list* data)
+@@ -754,8 +821,7 @@ get_global_format(MesonHdmiAudio* audio, multi_format_info* data)
+ static status_t
+ set_global_format(MesonHdmiAudio* audio, multi_format_info* data)
+ {
+-	// 48 kHz 16-bit stereo only
+-	return B_OK;
++	return audio->SetGlobalFormat(data);
+ }
+ 
+ 
+diff --git a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi_audio.h b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi_audio.h
+index 3ff62882c3..994475afb4 100644
+--- a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi_audio.h
++++ b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi_audio.h
+@@ -57,6 +57,7 @@ public:
+ 			status_t			GetDescription(multi_description* data);
+ 			status_t			GetEnabledChannels(multi_channel_enable* data);
+ 			status_t			GetGlobalFormat(multi_format_info* data);
++			status_t			SetGlobalFormat(multi_format_info* data);
+ 			status_t			GetBuffers(multi_buffer_list* data);
+ 			status_t			BufferExchange(multi_buffer_info* data);
+ 			status_t			ForceStop();
+@@ -94,6 +95,7 @@ private:
+ 			uint32				fPlaying;		// buffer the DMA reads
+ 			int64				fFramesPlayed;
+ 			bigtime_t			fBufferTime;	// when it began
++			const struct audio_rate* fRate;
+ };
+ 
+ 

@@ -1,0 +1,19 @@
+#!/bin/bash
+# Haiku's package tool. For "create", the ELF files in the package tree get
+# their file types, signatures and icons first (Haiku attributes do not
+# survive cp on this host, see haiku_mimeset), cleaned up again afterwards.
+. "$HAIKU_PROJECT/tools/haiku-arm64-env.sh"
+if [ "$1" != create ]; then
+	exec "$HAIKU_HOST_TOOLS/package/package" "$@"
+fi
+files=()
+while IFS= read -r -d '' f; do
+	head -c 4 "$f" | grep -q ELF && files+=("$f")
+done < <(find . -type f -print0)
+[ ${#files[@]} -gt 0 ] && haiku_mimeset "${files[@]}"
+"$HAIKU_HOST_TOOLS/package/package" "$@"
+status=$?
+for f in "${files[@]}"; do
+	rm -rf "$HAIKU_ATTRIBUTES/$(stat -c %i "$f")"
+done
+exit $status

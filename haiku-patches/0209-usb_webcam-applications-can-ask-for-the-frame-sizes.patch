@@ -1,0 +1,288 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 11:21:07 -0500
+Subject: [PATCH 209/342] usb_webcam: applications can ask for the frame sizes
+
+A VIDEO_FRAME_SIZES_REQUEST to the producer's port is answered with each
+size the camera streams, its frame rate and whether it comes compressed,
+as AcceptVideoFrame() would choose the mode, from the smallest. Unlike a
+format proposal it changes nothing, also while streaming. For NeoCam.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/media/VideoFrameSizes.h       | 53 +++++++++++++++++++
+ .../media-add-ons/usb_webcam/CamDevice.cpp    | 21 ++++++++
+ .../media-add-ons/usb_webcam/CamDevice.h      |  6 +++
+ .../media/media-add-ons/usb_webcam/Jamfile    |  2 +-
+ .../media-add-ons/usb_webcam/Producer.cpp     | 34 ++++++++++++
+ .../usb_webcam/addons/uvc/UVCCamDevice.cpp    | 53 +++++++++++++++++++
+ .../usb_webcam/addons/uvc/UVCCamDevice.h      |  5 ++
+ 7 files changed, 173 insertions(+), 1 deletion(-)
+ create mode 100644 headers/private/media/VideoFrameSizes.h
+
+diff --git a/headers/private/media/VideoFrameSizes.h b/headers/private/media/VideoFrameSizes.h
+new file mode 100644
+index 0000000000..333fa7165d
+--- /dev/null
++++ b/headers/private/media/VideoFrameSizes.h
+@@ -0,0 +1,53 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef _VIDEO_FRAME_SIZES_H
++#define _VIDEO_FRAME_SIZES_H
++
++
++#include <OS.h>
++
++
++/*!	The frame sizes a video producer can stream, for an application to offer
++	them: it writes a video_frame_sizes_request to the producer node's
++	control port as VIDEO_FRAME_SIZES_REQUEST, and the producer writes a
++	video_frame_sizes_reply to the request's reply port as
++	VIDEO_FRAME_SIZES_REPLY. Unlike a format proposal, asking changes nothing
++	in the producer, also while it streams. usb_webcam answers it.
++*/
++
++
++enum {
++	VIDEO_FRAME_SIZES_REQUEST	= 0x60465301,
++	VIDEO_FRAME_SIZES_REPLY		= 0x60465302
++};
++
++enum {
++	VIDEO_FRAME_SIZE_COMPRESSED	= 0x01
++		// the camera sends it compressed (MJPEG): it costs CPU to decode
++};
++
++#define VIDEO_FRAME_SIZES_MAX	64
++
++
++struct video_frame_sizes_request {
++	port_id				reply_port;
++};
++
++struct video_frame_size {
++	uint32				width;
++	uint32				height;
++	float				frame_rate;
++	uint32				flags;
++};
++
++struct video_frame_sizes_reply {
++	status_t			status;
++	int32				count;
++	video_frame_size	sizes[VIDEO_FRAME_SIZES_MAX];
++		// from the smallest to the largest
++};
++
++
++#endif	// _VIDEO_FRAME_SIZES_H
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
+index 06c6d3b21c..d8a8fc0eea 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.cpp
+@@ -213,6 +213,27 @@ CamDevice::SuggestVideoFrame(uint32 &width, uint32 &height)
+ }
+ 
+ 
++/*!	Without a list of its own, a camera offers the size it suggests. */
++int32
++CamDevice::CountFrameSizes()
++{
++	uint32 width, height;
++	return SuggestVideoFrame(width, height) == B_OK ? 1 : 0;
++}
++
++
++status_t
++CamDevice::GetFrameSize(int32 index, uint32& width, uint32& height,
++	float& frameRate, bool& compressed)
++{
++	if (index != 0)
++		return B_BAD_INDEX;
++	frameRate = 0;
++	compressed = false;
++	return SuggestVideoFrame(width, height);
++}
++
++
+ status_t
+ CamDevice::AcceptVideoFrame(uint32 &width, uint32 &height)
+ {
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.h b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.h
+index 08934990f2..f57cbddca3 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/CamDevice.h
+@@ -65,6 +65,12 @@ class CamDevice {
+ 
+ 	virtual status_t	SuggestVideoFrame(uint32 &width, uint32 &height);
+ 	virtual status_t	AcceptVideoFrame(uint32 &width, uint32 &height);
++	// the frame sizes it streams, from the smallest (for applications to
++	// choose from; asking changes nothing)
++	virtual int32		CountFrameSizes();
++	virtual status_t	GetFrameSize(int32 index, uint32& width,
++							uint32& height, float& frameRate,
++							bool& compressed);
+ 	virtual status_t	SetVideoFrame(BRect rect);
+ 	virtual BRect		VideoFrame() const { return fVideoFrame; };
+ 	virtual status_t	SetScale(float scale);
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/Jamfile b/src/add-ons/media/media-add-ons/usb_webcam/Jamfile
+index 266e06a852..8b8be8ec34 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/Jamfile
++++ b/src/add-ons/media/media-add-ons/usb_webcam/Jamfile
+@@ -1,6 +1,6 @@
+ SubDir HAIKU_TOP src add-ons media media-add-ons usb_webcam ;
+ 
+-UsePrivateHeaders drivers ;
++UsePrivateHeaders drivers media ;
+ 
+ usbKitLibraryName = libdevice.so ;
+ 
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp b/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
+index e369647b7d..36c5ae4528 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/Producer.cpp
+@@ -22,6 +22,8 @@
+ //XXX: change interface
+ #include <interface/Bitmap.h>
+ 
++#include <VideoFrameSizes.h>
++
+ #include "AddOn.h"
+ #include "CamDevice.h"
+ #include "CamSensor.h"
+@@ -158,6 +160,38 @@ VideoProducer::HandleMessage(int32 message, const void* data, size_t size)
+ 				return B_BAD_VALUE;
+ 			_ReplaceCamera(*(CamDevice* const*)data);
+ 			return B_OK;
++
++		case VIDEO_FRAME_SIZES_REQUEST:
++		{
++			if (size < sizeof(video_frame_sizes_request))
++				return B_BAD_VALUE;
++			const video_frame_sizes_request* request
++				= (const video_frame_sizes_request*)data;
++
++			video_frame_sizes_reply reply;
++			memset(&reply, 0, sizeof(reply));
++			reply.status = B_NO_INIT;
++			if (HasCamera()) {
++				int32 count = fCamDevice->CountFrameSizes();
++				for (int32 i = 0; i < count
++						&& reply.count < VIDEO_FRAME_SIZES_MAX; i++) {
++					video_frame_size& frameSize = reply.sizes[reply.count];
++					bool compressed;
++					if (fCamDevice->GetFrameSize(i, frameSize.width,
++							frameSize.height, frameSize.frame_rate,
++							compressed) != B_OK) {
++						continue;
++					}
++					frameSize.flags
++						= compressed ? VIDEO_FRAME_SIZE_COMPRESSED : 0;
++					reply.count++;
++				}
++				reply.status = B_OK;
++			}
++			write_port_etc(request->reply_port, VIDEO_FRAME_SIZES_REPLY,
++				&reply, sizeof(reply), B_RELATIVE_TIMEOUT, 1000000);
++			return B_OK;
++		}
+ 	}
+ 	return B_ERROR;
+ }
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+index 19fb7cf5c2..69f4c78fe4 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.cpp
+@@ -671,6 +671,31 @@ UVCCamDevice::SuggestVideoFrame(uint32& width, uint32& height)
+ }
+ 
+ 
++int32
++UVCCamDevice::CountFrameSizes()
++{
++	const Mode* modes[64];
++	return _SizeModes(modes);
++}
++
++
++status_t
++UVCCamDevice::GetFrameSize(int32 index, uint32& width, uint32& height,
++	float& frameRate, bool& compressed)
++{
++	const Mode* modes[64];
++	int32 count = _SizeModes(modes);
++	if (index < 0 || index >= count)
++		return B_BAD_INDEX;
++	width = modes[index]->width;
++	height = modes[index]->height;
++	frameRate = modes[index]->interval > 0
++		? 10000000.0f / modes[index]->interval : 0;
++	compressed = modes[index]->compressed;
++	return B_OK;
++}
++
++
+ /*!	A frame size of either format; 0x0 asks for the suggested one. */
+ status_t
+ UVCCamDevice::AcceptVideoFrame(uint32& width, uint32& height)
+@@ -788,6 +813,34 @@ UVCCamDevice::_FindMode(uint32 width, uint32 height) const
+ }
+ 
+ 
++/*!	Each frame size once, as the mode AcceptVideoFrame() would choose for
++	it, from the smallest to the largest.
++*/
++int32
++UVCCamDevice::_SizeModes(const Mode** modes) const
++{
++	int32 count = 0;
++	for (int32 i = 0; i < fModeCount; i++) {
++		const Mode* mode = _FindMode(fModes[i].width, fModes[i].height);
++		bool listed = false;
++		for (int32 j = 0; j < count && !listed; j++)
++			listed = modes[j] == mode;
++		if (listed)
++			continue;
++
++		int32 at = count++;
++		uint32 pixels = (uint32)mode->width * mode->height;
++		while (at > 0 && (uint32)modes[at - 1]->width * modes[at - 1]->height
++				> pixels) {
++			modes[at] = modes[at - 1];
++			at--;
++		}
++		modes[at] = mode;
++	}
++	return count;
++}
++
++
+ status_t
+ UVCCamDevice::_ProbeCommitFormat()
+ {
+diff --git a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+index af327b8417..8aa20fcab0 100644
+--- a/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
++++ b/src/add-ons/media/media-add-ons/usb_webcam/addons/uvc/UVCCamDevice.h
+@@ -29,6 +29,10 @@ public:
+ 									uint32 &height);
+ 	virtual status_t			AcceptVideoFrame(uint32 &width,
+ 									uint32 &height);
++	virtual int32				CountFrameSizes();
++	virtual status_t			GetFrameSize(int32 index, uint32& width,
++									uint32& height, float& frameRate,
++									bool& compressed);
+ 	virtual void				AddParameters(BParameterGroup *group,
+ 									int32 &index);
+ 	virtual status_t			GetParameterValue(int32 id,
+@@ -52,6 +56,7 @@ private:
+ 			};
+ 
+ 			const Mode*			_FindMode(uint32 width, uint32 height) const;
++			int32				_SizeModes(const Mode** modes) const;
+ 			void				_AddMode(const usb_video_frame_descriptor*
+ 									descriptor, bool compressed, size_t len);
+ 			status_t			_StartDecoders();

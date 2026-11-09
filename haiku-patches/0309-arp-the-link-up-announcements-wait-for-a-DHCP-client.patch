@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 5 Nov 2026 19:39:49 -0500
+Subject: [PATCH 309/342] arp: the link-up announcements wait for a DHCP client
+ to finish
+
+A DHCP client asks for its address again when the link comes back, and until
+it has it the interface is IFF_CONFIGURING: the announcements went out before
+the address was there, or not at all. They wait now, up to 30 seconds, and
+announce the address the client ends up with.
+
+On the board with the RTL8812BU: link up, three waits of a second, the DHCP
+acknowledgement, then the three announcements of the new address.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/network/datalink_protocols/arp/arp.cpp     | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp b/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp
+index 34ba23166e..e770983f04 100644
+--- a/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp
++++ b/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp
+@@ -118,6 +118,7 @@ struct arp_protocol : net_datalink_protocol {
+ 	in_addr_t	local_address;
+ 	net_timer	announce_timer;
+ 	int32		announcements_left;
++	int32		announce_waits;
+ };
+ 
+ 
+@@ -983,6 +984,14 @@ arp_announce_timer(struct net_timer* timer, void* data)
+ 		|| (interface->device->flags & IFF_LINK) == 0)
+ 		return;
+ 
++	// A DHCP client asks for the address again after a link came back: the
++	// announcements are for the address it ends up with.
++	if ((interface->flags & IFF_CONFIGURING) != 0) {
++		if (++protocol->announce_waits < 30)
++			sStackModule->set_timer(&protocol->announce_timer, 1000000);
++		return;
++	}
++
+ 	net_interface_address* address = NULL;
+ 	while (sDatalinkModule->get_next_interface_address(interface, &address)) {
+ 		if (address->local == NULL || address->local->sa_family != AF_INET)
+@@ -1031,6 +1040,7 @@ arp_init_protocol(net_interface* interface, net_domain* domain,
+ 	sStackModule->init_timer(&protocol->announce_timer, arp_announce_timer,
+ 		protocol);
+ 	protocol->announcements_left = 0;
++	protocol->announce_waits = 0;
+ 
+ 	*_protocol = protocol;
+ 	return B_OK;
+@@ -1188,6 +1198,7 @@ arp_control(net_datalink_protocol *_protocol, int32 op, void *argument,
+ 		// RFC 5227 announces twice, 2 seconds apart; the first one here waits
+ 		// a second for a wireless link's keys, and a third goes for luck
+ 		protocol->announcements_left = 3;
++		protocol->announce_waits = 0;
+ 		sStackModule->set_timer(&protocol->announce_timer, 1000000);
+ 		return B_OK;
+ 	}

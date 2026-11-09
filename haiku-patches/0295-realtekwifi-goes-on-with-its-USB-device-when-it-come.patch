@@ -1,0 +1,356 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 4 Nov 2026 18:27:05 -0500
+Subject: [PATCH 295/342] realtekwifi: goes on with its USB device when it
+ comes back
+
+Unplugged and plugged in again, or back from a hub that cut its power for a
+moment (the C2's does at most cold boots, about when the driver loads), the
+device was a new one to the USB stack. The driver stayed with the old one, failing
+each initialization until a reboot.
+
+- A control request failing on a device the stack no longer knows now looks for
+  one of the same kind, and repoints the transfers to its endpoints. Nothing tells
+  the driver that a device went, and it can't be detached with its interface open.
+- A device that goes cancels its transfers by force, with no callback, so they
+  stayed "in progress": draining them hung the stop path for good, and the Rx
+  buffer stayed on the active list, so that each later transfer was read from the
+  buffer before it. usbd_transfer_drain() and _start() now see that the device has
+  gone, and the Rx list is reset with the rest. Nor can a callback resubmit
+  during a drain, which nothing would cancel.
+- Without a link the receive watchdog waits 30 s instead of 2 minutes once frames
+  had been coming, over a whole scan: that's what initializes a chip that lost
+  its power while the driver was in a scan.
+
+19 of 19 port power cuts recovered with no reboot, in 24-54 s (24 s under load):
+tools/probes/hubport.cpp in the project.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../wlan/realtekwifi/dev/rtwn/if_rtwn.c       |   9 +-
+ .../dev/rtwn/usb/rtwn_usb_attach.c            |  12 ++
+ .../compat/dev/usb/usb_device.h               |   5 +
+ src/libs/compat/freebsd_network/usb.cpp       | 158 +++++++++++++++++-
+ 4 files changed, 178 insertions(+), 6 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn.c
+index 159f3993ef..53d92ebaf2 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/if_rtwn.c
+@@ -1480,9 +1480,10 @@ rtwn_watchdog(void *arg)
+ 	 * A chip that has stopped receiving (see rx_silence_limit): after frames
+ 	 * came and then none for the limit, or every 2 minutes if a restart
+ 	 * didn't bring any, as there may simply be nothing around.  Only a link
+-	 * that is up has frames to expect: a scan spends seconds on empty
+-	 * channels, the radio waits on one for the supplicant's choice after it,
+-	 * and a restart would only start all that again.  The 2 minutes there too.
++	 * that is up has frames to expect at once: a scan spends seconds on empty
++	 * channels, and the radio waits on one for the supplicant's choice after
++	 * it, so without a link 30 s, over a whole scan.  That's also how a chip
++	 * that has lost its power and come back gets initialized again.
+ 	 */
+ 	if (sc->rx_silence_limit != 0) {
+ 		struct ieee80211vap *vap = TAILQ_FIRST(&ic->ic_vaps);
+@@ -1494,7 +1495,7 @@ rtwn_watchdog(void *arg)
+ 			sc->sc_rx_silence = 0;
+ 			sc->sc_rx_flowing = 1;
+ 		} else if (++sc->sc_rx_silence
+-		    >= (sc->sc_rx_flowing && linked ? sc->rx_silence_limit : 120)) {
++		    >= (!sc->sc_rx_flowing ? 120 : linked ? sc->rx_silence_limit : 30)) {
+ 			ic_printf(ic, "nothing received for %d s, restarting\n",
+ 			    sc->sc_rx_silence);
+ 			sc->sc_rx_silence = 0;
+diff --git a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/usb/rtwn_usb_attach.c b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/usb/rtwn_usb_attach.c
+index 4958939a76..909c7d6823 100644
+--- a/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/usb/rtwn_usb_attach.c
++++ b/src/add-ons/kernel/drivers/network/wlan/realtekwifi/dev/rtwn/usb/rtwn_usb_attach.c
+@@ -283,6 +283,18 @@ rtwn_usb_reset_rx_list(struct rtwn_usb_softc *uc)
+ 	}
+ 	uc->uc_rx_stat_len = 0;
+ 	uc->uc_rx_off = 0;
++
++	/*
++	 * All transfers have been drained here. A buffer still marked active
++	 * belongs to one that went with its device, without a callback; left
++	 * here, each later transfer would be read from the buffer before it.
++	 */
++	while (!STAILQ_EMPTY(&uc->uc_rx_active)) {
++		struct rtwn_data *data = STAILQ_FIRST(&uc->uc_rx_active);
++
++		STAILQ_REMOVE_HEAD(&uc->uc_rx_active, next);
++		STAILQ_INSERT_TAIL(&uc->uc_rx_inactive, data, next);
++	}
+ }
+ 
+ static void
+diff --git a/src/libs/compat/freebsd_network/compat/dev/usb/usb_device.h b/src/libs/compat/freebsd_network/compat/dev/usb/usb_device.h
+index 450f5a4df1..aac340a241 100644
+--- a/src/libs/compat/freebsd_network/compat/dev/usb/usb_device.h
++++ b/src/libs/compat/freebsd_network/compat/dev/usb/usb_device.h
+@@ -10,6 +10,11 @@ struct usb_device {
+ 	uint8_t endpoints_max;		/* number of endpoints present */
+ 
+ 	uint32 haiku_usb_device;
++	uint16_t vendor, product;
++
++	/* for usb_find_device_again() */
++	struct usb_xfer* xfers;
++	struct usb_device* next;
+ };
+ 
+ #endif // _FBSD_COMPAT_USB_DEVICE_H_
+diff --git a/src/libs/compat/freebsd_network/usb.cpp b/src/libs/compat/freebsd_network/usb.cpp
+index 16d17e5b16..0fb400ef80 100644
+--- a/src/libs/compat/freebsd_network/usb.cpp
++++ b/src/libs/compat/freebsd_network/usb.cpp
+@@ -124,6 +124,8 @@ get_usb_device_attach_arg(struct freebsd_usb_device* device, struct usb_attach_a
+ 	if (device_desc == NULL)
+ 		return B_BAD_VALUE;
+ 
++	device->vendor = device_desc->vendor_id;
++	device->product = device_desc->product_id;
+ 	uaa->info.idVendor = device_desc->vendor_id;
+ 	uaa->info.idProduct = device_desc->product_id;
+ 	uaa->info.bcdDevice = device_desc->device_version;
+@@ -274,6 +276,9 @@ map_usb_error(status_t err)
+ }
+ 
+ 
++static bool usb_find_device_again(struct freebsd_usb_device* udev);
++
++
+ extern "C" usb_error_t
+ usbd_do_request_flags(struct freebsd_usb_device* udev, struct mtx* mtx,
+ 	struct usb_device_request* req, void* data, uint16_t flags,
+@@ -290,6 +295,12 @@ usbd_do_request_flags(struct freebsd_usb_device* udev, struct mtx* mtx,
+ 		req->bmRequestType, req->bRequest,
+ 		UGETW(req->wValue), UGETW(req->wIndex), UGETW(req->wLength),
+ 		data, &actualLen);
++	if (ret != B_OK && usb_find_device_again(udev)) {
++		ret = sUSB->send_request((usb_device)udev->haiku_usb_device,
++			req->bmRequestType, req->bRequest,
++			UGETW(req->wValue), UGETW(req->wIndex), UGETW(req->wLength),
++			data, &actualLen);
++	}
+ 	if (actlen)
+ 		*actlen = actualLen;
+ 
+@@ -336,6 +347,10 @@ struct usb_xfer {
+ 	usb_device device;
+ 	uint8 type;
+ 	usb_pipe pipe;
++	uint8 endpoint;
++	uint8 iface_index;
++	struct freebsd_usb_device* udev;
++	struct usb_xfer* next_of_device;
+ 
+ 	iovec* frames;
+ 	usb_page_cache* buffers;
+@@ -345,6 +360,8 @@ struct usb_xfer {
+ 
+ 	uint8 usb_state;
+ 	bool in_progress;
++	bool draining;
++	usb_device queued_on;
+ 	status_t result;
+ 	int transferred_length;
+ 
+@@ -353,6 +370,87 @@ struct usb_xfer {
+ };
+ 
+ 
++static struct freebsd_usb_device* sDevicesInUse = NULL;
++
++
++/*!	Whether all of the device's transfers have an endpoint in \a config. */
++static bool
++usb_config_fits(const struct freebsd_usb_device* udev,
++	const usb_configuration_info* config, bool repoint, usb_device device)
++{
++	for (struct usb_xfer* xfer = udev->xfers; xfer != NULL;
++			xfer = xfer->next_of_device) {
++		if (xfer->iface_index >= config->interface_count)
++			return false;
++		usb_interface_info* iface = config->interface[xfer->iface_index].active;
++		if (iface == NULL)
++			return false;
++
++		bool found = false;
++		for (size_t i = 0; i < iface->endpoint_count && !found; i++) {
++			if (iface->endpoint[i].descr->endpoint_address != xfer->endpoint)
++				continue;
++			found = true;
++			if (repoint) {
++				xfer->pipe = iface->endpoint[i].handle;
++				xfer->device = device;
++			}
++		}
++		if (!found)
++			return false;
++	}
++	return true;
++}
++
++
++/*!	The device has gone, as far as the USB stack knows. If one of the same
++	kind has come since, that's taken to be it: a dongle plugged in again, or
++	back from a hub that cut its power for a moment. Nothing tells a driver
++	here that its device went, and it couldn't be detached with its interface
++	open, so it just goes on with the new one. That one starts out as the old
++	one did after a power cut, which the driver's next initialization handles.
++*/
++static bool
++usb_find_device_again(struct freebsd_usb_device* udev)
++{
++	if (udev->xfers == NULL
++		|| sUSB->get_device_descriptor(udev->haiku_usb_device) != NULL) {
++		return false;
++	}
++
++	bool found = false;
++	mtx_lock(&sUSBLock);
++	for (uint32 id = 0; id < 1024 && !found; id++) {
++		const usb_device_descriptor* descriptor
++			= sUSB->get_device_descriptor(id);
++		if (descriptor == NULL || descriptor->vendor_id != udev->vendor
++			|| descriptor->product_id != udev->product) {
++			continue;
++		}
++
++		bool inUse = false;
++		for (struct freebsd_usb_device* other = sDevicesInUse; other != NULL;
++				other = other->next) {
++			if (other != udev && other->haiku_usb_device == id)
++				inUse = true;
++		}
++		const usb_configuration_info* config = sUSB->get_configuration(id);
++		if (inUse || config == NULL || !usb_config_fits(udev, config, false, id))
++			continue;
++
++		usb_config_fits(udev, config, true, id);
++		udev->haiku_usb_device = id;
++		found = true;
++	}
++	mtx_unlock(&sUSBLock);
++
++	if (found)
++		dprintf("%s: USB device %04x:%04x is back\n", gDriverName, udev->vendor,
++			udev->product);
++	return found;
++}
++
++
+ extern "C" usb_error_t
+ usbd_transfer_setup(struct freebsd_usb_device* udev,
+ 	const uint8_t* ifaces, struct usb_xfer** ppxfer,
+@@ -427,6 +525,18 @@ usbd_transfer_setup(struct freebsd_usb_device* udev,
+ 		if (xfer->pipe == -1)
+ 			panic("failed to locate endpoint!");
+ 
++		xfer->endpoint = endpoint;
++		xfer->iface_index = iface_index;
++		xfer->udev = udev;
++		mtx_lock(&sUSBLock);
++		if (udev->xfers == NULL) {
++			udev->next = sDevicesInUse;
++			sDevicesInUse = udev;
++		}
++		xfer->next_of_device = udev->xfers;
++		udev->xfers = xfer;
++		mtx_unlock(&sUSBLock);
++
+ 		xfer->nframes = setup->frames;
+ 		if (xfer->nframes == 0)
+ 			xfer->nframes = 1;
+@@ -436,6 +546,7 @@ usbd_transfer_setup(struct freebsd_usb_device* udev,
+ 
+ 		xfer->usb_state = USB_ST_SETUP;
+ 		xfer->in_progress = false;
++		xfer->draining = false;
+ 		xfer->transferred_length = 0;
+ 		cv_init(&xfer->condition, "FreeBSD USB transfer");
+ 
+@@ -454,9 +565,27 @@ usbd_transfer_unsetup(struct usb_xfer** pxfer, uint16_t n_setup)
+ {
+ 	for (int i = 0; i < n_setup; i++) {
+ 		struct usb_xfer* xfer = pxfer[i];
++		if (xfer == NULL)
++			continue;
+ 		usbd_transfer_drain(xfer);
+ 		cv_destroy(&xfer->condition);
+ 
++		struct freebsd_usb_device* udev = xfer->udev;
++		mtx_lock(&sUSBLock);
++		struct usb_xfer** link = &udev->xfers;
++		while (*link != NULL && *link != xfer)
++			link = &(*link)->next_of_device;
++		if (*link == xfer)
++			*link = xfer->next_of_device;
++		if (udev->xfers == NULL) {
++			struct freebsd_usb_device** deviceLink = &sDevicesInUse;
++			while (*deviceLink != NULL && *deviceLink != udev)
++				deviceLink = &(*deviceLink)->next;
++			if (*deviceLink == udev)
++				*deviceLink = udev->next;
++		}
++		mtx_unlock(&sUSBLock);
++
+ 		if (xfer->buffers != NULL) {
+ 			for (int i = 0; i < xfer->max_frame_count; i++)
+ 				free(xfer->buffers[i].buffer);
+@@ -658,9 +787,24 @@ usbd_data_sent(void* arg, status_t status, void* data, size_t actualLength)
+ }
+ 
+ 
++/*!	A device that goes takes its queued transfers with it, without a callback
++	(the USB stack doesn't call one for a cancellation by force). Such a transfer
++	would be in progress for good.
++*/
++static void
++usbd_transfer_check_lost(struct usb_xfer* xfer)
++{
++	if (xfer->in_progress
++		&& sUSB->get_device_descriptor(xfer->queued_on) == NULL) {
++		xfer->in_progress = false;
++	}
++}
++
++
+ extern "C" void
+ usbd_transfer_start(struct usb_xfer* xfer)
+ {
++	usbd_transfer_check_lost(xfer);
+ 	if (xfer->in_progress)
+ 		return;
+ 
+@@ -674,8 +818,14 @@ usbd_transfer_submit(struct usb_xfer* xfer)
+ {
+ 	KASSERT(!xfer->in_progress, ("cannot submit in-progress transfer!"));
+ 
++	// A callback going on after an error other than cancellation; nothing
++	// would cancel this one, and a device with nothing to send never ends it.
++	if (xfer->draining)
++		return;
++
+ 	xfer->transferred_length = 0;
+ 	xfer->in_progress = true;
++	xfer->queued_on = xfer->device;
+ 	status_t status = B_NOT_SUPPORTED;
+ 	switch (xfer->type) {
+ 	case UE_BULK:
+@@ -729,9 +879,13 @@ usbd_transfer_drain(struct usb_xfer* xfer)
+ 		return;
+ 
+ 	mtx_lock(xfer->mutex);
++	xfer->draining = true;
+ 	usbd_transfer_stop(xfer);
+-	while (xfer->in_progress)
+-		cv_wait(&xfer->condition, xfer->mutex);
++	while (xfer->in_progress) {
++		cv_timedwait(&xfer->condition, xfer->mutex, hz / 10);
++		usbd_transfer_check_lost(xfer);
++	}
++	xfer->draining = false;
+ 	mtx_unlock(xfer->mutex);
+ }
+ 

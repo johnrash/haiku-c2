@@ -1,0 +1,276 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 11:27:02 -0400
+Subject: [PATCH 026/342] registrar: sync the user DB files, survive losing
+ them
+
+The authentication manager rewrote /etc/passwd, /etc/shadow and
+/etc/group with fopen()/fprintf() and never synced them. After a power
+cut the renames had reached the disk but the data had not: /etc/passwd
+was 43 bytes of zeros, the registrar knew no user, autologin could not
+start a session, and every following boot ended without a desktop until
+the system was reinstalled. On the ODROID-C2 that happened after the
+first password change whenever the board lost power later (reproduced:
+password set, power cut 30 s later, no user 0 on the next boot).
+
+- replace_db_file() writes "<file>.new", syncs it, keeps the previous
+  file as "<file>.old" and renames the new one into place.
+- Without a user 0 in /etc/passwd the registrar reads /etc/passwd.old,
+  and failing that adds the image's default user (baron, ID 0); without
+  shadow entries it reads /etc/shadow.old.
+
+Tested on the ODROID-C2: the same power cut now keeps both files; a
+zeroed /etc/passwd falls back to /etc/passwd.old and the desktop starts.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../registrar/AuthenticationManager.cpp       | 174 ++++++++++++------
+ src/servers/registrar/AuthenticationManager.h |   3 +
+ 2 files changed, 123 insertions(+), 54 deletions(-)
+
+diff --git a/src/servers/registrar/AuthenticationManager.cpp b/src/servers/registrar/AuthenticationManager.cpp
+index 355b36d920..a32d266e86 100644
+--- a/src/servers/registrar/AuthenticationManager.cpp
++++ b/src/servers/registrar/AuthenticationManager.cpp
+@@ -38,6 +38,46 @@ using namespace BPrivate;
+ typedef std::set<std::string> StringSet;
+ 
+ 
++/*!	Replaces the DB file \a path with what \a write puts into a new file.
++	The new file is synced before it takes the place of the old one (which
++	stays as "<path>.old"): file data that never reached the disk before a
++	power cut left /etc/passwd full of zeros, with no user and therefore no
++	desktop session.
++*/
++template<typename Writer>
++static void
++replace_db_file(const char* path, Writer write)
++{
++	string newPath(path);
++	newPath += ".new";
++	string backupPath(path);
++	backupPath += ".old";
++
++	FILE* file = fopen(newPath.c_str(), "w");
++	if (file == NULL) {
++		debug_printf("REG: Failed to open \"%s\" for writing: %s\n",
++			newPath.c_str(), strerror(errno));
++		return;
++	}
++	write(file);
++	bool written = fflush(file) == 0 && fsync(fileno(file)) == 0;
++	fclose(file);
++	if (!written) {
++		debug_printf("REG: Failed to write \"%s\": %s\n", newPath.c_str(),
++			strerror(errno));
++		unlink(newPath.c_str());
++		return;
++	}
++
++	rename(path, backupPath.c_str());
++		// no error check: there may be no old file
++	if (rename(newPath.c_str(), path) != 0) {
++		debug_printf("REG: Failed to replace \"%s\": %s\n", path,
++			strerror(errno));
++	}
++}
++
++
+ class AuthenticationManager::FlatStore {
+ public:
+ 	FlatStore()
+@@ -553,36 +593,18 @@ public:
+ 
+ 	void WriteToDisk()
+ 	{
+-		// rename the old files
+-		string passwdBackup(kPasswdFile);
+-		string shadowBackup(kShadowPwdFile);
+-		passwdBackup += ".old";
+-		shadowBackup += ".old";
+-
+-		rename(kPasswdFile, passwdBackup.c_str());
+-		rename(kShadowPwdFile, shadowBackup.c_str());
+-			// Don't check errors. We can't do anything anyway.
+-
+-		// open files
+-		FileCloser passwdFile(fopen(kPasswdFile, "w"));
+-		if (!passwdFile.IsSet()) {
+-			debug_printf("REG: Failed to open passwd file \"%s\" for "
+-				"writing: %s\n", kPasswdFile, strerror(errno));
+-		}
+-
+-		FileCloser shadowFile(fopen(kShadowPwdFile, "w"));
+-		if (!shadowFile.IsSet()) {
+-			debug_printf("REG: Failed to open shadow passwd file \"%s\" for "
+-				"writing: %s\n", kShadowPwdFile, strerror(errno));
+-		}
+-
+-		// write users
+-		for (map<uid_t, User*>::const_iterator it = fUsersByID.begin();
+-			 it != fUsersByID.end(); ++it) {
+-			User* user = it->second;
+-			user->WritePasswdLine(passwdFile.Get());
+-			user->WriteShadowPwdLine(shadowFile.Get());
+-		}
++		replace_db_file(kPasswdFile, [this](FILE* file) {
++			for (map<uid_t, User*>::const_iterator it = fUsersByID.begin();
++				 it != fUsersByID.end(); ++it) {
++				it->second->WritePasswdLine(file);
++			}
++		});
++		replace_db_file(kShadowPwdFile, [this](FILE* file) {
++			for (map<uid_t, User*>::const_iterator it = fUsersByID.begin();
++				 it != fUsersByID.end(); ++it) {
++				it->second->WriteShadowPwdLine(file);
++			}
++		});
+ 	}
+ 
+ private:
+@@ -680,26 +702,12 @@ public:
+ 
+ 	void WriteToDisk()
+ 	{
+-		// rename the old files
+-		string groupBackup(kGroupFile);
+-		groupBackup += ".old";
+-
+-		rename(kGroupFile, groupBackup.c_str());
+-			// Don't check errors. We can't do anything anyway.
+-
+-		// open file
+-		FileCloser groupFile(fopen(kGroupFile, "w"));
+-		if (!groupFile.IsSet()) {
+-			debug_printf("REG: Failed to open group file \"%s\" for "
+-				"writing: %s\n", kGroupFile, strerror(errno));
+-		}
+-
+-		// write groups
+-		for (map<gid_t, Group*>::const_iterator it = fGroupsByID.begin();
+-			it != fGroupsByID.end(); ++it) {
+-			Group* group = it->second;
+-			group->WriteGroupLine(groupFile.Get());
+-		}
++		replace_db_file(kGroupFile, [this](FILE* file) {
++			for (map<gid_t, Group*>::const_iterator it = fGroupsByID.begin();
++				it != fGroupsByID.end(); ++it) {
++				it->second->WriteGroupLine(file);
++			}
++		});
+ 	}
+ 
+ private:
+@@ -1234,13 +1242,49 @@ AuthenticationManager::_RequestThread()
+ }
+ 
+ 
++/*!	Reads the passwd DB. Without a user 0 (no file, or one whose data was
++	lost) nobody could log in and no desktop session would start: then the
++	previous version of the file is read, and failing that the image's
++	default user is added.
++*/
+ status_t
+ AuthenticationManager::_InitPasswdDB()
+ {
+-	FileCloser file(fopen(kPasswdFile, "r"));
++	status_t status = _ReadPasswdDB(kPasswdFile);
++	if (fUserDB->UserByID(0) != NULL)
++		return status;
++
++	string backup(kPasswdFile);
++	backup += ".old";
++	debug_printf("REG: No user 0 in \"%s\", reading \"%s\"\n", kPasswdFile,
++		backup.c_str());
++	status = _ReadPasswdDB(backup.c_str());
++	if (fUserDB->UserByID(0) != NULL)
++		return status;
++
++	debug_printf("REG: No user 0 in \"%s\" either, using the default user\n",
++		backup.c_str());
++	User* user = NULL;
++	try {
++		user = new User("baron", "x", 0, 0, "/boot/home", "/bin/bash",
++			"Root");
++	} catch (...) {
++	}
++	if (user == NULL || fUserDB->AddUser(user) != B_OK) {
++		delete user;
++		return B_NO_MEMORY;
++	}
++	return B_OK;
++}
++
++
++status_t
++AuthenticationManager::_ReadPasswdDB(const char* path)
++{
++	FileCloser file(fopen(path, "r"));
+ 	if (!file.IsSet()) {
+ 		debug_printf("REG: Failed to open passwd DB file \"%s\": %s\n",
+-			kPasswdFile, strerror(errno));
++			path, strerror(errno));
+ 		return errno;
+ 	}
+ 
+@@ -1329,13 +1373,34 @@ AuthenticationManager::_InitGroupDB()
+ }
+ 
+ 
++/*!	Reads the shadow passwd DB; when it yields no entry (no file, or one
++	whose data was lost), the previous version.
++*/
+ status_t
+ AuthenticationManager::_InitShadowPwdDB()
+ {
+-	FileCloser file(fopen(kShadowPwdFile, "r"));
++	int32 entries = 0;
++	status_t status = _ReadShadowPwdDB(kShadowPwdFile, entries);
++	if (entries > 0 || status == B_NO_MEMORY)
++		return status;
++
++	string backup(kShadowPwdFile);
++	backup += ".old";
++	if (access(backup.c_str(), F_OK) != 0)
++		return status;
++	debug_printf("REG: No entries in \"%s\", reading \"%s\"\n",
++		kShadowPwdFile, backup.c_str());
++	return _ReadShadowPwdDB(backup.c_str(), entries);
++}
++
++
++status_t
++AuthenticationManager::_ReadShadowPwdDB(const char* path, int32& entries)
++{
++	FileCloser file(fopen(path, "r"));
+ 	if (!file.IsSet()) {
+ 		debug_printf("REG: Failed to open shadow passwd DB file \"%s\": %s\n",
+-			kShadowPwdFile, strerror(errno));
++			path, strerror(errno));
+ 		return errno;
+ 	}
+ 
+@@ -1376,6 +1441,7 @@ AuthenticationManager::_InitShadowPwdDB()
+ 			debug_printf("REG: Out of memory\n");
+ 			return B_NO_MEMORY;
+ 		}
++		entries++;
+ 	}
+ 
+ 	return B_OK;
+diff --git a/src/servers/registrar/AuthenticationManager.h b/src/servers/registrar/AuthenticationManager.h
+index 849cd526b8..6907acbe7a 100644
+--- a/src/servers/registrar/AuthenticationManager.h
++++ b/src/servers/registrar/AuthenticationManager.h
+@@ -32,8 +32,11 @@ private:
+ 			status_t			_RequestThread();
+ 
+ 			status_t			_InitPasswdDB();
++			status_t			_ReadPasswdDB(const char* path);
+ 			status_t			_InitGroupDB();
+ 			status_t			_InitShadowPwdDB();
++			status_t			_ReadShadowPwdDB(const char* path,
++									int32& entries);
+ 
+ 			void				_InvalidatePasswdDBReply();
+ 			void				_InvalidateGroupDBReply();

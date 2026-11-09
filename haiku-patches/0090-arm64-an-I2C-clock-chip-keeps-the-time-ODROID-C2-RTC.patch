@@ -1,0 +1,1753 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 12:00:33 -0400
+Subject: [PATCH 090/342] arm64: an I2C clock chip keeps the time (ODROID-C2
+ RTC shield)
+
+The C2 has no battery-backed clock; Hardkernel's RTC shield adds an NXP
+PCF8563 with a coin cell on the header's I2C pins.
+
+- kernel: a driver can serve the hardware clock (rtc_set_hw_clock()):
+  it is told whenever the system time is set, as arch_rtc_set_hw_time()
+  is, and sets the system time from its reading (rtc_hw_clock_read()).
+- i2c bus manager: a controller can register a device that no ACPI
+  table describes, by its compatible string ("i2c/compatible").
+- meson_i2c: the Amlogic Meson GX I2C master, polled token lists. It
+  muxes the header's I2C A and B pins and opens the clock gate (no pin
+  controller driver does), sets 100 kHz from clk81, and probes for the
+  shield's PCF8563 at 0x51.
+- pcf8563: reads the clock at boot, at once and then at its next second
+  tick, and sets it when the system time is set, its divider stopped and
+  released so its next tick falls on the second. A clock with VL set
+  (battery ran low, never set) is not used. /dev/misc/rtc reads as text.
+- The bus manager, both drivers (as boot modules, so the time is set
+  before userland starts) and the i2c tool are in arm64 images.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/jam/images/definitions/minimum          |   2 +-
+ build/jam/images/definitions/regular          |   2 +-
+ build/jam/packages/Haiku                      |   5 +
+ headers/private/i2c/i2c.h                     |   4 +
+ headers/private/kernel/real_time_clock.h      |  20 +
+ .../kernel/bus_managers/i2c/I2CBus.cpp        |  17 +
+ src/add-ons/kernel/busses/i2c/Jamfile         |   1 +
+ src/add-ons/kernel/busses/i2c/meson/Jamfile   |  10 +
+ .../kernel/busses/i2c/meson/meson_i2c.cpp     | 667 +++++++++++++++
+ src/add-ons/kernel/drivers/Jamfile            |   1 +
+ src/add-ons/kernel/drivers/rtc/Jamfile        |   3 +
+ .../kernel/drivers/rtc/pcf8563/Jamfile        |   8 +
+ .../kernel/drivers/rtc/pcf8563/pcf8563.cpp    | 757 ++++++++++++++++++
+ src/system/kernel/real_time_clock.cpp         |  39 +
+ 14 files changed, 1534 insertions(+), 2 deletions(-)
+ create mode 100644 src/add-ons/kernel/busses/i2c/meson/Jamfile
+ create mode 100644 src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp
+ create mode 100644 src/add-ons/kernel/drivers/rtc/Jamfile
+ create mode 100644 src/add-ons/kernel/drivers/rtc/pcf8563/Jamfile
+ create mode 100644 src/add-ons/kernel/drivers/rtc/pcf8563/pcf8563.cpp
+
+diff --git a/build/jam/images/definitions/minimum b/build/jam/images/definitions/minimum
+index f493f6718d..8d72120a20 100644
+--- a/build/jam/images/definitions/minimum
++++ b/build/jam/images/definitions/minimum
+@@ -363,7 +363,7 @@ SYSTEM_ADD_ONS_BUS_MANAGERS = [ FFilterByBuildFeatures
+ 	agp_gart@x86,x86_64
+ 	ata
+ 	hyperv@x86,x86_64
+-	i2c@x86,x86_64
++	i2c@x86,x86_64,arm64
+ 	isa@x86,x86_64
+ 	mmc
+ 	scsi
+diff --git a/build/jam/images/definitions/regular b/build/jam/images/definitions/regular
+index 0398c92c98..cea3ca898c 100644
+--- a/build/jam/images/definitions/regular
++++ b/build/jam/images/definitions/regular
+@@ -13,7 +13,7 @@ SYSTEM_BIN += [ FFilterByBuildFeatures
+ 	CortexAddOnHost
+ 	dpms
+ 	FirstBootPrompt
+-	<bin>i2c@x86,x86_64
++	<bin>i2c@x86,x86_64,arm64
+ 	installsound
+ 	mail
+ 	mail2mbox
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index cb639d06cf..4146c061fc 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -38,6 +38,7 @@ AddFilesToPackage add-ons kernel busses ata :
+ 
+ AddFilesToPackage add-ons kernel busses i2c :
+ 	pch_i2c@x86,x86_64
++	meson_i2c@arm64
+ 	;
+ AddFilesToPackage add-ons kernel busses mmc :
+ 	sdhci
+@@ -143,6 +144,7 @@ AddNewDriversToPackage graphics :
+ AddNewDriversToPackage power
+ 	: $(SYSTEM_ADD_ONS_DRIVERS_POWER) ;
+ AddNewDriversToPackage power : meson_scpi@arm64 ;
++AddNewDriversToPackage rtc : pcf8563@arm64 ;
+ AddNewDriversToPackage sensor
+ 	: $(SYSTEM_ADD_ONS_DRIVERS_SENSOR) ;
+ AddNewDriversToPackage network :
+@@ -357,6 +359,9 @@ AddBootModuleSymlinksToPackage
+ 	smbios@x86,x86_64
+ 	sdhci
+ 	meson_gx_mmc@arm64
++	i2c@arm64
++	meson_i2c@arm64
++	pcf8563@arm64
+ 	ufshci
+ 	usb
+ 	usb_disk
+diff --git a/headers/private/i2c/i2c.h b/headers/private/i2c/i2c.h
+index b68780cf07..c7eefe5062 100644
+--- a/headers/private/i2c/i2c.h
++++ b/headers/private/i2c/i2c.h
+@@ -37,6 +37,10 @@ typedef void* i2c_device;
+ 
+ // slave address (uint16)
+ #define I2C_DEVICE_SLAVE_ADDR_ITEM "i2c/slave_addr"
++// compatible string (string), for a device that no ACPI table describes (a
++// device tree, or a probe by the controller): register_device() with a NULL
++// ACPI handle, the compatible string as hid
++#define I2C_DEVICE_COMPATIBLE_ITEM "i2c/compatible"
+ 
+ // node type
+ #define I2C_DEVICE_TYPE_NAME "i2c/device/v1"
+diff --git a/headers/private/kernel/real_time_clock.h b/headers/private/kernel/real_time_clock.h
+index 6e380d31f9..8738c7e335 100644
+--- a/headers/private/kernel/real_time_clock.h
++++ b/headers/private/kernel/real_time_clock.h
+@@ -35,6 +35,26 @@ void rtc_secs_to_tm(uint64 seconds, struct tm *t);
+ 
+ uint32 get_timezone_offset(void);
+ 
++/*!	A real-time clock chip that a driver serves, for a machine whose
++	architecture code has none (an I2C clock on an ARM board, for example).
++	set_time() is called whenever the system time is set: the clock is to
++	show system_time() + offset microseconds since 1970, in its own time zone
++	(GMT or local time, as for arch_rtc_set_hw_time()). It is called with a
++	spinlock held and must not block; it is not called in the kernel
++	debugger.
++*/
++typedef struct rtc_hw_clock {
++	void*	cookie;
++	void	(*set_time)(void* cookie, bigtime_t offset);
++} rtc_hw_clock;
++
++status_t rtc_set_hw_clock(const rtc_hw_clock* clock);
++	// Registers the clock, or with NULL unregisters it; after that it is not
++	// called anymore.
++void rtc_hw_clock_read(bigtime_t offset);
++	// The driver read the clock: it shows system_time() + offset. Sets the
++	// system time from it, without writing it back.
++
+ bigtime_t _user_system_time(void);
+ status_t _user_set_real_time_clock(bigtime_t time);
+ status_t _user_set_timezone(int32 timezoneOffset, const char *name,
+diff --git a/src/add-ons/kernel/bus_managers/i2c/I2CBus.cpp b/src/add-ons/kernel/bus_managers/i2c/I2CBus.cpp
+index baf7157d4d..95733a3795 100644
+--- a/src/add-ons/kernel/bus_managers/i2c/I2CBus.cpp
++++ b/src/add-ons/kernel/bus_managers/i2c/I2CBus.cpp
+@@ -56,6 +56,23 @@ I2CBus::RegisterDevice(i2c_addr slaveAddress, char* hid, char** cid,
+ {
+ 	CALLED();
+ 
++	if (acpiHandle == NULL) {
++		// no ACPI table describes it: hid is its compatible string
++		device_attr attrs[] = {
++			{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE, { .string = "I2C device" }},
++			{ I2C_DEVICE_SLAVE_ADDR_ITEM, B_UINT16_TYPE,
++				{ .ui16 = slaveAddress }},
++			{ B_DEVICE_BUS, B_STRING_TYPE, { .string = "i2c" }},
++			{ B_DEVICE_FLAGS, B_UINT32_TYPE,
++				{ .ui32 = B_FIND_MULTIPLE_CHILDREN }},
++			{ I2C_DEVICE_COMPATIBLE_ITEM, B_STRING_TYPE, { .string = hid }},
++			{ NULL }
++		};
++
++		return gDeviceManager->register_node(fNode, I2C_DEVICE_MODULE_NAME,
++			attrs, NULL, NULL);
++	}
++
+ 	device_attr attrs[] = {
+ 		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE, { .string = "I2C device" }},
+ 
+diff --git a/src/add-ons/kernel/busses/i2c/Jamfile b/src/add-ons/kernel/busses/i2c/Jamfile
+index 17b385a68e..60db9523b9 100644
+--- a/src/add-ons/kernel/busses/i2c/Jamfile
++++ b/src/add-ons/kernel/busses/i2c/Jamfile
+@@ -1,4 +1,5 @@
+ SubDir HAIKU_TOP src add-ons kernel busses i2c ;
+ 
++SubInclude HAIKU_TOP src add-ons kernel busses i2c meson ;
+ SubInclude HAIKU_TOP src add-ons kernel busses i2c ocores ;
+ SubInclude HAIKU_TOP src add-ons kernel busses i2c pch ;
+diff --git a/src/add-ons/kernel/busses/i2c/meson/Jamfile b/src/add-ons/kernel/busses/i2c/meson/Jamfile
+new file mode 100644
+index 0000000000..d3d8489d44
+--- /dev/null
++++ b/src/add-ons/kernel/busses/i2c/meson/Jamfile
+@@ -0,0 +1,10 @@
++SubDir HAIKU_TOP src add-ons kernel busses i2c meson ;
++
++UsePrivateHeaders i2c ;
++UsePrivateKernelHeaders ;
++
++if $(TARGET_ARCH) = arm64 {
++	KernelAddon meson_i2c :
++		meson_i2c.cpp
++	;
++}
+diff --git a/src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp b/src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp
+new file mode 100644
+index 0000000000..fffc4e2bc6
+--- /dev/null
++++ b/src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp
+@@ -0,0 +1,667 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * Amlogic Meson GX I2C master (S905, ODROID-C2) for the I2C bus manager.
++ *
++ * The controller runs a list of up to 16 four-bit tokens (start, slave
++ * address for writing or reading, data byte, last data byte, stop) and moves
++ * up to 8 data bytes each way through its registers; longer transfers take
++ * more lists. Transfers are polled: they are short (a list of 8 bytes takes
++ * under a millisecond at 100 kHz), and the one user so far, the real-time
++ * clock, needs no interrupt.
++ *
++ * Neither U-Boot nor Haiku has a pin controller driver for these pins, so
++ * the driver muxes them itself for the two controllers on the ODROID-C2's
++ * 40-pin header: I2C A on pins 3 (SDA, GPIODV_24) and 5 (SCK, GPIODV_25),
++ * I2C B on pins 27 and 28 (GPIODV_26, GPIODV_27). It also opens the
++ * controllers' clock gate and sets 100 kHz from clk81.
++ *
++ * Devices: the C2's device tree describes none (its I2C nodes have no
++ * children), and add-on boards are found by probing their addresses:
++ * scan_bus() looks for the real-time clock of Hardkernel's RTC shield, an
++ * NXP PCF8563 at address 0x51, and registers it with its compatible string.
++ */
++
++
++#include <new>
++#include <stdlib.h>
++#include <string.h>
++
++#include <KernelExport.h>
++#include <bus/FDT.h>
++#include <cpu.h>
++#include <device_manager.h>
++#include <i2c.h>
++#include <kernel.h>
++#include <lock.h>
++#include <util/AutoLock.h>
++
++
++#define DRIVER_MODULE_NAME	"busses/i2c/meson_i2c/driver_v1"
++
++//#define TRACE_MESON_I2C
++#ifdef TRACE_MESON_I2C
++#	define TRACE(x...) dprintf("meson_i2c: " x)
++#else
++#	define TRACE(x...)
++#endif
++#define INFO(x...) dprintf("meson_i2c: " x)
++
++
++// registers
++static const uint32 kControl = 0x00;
++static const uint32 kSlaveAddress = 0x04;
++static const uint32 kTokenList0 = 0x08;
++static const uint32 kTokenList1 = 0x0c;
++static const uint32 kWriteData0 = 0x10;
++static const uint32 kWriteData1 = 0x14;
++static const uint32 kReadData0 = 0x18;
++static const uint32 kReadData1 = 0x1c;
++static const uint32 kRegistersSize = 0x20;
++
++// control register
++static const uint32 kControlStart = 1 << 0;
++static const uint32 kControlBusy = 1 << 2;
++static const uint32 kControlError = 1 << 3;
++	// the slave did not acknowledge
++static const uint32 kControlClockDividerShift = 12;
++static const uint32 kControlClockDividerMask = 0x3ff << 12;
++static const uint32 kControlClockDividerExtShift = 28;
++static const uint32 kControlClockDividerExtMask = 0x3 << 28;
++
++// tokens
++enum {
++	kTokenEnd = 0,
++	kTokenStart,
++	kTokenSlaveAddressWrite,
++	kTokenSlaveAddressRead,
++	kTokenData,
++	kTokenDataLast,
++		// a byte read and not acknowledged: the last one
++	kTokenStop
++};
++
++static const size_t kMaxTokens = 16;
++static const size_t kMaxDataBytes = 8;
++static const bigtime_t kTransferTimeout = 50000;
++
++static const uint32 kBusSpeed = 100000;
++static const uint32 kDividerFactor = 4;
++	// SCL = clk81 / (divider * 4) on GXBB
++
++// the clock input, clk81 (HHI registers)
++static const phys_addr_t kHhiBase = 0xc883c000;
++static const uint32 kHhiGateMpeg0 = 0x50 * 4;
++static const uint32 kHhiGateMpeg0I2c = 1 << 9;
++static const uint32 kHhiMpegClockControl = 0x5d * 4;
++static const uint32 kXtalRate = 24000000;
++static const uint32 kFixedPllRate = 2000000000;
++static const uint32 kDefaultClk81Rate = 166666667;
++
++// pin muxing (periphs pin controller)
++static const phys_addr_t kPinMuxBase = 0xc88344b0;
++	// PERIPHS_PIN_MUX_0
++static const phys_addr_t kI2cABase = 0xc1108500;
++static const phys_addr_t kI2cBBase = 0xc11087c0;
++
++struct PinMux {
++	phys_addr_t	controller;
++	const char*	name;
++	uint32		set7;
++		// PERIPHS_PIN_MUX_7: the I2C function
++	uint32		clear2;
++		// PERIPHS_PIN_MUX_2: UART B, which shares the pins
++};
++
++static const PinMux kPinMuxes[] = {
++	{ kI2cABase, "I2C A (header pins 3, 5)", (1 << 27) | (1 << 26),
++		(1 << 29) | (1 << 28) },
++	{ kI2cBBase, "I2C B (header pins 27, 28)", (1 << 25) | (1 << 24),
++		(1 << 27) | (1 << 26) },
++};
++
++// add-on boards
++static const i2c_addr kPcf8563Address = 0x51;
++
++
++static device_manager_info* gDeviceManager;
++static i2c_for_controller_interface* gI2c;
++
++
++class MesonI2c {
++public:
++								MesonI2c(device_node* node);
++								~MesonI2c();
++
++			status_t			Init();
++
++			void				SetBus(i2c_bus bus) { fBus = bus; }
++			status_t			ExecCommand(i2c_op op, i2c_addr address,
++									const uint8* command, size_t commandLength,
++									uint8* data, size_t dataLength);
++			status_t			ScanBus();
++			status_t			AcquireBus();
++			void				ReleaseBus();
++
++private:
++			uint32				_Read(uint32 offset)
++									{ return fRegisters[offset / 4]; }
++			void				_Write(uint32 offset, uint32 value)
++									{ fRegisters[offset / 4] = value; }
++
++			void				_SetupPinsAndClock(phys_addr_t base);
++			status_t			_Run();
++			status_t			_Message(i2c_addr address, bool read,
++									uint8* buffer, size_t length, bool stop);
++			void				_Stop();
++			void				_AddToken(uint32 token);
++			bool				_LooksLikePcf8563(const uint8* registers);
++
++			device_node*		fNode;
++			i2c_bus				fBus;
++			recursive_lock		fLock;
++			area_id				fRegistersArea;
++			volatile uint32*	fRegisters;
++			uint32				fTokens[2];
++			size_t				fTokenCount;
++};
++
++
++MesonI2c::MesonI2c(device_node* node)
++	:
++	fNode(node),
++	fBus(NULL),
++	fRegistersArea(-1),
++	fRegisters(NULL),
++	fTokenCount(0)
++{
++	recursive_lock_init(&fLock, "meson i2c");
++}
++
++
++MesonI2c::~MesonI2c()
++{
++	if (fRegistersArea >= 0)
++		delete_area(fRegistersArea);
++	recursive_lock_destroy(&fLock);
++}
++
++
++status_t
++MesonI2c::Init()
++{
++	device_node* parent = gDeviceManager->get_parent_node(fNode);
++	fdt_device_module_info* fdtModule;
++	fdt_device* fdtDevice;
++	status_t status = gDeviceManager->get_driver(parent,
++		(driver_module_info**)&fdtModule, (void**)&fdtDevice);
++	gDeviceManager->put_node(parent);
++	if (status != B_OK)
++		return status;
++
++	uint64 base;
++	uint64 size;
++	if (!fdtModule->get_reg(fdtDevice, 0, &base, &size)
++		|| size < kRegistersSize) {
++		return B_ERROR;
++	}
++
++	// the registers sit inside a page shared with other controllers
++	phys_addr_t pageBase = ROUNDDOWN(base, B_PAGE_SIZE);
++	void* page;
++	fRegistersArea = map_physical_memory("meson i2c", pageBase, B_PAGE_SIZE,
++		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &page);
++	if (fRegistersArea < 0)
++		return fRegistersArea;
++	fRegisters = (volatile uint32*)((addr_t)page + (base - pageBase));
++
++	_SetupPinsAndClock(base);
++	return B_OK;
++}
++
++
++/*!	Muxes the pins of the header's controllers, opens the clock gate and
++	sets the bus clock.
++*/
++void
++MesonI2c::_SetupPinsAndClock(phys_addr_t base)
++{
++	uint32 clk81 = kDefaultClk81Rate;
++
++	void* hhi;
++	area_id area = map_physical_memory("meson i2c hhi", kHhiBase,
++		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &hhi);
++	if (area >= 0) {
++		volatile uint32* gate
++			= (volatile uint32*)((addr_t)hhi + kHhiGateMpeg0);
++		*gate |= kHhiGateMpeg0I2c;
++
++		// clk81: a source, divided by (n + 1)
++		uint32 control = *(volatile uint32*)((addr_t)hhi
++			+ kHhiMpegClockControl);
++		uint32 divider = (control & 0x7f) + 1;
++		uint32 source = 0;
++		switch ((control >> 12) & 7) {
++			case 0:
++				source = kXtalRate;
++				break;
++			case 2:
++				source = kFixedPllRate / 7;
++				break;
++			case 5:
++				source = kFixedPllRate / 4;
++				break;
++			case 6:
++				source = kFixedPllRate / 3;
++				break;
++			case 7:
++				source = kFixedPllRate / 5;
++				break;
++		}
++		if (source != 0)
++			clk81 = source / divider;
++		delete_area(area);
++	}
++
++	for (size_t i = 0; i < B_COUNT_OF(kPinMuxes); i++) {
++		const PinMux& mux = kPinMuxes[i];
++		if (mux.controller != base)
++			continue;
++
++		phys_addr_t pageBase = ROUNDDOWN(kPinMuxBase, B_PAGE_SIZE);
++		void* page;
++		area = map_physical_memory("meson i2c pinmux", pageBase,
++			B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &page);
++		if (area < 0)
++			break;
++		volatile uint32* pinMux = (volatile uint32*)((addr_t)page
++			+ (kPinMuxBase - pageBase));
++		pinMux[2] &= ~mux.clear2;
++		pinMux[7] |= mux.set7;
++		delete_area(area);
++		INFO("%s: pins muxed\n", mux.name);
++	}
++
++	uint32 divider = (clk81 + kBusSpeed * kDividerFactor - 1)
++		/ (kBusSpeed * kDividerFactor);
++	uint32 control = _Read(kControl);
++	control &= ~(kControlStart | kControlClockDividerMask
++		| kControlClockDividerExtMask);
++	control |= ((divider & 0x3ff) << kControlClockDividerShift)
++		| ((divider >> 10) << kControlClockDividerExtShift);
++	_Write(kControl, control);
++	INFO("controller at %#" B_PRIx64 ": clk81 %" B_PRIu32 " Hz, divider %"
++		B_PRIu32 ", %" B_PRIu32 " Hz\n", (uint64)base, clk81, divider,
++		clk81 / (divider * kDividerFactor));
++}
++
++
++void
++MesonI2c::_AddToken(uint32 token)
++{
++	if (fTokenCount >= kMaxTokens)
++		return;
++	fTokens[fTokenCount / 8] |= token << ((fTokenCount % 8) * 4);
++	fTokenCount++;
++}
++
++
++/*!	Runs the token list and resets it. */
++status_t
++MesonI2c::_Run()
++{
++	_Write(kTokenList0, fTokens[0]);
++	_Write(kTokenList1, fTokens[1]);
++	fTokens[0] = fTokens[1] = 0;
++	fTokenCount = 0;
++
++	uint32 control = _Read(kControl) & ~kControlStart;
++	_Write(kControl, control);
++	_Write(kControl, control | kControlStart);
++
++	bigtime_t start = system_time();
++	status_t status = B_OK;
++	while ((_Read(kControl) & kControlBusy) != 0) {
++		bigtime_t now = system_time();
++		if (now - start > kTransferTimeout) {
++			status = B_TIMED_OUT;
++			break;
++		}
++		if (now - start > 200)
++			snooze(50);
++		else
++			cpu_pause();
++	}
++	control = _Read(kControl);
++	_Write(kControl, control & ~kControlStart);
++	if (status == B_OK && (control & kControlError) != 0)
++		status = B_DEV_NOT_READY;
++	return status;
++}
++
++
++/*!	A stop condition, after an error. */
++void
++MesonI2c::_Stop()
++{
++	_AddToken(kTokenStop);
++	_Run();
++}
++
++
++/*!	One message: a start, the address, \a length bytes written or read
++	(none: only the address), and a stop if \a stop.
++*/
++status_t
++MesonI2c::_Message(i2c_addr address, bool read, uint8* buffer, size_t length,
++	bool stop)
++{
++	_Write(kSlaveAddress, (address & 0x7f) << 1);
++	_AddToken(kTokenStart);
++	_AddToken(read ? kTokenSlaveAddressRead : kTokenSlaveAddressWrite);
++
++	size_t position = 0;
++	do {
++		size_t count = length - position;
++		if (count > kMaxDataBytes)
++			count = kMaxDataBytes;
++
++		uint32 data[2] = { 0, 0 };
++		for (size_t i = 0; i < count; i++) {
++			_AddToken(read && position + i + 1 == length
++				? kTokenDataLast : kTokenData);
++			if (!read)
++				data[i / 4] |= (uint32)buffer[position + i] << ((i % 4) * 8);
++		}
++		if (!read) {
++			_Write(kWriteData0, data[0]);
++			_Write(kWriteData1, data[1]);
++		}
++		if (stop && position + count == length)
++			_AddToken(kTokenStop);
++
++		status_t status = _Run();
++		if (status != B_OK) {
++			TRACE("address %#x: %s at byte %" B_PRIuSIZE "\n", address,
++				strerror(status), position);
++			_Stop();
++			return status;
++		}
++
++		if (read) {
++			data[0] = _Read(kReadData0);
++			data[1] = _Read(kReadData1);
++			for (size_t i = 0; i < count; i++)
++				buffer[position + i] = data[i / 4] >> ((i % 4) * 8);
++		}
++		position += count;
++	} while (position < length);
++
++	return B_OK;
++}
++
++
++status_t
++MesonI2c::ExecCommand(i2c_op op, i2c_addr address, const uint8* command,
++	size_t commandLength, uint8* data, size_t dataLength)
++{
++	if (IS_BLOCK_OP(op))
++		return B_NOT_SUPPORTED;
++
++	RecursiveLocker locker(fLock);
++
++	bool stop = IS_STOP_OP(op);
++	if (IS_WRITE_OP(op)) {
++		// the command and the data as one message
++		size_t length = commandLength + dataLength;
++		uint8 stackBuffer[64];
++		uint8* buffer = stackBuffer;
++		if (length > sizeof(stackBuffer)) {
++			buffer = (uint8*)malloc(length);
++			if (buffer == NULL)
++				return B_NO_MEMORY;
++		}
++		if (commandLength > 0)
++			memcpy(buffer, command, commandLength);
++		if (dataLength > 0)
++			memcpy(buffer + commandLength, data, dataLength);
++		status_t status = _Message(address, false, buffer, length, stop);
++		if (buffer != stackBuffer)
++			free(buffer);
++		return status;
++	}
++
++	// the command written, then the data read after a repeated start
++	if (commandLength > 0) {
++		status_t status = _Message(address, false, (uint8*)command,
++			commandLength, false);
++		if (status != B_OK)
++			return status;
++	}
++	return _Message(address, true, data, dataLength, stop);
++}
++
++
++/*!	The PCF8563's control and time registers (0 to 8): the bits it doesn't
++	have read as 0, and the time is valid BCD unless the clock says it isn't
++	(VL, its battery ran out or it was never set).
++*/
++bool
++MesonI2c::_LooksLikePcf8563(const uint8* registers)
++{
++	if ((registers[0] & 0x57) != 0 || (registers[1] & 0xe0) != 0)
++		return false;
++	if ((registers[2] & 0x80) != 0)
++		return true;
++
++	static const uint8 kMasks[7] = { 0x7f, 0x7f, 0x3f, 0x3f, 0x07, 0x1f,
++		0xff };
++	static const uint8 kMaxima[7] = { 59, 59, 23, 31, 6, 12, 99 };
++	for (int i = 0; i < 7; i++) {
++		uint8 value = registers[2 + i] & kMasks[i];
++		if ((value & 0xf) > 9)
++			return false;
++		if ((value >> 4) * 10 + (value & 0xf) > kMaxima[i])
++			return false;
++	}
++	return true;
++}
++
++
++status_t
++MesonI2c::ScanBus()
++{
++	uint8 reg = 0;
++	uint8 registers[9];
++	status_t status = ExecCommand(I2C_OP_READ_STOP, kPcf8563Address, &reg, 1,
++		registers, sizeof(registers));
++	if (status != B_OK) {
++		INFO("nothing at address %#x\n", kPcf8563Address);
++		return B_OK;
++	}
++	if (!_LooksLikePcf8563(registers)) {
++		INFO("the device at address %#x is not a PCF8563 (%02x %02x %02x)\n",
++			kPcf8563Address, registers[0], registers[1], registers[2]);
++		return B_OK;
++	}
++	INFO("PCF8563 real-time clock at address %#x\n", kPcf8563Address);
++	return gI2c->register_device(fBus, kPcf8563Address,
++		(char*)"nxp,pcf8563", NULL, NULL);
++}
++
++
++status_t
++MesonI2c::AcquireBus()
++{
++	return recursive_lock_lock(&fLock);
++}
++
++
++void
++MesonI2c::ReleaseBus()
++{
++	recursive_lock_unlock(&fLock);
++}
++
++
++//	#pragma mark - driver module
++
++
++/*!	The FDT bus also registers nodes with status "disabled" (I2C B and C on
++	the ODROID-C2).
++*/
++static bool
++fdt_device_enabled(fdt_device_module_info* module, fdt_device* device)
++{
++	int length;
++	const char* status = (const char*)module->get_prop(device, "status",
++		&length);
++	return status == NULL || strcmp(status, "okay") == 0
++		|| strcmp(status, "ok") == 0;
++}
++
++
++static float
++supports_device(device_node* parent)
++{
++	const char* bus;
++	if (gDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false)
++			!= B_OK || strcmp(bus, "fdt") != 0) {
++		return 0.0f;
++	}
++	const char* compatible;
++	if (gDeviceManager->get_attr_string(parent, "fdt/compatible", &compatible,
++			false) != B_OK
++		|| (strcmp(compatible, "amlogic,meson-gxbb-i2c") != 0
++			&& strcmp(compatible, "amlogic,meson-gx-i2c") != 0
++			&& strcmp(compatible, "amlogic,meson6-i2c") != 0)) {
++		return 0.0f;
++	}
++
++	fdt_device_module_info* fdtModule;
++	fdt_device* fdtDevice;
++	if (gDeviceManager->get_driver(parent, (driver_module_info**)&fdtModule,
++			(void**)&fdtDevice) != B_OK
++		|| !fdt_device_enabled(fdtModule, fdtDevice)) {
++		return 0.0f;
++	}
++	return 0.8f;
++}
++
++
++static status_t
++register_device(device_node* parent)
++{
++	device_attr attrs[] = {
++		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE,
++			{ .string = "Amlogic Meson GX I2C controller" } },
++		{ B_DEVICE_FIXED_CHILD, B_STRING_TYPE,
++			{ .string = I2C_FOR_CONTROLLER_MODULE_NAME } },
++		{ NULL }
++	};
++	return gDeviceManager->register_node(parent, DRIVER_MODULE_NAME, attrs,
++		NULL, NULL);
++}
++
++
++static status_t
++init_driver(device_node* node, void** _cookie)
++{
++	MesonI2c* controller = new(std::nothrow) MesonI2c(node);
++	if (controller == NULL)
++		return B_NO_MEMORY;
++	status_t status = controller->Init();
++	if (status != B_OK) {
++		delete controller;
++		return status;
++	}
++	*_cookie = controller;
++	return B_OK;
++}
++
++
++static void
++uninit_driver(void* cookie)
++{
++	delete (MesonI2c*)cookie;
++}
++
++
++static void
++set_i2c_bus(i2c_bus_cookie cookie, i2c_bus bus)
++{
++	((MesonI2c*)cookie)->SetBus(bus);
++}
++
++
++static status_t
++exec_command(i2c_bus_cookie cookie, i2c_op op, i2c_addr address,
++	const void* command, size_t commandLength, void* data, size_t dataLength)
++{
++	return ((MesonI2c*)cookie)->ExecCommand(op, address,
++		(const uint8*)command, commandLength, (uint8*)data, dataLength);
++}
++
++
++static status_t
++scan_bus(i2c_bus_cookie cookie)
++{
++	return ((MesonI2c*)cookie)->ScanBus();
++}
++
++
++static status_t
++acquire_bus(i2c_bus_cookie cookie)
++{
++	return ((MesonI2c*)cookie)->AcquireBus();
++}
++
++
++static void
++release_bus(i2c_bus_cookie cookie)
++{
++	((MesonI2c*)cookie)->ReleaseBus();
++}
++
++
++module_dependency module_dependencies[] = {
++	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&gDeviceManager },
++	{ I2C_FOR_CONTROLLER_MODULE_NAME, (module_info**)&gI2c },
++	{}
++};
++
++
++static i2c_sim_interface sMesonI2cDriver = {
++	{
++		{
++			DRIVER_MODULE_NAME,
++			0,
++			NULL
++		},
++
++		supports_device,
++		register_device,
++		init_driver,
++		uninit_driver,
++		NULL,	// register child devices
++		NULL,	// rescan
++		NULL,	// removed
++	},
++
++	set_i2c_bus,
++	exec_command,
++	scan_bus,
++	acquire_bus,
++	release_bus,
++	NULL,	// install interrupt handler
++	NULL,	// uninstall interrupt handler
++};
++
++
++module_info* modules[] = {
++	(module_info*)&sMesonI2cDriver,
++	NULL
++};
+diff --git a/src/add-ons/kernel/drivers/Jamfile b/src/add-ons/kernel/drivers/Jamfile
+index 5b4410be72..5a3a6a23cf 100644
+--- a/src/add-ons/kernel/drivers/Jamfile
++++ b/src/add-ons/kernel/drivers/Jamfile
+@@ -18,6 +18,7 @@ SubInclude HAIKU_TOP src add-ons kernel drivers network ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers ports ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers power ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers pty ;
++SubInclude HAIKU_TOP src add-ons kernel drivers rtc ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers sensor ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers timer ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers video ;
+diff --git a/src/add-ons/kernel/drivers/rtc/Jamfile b/src/add-ons/kernel/drivers/rtc/Jamfile
+new file mode 100644
+index 0000000000..cff7346734
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/rtc/Jamfile
+@@ -0,0 +1,3 @@
++SubDir HAIKU_TOP src add-ons kernel drivers rtc ;
++
++SubInclude HAIKU_TOP src add-ons kernel drivers rtc pcf8563 ;
+diff --git a/src/add-ons/kernel/drivers/rtc/pcf8563/Jamfile b/src/add-ons/kernel/drivers/rtc/pcf8563/Jamfile
+new file mode 100644
+index 0000000000..c5b51162a8
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/rtc/pcf8563/Jamfile
+@@ -0,0 +1,8 @@
++SubDir HAIKU_TOP src add-ons kernel drivers rtc pcf8563 ;
++
++UsePrivateHeaders i2c ;
++UsePrivateKernelHeaders ;
++
++KernelAddon pcf8563 :
++	pcf8563.cpp
++	;
+diff --git a/src/add-ons/kernel/drivers/rtc/pcf8563/pcf8563.cpp b/src/add-ons/kernel/drivers/rtc/pcf8563/pcf8563.cpp
+new file mode 100644
+index 0000000000..96fa37cebf
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/rtc/pcf8563/pcf8563.cpp
+@@ -0,0 +1,757 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * NXP PCF8563 real-time clock on I2C (Hardkernel's RTC shield for the
++ * ODROID-C2, with a coin cell): the system time comes from it at boot, and
++ * it is set whenever the system time is (Time preferences, NTP).
++ *
++ * The kernel knows it as its hardware clock (rtc_set_hw_clock(): GMT or
++ * local time, as the Time preferences say). Its registers hold whole
++ * seconds, so the driver works at its second ticks:
++ * - Reading: it reads the clock once at once and sets the system time
++ *   from it, half a second assumed; then it polls the clock until its
++ *   seconds change and sets the system time again from that moment, to a
++ *   millisecond or two.
++ * - Writing: it stops the clock's divider (STOP), writes the second about
++ *   to come and releases the divider so the next tick, which the datasheet
++ *   puts 0.507813 s after the release, falls on the second. Then it polls
++ *   for that tick and logs how far off it came.
++ * A clock whose VL flag is set (its supply dropped too low: battery empty,
++ * or never set) is not used until the time is set.
++ *
++ * /dev/misc/rtc reads as a short text: the clock's time, and how the last
++ * reading and setting went.
++ */
++
++
++#include <new>
++#include <stdio.h>
++#include <string.h>
++#include <time.h>
++
++#include <KernelExport.h>
++#include <device_manager.h>
++#include <cpu.h>
++#include <i2c.h>
++#include <lock.h>
++#include <real_time_clock.h>
++#include <util/AutoLock.h>
++
++
++#define DRIVER_MODULE_NAME	"drivers/rtc/pcf8563/driver_v1"
++#define DEVICE_MODULE_NAME	"drivers/rtc/pcf8563/device_v1"
++
++#define INFO(x...) dprintf("pcf8563: " x)
++
++
++// registers
++static const uint8 kControl1 = 0x00;
++static const uint8 kControl1Stop = 1 << 5;
++static const uint8 kSeconds = 0x02;
++	// then minutes, hours, days, weekdays, months, years
++static const uint8 kSecondsVoltageLow = 1 << 7;
++static const size_t kTimeRegisters = 7;
++
++static const bigtime_t kFirstTickAfterStop = 507813;
++	// the datasheet: 0.507813 to 0.507935 s after STOP is released
++static const bigtime_t kReleaseWriteTime = 270;
++	// from the start of the release's write to the end of its data byte
++static const bigtime_t kSetMargin = 50000;
++static const bigtime_t kTickTimeout = 1300000;
++
++
++static device_manager_info* gDeviceManager;
++
++
++struct Measurement {
++	bool		done;
++	int64		seconds;
++		// the clock's time at the tick
++	bigtime_t	error;
++		// writing: when the tick came, against when it should have
++	bigtime_t	when;
++		// real time, for the status text
++};
++
++
++class Pcf8563 {
++public:
++								Pcf8563(device_node* node);
++								~Pcf8563();
++
++			status_t			Init();
++			device_node*		Node() const { return fNode; }
++			status_t			Read(off_t position, char* buffer,
++									size_t* _length);
++
++private:
++	static	void				_SetTimeHook(void* cookie, bigtime_t offset);
++	static	status_t			_ThreadEntry(void* cookie);
++			void				_Thread();
++
++			status_t			_ReadRegisters(uint8 first, uint8* buffer,
++									size_t count);
++			status_t			_WriteRegisters(uint8 first,
++									const uint8* buffer, size_t count);
++			status_t			_WaitForTick(uint8* registers,
++									bigtime_t* _tick);
++			status_t			_WriteTime(bigtime_t offset);
++			void				_ReadAtTick();
++
++	static	bool				_SecondsFromRegisters(const uint8* registers,
++									int64* _seconds);
++	static	void				_RegistersFromSeconds(int64 seconds,
++									uint8* registers);
++	static	void				_FormatTime(char* buffer, size_t size,
++									int64 seconds);
++
++			device_node*		fNode;
++			i2c_device_interface* fI2c;
++			i2c_device			fI2cCookie;
++			i2c_addr			fAddress;
++
++			rtc_hw_clock		fHwClock;
++			bool				fHwClockSet;
++			spinlock			fRequestLock;
++			bool				fRequestPending;
++			bigtime_t			fRequestOffset;
++			sem_id				fRequestSem;
++			thread_id			fThread;
++			bool				fQuit;
++
++			mutex				fStatusLock;
++			bool				fValidAtBoot;
++			Measurement			fBootRead;
++			Measurement			fLastSet;
++};
++
++
++Pcf8563::Pcf8563(device_node* node)
++	:
++	fNode(node),
++	fI2c(NULL),
++	fI2cCookie(NULL),
++	fAddress(0),
++	fHwClockSet(false),
++	fRequestPending(false),
++	fRequestOffset(0),
++	fRequestSem(-1),
++	fThread(-1),
++	fQuit(false),
++	fValidAtBoot(false)
++{
++	B_INITIALIZE_SPINLOCK(&fRequestLock);
++	mutex_init(&fStatusLock, "pcf8563 status");
++	memset(&fBootRead, 0, sizeof(fBootRead));
++	memset(&fLastSet, 0, sizeof(fLastSet));
++	fHwClock.cookie = this;
++	fHwClock.set_time = &_SetTimeHook;
++}
++
++
++Pcf8563::~Pcf8563()
++{
++	if (fHwClockSet)
++		rtc_set_hw_clock(NULL);
++	if (fThread >= 0) {
++		fQuit = true;
++		release_sem(fRequestSem);
++		resume_thread(fThread);
++			// if Init() failed before it did
++		status_t result;
++		wait_for_thread(fThread, &result);
++	}
++	if (fRequestSem >= 0)
++		delete_sem(fRequestSem);
++	mutex_destroy(&fStatusLock);
++}
++
++
++status_t
++Pcf8563::Init()
++{
++	device_node* parent = gDeviceManager->get_parent_node(fNode);
++	status_t status = gDeviceManager->get_driver(parent,
++		(driver_module_info**)&fI2c, (void**)&fI2cCookie);
++	if (status == B_OK) {
++		status = gDeviceManager->get_attr_uint16(parent,
++			I2C_DEVICE_SLAVE_ADDR_ITEM, &fAddress, false);
++	}
++	gDeviceManager->put_node(parent);
++	if (status != B_OK)
++		return status;
++
++	uint8 control;
++	uint8 registers[kTimeRegisters];
++	bigtime_t readTime = system_time();
++	status = _ReadRegisters(kControl1, &control, 1);
++	if (status == B_OK)
++		status = _ReadRegisters(kSeconds, registers, kTimeRegisters);
++	if (status != B_OK) {
++		INFO("can't read the clock: %s\n", strerror(status));
++		return status;
++	}
++
++	int64 seconds;
++	fValidAtBoot = (control & kControl1Stop) == 0
++		&& _SecondsFromRegisters(registers, &seconds);
++	char text[32];
++	if (fValidAtBoot) {
++		// within a second; the thread reads it at its next tick
++		rtc_hw_clock_read(seconds * 1000000 + 500000 - readTime);
++		_FormatTime(text, sizeof(text), seconds);
++		INFO("clock at I2C address %#x: %s\n", fAddress, text);
++	} else {
++		INFO("clock at I2C address %#x: no valid time (%s); set the time to "
++			"set it\n", fAddress, (control & kControl1Stop) != 0
++				? "stopped" : "battery ran low, or never set");
++	}
++
++	fRequestSem = create_sem(0, "pcf8563 requests");
++	if (fRequestSem < 0)
++		return fRequestSem;
++	fThread = spawn_kernel_thread(&_ThreadEntry, "pcf8563",
++		B_NORMAL_PRIORITY, this);
++	if (fThread < 0)
++		return fThread;
++
++	status = rtc_set_hw_clock(&fHwClock);
++	if (status != B_OK) {
++		INFO("the kernel has a hardware clock already\n");
++		return status;
++	}
++	fHwClockSet = true;
++	resume_thread(fThread);
++	return B_OK;
++}
++
++
++/*!	The kernel's request: the clock is to show system_time() + offset. Called
++	with interrupts disabled; the thread does the work.
++*/
++/*static*/ void
++Pcf8563::_SetTimeHook(void* cookie, bigtime_t offset)
++{
++	Pcf8563* clock = (Pcf8563*)cookie;
++	SpinLocker locker(clock->fRequestLock);
++	clock->fRequestOffset = offset;
++	clock->fRequestPending = true;
++	locker.Unlock();
++	release_sem_etc(clock->fRequestSem, 1, B_DO_NOT_RESCHEDULE);
++}
++
++
++/*static*/ status_t
++Pcf8563::_ThreadEntry(void* cookie)
++{
++	((Pcf8563*)cookie)->_Thread();
++	return B_OK;
++}
++
++
++void
++Pcf8563::_Thread()
++{
++	if (fValidAtBoot)
++		_ReadAtTick();
++
++	while (acquire_sem(fRequestSem) == B_OK && !fQuit) {
++		InterruptsSpinLocker locker(fRequestLock);
++		if (!fRequestPending)
++			continue;
++		bigtime_t offset = fRequestOffset;
++		fRequestPending = false;
++		locker.Unlock();
++
++		status_t status = _WriteTime(offset);
++		if (status != B_OK)
++			INFO("setting the clock failed: %s\n", strerror(status));
++	}
++}
++
++
++status_t
++Pcf8563::_ReadRegisters(uint8 first, uint8* buffer, size_t count)
++{
++	status_t status = fI2c->acquire_bus(fI2cCookie);
++	if (status != B_OK)
++		return status;
++	status = fI2c->exec_command(fI2cCookie, I2C_OP_READ_STOP, &first, 1,
++		buffer, count);
++	fI2c->release_bus(fI2cCookie);
++	return status;
++}
++
++
++status_t
++Pcf8563::_WriteRegisters(uint8 first, const uint8* buffer, size_t count)
++{
++	status_t status = fI2c->acquire_bus(fI2cCookie);
++	if (status != B_OK)
++		return status;
++	status = fI2c->exec_command(fI2cCookie, I2C_OP_WRITE_STOP, &first, 1,
++		(void*)buffer, count);
++	fI2c->release_bus(fI2cCookie);
++	return status;
++}
++
++
++/*!	Polls the time registers until the seconds change: \a registers gets
++	them after the change, \a _tick the system time of the change (between
++	the last two reads, which take about a millisecond each).
++*/
++status_t
++Pcf8563::_WaitForTick(uint8* registers, bigtime_t* _tick)
++{
++	bigtime_t deadline = system_time() + kTickTimeout;
++	int previous = -1;
++	bigtime_t previousTime = 0;
++	while (!fQuit) {
++		bigtime_t before = system_time();
++		if (before > deadline)
++			return B_TIMED_OUT;
++		status_t status = _ReadRegisters(kSeconds, registers,
++			kTimeRegisters);
++		if (status != B_OK)
++			return status;
++		int seconds = registers[0] & 0x7f;
++		if (previous >= 0 && seconds != previous) {
++			*_tick = (previousTime + before) / 2;
++			return B_OK;
++		}
++		previous = seconds;
++		previousTime = before;
++		snooze(1000);
++	}
++	return B_INTERRUPTED;
++}
++
++
++/*!	At boot: the system time from the clock's next tick, unless the time has
++	been set meanwhile.
++*/
++void
++Pcf8563::_ReadAtTick()
++{
++	uint8 registers[kTimeRegisters];
++	bigtime_t tick;
++	status_t status = _WaitForTick(registers, &tick);
++	int64 seconds;
++	if (status != B_OK || !_SecondsFromRegisters(registers, &seconds)) {
++		INFO("reading the clock at its tick failed: %s\n",
++			status != B_OK ? strerror(status) : "no valid time");
++		return;
++	}
++
++	{
++		InterruptsSpinLocker locker(fRequestLock);
++		if (fRequestPending)
++			return;
++	}
++	bigtime_t before = real_time_clock_usecs();
++	rtc_hw_clock_read(seconds * 1000000 - tick);
++	bigtime_t correction = real_time_clock_usecs() - before;
++
++	MutexLocker locker(fStatusLock);
++	fBootRead.done = true;
++	fBootRead.seconds = seconds;
++	fBootRead.error = correction;
++	fBootRead.when = real_time_clock_usecs();
++	char text[32];
++	_FormatTime(text, sizeof(text), seconds);
++	INFO("system time from the clock's tick at %s (%" B_PRId64 " ms from the "
++		"first reading)\n", text, correction / 1000);
++}
++
++
++/*!	Sets the clock to show system_time() + offset, its next tick on the
++	second; then measures that tick.
++*/
++status_t
++Pcf8563::_WriteTime(bigtime_t offset)
++{
++	// set to the second whose last part is at least kSetMargin away, the
++	// divider released (1 - kFirstTickAfterStop) into it
++	bigtime_t clockNow = system_time() + offset;
++	int64 seconds = (clockNow + kSetMargin + kFirstTickAfterStop - 1)
++		/ 1000000;
++	bigtime_t release = seconds * 1000000 + 1000000 - kFirstTickAfterStop
++		- offset - kReleaseWriteTime;
++
++	uint8 stop = kControl1Stop;
++	uint8 registers[kTimeRegisters];
++	_RegistersFromSeconds(seconds, registers);
++	status_t status = _WriteRegisters(kControl1, &stop, 1);
++	if (status == B_OK)
++		status = _WriteRegisters(kSeconds, registers, kTimeRegisters);
++	if (status != B_OK)
++		return status;
++
++	snooze_until(release - 2000, B_SYSTEM_TIMEBASE);
++	while (system_time() < release)
++		cpu_pause();
++	uint8 run = 0;
++	bigtime_t released = system_time();
++	status = _WriteRegisters(kControl1, &run, 1);
++	if (status != B_OK)
++		return status;
++
++	// when it ticked to seconds + 1, against when it should have
++	bigtime_t tick;
++	status = _WaitForTick(registers, &tick);
++	int64 tickSeconds;
++	if (status != B_OK || !_SecondsFromRegisters(registers, &tickSeconds)) {
++		INFO("the clock didn't tick after it was set: %s\n",
++			status != B_OK ? strerror(status) : "no valid time");
++		return B_OK;
++	}
++	bigtime_t error = tick + offset - (seconds + 1) * 1000000;
++
++	MutexLocker locker(fStatusLock);
++	fLastSet.done = true;
++	fLastSet.seconds = tickSeconds;
++	fLastSet.error = error;
++	fLastSet.when = real_time_clock_usecs();
++	char text[32];
++	_FormatTime(text, sizeof(text), tickSeconds);
++	INFO("clock set: %s, its tick %" B_PRId64 ".%03" B_PRId64 " ms %s the "
++		"second (released %" B_PRId64 " us late, ticked %" B_PRId64 " us "
++		"after the release)\n", text, (error < 0 ? -error : error) / 1000,
++		(error < 0 ? -error : error) % 1000, error < 0 ? "before" : "after",
++		released - release, tick - released);
++	return B_OK;
++}
++
++
++static inline int
++from_bcd(uint8 value)
++{
++	return (value >> 4) * 10 + (value & 0xf);
++}
++
++
++static inline uint8
++to_bcd(int value)
++{
++	return ((value / 10) << 4) | (value % 10);
++}
++
++
++/*!	From the seconds to the years register; false if the clock's time isn't
++	valid. Years 00 to 99 are 2000 to 2099 (the century bit is left as it
++	is: Linux uses either value for this century).
++*/
++/*static*/ bool
++Pcf8563::_SecondsFromRegisters(const uint8* registers, int64* _seconds)
++{
++	if ((registers[0] & kSecondsVoltageLow) != 0)
++		return false;
++
++	static const uint8 kMasks[kTimeRegisters]
++		= { 0x7f, 0x7f, 0x3f, 0x3f, 0x07, 0x1f, 0xff };
++	static const uint8 kMinima[kTimeRegisters] = { 0, 0, 0, 1, 0, 1, 0 };
++	static const uint8 kMaxima[kTimeRegisters] = { 59, 59, 23, 31, 6, 12, 99 };
++	int values[kTimeRegisters];
++	for (size_t i = 0; i < kTimeRegisters; i++) {
++		uint8 value = registers[i] & kMasks[i];
++		values[i] = from_bcd(value);
++		if ((value & 0xf) > 9 || values[i] < kMinima[i]
++			|| values[i] > kMaxima[i]) {
++			return false;
++		}
++	}
++
++	struct tm time = {};
++	time.tm_sec = values[0];
++	time.tm_min = values[1];
++	time.tm_hour = values[2];
++	time.tm_mday = values[3];
++	time.tm_mon = values[5] - 1;
++	time.tm_year = 2000 + values[6] - RTC_EPOCH_BASE_YEAR;
++	*_seconds = rtc_tm_to_secs(&time);
++	return true;
++}
++
++
++/*static*/ void
++Pcf8563::_RegistersFromSeconds(int64 seconds, uint8* registers)
++{
++	struct tm time;
++	rtc_secs_to_tm(seconds, &time);
++	int year = time.tm_year + RTC_EPOCH_BASE_YEAR;
++
++	registers[0] = to_bcd(time.tm_sec);
++		// VL cleared
++	registers[1] = to_bcd(time.tm_min);
++	registers[2] = to_bcd(time.tm_hour);
++	registers[3] = to_bcd(time.tm_mday);
++	registers[4] = (seconds / 86400 + 4) % 7;
++		// 1 January 1970 was a Thursday; Sunday is 0
++	registers[5] = to_bcd(time.tm_mon + 1);
++	registers[6] = to_bcd(year % 100);
++}
++
++
++/*static*/ void
++Pcf8563::_FormatTime(char* buffer, size_t size, int64 seconds)
++{
++	struct tm time;
++	rtc_secs_to_tm(seconds, &time);
++	snprintf(buffer, size, "%04d-%02d-%02d %02d:%02d:%02d",
++		time.tm_year + RTC_EPOCH_BASE_YEAR, time.tm_mon + 1, time.tm_mday,
++		time.tm_hour, time.tm_min, time.tm_sec);
++}
++
++
++/*!	/dev/misc/rtc: the clock's time now, and how the boot reading and the
++	last setting went.
++*/
++status_t
++Pcf8563::Read(off_t position, char* buffer, size_t* _length)
++{
++	char text[640];
++	size_t length = 0;
++	char time[32];
++
++	uint8 control;
++	uint8 registers[kTimeRegisters];
++	status_t status = _ReadRegisters(kControl1, &control, 1);
++	if (status == B_OK)
++		status = _ReadRegisters(kSeconds, registers, kTimeRegisters);
++	int64 seconds;
++	if (status != B_OK) {
++		length += snprintf(text + length, sizeof(text) - length,
++			"clock:    can't be read (%s)\n", strerror(status));
++	} else if ((control & kControl1Stop) != 0
++		|| !_SecondsFromRegisters(registers, &seconds)) {
++		length += snprintf(text + length, sizeof(text) - length,
++			"clock:    no valid time (%s)\n", (control & kControl1Stop) != 0
++				? "stopped" : "battery ran low, or never set");
++	} else {
++		_FormatTime(time, sizeof(time), seconds);
++		length += snprintf(text + length, sizeof(text) - length,
++			"clock:    %s (PCF8563 at I2C address %#x)\n", time, fAddress);
++	}
++
++	MutexLocker locker(fStatusLock);
++	if (fBootRead.done) {
++		_FormatTime(time, sizeof(time), fBootRead.seconds);
++		length += snprintf(text + length, sizeof(text) - length,
++			"boot:     system time from its tick at %s (%" B_PRId64 " ms "
++			"from the first reading)\n", time, fBootRead.error / 1000);
++	} else {
++		length += snprintf(text + length, sizeof(text) - length,
++			"boot:     %s\n", fValidAtBoot
++				? "reading at its tick not done" : "not used, no valid time");
++	}
++	if (fLastSet.done) {
++		_FormatTime(time, sizeof(time), fLastSet.seconds);
++		bigtime_t error = fLastSet.error;
++		length += snprintf(text + length, sizeof(text) - length,
++			"last set: ticked to %s %" B_PRId64 ".%03" B_PRId64 " ms %s the "
++			"second\n", time, (error < 0 ? -error : error) / 1000,
++			(error < 0 ? -error : error) % 1000,
++			error < 0 ? "before" : "after");
++	} else {
++		length += snprintf(text + length, sizeof(text) - length,
++			"last set: not since boot\n");
++	}
++	locker.Unlock();
++
++	if (length > sizeof(text) - 1)
++		length = sizeof(text) - 1;
++	if (position >= (off_t)length) {
++		*_length = 0;
++		return B_OK;
++	}
++	size_t count = length - position;
++	if (count > *_length)
++		count = *_length;
++	if (user_memcpy(buffer, text + position, count) != B_OK)
++		return B_BAD_ADDRESS;
++	*_length = count;
++	return B_OK;
++}
++
++
++//	#pragma mark - driver module
++
++
++static float
++supports_device(device_node* parent)
++{
++	const char* bus;
++	const char* compatible;
++	if (gDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false)
++			!= B_OK || strcmp(bus, "i2c") != 0
++		|| gDeviceManager->get_attr_string(parent, I2C_DEVICE_COMPATIBLE_ITEM,
++			&compatible, false) != B_OK
++		|| strcmp(compatible, "nxp,pcf8563") != 0) {
++		return 0.0f;
++	}
++	return 0.8f;
++}
++
++
++static status_t
++register_device(device_node* parent)
++{
++	device_attr attrs[] = {
++		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE,
++			{ .string = "NXP PCF8563 real-time clock" } },
++		{ B_DEVICE_FLAGS, B_UINT32_TYPE, { .ui32 = B_KEEP_DRIVER_LOADED } },
++		{ NULL }
++	};
++	return gDeviceManager->register_node(parent, DRIVER_MODULE_NAME, attrs,
++		NULL, NULL);
++}
++
++
++static status_t
++init_driver(device_node* node, void** _cookie)
++{
++	Pcf8563* clock = new(std::nothrow) Pcf8563(node);
++	if (clock == NULL)
++		return B_NO_MEMORY;
++	status_t status = clock->Init();
++	if (status != B_OK) {
++		delete clock;
++		return status;
++	}
++	*_cookie = clock;
++	return B_OK;
++}
++
++
++static void
++uninit_driver(void* cookie)
++{
++	delete (Pcf8563*)cookie;
++}
++
++
++static status_t
++register_child_devices(void* cookie)
++{
++	Pcf8563* clock = (Pcf8563*)cookie;
++	return gDeviceManager->publish_device(clock->Node(), "misc/rtc",
++		DEVICE_MODULE_NAME);
++}
++
++
++//	#pragma mark - device module
++
++
++static status_t
++device_init(void* driverCookie, void** _deviceCookie)
++{
++	*_deviceCookie = driverCookie;
++	return B_OK;
++}
++
++
++static void
++device_uninit(void* deviceCookie)
++{
++}
++
++
++static status_t
++device_open(void* deviceCookie, const char* path, int openMode,
++	void** _cookie)
++{
++	*_cookie = deviceCookie;
++	return B_OK;
++}
++
++
++static status_t
++device_close(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++device_free(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++device_read(void* cookie, off_t position, void* buffer, size_t* _length)
++{
++	return ((Pcf8563*)cookie)->Read(position, (char*)buffer, _length);
++}
++
++
++static status_t
++device_write(void* cookie, off_t position, const void* buffer,
++	size_t* _length)
++{
++	*_length = 0;
++	return B_NOT_ALLOWED;
++}
++
++
++static status_t
++device_control(void* cookie, uint32 op, void* buffer, size_t length)
++{
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++module_dependency module_dependencies[] = {
++	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&gDeviceManager },
++	{}
++};
++
++
++static struct device_module_info sPcf8563Device = {
++	{
++		DEVICE_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	device_init,
++	device_uninit,
++	NULL,	// remove
++
++	device_open,
++	device_close,
++	device_free,
++	device_read,
++	device_write,
++	NULL,	// io
++	device_control,
++
++	NULL,	// select
++	NULL,	// deselect
++};
++
++
++static struct driver_module_info sPcf8563Driver = {
++	{
++		DRIVER_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	supports_device,
++	register_device,
++	init_driver,
++	uninit_driver,
++	register_child_devices,
++	NULL,	// rescan
++	NULL,	// removed
++};
++
++
++module_info* modules[] = {
++	(module_info*)&sPcf8563Driver,
++	(module_info*)&sPcf8563Device,
++	NULL
++};
+diff --git a/src/system/kernel/real_time_clock.cpp b/src/system/kernel/real_time_clock.cpp
+index 63aff11f53..59a95a40c1 100644
+--- a/src/system/kernel/real_time_clock.cpp
++++ b/src/system/kernel/real_time_clock.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include <arch/real_time_clock.h>
+ #include <commpage.h>
++#include <debug.h>
+ #ifdef _COMPAT_MODE
+ #	include <commpage_compat.h>
+ #endif
+@@ -17,6 +18,7 @@
+ #include <real_time_data.h>
+ #include <syscalls.h>
+ #include <thread.h>
++#include <util/AutoLock.h>
+ 
+ #include <stdlib.h>
+ 
+@@ -39,6 +41,8 @@ static struct real_time_data *sRealTimeDataCompat;
+ static bool sIsGMT = false;
+ static bigtime_t sTimezoneOffset = 0;
+ static char sTimezoneName[B_FILE_NAME_LENGTH] = "GMT";
++static const rtc_hw_clock* sHwClock;
++static spinlock sHwClockLock = B_SPINLOCK_INITIALIZER;
+ 
+ 
+ static void
+@@ -59,6 +63,16 @@ rtc_system_to_hw(void)
+ 		+ (sIsGMT ? 0 : sTimezoneOffset)) / 1000000;
+ 
+ 	arch_rtc_set_hw_time(seconds);
++
++	// a clock chip a driver serves
++	if (debug_debugger_running())
++		return;
++	InterruptsSpinLocker locker(sHwClockLock);
++	if (sHwClock != NULL) {
++		sHwClock->set_time(sHwClock->cookie,
++			arch_rtc_get_system_time_offset(sRealTimeData)
++				+ (sIsGMT ? 0 : sTimezoneOffset));
++	}
+ }
+ 
+ 
+@@ -227,6 +241,31 @@ rtc_secs_to_tm(uint64 seconds, struct tm *t)
+ }
+ 
+ 
++status_t
++rtc_set_hw_clock(const rtc_hw_clock* clock)
++{
++	InterruptsSpinLocker locker(sHwClockLock);
++	if (clock != NULL && sHwClock != NULL)
++		return B_BUSY;
++	sHwClock = clock;
++	return B_OK;
++}
++
++
++void
++rtc_hw_clock_read(bigtime_t offset)
++{
++	// the clock shows system_time() + offset, in local time unless it keeps
++	// GMT (rtc_system_to_hw())
++	bigtime_t systemOffset = offset - (sIsGMT ? 0 : sTimezoneOffset);
++	arch_rtc_set_system_time_offset(sRealTimeData, systemOffset);
++#ifdef _COMPAT_MODE
++	arch_rtc_set_system_time_offset(sRealTimeDataCompat, systemOffset);
++#endif
++	real_time_clock_changed();
++}
++
++
+ //	#pragma mark - syscalls
+ 
+ 

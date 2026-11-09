@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 4 Nov 2026 00:38:38 -0500
+Subject: [PATCH 285/342] Revert "libbnetapi: a Wi-Fi scan gives each channel
+ some time"
+
+It didn't help. Three cold boots still joined on 2.4 GHz, scans ran at the same
+rate as before, and the dwell only keeps the radio off its channel longer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kits/network/libnetapi/NetworkDevice.cpp | 6 ------
+ 1 file changed, 6 deletions(-)
+
+diff --git a/src/kits/network/libnetapi/NetworkDevice.cpp b/src/kits/network/libnetapi/NetworkDevice.cpp
+index e44c3ac392..b3beebdf04 100644
+--- a/src/kits/network/libnetapi/NetworkDevice.cpp
++++ b/src/kits/network/libnetapi/NetworkDevice.cpp
+@@ -792,12 +792,6 @@ BNetworkDevice::Scan(bool wait, bool forceRescan)
+ 		| IEEE80211_IOC_SCAN_ONCE
+ 		| (forceRescan ? IEEE80211_IOC_SCAN_FLUSH : 0);
+ 	request.sr_duration = IEEE80211_IOC_SCAN_FOREVER;
+-	// In ms. Left at 0 a channel gets no time at all, and access points that
+-	// don't answer at once go unseen: those on 5 GHz channels with radar
+-	// detection, for one. The supplicant takes a join from this result if it
+-	// is recent. 120 ms hears a beacon sent every 102.4 ms.
+-	request.sr_mindwell = 20;
+-	request.sr_maxdwell = 120;
+ 	request.sr_nssid = 0;
+ 
+ 	status_t status = set_80211(Name(), IEEE80211_IOC_SCAN_REQ, &request,

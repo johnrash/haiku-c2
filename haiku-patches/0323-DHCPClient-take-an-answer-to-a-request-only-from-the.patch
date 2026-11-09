@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 6 Nov 2026 14:30:44 -0500
+Subject: [PATCH 323/342] DHCPClient: take an answer to a request only from the
+ server it names
+
+A request for an offer names the server that made it (option 54), and RFC
+2131 4.3.2 has the other servers take it as their offers being declined.
+The client took any ACK or NAK that matched its transaction instead. On
+a C2 on Wi-Fi (2026-11-06 capture), the home router broadcast a NAK, with its
+own server identifier, to a request for the wireless bridge's offer: the
+client started over, and the router NAKed the next round too, until the
+bridge's ACK happened to come first. Had the router ACKed instead, the
+client would have taken the router's lease while the bridge thought it
+had taken the bridge's.
+
+While requesting, an ACK or NAK from another server is now logged and
+ignored, and the client goes on waiting for the server it asked. An answer
+without a server identifier is still taken, and the other states (which
+ask no server in particular) are unchanged.
+
+tools/dhcp-two-server-sim.py on the test board's cable, a bridge-like and
+a router-like server: on +331 the router's NAK restarted the client twice,
+and its ACK gave the board the router's 24 h lease. Now both are ignored
+and the bridge's ACK taken in the first round; a NAK without a server
+identifier, and the bridge's own NAK, still start the client over.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/servers/net/DHCPClient.cpp | 33 +++++++++++++++++++++++++++++++++
+ src/servers/net/DHCPClient.h   |  1 +
+ 2 files changed, 34 insertions(+)
+
+diff --git a/src/servers/net/DHCPClient.cpp b/src/servers/net/DHCPClient.cpp
+index 78ad94ce56..06e1552343 100644
+--- a/src/servers/net/DHCPClient.cpp
++++ b/src/servers/net/DHCPClient.cpp
+@@ -143,6 +143,7 @@ struct dhcp_message {
+ 	const uint8* FindOption(message_option which) const;
+ 	const uint8* LastOption() const;
+ 	message_type Type() const;
++	in_addr_t ServerIdentifier() const;
+ 
+ 	uint8* PrepareMessage(uint8 type);
+ 	uint8* PutOption(uint8* options, message_option option);
+@@ -340,6 +341,18 @@ dhcp_message::Type() const
+ }
+ 
+ 
++in_addr_t
++dhcp_message::ServerIdentifier() const
++{
++	in_addr_t server = INADDR_ANY;
++	const uint8* data = FindOption(OPTION_SERVER_ADDRESS);
++	if (data != NULL)
++		memcpy(&server, data, sizeof(server));
++
++	return server;
++}
++
++
+ size_t
+ dhcp_message::Size() const
+ {
+@@ -493,6 +506,7 @@ DHCPClient::DHCPClient(BMessenger target, const char* device)
+ 	fNegotiateThread(-1),
+ 	fAssignedAddress(0),
+ 	fServer(AF_INET, NULL, DHCP_SERVER_PORT, B_UNCONFIGURED_ADDRESS_FAMILIES),
++	fOfferServer(INADDR_ANY),
+ 	fStartTime(0),
+ 	fRequestTime(0),
+ 	fRenewalTime(0),
+@@ -692,10 +706,13 @@ DHCPClient::_Negotiate()
+ status_t
+ DHCPClient::_GotMessage(dhcp_state& state, dhcp_message* message)
+ {
++	in_addr_t server = message->ServerIdentifier();
++
+ 	switch (state) {
+ 		case SELECTING:
+ 			if (message->Type() == DHCP_OFFER) {
+ 				state = REQUESTING;
++				fOfferServer = server;
+ 
+ 				fAssignedAddress = message->your_address;
+ 				syslog(LOG_INFO, "  your_address: %s\n",
+@@ -721,6 +738,22 @@ DHCPClient::_GotMessage(dhcp_state& state, dhcp_message* message)
+ 		case REBINDING:
+ 		case RENEWING:
+ 		case REQUESTING:
++			// A request for an offer names the server that made it, and RFC
++			// 2131 4.3.2 has the other servers take it as their offers being
++			// declined. Some answer it anyway: a home router NAKs (or ACKs) a
++			// request for its wireless bridge's offer. Only the answer of the
++			// server asked counts (or one without a server identifier, as
++			// before). The other states ask no server in particular.
++			if (state == REQUESTING && server != INADDR_ANY
++				&& fOfferServer != INADDR_ANY && server != fOfferServer) {
++				syslog(LOG_DEBUG, "%s: Ignoring %s from server %s: we asked "
++					"%s\n", Device(),
++					dhcp_message::TypeToString(message->Type()),
++					_AddressToString(server).String(),
++					_AddressToString(fOfferServer).String());
++				return B_BAD_VALUE;
++			}
++
+ 			if (message->Type() == DHCP_ACK) {
+ 				// Our address request has been acknowledged. The interface is
+ 				// configured from the acknowledgement: a client that asks for
+diff --git a/src/servers/net/DHCPClient.h b/src/servers/net/DHCPClient.h
+index 47b60698c1..c64d784737 100644
+--- a/src/servers/net/DHCPClient.h
++++ b/src/servers/net/DHCPClient.h
+@@ -76,6 +76,7 @@ private:
+ 			uint32				fTransactionID;
+ 			in_addr_t			fAssignedAddress;
+ 			BNetworkAddress		fServer;
++			in_addr_t			fOfferServer;
+ 			bigtime_t			fStartTime;
+ 			bigtime_t			fRequestTime;
+ 			bigtime_t			fRenewalTime;

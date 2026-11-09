@@ -1,0 +1,227 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 02:13:27 -0400
+Subject: [PATCH 047/342] MediaPlayer, ffmpeg: decode to B_YCbCr422 for
+ overlays that need it
+
+Planar YUV video was always decoded to B_RGB32, because the ffmpeg
+plugin built with swscale only gave B_RGB32. Overlay hardware that can
+show B_YCbCr422 but not B_RGB32 (the Amlogic VPU's video layer) then got
+no overlay, and app_server scaled every frame in software.
+
+- ffmpeg: B_YCbCr422 when asked for, also with swscale (as
+  AV_PIX_FMT_YUYV422), and a larger row stride when asked for, as an
+  overlay may need. The output buffer grows when a format switch needs
+  more room.
+- MediaPlayer: with overlays on, for planar YUV video, and when
+  bitmaps_support_space() says B_YCbCr422 can be an overlay but B_RGB32
+  cannot, the Controller switches the decoder to B_YCbCr422 at the
+  overlay's row stride before playing. Switching at the first frame took
+  more than a second for H.264, after which the frames up to the next
+  keyframe were lost. NodeManager still falls back to B_RGB32 when there
+  is no overlay. Video track suppliers get a SwitchFormat() for this.
+
+Machines with B_RGB32 overlays (intel_extreme) are unaffected.
+
+Tested on the ODROID-C2: 1080p30 H.264 plays through the overlay with no
+dropped frames; 35% CPU instead of 61% without the overlay.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../media/plugins/ffmpeg/AVCodecDecoder.cpp   | 23 ++++++---
+ .../media/plugins/ffmpeg/AVCodecDecoder.h     |  3 ++
+ src/apps/mediaplayer/Controller.cpp           | 49 +++++++++++++++++++
+ src/apps/mediaplayer/Controller.h             |  1 +
+ .../supplier/MediaTrackVideoSupplier.h        |  5 ++
+ .../mediaplayer/supplier/VideoTrackSupplier.h |  5 ++
+ 6 files changed, 80 insertions(+), 6 deletions(-)
+
+diff --git a/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.cpp b/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.cpp
+index 87616a1b77..e361319e97 100644
+--- a/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.cpp
++++ b/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.cpp
+@@ -108,6 +108,8 @@ AVCodecDecoder::AVCodecDecoder()
+ 	fBlockAlign(0),
+ 
+ 	fOutputColorSpace(B_NO_COLOR_SPACE),
++	fOutputBytesPerRow(0),
++	fDecodedVideoBufferSize(0),
+ 	fOutputFrameCount(0),
+ 	fOutputFrameRate(1.0),
+ 	fOutputFrameSize(0),
+@@ -484,17 +486,16 @@ AVCodecDecoder::_NegotiateVideoOutputFormat(media_format* inOutFormat)
+ 	}
+ 	fCodecInitDone = true;
+ 
+-#if USE_SWS_FOR_COLOR_SPACE_CONVERSION
+-	fOutputColorSpace = B_RGB32;
+-#else
+ 	// Make MediaPlayer happy (if not in rgb32 screen depth and no overlay,
+ 	// it will only ask for YCbCr, which DrawBitmap doesn't handle, so the
+-	// default colordepth is RGB32).
++	// default colordepth is RGB32). B_YCbCr422 when asked for: overlays that
++	// cannot show B_RGB32 take it.
+ 	if (inOutFormat->u.raw_video.display.format == B_YCbCr422)
+ 		fOutputColorSpace = B_YCbCr422;
+ 	else
+ 		fOutputColorSpace = B_RGB32;
+-#endif
++	// a larger row stride when asked for, as an overlay may need
++	fOutputBytesPerRow = inOutFormat->u.raw_video.display.bytes_per_row;
+ 
+ #if USE_SWS_FOR_COLOR_SPACE_CONVERSION
+ 	if (fSwsContext != NULL)
+@@ -1585,6 +1586,11 @@ AVCodecDecoder::_UpdateMediaHeaderForVideoFrame()
+ 	fHeader.u.raw_video.bytes_per_row
+ 		= CalculateBytesPerRowWithColorSpaceAndVideoWidth(fOutputColorSpace,
+ 			fRawDecodedPicture->width);
++	if (fOutputBytesPerRow > fHeader.u.raw_video.bytes_per_row) {
++		fHeader.u.raw_video.bytes_per_row = fOutputBytesPerRow;
++		fHeader.size_used = (size_t)fOutputBytesPerRow
++			* fRawDecodedPicture->height;
++	}
+ 	fHeader.u.raw_video.field_gamma = 1.0;
+ 	fHeader.u.raw_video.field_sequence = fFrame;
+ 	fHeader.u.raw_video.field_number = 0;
+@@ -1672,10 +1678,15 @@ AVCodecDecoder::_DeinterlaceAndColorConvertVideoFrame()
+ 
+ 	fDecodedDataSizeInBytes = fHeader.size_used;
+ 
+-	if (fDecodedData == NULL) {
++	if (fDecodedData == NULL
++		|| fDecodedVideoBufferSize < fDecodedDataSizeInBytes) {
++		// first frame, or a format switch to a larger one
++		free(fDecodedData);
++		fDecodedData = NULL;
+ 		const size_t kOptimalAlignmentForColorConversion = 64;
+ 		posix_memalign(reinterpret_cast<void**>(&fDecodedData),
+ 			kOptimalAlignmentForColorConversion, fDecodedDataSizeInBytes + 63);
++		fDecodedVideoBufferSize = fDecodedDataSizeInBytes;
+ 	}
+ 	if (fDecodedData == NULL)
+ 		return B_NO_MEMORY;
+diff --git a/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.h b/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.h
+index 64f3f718d0..a2c1b13e37 100644
+--- a/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.h
++++ b/src/add-ons/media/plugins/ffmpeg/AVCodecDecoder.h
+@@ -138,6 +138,9 @@ private:
+ 			int					fBlockAlign;
+ 
+ 			color_space			fOutputColorSpace;
++			uint32				fOutputBytesPerRow;
++									// as asked for; 0: the natural one
++			size_t				fDecodedVideoBufferSize;
+ 			int32				fOutputFrameCount;
+ 			float				fOutputFrameRate;
+ 									// only for audio streams
+diff --git a/src/apps/mediaplayer/Controller.cpp b/src/apps/mediaplayer/Controller.cpp
+index cff2f5082e..25e3d0d8d5 100644
+--- a/src/apps/mediaplayer/Controller.cpp
++++ b/src/apps/mediaplayer/Controller.cpp
+@@ -238,6 +238,38 @@ Controller::SetToAsync(const PlaylistItemRef& item)
+ }
+ 
+ 
++/*!	Whether to have the video decoded to B_YCbCr422 instead of B_RGB32:
++	if it is planar YUV, which the decoders do not give, and the graphics
++	hardware can show B_YCbCr422 as an overlay, but not B_RGB32 (the Amlogic
++	VPU's video layer, for one). The overlay then does the scaling and the
++	conversion to RGB.
++*/
++bool
++Controller::_OverlayNeedsYCbCr422() const
++{
++	media_format encoded;
++	if (fVideoTrackSupplier->GetEncodedFormat(&encoded) != B_OK)
++		return false;
++	switch (encoded.u.encoded_video.output.display.format) {
++		case B_YUV420: case B_YUV422: case B_YUV411: case B_YUV444:
++		case B_YUV9: case B_YUV12:
++		case B_YCbCr420: case B_YCbCr411: case B_YCbCr444:
++			break;
++		default:
++			return false;
++	}
++
++	uint32 flags = 0;
++	if (!bitmaps_support_space(B_YCbCr422, &flags)
++		|| (flags & B_BITMAPS_SUPPORT_OVERLAY) == 0) {
++		return false;
++	}
++	flags = 0;
++	return !bitmaps_support_space(B_RGB32, &flags)
++		|| (flags & B_BITMAPS_SUPPORT_OVERLAY) == 0;
++}
++
++
+ status_t
+ Controller::SetTo(const PlaylistItemRef& item)
+ {
+@@ -330,6 +362,23 @@ Controller::SetTo(const PlaylistItemRef& item)
+ 	if (fVideoTrackSupplier != NULL) {
+ 		const media_format& format = fVideoTrackSupplier->Format();
+ 		preferredVideoFormat = format.u.raw_video.display.format;
++		if (useOverlays && preferredVideoFormat == B_RGB32
++			&& _OverlayNeedsYCbCr422()) {
++			// Switch the decoder now, to the overlay's row stride: doing it
++			// at the first frame takes long enough (more than a second for
++			// H.264) to lose the frames up to the next keyframe. NodeManager
++			// falls back to B_RGB32 if there is no overlay after all.
++			BRect bounds(0, 0, width - 1, height - 1);
++			BBitmap probe(bounds, B_BITMAP_WILL_OVERLAY, B_YCbCr422);
++			uint32 bytesPerRow
++				= probe.InitCheck() == B_OK ? probe.BytesPerRow() : 0;
++			if (fVideoTrackSupplier->SwitchFormat(B_YCbCr422, bytesPerRow)
++					== B_OK
++				&& fVideoTrackSupplier->Format().u.raw_video.display.format
++					== B_YCbCr422) {
++				preferredVideoFormat = B_YCbCr422;
++			}
++		}
+ 	}
+ 
+ 	uint32 enabledNodes;
+diff --git a/src/apps/mediaplayer/Controller.h b/src/apps/mediaplayer/Controller.h
+index 43de122b18..144404d4b0 100644
+--- a/src/apps/mediaplayer/Controller.h
++++ b/src/apps/mediaplayer/Controller.h
+@@ -150,6 +150,7 @@ private:
+ 			uint32				_PlaybackState(int32 playingMode) const;
+ 			int64				_FrameDuration() const;
+ 			bigtime_t			_TimePosition() const;
++			bool				_OverlayNeedsYCbCr422() const;
+ 
+ 			void				_NotifyFileChanged(PlaylistItem* item,
+ 									status_t result) const;
+diff --git a/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.h b/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.h
+index aafe415ab7..299fabd1f0 100644
+--- a/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.h
++++ b/src/apps/mediaplayer/supplier/MediaTrackVideoSupplier.h
+@@ -43,6 +43,11 @@ class MediaTrackVideoSupplier : public VideoTrackSupplier {
+ 	virtual	color_space			ColorSpace() const;
+ 	virtual	uint32				BytesPerRow() const;
+ 
++	virtual	status_t			SwitchFormat(color_space format,
++									uint32 bytesPerRow)
++									{ return _SwitchFormat(format,
++										bytesPerRow); }
++
+ 	virtual	int32				TrackIndex() const
+ 									{ return fTrackIndex; }
+ 
+diff --git a/src/apps/mediaplayer/supplier/VideoTrackSupplier.h b/src/apps/mediaplayer/supplier/VideoTrackSupplier.h
+index 7abb4e125a..7977fb5169 100644
+--- a/src/apps/mediaplayer/supplier/VideoTrackSupplier.h
++++ b/src/apps/mediaplayer/supplier/VideoTrackSupplier.h
+@@ -34,6 +34,11 @@ public:
+ 	virtual	int64				CurrentFrame() const = 0;
+ 
+ 	virtual	int32				TrackIndex() const = 0;
++
++	virtual	status_t			SwitchFormat(color_space format,
++									uint32 bytesPerRow)
++									{ return B_NOT_SUPPORTED; }
++									// to decode to before playing
+ };
+ 
+ #endif // VIDEO_TRACK_SUPPLIER_H

@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Tue, 3 Nov 2026 13:00:27 -0500
+Subject: [PATCH 265/342] usb_hid: leave the AB13X headset adapter's phantom
+ buttons alone
+
+The adapter (001f:0b21) declares ten media buttons, has none, and reports
+"play" going up and down by itself every few seconds. Each event reset the
+screen saver's idle time. Tested on the board that has it: no events, and the
+screen saver starts. Its audio is usb_audio's, which this doesn't touch.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/drivers/input/usb_hid/Driver.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/add-ons/kernel/drivers/input/usb_hid/Driver.cpp b/src/add-ons/kernel/drivers/input/usb_hid/Driver.cpp
+index 6d1445da49..82a61dbd69 100644
+--- a/src/add-ons/kernel/drivers/input/usb_hid/Driver.cpp
++++ b/src/add-ons/kernel/drivers/input/usb_hid/Driver.cpp
+@@ -47,6 +47,12 @@ usb_support_descriptor gBlackListedDevices[] = {
+ 	{
+ 		// wacom devices are handled by the dedicated wacom driver
+ 		0, 0, 0, USB_VENDOR_WACOM, 0
++	},
++	{
++		// AB13X USB-C headset adapter: declares ten media buttons, has none,
++		// and reports "play" going up and down by itself every few seconds,
++		// which counts as input (no screen saver). Its audio is usb_audio's.
++		0, 0, 0, 0x001f, 0x0b21
+ 	}
+ 
+ };

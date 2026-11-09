@@ -1,0 +1,497 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 01:29:38 -0500
+Subject: [PATCH 193/342] dwc2: high speed isochronous IN, one packet a
+ microframe (M45, testing)
+
+A third isochronous stream (channel 4) for high speed endpoints, with
+256 KiB slots: a packet descriptor per microframe, up to wMaxPacketSize
+times the transactions per microframe (HCCHAR.MC, PKTCNT, a DATA0, DATA1
+or DATA2 start for 1, 2 or 3). Each packet is armed from the halt of the
+one before for the next microframe (ODDFRM); microframes the chain
+misses, overruns, incomplete and short packets go into the stop summary.
+For now only IN endpoints with bInterval 1 (a webcam's video). Still with
+debug output for the C920 tests.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/busses/usb/dwc2.cpp        |  12 +-
+ src/add-ons/kernel/busses/usb/dwc2.h          |  28 ++-
+ src/add-ons/kernel/busses/usb/dwc2_hardware.h |   1 +
+ .../kernel/busses/usb/dwc2_isochronous.cpp    | 198 +++++++++++++++---
+ 4 files changed, 208 insertions(+), 31 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.cpp b/src/add-ons/kernel/busses/usb/dwc2.cpp
+index 24f9f34cbb..806a8b8bfe 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2.cpp
+@@ -212,7 +212,8 @@ DWC2::DWC2(Stack* stack, device_node* node, phys_addr_t registers,
+ 	uint8* bounce;
+ 	fBounceArea = create_area("dwc2 bounce", (void**)&bounce,
+ 		B_ANY_KERNEL_ADDRESS, kBounceSize + kInterruptBounceSize
+-			+ kIsoStreamCount * kIsoSlotCount * kIsoSlotSize,
++			+ (kIsoStreamCount - 1) * kIsoSlotCount * kIsoSlotSize
++			+ kIsoSlotCount * kIsoHighSpeedSlotSize,
+ 		B_32_BIT_CONTIGUOUS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
+ 	if (fBounceArea < 0)
+ 		return;
+@@ -1159,8 +1160,15 @@ DWC2::_Transaction(dwc2_lane* lane, Pipe* pipe, uint32 pid, bool in,
+ 
+ 	*_nextPid = (transferSize >> HCTSIZ_PID_SHIFT) & 3;
+ 	result = dwc2_channel_error(status);
+-	if (result != B_OK)
++	if (result != B_OK) {
++		// DEBUG M45
++		dprintf("dwc2: DEBUG device %d endpoint %d %s pid %u size %u: HCINT "
++			"%#" B_PRIx32 ", HCTSIZ %#" B_PRIx32 ", HCCHAR %#" B_PRIx32 "\n",
++			pipe->DeviceAddress(), pipe->EndpointAddress() & 0xf,
++			in ? "in" : "out", pid, size, status, transferSize,
++			_ChannelCharacteristics(pipe, in, false));
+ 		return result;
++	}
+ 	if ((status & HCINT_XFERCOMPL) == 0) {
+ 		if ((status & HCINT_NAK) != 0) {
+ 			*_nak = true;
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.h b/src/add-ons/kernel/busses/usb/dwc2.h
+index ed2d78f09a..7809de5c39 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.h
++++ b/src/add-ons/kernel/busses/usb/dwc2.h
+@@ -29,9 +29,13 @@ typedef DoublyLinkedList<dwc2_transfer> dwc2_transfer_list;
+ 
+ 
+ static const uint32 kLaneCount = 2;		// channels 0, 1
+-static const uint32 kIsoStreamCount = 2;	// channels 2, 3
++static const uint32 kIsoStreamCount = 3;	// channels 2, 3, 4
++static const uint32 kIsoHighSpeedStream = 2;
++	// the others: full speed devices behind the hub
+ static const uint32 kIsoSlotCount = 4;
+ static const size_t kIsoSlotSize = 16 * 1024;
++static const size_t kIsoHighSpeedSlotSize = 256 * 1024;
++	// 85 microframes of 3 x 1024 bytes (a webcam's high bandwidth endpoint)
+ static const uint32 kIsoMaxPackets = 128;
+ static const uint32 kIsoMaxPieces = 4;
+ 	// an IN packet the translator returns in pieces ("MDATA")
+@@ -75,13 +79,20 @@ struct dwc2_iso_statistics {
+ 	bigtime_t	worstTimer;			// the latest the timer fired
+ 	uint64		underruns;			// the queue ran empty while running
+ 	bigtime_t	worstFinish;		// transfer done to handed back
++	uint64		missed;				// high speed: microframes not served
++	uint64		overruns;			// high speed: FRMOVRUN
++	uint64		incomplete;			// high speed: halted, neither done nor
++									// an error
++	uint64		shortPackets;		// high speed: fewer bytes than asked
+ };
+ 
+ 
+-/*!	One isochronous endpoint of a full speed device behind the high speed
+-	hub, on a host channel of its own. Each frame a timer arms the channel
+-	for the frame's packet; its start-split parts (and complete-splits, IN)
+-	follow from the channel's halt interrupt. State changes under
++/*!	One isochronous endpoint on a host channel of its own: of a full speed
++	device behind the high speed hub, where each frame a timer arms the
++	channel for the frame's packet and its start-split parts (and
++	complete-splits, IN) follow from the channel's halt interrupt; or of a
++	high speed device (kIsoHighSpeedStream), one packet per microframe, each
++	armed from the halt of the one before. State changes under
+ 	DWC2::fIsoLock.
+ */
+ struct dwc2_iso_stream {
+@@ -90,6 +101,12 @@ struct dwc2_iso_stream {
+ 	Pipe*					pipe;			// NULL: unused
+ 	uint32					channel;
+ 	bool					in;
++	bool					highSpeed;
++	uint32					mult;			// high speed: transactions per
++											// microframe
++	uint32					targetFrame;	// high speed: of the running
++											// packet
++	size_t					slotSize;
+ 	uint8*					bounce;
+ 	phys_addr_t				bouncePhysical;
+ 	uint32					freeSlots;		// bit mask
+@@ -207,6 +224,7 @@ private:
+ 			void				_IsoArm(dwc2_iso_stream* stream);
+ 			void				_IsoStartPart(dwc2_iso_stream* stream,
+ 										bool oddFrame);
++			void				_IsoStartHighSpeed(dwc2_iso_stream* stream);
+ 			void				_IsoHalted(dwc2_iso_stream* stream,
+ 										uint32 status);
+ 			void				_IsoPacketDone(dwc2_iso_stream* stream,
+diff --git a/src/add-ons/kernel/busses/usb/dwc2_hardware.h b/src/add-ons/kernel/busses/usb/dwc2_hardware.h
+index f3e3728a01..cc0e1dd83d 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2_hardware.h
++++ b/src/add-ons/kernel/busses/usb/dwc2_hardware.h
+@@ -116,6 +116,7 @@ enum {
+ #define HCTSIZ_XFERSIZE_MASK	0x7ffff
+ 
+ #define PID_DATA0				0
++#define PID_DATA2				1		// high bandwidth IN: 3 transactions
+ #define PID_DATA1				2
+ #define PID_SETUP				3
+ #define PID_MDATA				3		// non-control endpoints
+diff --git a/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp b/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
+index 577421b5ad..fb5aa6b12d 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
+@@ -3,7 +3,8 @@
+  * Distributed under the terms of the MIT License.
+  *
+  * Isochronous transfers of the DWC2 host driver (dwc2.cpp): full speed
+- * devices behind the ODROID-C2's high speed hub, such as USB audio.
++ * devices behind the ODROID-C2's high speed hub, such as USB audio, and
++ * (below) high speed devices such as webcams.
+  *
+  * An isochronous endpoint moves one packet per 1 ms frame. Through the
+  * hub's transaction translator (USB 2.0, 11.18 to 11.21) a packet goes
+@@ -30,6 +31,16 @@
+  * maintained by hand): OUT data is copied in when the transfer is
+  * submitted; a worker thread copies IN data out, fills in the packet
+  * descriptors and finishes the transfers.
++ *
++ * High speed (docs/m45-uvc-facts.md §A.3, A.6): a packet descriptor per
++ * microframe (bInterval 1), up to wMaxPacketSize times the endpoint's
++ * transactions per microframe (1 to 3, "high bandwidth"). The channel runs
++ * all of a microframe's transactions from one enable (HCCHAR.MC, PKTCNT;
++ * IN starts at DATA0, DATA1 or DATA2 for 1, 2 or 3) and halts when they
++ * are done. Each packet is armed from the halt of the one before, for the
++ * next microframe (ODDFRM: its parity), so no timer runs; a microframe the
++ * chain could not catch is counted as missed. The timer only starts the
++ * chain.
+  */
+ 
+ 
+@@ -81,7 +92,7 @@ DWC2::_InitIsochronous(uint8* bounce, phys_addr_t physical)
+ 	if (fIsoSemaphore < 0)
+ 		return fIsoSemaphore;
+ 
+-	size_t streamSize = kIsoSlotCount * kIsoSlotSize;
++	size_t offset = 0;
+ 	for (uint32 i = 0; i < kIsoStreamCount; i++) {
+ 		dwc2_iso_stream& stream = fIsoStreams[i];
+ 		memset(&stream.armTimer, 0, sizeof(stream.armTimer));
+@@ -89,8 +100,14 @@ DWC2::_InitIsochronous(uint8* bounce, phys_addr_t physical)
+ 		stream.pipe = NULL;
+ 		stream.channel = kLaneCount + i;
+ 		stream.in = false;
+-		stream.bounce = bounce + i * streamSize;
+-		stream.bouncePhysical = physical + i * streamSize;
++		stream.highSpeed = i == kIsoHighSpeedStream;
++		stream.mult = 1;
++		stream.targetFrame = UINT32_MAX;
++		stream.slotSize = stream.highSpeed
++			? kIsoHighSpeedSlotSize : kIsoSlotSize;
++		stream.bounce = bounce + offset;
++		stream.bouncePhysical = physical + offset;
++		offset += kIsoSlotCount * stream.slotSize;
+ 		stream.freeSlots = (1 << kIsoSlotCount) - 1;
+ 		stream.packet = 0;
+ 		stream.part = 0;
+@@ -105,24 +122,30 @@ DWC2::_InitIsochronous(uint8* bounce, phys_addr_t physical)
+ }
+ 
+ 
+-/*!	The stream of \a pipe, a new one if \a create is set and one is free.
+-	Called with fIsoLock held.
++/*!	The stream of \a pipe, a new one if \a create is set and one of its
++	kind (full speed behind the hub, or high speed) is free. Called with
++	fIsoLock held.
+ */
+ dwc2_iso_stream*
+ DWC2::_IsoStreamFor(Pipe* pipe, bool create)
+ {
++	bool highSpeed = !_NeedsSplit(pipe);
+ 	dwc2_iso_stream* unused = NULL;
+ 	for (uint32 i = 0; i < kIsoStreamCount; i++) {
+ 		if (fIsoStreams[i].pipe == pipe)
+ 			return &fIsoStreams[i];
+-		if (fIsoStreams[i].pipe == NULL && unused == NULL)
++		if (fIsoStreams[i].pipe == NULL && unused == NULL
++			&& fIsoStreams[i].highSpeed == highSpeed) {
+ 			unused = &fIsoStreams[i];
++		}
+ 	}
+ 	if (!create || unused == NULL)
+ 		return NULL;
+ 
+ 	unused->pipe = pipe;
+ 	unused->in = pipe->Direction() == Pipe::In;
++	unused->mult = highSpeed ? pipe->MaxBurst() + 1 : 1;
++	unused->targetFrame = UINT32_MAX;
+ 	unused->freeSlots = (1 << kIsoSlotCount) - 1;
+ 	unused->packet = 0;
+ 	unused->part = 0;
+@@ -138,10 +161,22 @@ DWC2::_SubmitIsochronous(Transfer* transfer)
+ 	usb_isochronous_data* isochronousData = transfer->IsochronousData();
+ 	if (!fIsoAvailable || isochronousData == NULL)
+ 		return B_NOT_SUPPORTED;
+-	if (!_NeedsSplit(pipe)) {
++	bool highSpeed = !_NeedsSplit(pipe);
++	// DEBUG M45
++	dprintf("dwc2: DEBUG iso submit: high speed %d, interval %u, in %d, mps %"
++		B_PRIu32 ", burst %u, packets %" B_PRIu32 ", length %" B_PRIuSIZE
++		", first request %d\n", highSpeed, pipe->Interval(),
++		pipe->Direction() == Pipe::In, (uint32)pipe->MaxPacketSize(),
++		pipe->MaxBurst(), isochronousData->packet_count,
++		transfer->DataLength(),
++		isochronousData->packet_count > 0
++			? isochronousData->packet_descriptors[0].request_length : -1);
++	if (highSpeed && (pipe->Interval() != 1
++			|| pipe->Direction() != Pipe::In)) {
++		// so far a packet every microframe, IN: a webcam's video
+ 		if (!fWarnedIso) {
+-			INFO("isochronous endpoints of high speed devices are not"
+-				" supported\n");
++			INFO("high speed isochronous endpoints other than IN every"
++				" microframe are not supported\n");
+ 			fWarnedIso = true;
+ 		}
+ 		return B_NOT_SUPPORTED;
+@@ -149,13 +184,18 @@ DWC2::_SubmitIsochronous(Transfer* transfer)
+ 
+ 	// each packet at a 32-bit aligned place for the controller's DMA: OUT
+ 	// packets as large as the largest, IN packets as large as the endpoint
+-	// allows, with room for the alignment of their pieces
++	// allows (high speed: all of a microframe's transactions), with room
++	// for the alignment of their pieces (full speed)
+ 	uint32 maxPacket = pipe->MaxPacketSize();
++	if (highSpeed)
++		maxPacket *= pipe->MaxBurst() + 1;
+ 	uint32 count = isochronousData->packet_count;
+ 	if (count == 0 || count > kIsoMaxPackets)
+ 		return B_BAD_VALUE;
+ 	uint32 stride = 0;
+-	if (pipe->Direction() == Pipe::In)
++	if (highSpeed)
++		stride = maxPacket;
++	else if (pipe->Direction() == Pipe::In)
+ 		stride = maxPacket + 3 * (kIsoMaxPieces - 1);
+ 	else {
+ 		for (uint32 i = 0; i < count; i++) {
+@@ -164,7 +204,7 @@ DWC2::_SubmitIsochronous(Transfer* transfer)
+ 		}
+ 	}
+ 	stride = (stride + 3) & ~(uint32)3;
+-	if (count * stride > kIsoSlotSize)
++	if (count * stride > (highSpeed ? kIsoHighSpeedSlotSize : kIsoSlotSize))
+ 		return B_BAD_VALUE;
+ 
+ 	dwc2_iso_transfer* entry = new(std::nothrow) dwc2_iso_transfer;
+@@ -203,7 +243,7 @@ DWC2::_SubmitIsochronous(Transfer* transfer)
+ 	stream->freeSlots &= ~(1 << entry->slot);
+ 	locker.Unlock();
+ 
+-	uint8* slot = stream->bounce + entry->slot * kIsoSlotSize;
++	uint8* slot = stream->bounce + entry->slot * stream->slotSize;
+ 	if (!stream->in) {
+ 		size_t offset = 0;
+ 		for (uint32 i = 0; i < count && status == B_OK; i++) {
+@@ -219,7 +259,8 @@ DWC2::_SubmitIsochronous(Transfer* transfer)
+ 	}
+ 	// OUT: the data has to be in memory for the DMA; IN: no dirty cache line
+ 	// may later be written back over what the controller stored
+-	dwc2_dcache_maintain(stream->bouncePhysical + entry->slot * kIsoSlotSize,
++	dwc2_dcache_maintain(
++		stream->bouncePhysical + entry->slot * stream->slotSize,
+ 		count * stride, stream->in);
+ 
+ 	locker.Lock();
+@@ -230,8 +271,12 @@ DWC2::_SubmitIsochronous(Transfer* transfer)
+ 	}
+ 	frame -= stream->packet;
+ 	stream->queue.Add(entryDeleter.Detach());
+-	if (!stream->running && !stream->timerPending && !stream->stopping)
+-		_IsoScheduleTimer(stream);
++	if (!stream->running && !stream->timerPending && !stream->stopping) {
++		if (stream->highSpeed)
++			_IsoStartHighSpeed(stream);
++		else
++			_IsoScheduleTimer(stream);
++	}
+ 	locker.Unlock();
+ 
+ 	if (isochronousData->starting_frame_number != NULL) {
+@@ -300,14 +345,22 @@ DWC2::_CancelIsochronous(Pipe* pipe, bool force)
+ 	stream->part = 0;
+ 	stream->timerPending = false;
+ 	stream->stopping = false;
++	stream->targetFrame = UINT32_MAX;
+ 	bool in = stream->in;
++	bool highSpeed = stream->highSpeed;
+ 	dwc2_iso_statistics stats = stream->stats;
+ 	memset(&stream->stats, 0, sizeof(stream->stats));
+ 	locker.Unlock();
+ 
+ 	if (stats.packets > 0) {
+-		char detail[96];
+-		if (in) {
++		char detail[160];
++		if (highSpeed) {
++			snprintf(detail, sizeof(detail), "%" B_PRIu64 " microframes"
++				" missed, %" B_PRIu64 " overruns, %" B_PRIu64 " incomplete, %"
++				B_PRIu64 " short, %" B_PRIu64 " empty", stats.missed,
++				stats.overruns, stats.incomplete, stats.shortPackets,
++				stats.empty);
++		} else if (in) {
+ 			snprintf(detail, sizeof(detail), "%" B_PRIu64 " empty, data at"
+ 				" complete-split 1-4: %" B_PRIu32 " %" B_PRIu32 " %" B_PRIu32
+ 				" %" B_PRIu32, stats.empty, stats.completeSplits[1],
+@@ -351,6 +404,10 @@ DWC2::_IsoArm(dwc2_iso_stream* stream)
+ {
+ 	if (stream->queue.IsEmpty())
+ 		return;
++	if (stream->highSpeed) {
++		_IsoStartHighSpeed(stream);
++		return;
++	}
+ 
+ 	uint32 arm = (start_microframe(stream) + 7) & 7;
+ 	uint32 offset = ((_Read(kHfnum) & 7) - arm) & 7;
+@@ -385,7 +442,8 @@ DWC2::_IsoStartPart(dwc2_iso_stream* stream, bool oddFrame)
+ 	dwc2_iso_transfer* entry = stream->queue.Head();
+ 	Pipe* pipe = stream->pipe;
+ 	uint32 length = entry->length[stream->packet];
+-	uint32 offset = entry->slot * kIsoSlotSize + stream->packet * entry->stride;
++	uint32 offset = entry->slot * stream->slotSize
++		+ stream->packet * entry->stride;
+ 
+ 	uint32 split = HCSPLT_SPLTENA
+ 		| ((uint32)pipe->HubAddress() << HCSPLT_HUBADDR_SHIFT)
+@@ -435,6 +493,52 @@ DWC2::_IsoStartPart(dwc2_iso_stream* stream, bool oddFrame)
+ }
+ 
+ 
++/*!	Runs the head transfer's current packet on a high speed stream's channel
++	in the next microframe: all its transactions (HCCHAR.MC). Called with
++	fIsoLock held.
++*/
++void
++DWC2::_IsoStartHighSpeed(dwc2_iso_stream* stream)
++{
++	dwc2_iso_transfer* entry = stream->queue.Head();
++	Pipe* pipe = stream->pipe;
++	uint32 maxPacket = pipe->MaxPacketSize();
++	uint32 offset = entry->slot * stream->slotSize
++		+ stream->packet * entry->stride;
++	// whole packets for IN, whatever the request: the stride holds them
++	uint32 size = maxPacket * stream->mult;
++	uint32 pid = stream->mult == 3 ? PID_DATA2
++		: stream->mult == 2 ? PID_DATA1 : PID_DATA0;
++
++	// the next microframe: the channel waits for one of its parity; if the
++	// microframe changes meanwhile, it runs in that one at once
++	uint32 frame = (_Read(kHfnum) + 1) & 0x3fff;
++	if (stream->targetFrame != UINT32_MAX)
++		stream->stats.missed += (frame - stream->targetFrame - 1) & 0x3fff;
++	stream->targetFrame = frame;
++	stream->size = size;
++
++	uint32 character = maxPacket
++		| ((pipe->EndpointAddress() & 0xf) << HCCHAR_EPNUM_SHIFT)
++		| (stream->in ? HCCHAR_EPDIR_IN : 0)
++		| (EPTYPE_ISOCHRONOUS << HCCHAR_EPTYPE_SHIFT)
++		| (stream->mult << HCCHAR_MC_SHIFT)
++		| ((uint32)pipe->DeviceAddress() << HCCHAR_DEVADDR_SHIFT)
++		| ((frame & 1) != 0 ? HCCHAR_ODDFRM : 0);
++
++	uint32 channel = stream->channel;
++	_Write(HC_SPLT(channel), 0);
++	_Write(HC_INT(channel), HCINT_ALL);
++	_Write(HC_INTMSK(channel), HCINT_CHHLTD);
++	_Write(HC_TSIZ(channel), size | (stream->mult << HCTSIZ_PKTCNT_SHIFT)
++		| (pid << HCTSIZ_PID_SHIFT));
++	_Write(HC_DMA(channel), (uint32)(stream->bouncePhysical + offset));
++	asm volatile("dsb sy" : : : "memory");
++	_Write(HC_CHAR(channel), character | HCCHAR_CHENA);
++	stream->running = true;
++}
++
++
+ /*!	The stream's channel halted: the next part goes out in the next
+ 	microframe, or the packet is done. Called from the interrupt handler
+ 	with fIsoLock held.
+@@ -448,6 +552,33 @@ DWC2::_IsoHalted(dwc2_iso_stream* stream, uint32 status)
+ 	if (stream->stopping || stream->queue.IsEmpty())
+ 		return;
+ 
++	if (stream->highSpeed) {
++		// the microframe's transactions are over: what came is the packet
++		uint32 transferSize = _Read(HC_TSIZ(stream->channel));
++		uint32 got = stream->size
++			- min_c(transferSize & HCTSIZ_XFERSIZE_MASK, stream->size);
++		status_t result = B_OK;
++		if ((status & HCINT_FRMOVRUN) != 0) {
++			// it could not finish within its microframe
++			stream->stats.overruns++;
++			result = B_DEV_TOO_LATE;
++			got = 0;
++		} else if (dwc2_channel_error(status) != B_OK) {
++			stream->stats.lastError = status;
++			result = dwc2_channel_error(status);
++			got = 0;
++		} else if ((status & HCINT_XFERCOMPL) == 0)
++			stream->stats.incomplete++;
++		if (result == B_OK) {
++			if (got == 0)
++				stream->stats.empty++;
++			else if (got < stream->queue.Head()->length[stream->packet])
++				stream->stats.shortPackets++;
++		}
++		_IsoPacketDone(stream, result, got);
++		return;
++	}
++
+ 	uint32 frame = _Read(kHfnum) & 0x3fff;
+ 	bool nextOdd = ((frame + 1) & 1) != 0;
+ 	status_t error = dwc2_channel_error(status);
+@@ -533,11 +664,19 @@ DWC2::_IsoPacketDone(dwc2_iso_stream* stream, status_t status,
+ 		fIsoDone.Add(entry);
+ 		stream->packet = 0;
+ 		release_sem_etc(fIsoSemaphore, 1, B_DO_NOT_RESCHEDULE);
+-		if (stream->queue.IsEmpty())
++		if (stream->queue.IsEmpty()) {
+ 			stream->stats.underruns++;
++			stream->targetFrame = UINT32_MAX;
++				// the chain breaks: no missed microframes counted
++		}
+ 	}
+ 
+-	if (!stream->queue.IsEmpty() && !stream->timerPending)
++	if (stream->queue.IsEmpty() || stream->stopping)
++		return;
++	if (stream->highSpeed) {
++		// the next microframe's packet, from here (the halt)
++		_IsoStartHighSpeed(stream);
++	} else if (!stream->timerPending)
+ 		_IsoScheduleTimer(stream);
+ }
+ 
+@@ -618,16 +757,27 @@ DWC2::_IsoFinish(dwc2_iso_transfer* entry, bool callback)
+ 
+ 	if (callback) {
+ 		usb_isochronous_data* isochronousData = transfer->IsochronousData();
+-		uint8* slot = stream->bounce + entry->slot * kIsoSlotSize;
++		uint8* slot = stream->bounce + entry->slot * stream->slotSize;
+ 		if (stream->in) {
+ 			dwc2_dcache_maintain(
+-				stream->bouncePhysical + entry->slot * kIsoSlotSize,
++				stream->bouncePhysical + entry->slot * stream->slotSize,
+ 				entry->packetCount * entry->stride, true);
+ 			status_t status = transfer->PrepareKernelAccess();
+ 			size_t offset = 0;
+ 			for (uint32 i = 0; i < entry->packetCount; i++) {
+ 				if (status != B_OK)
+ 					entry->actual[i] = 0;
++				if (stream->highSpeed) {
++					// in one piece, as long as it fits the packet's place
++					uint32 length = min_c(entry->actual[i], entry->length[i]);
++					if (length > 0) {
++						dwc2_copy_transfer_data(transfer, offset,
++							slot + i * entry->stride, length, false);
++					}
++					entry->actual[i] = length;
++					offset += entry->length[i];
++					continue;
++				}
+ 				// pieces, each from the next 32-bit boundary, as long as
+ 				// they fit the packet's place in the data
+ 				uint32 pieceOffset = 0;

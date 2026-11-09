@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""Send text to the C2 console through c2console's FIFO.
+
+c2send "mmc list"      sends the line plus CR
+c2send -n " "          sends without CR
+c2send -k ctrl-c       sends a control key
+Before sending it records the console's current size in run/console.mark,
+so a following c2wait only looks at output produced after this command.
+"""
+import os
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RUN = os.path.join(ROOT, "run")
+KEYS = {"ctrl-c": b"\x03", "enter": b"\r", "esc": b"\x1b", "space": b" "}
+
+
+def main():
+	args = sys.argv[1:]
+	if not args:
+		sys.exit(__doc__)
+	if args[0] == "-k":
+		data = KEYS[args[1]]
+	elif args[0] == "-n":
+		data = args[1].encode()
+	else:
+		data = " ".join(args).encode() + b"\r"
+	if not os.path.exists(os.path.join(RUN, "console.pid")):
+		sys.exit("c2send: c2console is not running")
+	raw = os.path.join(RUN, "console.raw")
+	with open(os.path.join(RUN, "console.mark"), "w") as f:
+		f.write(str(os.path.getsize(raw) if os.path.exists(raw) else 0))
+	fd = os.open(os.path.join(RUN, "console.in"), os.O_WRONLY | os.O_NONBLOCK)
+	os.write(fd, data)
+	os.close(fd)
+
+
+if __name__ == "__main__":
+	main()

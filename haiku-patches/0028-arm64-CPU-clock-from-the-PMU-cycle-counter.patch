@@ -1,0 +1,145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 13:24:58 -0400
+Subject: [PATCH 028/342] arm64: CPU clock from the PMU cycle counter
+
+arch_get_frequency() returned 0 and the topology's default frequency
+was 0, so About showed "@ 0 MHz". The kernel now counts the PMU cycle
+counter (PMCCNTR_EL0) against the generic timer: for 1 ms on the boot
+CPU at startup (the default frequency in the CPU topology), and for
+100 us on the CPU asked about (current_frequency), so a clock changed by
+DVFS shows. Without an architected PMU both stay 0.
+
+The loader's EL2 to EL1 drop now sets MDCR_EL2 on every CPU: all event
+counters to EL1 (HPMN = PMCR_EL0.N) and no PMU or debug traps; its reset
+value is not architecturally defined.
+
+Tested on the ODROID-C2: "arm64: CPU clock 1535 MHz" at boot (the
+firmware's 1536 MHz), About shows 1.53 GHz, sysinfo 1535MHz; 50 sysinfo
+runs measuring all four CPUs, no crash.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../boot/platform/efi/arch/arm64/transition.S |  9 +++
+ .../kernel/arch/arm64/arch_system_info.cpp    | 65 +++++++++++++++----
+ 2 files changed, 63 insertions(+), 11 deletions(-)
+
+diff --git a/src/system/boot/platform/efi/arch/arm64/transition.S b/src/system/boot/platform/efi/arch/arm64/transition.S
+index 4d6f822a4d..b4972117fd 100644
+--- a/src/system/boot/platform/efi/arch/arm64/transition.S
++++ b/src/system/boot/platform/efi/arch/arm64/transition.S
+@@ -98,6 +98,15 @@ FUNCTION(drop_to_el1):
+ 	/* Don't trap to EL2 for CP15 traps */
+ 	msr	hstr_el2, xzr
+ 
++	/*
++	 * Leave the performance monitors to EL1: all event counters (HPMN =
++	 * PMCR_EL0.N) and no PMU or debug traps. The reset value is not
++	 * architecturally defined, and the kernel samples the cycle counter.
++	 */
++	mrs	x2, pmcr_el0
++	ubfx	x2, x2, #11, #5
++	msr	mdcr_el2, x2
++
+ 	/* Enable access to the physical timers at EL1 */
+ 	mrs	x2, cnthctl_el2
+ 	orr	x2, x2, #(CNTHCTL_EL1PCTEN | CNTHCTL_EL1PCEN)
+diff --git a/src/system/kernel/arch/arm64/arch_system_info.cpp b/src/system/kernel/arch/arm64/arch_system_info.cpp
+index 68f5367696..8e2a9e27aa 100644
+--- a/src/system/kernel/arch/arm64/arch_system_info.cpp
++++ b/src/system/kernel/arch/arm64/arch_system_info.cpp
+@@ -10,9 +10,53 @@
+ #include <boot/kernel_args.h>
+ 
+ #include "cpu.h"
++#include <smp.h>
+ 
+ 
+ static cpu_vendor sCPUVendor = B_CPU_VENDOR_UNKNOWN;
++static uint64 sCPUClockSpeed;
++
++
++/*!	Measures the clock of the current CPU: counts its cycles (PMCCNTR_EL0)
++	against the generic timer for \a microseconds. The loader leaves the PMU
++	to EL1 (MDCR_EL2); the cycle counter is enabled here and left running.
++	Returns 0 without an architected PMU.
++*/
++static uint64
++measure_cpu_clock(uint32 microseconds)
++{
++	uint64 pmuVersion = (READ_SPECIALREG(ID_AA64DFR0_EL1) >> 8) & 0xf;
++	if (pmuVersion == 0 || pmuVersion == 0xf)
++		return 0;
++
++	// count at EL0 and EL1; PMCR_EL0.LC (64 bit) and .E, PMCNTENSET_EL0.C
++	WRITE_SPECIALREG(PMCCFILTR_EL0, 0);
++	WRITE_SPECIALREG(PMCR_EL0, READ_SPECIALREG(PMCR_EL0) | (1 << 6) | (1 << 0));
++	WRITE_SPECIALREG(PMCNTENSET_EL0, 1u << 31);
++	arm64_isb();
++
++	uint64 timerFrequency = READ_SPECIALREG(CNTFRQ_EL0);
++	uint64 ticks = timerFrequency * microseconds / 1000000;
++	uint64 start = READ_SPECIALREG(CNTVCT_EL0);
++	arm64_isb();
++	uint64 cycles = READ_SPECIALREG(PMCCNTR_EL0);
++	uint64 now;
++	do {
++		arm64_isb();
++		now = READ_SPECIALREG(CNTVCT_EL0);
++	} while (now - start < ticks);
++	arm64_isb();
++	cycles = READ_SPECIALREG(PMCCNTR_EL0) - cycles;
++
++	return cycles * timerFrequency / (now - start);
++}
++
++
++static void
++get_frequency_for(void* _frequency, int cpu)
++{
++	*(uint64*)_frequency = measure_cpu_clock(100);
++}
+ 
+ 
+ void
+@@ -28,9 +72,8 @@ arch_fill_topology_node(cpu_topology_node_info* node, int32 cpu)
+ 			break;
+ 		case B_TOPOLOGY_CORE:
+ 			node->data.core.model = static_cast<uint32>(gCPU[cpu].arch.midr);
+-			// TODO: This can be taken from SMBIOS Type 4, or the device tree depending on the
+-			// device
+-			node->data.core.default_frequency = 0;
++			// the boot CPU's clock when the kernel started
++			node->data.core.default_frequency = sCPUClockSpeed;
+ 			break;
+ 		default:
+ 			break;
+@@ -43,6 +86,9 @@ arch_system_info_init(struct kernel_args *args)
+ {
+ 	cpu_ent* cpu = get_cpu_struct();
+ 
++	sCPUClockSpeed = measure_cpu_clock(1000);
++	dprintf("arm64: CPU clock %" B_PRIu64 " MHz\n", sCPUClockSpeed / 1000000);
++
+ 	// TODO: It *is* possible for the package vendors to be heterogeneous,
+ 	//       (Tegra X2 has NVIDIA and ARM-designed cores on the same package)
+ 	//       but as vendor field is set for the whole package currently,
+@@ -107,13 +153,10 @@ arch_system_info_init(struct kernel_args *args)
+ status_t
+ arch_get_frequency(uint64 *frequency, int32 cpu)
+ {
+-	// HACKME: This is a tricky one. There are a few options with wildly varying availability:
+-	// * ARMv8.4 Activity Monitors (AMEVCNTR0 counter)
+-	// * PMU cycle counter sampling
+-	// * on Apple M-series, p-state registers
+-	// * ACPI CPPC feedback counters
+-	// In QEMU, the only one that "works" is PMU, but it returns constant 1 GHz.
+-
+-	*frequency = 0;
++	// PMU cycle counter sampling. Other options, with varying availability:
++	// ARMv8.4 Activity Monitors (AMEVCNTR0), Apple M-series p-state
++	// registers, ACPI CPPC feedback counters. In QEMU the PMU gives a
++	// constant 1 GHz.
++	call_single_cpu_sync(cpu, get_frequency_for, frequency);
+ 	return B_OK;
+ }

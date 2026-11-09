@@ -1,0 +1,4 @@
+#!/bin/sh
+# Copy a file from Haiku on the C2 over FTP: c2get <absolute remote path> <local file>
+"$(dirname "$0")/c2sh" true > /dev/null || exit 1
+exec curl -sS -o "$2" "ftp://baron:haiku@10.42.0.2/$1"

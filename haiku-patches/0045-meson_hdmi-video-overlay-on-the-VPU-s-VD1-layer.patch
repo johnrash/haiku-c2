@@ -1,0 +1,1052 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 02:13:16 -0400
+Subject: [PATCH 045/342] meson_hdmi: video overlay on the VPU's VD1 layer
+
+One overlay channel for B_YCbCr422 buffers of up to 2048x2048:
+
+- Buffers are physically contiguous pages, mapped write combining into
+  the kernel's address space with user access and B_CLONEABLE_AREA, like
+  the frame buffer: the one address works in app_server, in the client
+  drawing into the overlay bitmap, and in a media_server clone.
+- The VD1 read interface takes the visible part of the buffer through
+  canvas 0x60 or 0x61 (in turn, so a new frame replaces the shown one at
+  the start of a frame: no tearing at 30 fps), the formatter expands
+  4:2:2, the VPP scaler scales it (4.24 fixed point steps, 1/4 to 64x),
+  and the postblender puts it under OSD1.
+- Keying: the video shows where the frame buffer's alpha is 0. OSD1
+  normally replaces every alpha with 0xff; while the video layer is on,
+  the frame buffer's own alpha counts. app_server fills the overlay with
+  its key colour, whose alpha is 0, and draws everything else opaque.
+  OSD1's colour key registers do nothing for 32 bit pixels.
+- KDL: "meson_hdmi overlay" shows the state, "meson_hdmi vpu <word>
+  [<value>]" reads or writes a VPU register.
+
+Register facts are from the S905X datasheet (VD1, VPP); the programming
+sequence follows Linux's meson_overlay.c (GPL), read for facts only.
+
+Tested on the ODROID-C2: 1280x720 colour bars scaled to 960x540 and
+1080p H.264 in MediaPlayer scaled to its window, both 1080p60 output;
+1080p30 playback takes 35% of the CPU instead of 61%.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../graphics/meson_hdmi/meson_hdmi_info.h     |  41 ++
+ .../accelerants/meson_hdmi/accelerant.cpp     | 234 +++++++-
+ .../graphics/meson_hdmi/meson_hdmi.cpp        | 560 +++++++++++++++++-
+ 3 files changed, 816 insertions(+), 19 deletions(-)
+
+diff --git a/headers/private/graphics/meson_hdmi/meson_hdmi_info.h b/headers/private/graphics/meson_hdmi/meson_hdmi_info.h
+index 539052db2a..94db0e0c2f 100644
+--- a/headers/private/graphics/meson_hdmi/meson_hdmi_info.h
++++ b/headers/private/graphics/meson_hdmi/meson_hdmi_info.h
+@@ -25,6 +25,47 @@ enum {
+ 		// display_mode; must be one of the modes in the shared info
+ 	MESON_HDMI_GET_DEVICE_NAME,
+ 		// char[B_PATH_NAME_LENGTH], for clone accelerants
++	MESON_HDMI_ALLOCATE_OVERLAY_BUFFER,
++		// meson_hdmi_overlay_buffer
++	MESON_HDMI_FREE_OVERLAY_BUFFER,
++		// area_id of an overlay buffer
++	MESON_HDMI_CONFIGURE_OVERLAY,
++		// meson_hdmi_overlay_config
++};
++
++
++/*!	An overlay buffer is physically contiguous memory the video layer (VD1)
++	reads. The driver maps it write combining into the kernel's address space
++	with user access, like the frame buffer, so the one address works in
++	every team: app_server hands it to the client that draws into the
++	overlay bitmap.
++*/
++struct meson_hdmi_overlay_buffer {
++	size_t			size;			// in: bytes
++	area_id			area;			// out: names the buffer in other calls
++	void*			address;		// out
++	phys_addr_t		physical;		// out
++};
++
++
++struct meson_hdmi_overlay_config {
++	area_id			buffer;			// -1 hides the overlay
++	uint32			bytes_per_row;
++	uint16			width;			// of the buffer, in pixels
++	uint16			height;
++
++	// the part of the buffer shown
++	uint16			source_left;
++	uint16			source_top;
++	uint16			source_width;
++	uint16			source_height;
++
++	// where it is shown, partly off screen too; the video shows where the
++	// frame buffer's alpha is 0 (the overlay key colour's alpha)
++	int32			left;
++	int32			top;
++	uint32			window_width;
++	uint32			window_height;
+ };
+ 
+ 
+diff --git a/src/add-ons/accelerants/meson_hdmi/accelerant.cpp b/src/add-ons/accelerants/meson_hdmi/accelerant.cpp
+index 3a41e8d09e..a55751c050 100644
+--- a/src/add-ons/accelerants/meson_hdmi/accelerant.cpp
++++ b/src/add-ons/accelerants/meson_hdmi/accelerant.cpp
+@@ -5,8 +5,16 @@
+ 
+ /*!	Accelerant for the meson_hdmi driver (Amlogic Meson GXBB HDMI). The
+ 	kernel driver owns the hardware: it builds the mode list from the
+-	modes it can set and the EDID, and sets modes. This side only clones
+-	the shared info and the frame buffer and passes requests on.
++	modes it can set and the EDID, sets modes and programs the video
++	overlay. This side only clones the shared info and the frame buffer and
++	passes requests on.
++
++	One overlay channel, for B_YCbCr422 buffers. The driver maps overlay
++	buffers into the kernel's address space with user access, so the
++	address it returns works in app_server and in the client that draws
++	into the overlay bitmap. The video shows where the frame buffer's alpha
++	is 0: app_server's key colour has alpha 0 and everything else it draws
++	is opaque.
+ */
+ 
+ 
+@@ -21,6 +29,7 @@
+ #include <Accelerant.h>
+ #include <OS.h>
+ #include <edid.h>
++#include <video_overlay.h>
+ 
+ #include "meson_hdmi_info.h"
+ 
+@@ -37,6 +46,23 @@ struct accelerant_info {
+ 
+ static accelerant_info sInfo = { -1, false, -1, NULL, -1, NULL, 0 };
+ 
++static const uint32 kMaxOverlayBuffers = 8;
++static const uint16 kMaxOverlayWidth = 2048;
++static const uint16 kMaxOverlayHeight = 2048;
++
++struct overlay_buffer_slot {
++	overlay_buffer			buffer;
++	area_id					area;		// -1: unused
++};
++
++static overlay_buffer_slot sOverlayBuffers[kMaxOverlayBuffers] = {
++	{ {}, -1 }, { {}, -1 }, { {}, -1 }, { {}, -1 },
++	{ {}, -1 }, { {}, -1 }, { {}, -1 }, { {}, -1 },
++};
++static int32 sOverlayChannel;
++	// the token of the one overlay channel; its address is the token
++static int32 sOverlayChannelUsed;
++
+ 
+ static status_t
+ init_common(int device, bool isClone)
+@@ -247,6 +273,191 @@ meson_get_pixel_clock_limits(display_mode* mode, uint32* _low, uint32* _high)
+ }
+ 
+ 
++// #pragma mark - overlay
++
++
++static uint32
++meson_overlay_count(const display_mode* mode)
++{
++	return 1;
++}
++
++
++static const uint32*
++meson_overlay_supported_spaces(const display_mode* mode)
++{
++	static const uint32 kSpaces[] = { B_YCbCr422, 0 };
++	return kSpaces;
++}
++
++
++static uint32
++meson_overlay_supported_features(uint32 colorSpace)
++{
++	return B_OVERLAY_COLOR_KEY | B_OVERLAY_KEYING_USES_ALPHA
++		| B_OVERLAY_HORIZONTAL_FILTERING | B_OVERLAY_VERTICAL_FILTERING;
++}
++
++
++static const overlay_buffer*
++meson_allocate_overlay_buffer(color_space space, uint16 width, uint16 height)
++{
++	// the video layer's formatter and the VPP line buffers take lines of
++	// up to 2048 pixels; MediaPlayer uses a normal bitmap for larger ones
++	if (space != B_YCbCr422 || width == 0 || height == 0
++		|| width > kMaxOverlayWidth || height > kMaxOverlayHeight) {
++		return NULL;
++	}
++
++	overlay_buffer_slot* slot = NULL;
++	for (uint32 i = 0; i < kMaxOverlayBuffers; i++) {
++		if (sOverlayBuffers[i].area < 0) {
++			slot = &sOverlayBuffers[i];
++			break;
++		}
++	}
++	if (slot == NULL)
++		return NULL;
++
++	// the canvas takes rows in units of 8 bytes; 32 keep them in whole
++	// DDR bursts
++	uint32 bytesPerRow = ((uint32)((width + 1) & ~1) * 2 + 31) & ~31u;
++	meson_hdmi_overlay_buffer request;
++	request.size = (size_t)bytesPerRow * height;
++	if (ioctl(sInfo.device, MESON_HDMI_ALLOCATE_OVERLAY_BUFFER, &request,
++			sizeof(request)) != 0) {
++		return NULL;
++	}
++
++	slot->area = request.area;
++	slot->buffer.space = space;
++	slot->buffer.width = width;
++	slot->buffer.height = height;
++	slot->buffer.bytes_per_row = bytesPerRow;
++	slot->buffer.buffer = request.address;
++	slot->buffer.buffer_dma = (void*)(addr_t)request.physical;
++	return &slot->buffer;
++}
++
++
++static overlay_buffer_slot*
++find_overlay_buffer(const overlay_buffer* buffer)
++{
++	for (uint32 i = 0; i < kMaxOverlayBuffers; i++) {
++		if (sOverlayBuffers[i].area >= 0 && &sOverlayBuffers[i].buffer == buffer)
++			return &sOverlayBuffers[i];
++	}
++	return NULL;
++}
++
++
++static status_t
++meson_release_overlay_buffer(const overlay_buffer* buffer)
++{
++	overlay_buffer_slot* slot = find_overlay_buffer(buffer);
++	if (slot == NULL)
++		return B_BAD_VALUE;
++	ioctl(sInfo.device, MESON_HDMI_FREE_OVERLAY_BUFFER, &slot->area,
++		sizeof(area_id));
++	slot->area = -1;
++	return B_OK;
++}
++
++
++static status_t
++meson_get_overlay_constraints(const display_mode* mode,
++	const overlay_buffer* buffer, overlay_constraints* constraints)
++{
++	if (buffer == NULL || constraints == NULL)
++		return B_BAD_VALUE;
++
++	memset(constraints, 0, sizeof(overlay_constraints));
++	// the view: any part of the buffer, starting at an even column
++	constraints->view.h_alignment = 1;
++	constraints->view.width_alignment = 1;
++	constraints->view.width.min = 2;
++	constraints->view.width.max = buffer->width;
++	constraints->view.height.min = 1;
++	constraints->view.height.max = buffer->height;
++	// the window: anywhere, partly off screen too
++	constraints->window.width.min = 2;
++	constraints->window.width.max = 4096;
++	constraints->window.height.min = 2;
++	constraints->window.height.max = 4096;
++	constraints->h_scale.min = 0.25f;
++	constraints->h_scale.max = 64.0f;
++	constraints->v_scale.min = 0.25f;
++	constraints->v_scale.max = 64.0f;
++	return B_OK;
++}
++
++
++static overlay_token
++meson_allocate_overlay(void)
++{
++	if (atomic_test_and_set(&sOverlayChannelUsed, 1, 0) != 0)
++		return NULL;
++	return &sOverlayChannel;
++}
++
++
++static status_t
++meson_release_overlay(overlay_token token)
++{
++	if (token != &sOverlayChannel)
++		return B_BAD_VALUE;
++	meson_hdmi_overlay_config config;
++	memset(&config, 0, sizeof(config));
++	config.buffer = -1;
++	ioctl(sInfo.device, MESON_HDMI_CONFIGURE_OVERLAY, &config, sizeof(config));
++	atomic_set(&sOverlayChannelUsed, 0);
++	return B_OK;
++}
++
++
++static status_t
++meson_configure_overlay(overlay_token token, const overlay_buffer* buffer,
++	const overlay_window* window, const overlay_view* view)
++{
++	if (token != &sOverlayChannel)
++		return B_BAD_VALUE;
++
++	meson_hdmi_overlay_config config;
++	memset(&config, 0, sizeof(config));
++	config.buffer = -1;
++	if (buffer != NULL && window != NULL && view != NULL) {
++		overlay_buffer_slot* slot = find_overlay_buffer(buffer);
++		if (slot == NULL)
++			return B_BAD_VALUE;
++		// keying is by the frame buffer's alpha only
++		if ((window->flags & B_OVERLAY_COLOR_KEY) == 0
++			|| (window->alpha.value & window->alpha.mask) != 0) {
++			return B_NOT_SUPPORTED;
++		}
++		config.buffer = slot->area;
++		config.bytes_per_row = buffer->bytes_per_row;
++		config.width = buffer->width;
++		config.height = buffer->height;
++		config.source_left = view->h_start;
++		config.source_top = view->v_start;
++		config.source_width = view->width;
++		config.source_height = view->height;
++		// the window part the offsets cut off is not shown
++		config.left = window->h_start + window->offset_left;
++		config.top = window->v_start + window->offset_top;
++		config.window_width = window->width - window->offset_left
++			- window->offset_right;
++		config.window_height = window->height - window->offset_top
++			- window->offset_bottom;
++	}
++	if (ioctl(sInfo.device, MESON_HDMI_CONFIGURE_OVERLAY, &config,
++			sizeof(config)) != 0) {
++		return errno;
++	}
++	return B_OK;
++}
++
++
+ extern "C" void*
+ get_accelerant_hook(uint32 feature, void* data)
+ {
+@@ -284,6 +495,25 @@ get_accelerant_hook(uint32 feature, void* data)
+ 			return (void*)meson_get_frame_buffer_config;
+ 		case B_GET_PIXEL_CLOCK_LIMITS:
+ 			return (void*)meson_get_pixel_clock_limits;
++
++		case B_OVERLAY_COUNT:
++			return (void*)meson_overlay_count;
++		case B_OVERLAY_SUPPORTED_SPACES:
++			return (void*)meson_overlay_supported_spaces;
++		case B_OVERLAY_SUPPORTED_FEATURES:
++			return (void*)meson_overlay_supported_features;
++		case B_ALLOCATE_OVERLAY_BUFFER:
++			return (void*)meson_allocate_overlay_buffer;
++		case B_RELEASE_OVERLAY_BUFFER:
++			return (void*)meson_release_overlay_buffer;
++		case B_GET_OVERLAY_CONSTRAINTS:
++			return (void*)meson_get_overlay_constraints;
++		case B_ALLOCATE_OVERLAY:
++			return (void*)meson_allocate_overlay;
++		case B_RELEASE_OVERLAY:
++			return (void*)meson_release_overlay;
++		case B_CONFIGURE_OVERLAY:
++			return (void*)meson_configure_overlay;
+ 	}
+ 	return NULL;
+ }
+diff --git a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+index 613ba69d91..6ee7de3429 100644
+--- a/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
++++ b/src/add-ons/kernel/drivers/graphics/meson_hdmi/meson_hdmi.cpp
+@@ -22,6 +22,11 @@
+ 	settings (~/config/settings/kernel/drivers/meson_hdmi) keeps the device
+ 	unpublished, so app_server stays on the "framebuffer" driver.
+ 
++	Video overlays use the VD1 video layer: B_YCbCr422 buffers of physically
++	contiguous memory, scaled by the VPP scaler and shown under OSD1 where
++	the frame buffer's alpha is 0, which is where app_server draws the
++	overlay's key colour.
++
+ 	Sources: the S905 and S905X datasheets (VPU, ENCP, HHI, HDMI TX top),
+ 	NetBSD's dw_hdmi (BSD-2) for the DesignWare controller, and register
+ 	facts listed in docs/m6-hdmi-design.md of the port's project folder.
+@@ -74,6 +79,30 @@ enum {
+ 	VIU_OSD1_BLK0_CFG_W2		= 0x1a1d,
+ 	VIU_OSD1_BLK0_CFG_W3		= 0x1a1e,
+ 	VIU_OSD1_CTRL_STAT2			= 0x1a2d,
++	VD1_IF0_GEN_REG				= 0x1a50,
++	VD1_IF0_CANVAS0				= 0x1a51,
++	VD1_IF0_CANVAS1				= 0x1a52,
++	VD1_IF0_LUMA_X0				= 0x1a53,
++	VD1_IF0_LUMA_Y0				= 0x1a54,
++	VD1_IF0_CHROMA_X0			= 0x1a55,
++	VD1_IF0_CHROMA_Y0			= 0x1a56,
++	VD1_IF0_LUMA_X1				= 0x1a57,
++	VD1_IF0_LUMA_Y1				= 0x1a58,
++	VD1_IF0_CHROMA_X1			= 0x1a59,
++	VD1_IF0_CHROMA_Y1			= 0x1a5a,
++	VD1_IF0_RPT_LOOP			= 0x1a5b,
++	VD1_IF0_LUMA0_RPT_PAT		= 0x1a5c,
++	VD1_IF0_CHROMA0_RPT_PAT		= 0x1a5d,
++	VD1_IF0_LUMA1_RPT_PAT		= 0x1a5e,
++	VD1_IF0_CHROMA1_RPT_PAT		= 0x1a5f,
++	VD1_IF0_LUMA_PSEL			= 0x1a60,
++	VD1_IF0_CHROMA_PSEL			= 0x1a61,
++	VIU_VD1_FMT_CTRL			= 0x1a68,
++	VIU_VD1_FMT_W				= 0x1a69,
++	VD1_IF0_RANGE_MAP_Y			= 0x1a6a,
++	VD1_IF0_RANGE_MAP_CB		= 0x1a6b,
++	VD1_IF0_RANGE_MAP_CR		= 0x1a6c,
++	VD1_IF0_GEN_REG2			= 0x1a6d,
+ 	VENC_DVI_SETTING			= 0x1b62,
+ 	ENCP_VIDEO_EN				= 0x1b80,
+ 	ENCP_VIDEO_MODE				= 0x1b8d,
+@@ -100,6 +129,25 @@ enum {
+ 	ENCP_DE_H_END				= 0x1c3b,
+ 	ENCP_DE_V_BEGIN_EVEN		= 0x1c3c,
+ 	ENCP_DE_V_END_EVEN			= 0x1c3d,
++	VPP_LINE_IN_LENGTH			= 0x1d01,
++	VPP_PIC_IN_HEIGHT			= 0x1d02,
++	VPP_VSC_REGION12_STARTP		= 0x1d05,
++	VPP_VSC_REGION34_STARTP		= 0x1d06,
++	VPP_VSC_REGION4_ENDP		= 0x1d07,
++	VPP_VSC_START_PHASE_STEP	= 0x1d08,
++	VPP_VSC_REGION0_PHASE_SLOPE	= 0x1d09,	// to REGION4 at 0x1d0c
++	VPP_VSC_PHASE_CTRL			= 0x1d0d,
++	VPP_VSC_INI_PHASE			= 0x1d0e,
++	VPP_HSC_REGION12_STARTP		= 0x1d10,
++	VPP_HSC_REGION34_STARTP		= 0x1d11,
++	VPP_HSC_REGION4_ENDP		= 0x1d12,
++	VPP_HSC_START_PHASE_STEP	= 0x1d13,
++	VPP_HSC_REGION0_PHASE_SLOPE	= 0x1d14,	// to REGION4 at 0x1d17
++	VPP_HSC_PHASE_CTRL			= 0x1d18,
++	VPP_SC_MISC					= 0x1d19,
++	VPP_POSTBLEND_VD1_H_START_END = 0x1d1c,
++	VPP_POSTBLEND_VD1_V_START_END = 0x1d1d,
++	VPP_PREBLEND_H_SIZE			= 0x1d20,
+ 	VPP_POSTBLEND_H_SIZE		= 0x1d21,
+ 	VPP_MISC					= 0x1d26,
+ 	VPP_OSD_VSC_CTRL0			= 0x1dc2,
+@@ -110,6 +158,36 @@ enum {
+ };
+ 
+ #define OSD_ENABLE					(1 << 21)	// VIU_OSD1_CTRL_STAT
++#define OSD_REPLACE_ALPHA			(1 << 14)	// VIU_OSD1_CTRL_STAT2
++
++// VD1_IF0_GEN_REG
++#define VD_ENABLE					(1 << 0)
++#define VD_LITTLE_ENDIAN			(1 << 4)
++#define VD_CHROMA_REPEAT_LAST_LINE	(1 << 6)
++#define VD_BYTES_PER_PIXEL(n)		((n) << 14)	// 1: 4:2:2 stored together
++#define VD_HOLD_LINES(n)			((n) << 19)
++#define VD_URGENT_LUMA				(1 << 27)
++#define VD_URGENT_CHROMA			(1 << 28)
++
++// VIU_VD1_FMT_CTRL: the formatter turns 4:2:2 into 4:4:4
++#define VD_VERT_FORMAT				(1 << 0)
++#define VD_VERT_PHASE_STEP(n)		((n) << 1)	// 3.4 fixed point
++#define VD_VERT_INITIAL_PHASE(n)	((n) << 8)
++#define VD_VERT_REPEAT_LINE0		(1 << 16)
++#define VD_HORZ_FORMAT				(1 << 20)
++#define VD_HORZ_Y_C_RATIO(n)		((n) << 21)	// 1: two luma per chroma
++
++// VPP_SC_MISC
++#define VPP_VSC_BANK_LENGTH(n)		(n)
++#define VPP_HSC_BANK_LENGTH(n)		((n) << 8)
++#define VPP_SC_VD_OUT				(1 << 15)
++#define VPP_SC_TOP					(1 << 16)
++#define VPP_SC_HSC					(1 << 17)
++#define VPP_SC_VSC					(1 << 18)
++
++// VPP_MISC
++#define VPP_VD1_POSTBLEND			(1 << 10)
++#define VPP_VD1_PREBLEND			(1 << 14)
+ 
+ // HHI registers (byte offsets)
+ enum {
+@@ -137,6 +215,15 @@ enum {
+ };
+ 
+ #define CANVAS_LUT_WRITE			(1 << 9)
++#define CANVAS_ENDIAN_SHIFT			26			// DMC_CAV_LUT_DATAH
++#define CANVAS_SWAP_64				7			// byte order within 64 bits
++
++// canvases for the video layer, used in turn so that a new buffer only
++// replaces the shown one at the start of a frame
++static const uint32 kVideoCanvas[2] = { 0x60, 0x61 };
++static const uint32 kMaxOverlayBuffers = 8;
++static const uint32 kMaxOverlaySize = 2048;
++	// pixels per line and lines: the formatter's and scaler's limits
+ 
+ // HDMI TX: indirect ports to the Amlogic "top" glue and the DesignWare core
+ enum {
+@@ -301,6 +388,17 @@ public:
+ 			void				RestoreBootMode();
+ 			void				DumpState();
+ 
++			status_t			AllocateOverlayBuffer(
++									meson_hdmi_overlay_buffer& buffer);
++			status_t			FreeOverlayBuffer(area_id area);
++			status_t			ConfigureOverlay(
++									const meson_hdmi_overlay_config& config);
++			void				DumpOverlay();
++			void				SetOverlayEndian(uint32 endian);
++			uint32				ReadVpu(uint32 word) { return _Vpu(word); }
++			void				WriteVpu(uint32 word, uint32 value)
++									{ _SetVpu(word, value); }
++
+ private:
+ 			uint32				_Vpu(uint32 word)
+ 									{ return fVpu[word]; }
+@@ -326,7 +424,15 @@ private:
+ 			void				_BuildModeList();
+ 
+ 			void				_SetCanvas(phys_addr_t address,
+-									uint32 bytesPerRow, uint32 height);
++									uint32 bytesPerRow, uint32 height)
++									{ _WriteCanvas(kOsdCanvas, address,
++										bytesPerRow, height, 0); }
++			void				_WriteCanvas(uint32 index, phys_addr_t address,
++									uint32 bytesPerRow, uint32 height,
++									uint32 endian);
++			void				_ApplyOverlay();
++			void				_DisableVideoLayer();
++			void				_HideOverlay();
+ 			void				_ResetPhy();
+ 			status_t			_WaitForPllLock();
+ 			status_t			_ProgramMode(const meson_mode& mode,
+@@ -374,6 +480,18 @@ private:
+ 			uint32				fBootPllCntl2;
+ 			uint8				fBootComposer[14];
+ 			bool				fBootStateSaved;
++
++			struct overlay_buffer_info {
++				area_id			pagesArea;		// -1: unused slot
++				area_id			mapArea;		// write combining, user access
++				phys_addr_t		physical;
++				size_t			size;
++			};
++			overlay_buffer_info	fOverlayBuffers[kMaxOverlayBuffers];
++			meson_hdmi_overlay_config fOverlay;		// buffer -1: hidden
++			phys_addr_t			fOverlayPhysical;
++			uint32				fOverlayCanvas;		// index into kVideoCanvas
++			uint32				fOverlayEndian;
+ };
+ 
+ 
+@@ -426,10 +544,17 @@ MesonHdmi::MesonHdmi(device_node* node)
+ 	fEdidSize(0),
+ 	fBootVpuCount(0),
+ 	fBootPllCntl2(0),
+-	fBootStateSaved(false)
++	fBootStateSaved(false),
++	fOverlayPhysical(0),
++	fOverlayCanvas(0),
++	fOverlayEndian(CANVAS_SWAP_64)
+ {
+ 	B_INITIALIZE_SPINLOCK(&fPortLock);
+ 	mutex_init(&fModeLock, "meson_hdmi mode");
++	for (uint32 i = 0; i < kMaxOverlayBuffers; i++)
++		fOverlayBuffers[i].pagesArea = -1;
++	memset(&fOverlay, 0, sizeof(fOverlay));
++	fOverlay.buffer = -1;
+ }
+ 
+ 
+@@ -544,6 +669,23 @@ MesonHdmi::Init()
+ }
+ 
+ 
++/*!	Writes back and invalidates the cache lines of a physical range through
++	the kernel's cached map of all memory.
++*/
++static void
++flush_cache_range(phys_addr_t physical, size_t size)
++{
++	uint64 ctr;
++	asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
++	const addr_t lineSize = 4 << ((ctr >> 16) & 0xf);
++	for (addr_t line = KERNEL_PMAP_BASE + physical;
++			line < KERNEL_PMAP_BASE + physical + size; line += lineSize) {
++		asm volatile("dc civac, %0" : : "r"(line) : "memory");
++	}
++	asm volatile("dsb sy" : : : "memory");
++}
++
++
+ /*!	One buffer for the largest mode, allocated while memory is still
+ 	unfragmented. The VPU does not snoop caches: the pages are written
+ 	back and invalidated through their cached alias, then used only
+@@ -563,16 +705,7 @@ MesonHdmi::_AllocateFrameBuffer()
+ 	physical_entry entry;
+ 	get_memory_map(pages, B_PAGE_SIZE, &entry, 1);
+ 	fFrameBufferPhysical = entry.address;
+-
+-	uint64 ctr;
+-	asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
+-	const addr_t lineSize = 4 << ((ctr >> 16) & 0xf);
+-	for (addr_t line = KERNEL_PMAP_BASE + fFrameBufferPhysical;
+-			line < KERNEL_PMAP_BASE + fFrameBufferPhysical + fFrameBufferSize;
+-			line += lineSize) {
+-		asm volatile("dc civac, %0" : : "r"(line) : "memory");
+-	}
+-	asm volatile("dsb sy" : : : "memory");
++	flush_cache_range(fFrameBufferPhysical, fFrameBufferSize);
+ 
+ 	fFrameBufferMapArea = map_physical_memory("meson_hdmi frame buffer",
+ 		fFrameBufferPhysical, fFrameBufferSize, B_ANY_KERNEL_ADDRESS,
+@@ -683,12 +816,14 @@ MesonHdmi::_SaveBootState()
+ 
+ 
+ void
+-MesonHdmi::_SetCanvas(phys_addr_t address, uint32 bytesPerRow, uint32 height)
++MesonHdmi::_WriteCanvas(uint32 index, phys_addr_t address, uint32 bytesPerRow,
++	uint32 height, uint32 endian)
+ {
+ 	uint32 width = (bytesPerRow + 7) / 8;
+ 	fDmc[DMC_CAV_LUT_DATAL / 4] = ((address + 7) / 8) | (width << 29);
+-	fDmc[DMC_CAV_LUT_DATAH / 4] = (width >> 3) | (height << 9);
+-	fDmc[DMC_CAV_LUT_ADDR / 4] = CANVAS_LUT_WRITE | kOsdCanvas;
++	fDmc[DMC_CAV_LUT_DATAH / 4] = (width >> 3) | (height << 9)
++		| (endian << CANVAS_ENDIAN_SHIFT);
++	fDmc[DMC_CAV_LUT_ADDR / 4] = CANVAS_LUT_WRITE | index;
+ 	(void)fDmc[DMC_CAV_LUT_DATAH / 4];	// flush
+ }
+ 
+@@ -821,6 +956,9 @@ MesonHdmi::SetDisplayMode(const display_mode& displayMode)
+ 		return B_BAD_VALUE;
+ 
+ 	MutexLocker locker(fModeLock);
++	// the overlay's position and scaling depend on the mode; app_server
++	// configures it again
++	_HideOverlay();
+ 	uint32 bytesPerRow = mode->hActive * 4;
+ 	memset(fFrameBuffer, 0, bytesPerRow * mode->vActive);
+ 	status_t status = _ProgramMode(*mode, fFrameBufferPhysical, bytesPerRow);
+@@ -865,6 +1003,336 @@ MesonHdmi::RestoreBootMode()
+ }
+ 
+ 
++//	#pragma mark - overlay
++
++
++/*!	Physically contiguous pages for an overlay buffer, used like the frame
++	buffer: their cache lines are written back once, then they are only
++	accessed through a write-combining mapping with user access. The buffer
++	starts out black (Y 16, Cb and Cr 128).
++*/
++status_t
++MesonHdmi::AllocateOverlayBuffer(meson_hdmi_overlay_buffer& buffer)
++{
++	if (buffer.size == 0 || buffer.size > kMaxWidth * kMaxHeight * 4)
++		return B_BAD_VALUE;
++
++	MutexLocker locker(fModeLock);
++	overlay_buffer_info* info = NULL;
++	for (uint32 i = 0; i < kMaxOverlayBuffers; i++) {
++		if (fOverlayBuffers[i].pagesArea < 0) {
++			info = &fOverlayBuffers[i];
++			break;
++		}
++	}
++	if (info == NULL)
++		return B_NO_MEMORY;
++
++	size_t size = (buffer.size + B_PAGE_SIZE - 1) & ~(B_PAGE_SIZE - 1);
++	void* pages;
++	area_id pagesArea = create_area("meson_hdmi overlay pages", &pages,
++		B_ANY_KERNEL_ADDRESS, size, B_32_BIT_CONTIGUOUS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
++	if (pagesArea < 0)
++		return pagesArea;
++	physical_entry entry;
++	get_memory_map(pages, B_PAGE_SIZE, &entry, 1);
++	flush_cache_range(entry.address, size);
++
++	// cloneable: MediaPlayer hands the bitmap's area to the media_server
++	// as a media buffer (clones of a device area keep its memory type)
++	void* address;
++	area_id mapArea = map_physical_memory("meson_hdmi overlay buffer",
++		entry.address, size, B_ANY_KERNEL_ADDRESS,
++		B_READ_AREA | B_WRITE_AREA | B_CLONEABLE_AREA, &address);
++	if (mapArea < 0) {
++		delete_area(pagesArea);
++		return mapArea;
++	}
++	vm_set_area_memory_type(mapArea, entry.address, B_WRITE_COMBINING_MEMORY);
++	uint32* pixels = (uint32*)address;
++	for (size_t i = 0; i < size / 4; i++)
++		pixels[i] = B_HOST_TO_LENDIAN_INT32(0x80108010);
++
++	info->pagesArea = pagesArea;
++	info->mapArea = mapArea;
++	info->physical = entry.address;
++	info->size = size;
++
++	buffer.area = mapArea;
++	buffer.address = address;
++	buffer.physical = entry.address;
++	return B_OK;
++}
++
++
++status_t
++MesonHdmi::FreeOverlayBuffer(area_id area)
++{
++	MutexLocker locker(fModeLock);
++	for (uint32 i = 0; i < kMaxOverlayBuffers; i++) {
++		overlay_buffer_info& info = fOverlayBuffers[i];
++		if (info.pagesArea < 0 || info.mapArea != area)
++			continue;
++		if (fOverlay.buffer == area)
++			_HideOverlay();
++		delete_area(info.mapArea);
++		// the cached alias may hold stale lines from speculative reads
++		flush_cache_range(info.physical, info.size);
++		delete_area(info.pagesArea);
++		info.pagesArea = -1;
++		return B_OK;
++	}
++	return B_BAD_VALUE;
++}
++
++
++status_t
++MesonHdmi::ConfigureOverlay(const meson_hdmi_overlay_config& config)
++{
++	MutexLocker locker(fModeLock);
++	if (config.buffer < 0) {
++		_HideOverlay();
++		return B_OK;
++	}
++
++	const overlay_buffer_info* info = NULL;
++	for (uint32 i = 0; i < kMaxOverlayBuffers; i++) {
++		if (fOverlayBuffers[i].pagesArea >= 0
++			&& fOverlayBuffers[i].mapArea == config.buffer) {
++			info = &fOverlayBuffers[i];
++			break;
++		}
++	}
++	if (info == NULL || config.width < 2 || config.height < 1
++		|| config.width > kMaxOverlaySize || config.height > kMaxOverlaySize
++		|| config.bytes_per_row < (uint32)config.width * 2
++		|| config.bytes_per_row % 8 != 0
++		|| (size_t)config.bytes_per_row * config.height > info->size
++		|| config.source_width == 0 || config.source_height == 0
++		|| config.source_left + config.source_width > config.width
++		|| config.source_top + config.source_height > config.height
++		|| config.window_width == 0 || config.window_height == 0
++		|| config.window_width > 4 * kMaxWidth
++		|| config.window_height > 4 * kMaxHeight) {
++		return B_BAD_VALUE;
++	}
++	// the scaler steps are 4.24 fixed point: at most 1/4 down
++	if (config.source_width > 4 * config.window_width
++		|| config.source_height > 4 * config.window_height) {
++		return B_BAD_VALUE;
++	}
++
++	if (info->physical != fOverlayPhysical) {
++		// a new frame: the other canvas, so that the shown one stays intact
++		// until the video layer switches over
++		fOverlayCanvas ^= 1;
++		fOverlayPhysical = info->physical;
++	}
++	fOverlay = config;
++	_ApplyOverlay();
++	return B_OK;
++}
++
++
++/*!	Programs the video layer (VD1) for fOverlay: the read interface takes
++	the visible part of the buffer through a canvas, the formatter expands
++	4:2:2 to 4:4:4, the VPP scaler scales it to the visible part of the
++	window, and the postblender puts it under OSD1.
++
++	The video shows where OSD1's alpha is 0. Normally OSD1 replaces every
++	pixel's alpha with 0xff; while the video layer is on, the frame buffer's
++	own alpha counts instead. app_server fills the overlay window with its
++	key colour, whose alpha is 0, and draws everything else opaque. (OSD1's
++	colour key registers, VIU_OSD1_TCOLOR_AG0-3, do nothing for 32 bit
++	pixels: they only give an alpha to formats without one.)
++*/
++void
++MesonHdmi::_ApplyOverlay()
++{
++	const meson_hdmi_overlay_config& config = fOverlay;
++	int32 screenWidth = fShared->current_mode.timing.h_display;
++	int32 screenHeight = fShared->current_mode.timing.v_display;
++
++	// the visible part of the window
++	int32 left = max_c(config.left, 0);
++	int32 top = max_c(config.top, 0);
++	int32 right = min_c(config.left + (int32)config.window_width,
++		screenWidth) - 1;
++	int32 bottom = min_c(config.top + (int32)config.window_height,
++		screenHeight) - 1;
++	if (right < left || bottom < top) {
++		_DisableVideoLayer();
++		return;
++	}
++
++	// the buffer part it shows; a 4:2:2 pair cannot be split
++	uint32 hStart = config.source_left + (uint64)(left - config.left)
++		* config.source_width / config.window_width;
++	uint32 hEnd = config.source_left + ((uint64)(right + 1 - config.left)
++		* config.source_width + config.window_width - 1)
++		/ config.window_width - 1;
++	uint32 vStart = config.source_top + (uint64)(top - config.top)
++		* config.source_height / config.window_height;
++	uint32 vEnd = config.source_top + ((uint64)(bottom + 1 - config.top)
++		* config.source_height + config.window_height - 1)
++		/ config.window_height - 1;
++	hStart &= ~1u;
++	hEnd = min_c(hEnd | 1, config.bytes_per_row / 2 - 1);
++	vEnd = min_c(vEnd, (uint32)config.height - 1);
++
++	uint32 inWidth = hEnd - hStart + 1;
++	uint32 inHeight = vEnd - vStart + 1;
++	uint32 outWidth = right - left + 1;
++	uint32 outHeight = bottom - top + 1;
++	uint32 stepX = ((uint64)config.source_width << 24) / config.window_width;
++	uint32 stepY = ((uint64)config.source_height << 24)
++		/ config.window_height;
++
++	uint32 canvas = kVideoCanvas[fOverlayCanvas];
++	_WriteCanvas(canvas, fOverlayPhysical, config.bytes_per_row,
++		config.height, fOverlayEndian);
++
++	_SetVpu(VD1_IF0_GEN_REG, VD_URGENT_CHROMA | VD_URGENT_LUMA
++		| VD_HOLD_LINES(9) | VD_CHROMA_REPEAT_LAST_LINE | VD_BYTES_PER_PIXEL(1)
++		| VD_ENABLE);
++	_SetVpu(VD1_IF0_GEN_REG2, 0);
++	_SetVpu(VIU_VD1_FMT_CTRL, VD_HORZ_Y_C_RATIO(1) | VD_HORZ_FORMAT
++		| VD_VERT_REPEAT_LINE0 | VD_VERT_INITIAL_PHASE(12)
++		| VD_VERT_PHASE_STEP(16) | VD_VERT_FORMAT);
++	_SetVpu(VIU_VD1_FMT_W, (inWidth << 16) | (hEnd / 2 - hStart / 2 + 1));
++	uint32 canvases = canvas | (canvas << 8) | (canvas << 16);
++	_SetVpu(VD1_IF0_CANVAS0, canvases);
++	_SetVpu(VD1_IF0_CANVAS1, canvases);
++	uint32 lumaX = hStart | (hEnd << 16);
++	uint32 lumaY = vStart | (vEnd << 16);
++	uint32 chromaX = (hStart / 2) | ((hEnd / 2) << 16);
++	uint32 chromaY = (vStart / 2) | ((vEnd / 2) << 16);
++	_SetVpu(VD1_IF0_LUMA_X0, lumaX);
++	_SetVpu(VD1_IF0_LUMA_Y0, lumaY);
++	_SetVpu(VD1_IF0_CHROMA_X0, chromaX);
++	_SetVpu(VD1_IF0_CHROMA_Y0, chromaY);
++	_SetVpu(VD1_IF0_LUMA_X1, lumaX);
++	_SetVpu(VD1_IF0_LUMA_Y1, lumaY);
++	_SetVpu(VD1_IF0_CHROMA_X1, chromaX);
++	_SetVpu(VD1_IF0_CHROMA_Y1, chromaY);
++	_SetVpu(VD1_IF0_RPT_LOOP, 0);
++	_SetVpu(VD1_IF0_LUMA0_RPT_PAT, 0);
++	_SetVpu(VD1_IF0_CHROMA0_RPT_PAT, 0);
++	_SetVpu(VD1_IF0_LUMA1_RPT_PAT, 0);
++	_SetVpu(VD1_IF0_CHROMA1_RPT_PAT, 0);
++	_SetVpu(VD1_IF0_LUMA_PSEL, 0);
++	_SetVpu(VD1_IF0_CHROMA_PSEL, 0);
++	_SetVpu(VD1_IF0_RANGE_MAP_Y, 0);
++	_SetVpu(VD1_IF0_RANGE_MAP_CB, 0);
++	_SetVpu(VD1_IF0_RANGE_MAP_CR, 0);
++
++	// linear scaling everywhere: all region slopes 0; the regions before
++	// region 1 and after region 4's start are empty or one pixel
++	_SetVpu(VPP_LINE_IN_LENGTH, inWidth);
++	_SetVpu(VPP_PIC_IN_HEIGHT, inHeight);
++	_SetVpu(VPP_PREBLEND_H_SIZE, inWidth);
++	_SetVpu(VPP_HSC_REGION12_STARTP, 0);
++	_SetVpu(VPP_HSC_REGION34_STARTP, ((outWidth - 1) << 16) | (outWidth - 1));
++	_SetVpu(VPP_HSC_REGION4_ENDP, outWidth - 1);
++	_SetVpu(VPP_HSC_START_PHASE_STEP, stepX);
++	for (uint32 i = 0; i < 4; i++)
++		_SetVpu(VPP_HSC_REGION0_PHASE_SLOPE + i, 0);
++	_SetVpu(VPP_HSC_PHASE_CTRL, (1 << 21) | (4 << 16));
++		// initial: repeat pixel 0 once, receive 4 pixels; phase 0
++	_SetVpu(VPP_VSC_REGION12_STARTP, 0);
++	_SetVpu(VPP_VSC_REGION34_STARTP,
++		((outHeight - 1) << 16) | (outHeight - 1));
++	_SetVpu(VPP_VSC_REGION4_ENDP, outHeight - 1);
++	_SetVpu(VPP_VSC_START_PHASE_STEP, stepY);
++	for (uint32 i = 0; i < 4; i++)
++		_SetVpu(VPP_VSC_REGION0_PHASE_SLOPE + i, 0);
++	_SetVpu(VPP_VSC_INI_PHASE, 0);
++	_SetVpu(VPP_VSC_PHASE_CTRL, (1 << 13) | (4 << 8) | (1 << 5) | 4);
++		// bottom and top field: repeat line 0 once, receive 4 lines
++	_SetVpu(VPP_SC_MISC, VPP_VSC_BANK_LENGTH(4) | VPP_HSC_BANK_LENGTH(4)
++		| VPP_SC_VD_OUT | VPP_SC_TOP | VPP_SC_HSC | VPP_SC_VSC);
++	_SetVpu(VPP_POSTBLEND_VD1_H_START_END, ((uint32)left << 16) | right);
++	_SetVpu(VPP_POSTBLEND_VD1_V_START_END, ((uint32)top << 16) | bottom);
++
++	_SetVpu(VIU_OSD1_CTRL_STAT2,
++		_Vpu(VIU_OSD1_CTRL_STAT2) & ~OSD_REPLACE_ALPHA);
++	_SetVpu(VPP_MISC, _Vpu(VPP_MISC) | VPP_VD1_PREBLEND | VPP_VD1_POSTBLEND);
++}
++
++
++void
++MesonHdmi::_DisableVideoLayer()
++{
++	_SetVpu(VPP_MISC,
++		_Vpu(VPP_MISC) & ~(VPP_VD1_PREBLEND | VPP_VD1_POSTBLEND));
++	_SetVpu(VD1_IF0_GEN_REG, _Vpu(VD1_IF0_GEN_REG) & ~VD_ENABLE);
++	_SetVpu(VIU_OSD1_CTRL_STAT2,
++		_Vpu(VIU_OSD1_CTRL_STAT2) | OSD_REPLACE_ALPHA);
++}
++
++
++void
++MesonHdmi::_HideOverlay()
++{
++	_DisableVideoLayer();
++	fOverlay.buffer = -1;
++	fOverlayPhysical = 0;
++}
++
++
++/*!	For KDL: the canvas byte order of the video layer, applied at once. */
++void
++MesonHdmi::SetOverlayEndian(uint32 endian)
++{
++	fOverlayEndian = endian & 0xf;
++	if (fOverlay.buffer >= 0)
++		_ApplyOverlay();
++}
++
++
++void
++MesonHdmi::DumpOverlay()
++{
++	const meson_hdmi_overlay_config& config = fOverlay;
++	kprintf("meson_hdmi overlay: buffer %" B_PRId32 " (%#" B_PRIxPHYSADDR
++		"), canvas %#" B_PRIx32 ", endian %" B_PRIu32 "\n", config.buffer,
++		fOverlayPhysical, kVideoCanvas[fOverlayCanvas], fOverlayEndian);
++	kprintf("  %ux%u, %" B_PRIu32 " bytes per row; source %u,%u %ux%u; "
++		"window %" B_PRId32 ",%" B_PRId32 " %" B_PRIu32 "x%" B_PRIu32 "\n",
++		config.width, config.height, config.bytes_per_row, config.source_left,
++		config.source_top, config.source_width, config.source_height,
++		config.left, config.top, config.window_width, config.window_height);
++	for (uint32 i = 0; i < kMaxOverlayBuffers; i++) {
++		if (fOverlayBuffers[i].pagesArea >= 0) {
++			kprintf("  buffer %" B_PRId32 ": %#" B_PRIxPHYSADDR ", %" B_PRIuSIZE
++				" bytes\n", fOverlayBuffers[i].mapArea,
++				fOverlayBuffers[i].physical, fOverlayBuffers[i].size);
++		}
++	}
++	static const struct {
++		const char*	name;
++		uint32		first;
++		uint32		count;
++	} kRanges[] = {
++		{ "VD1_IF0", VD1_IF0_GEN_REG, 0x1e },
++		{ "VPP scaler", VPP_LINE_IN_LENGTH, 0x1d },
++		{ "VPP blend", VPP_PREBLEND_H_SIZE, 0x7 },
++	};
++	for (size_t r = 0; r < B_COUNT_OF(kRanges); r++) {
++		kprintf("  %s:", kRanges[r].name);
++		for (uint32 i = 0; i < kRanges[r].count; i++) {
++			if (i % 8 == 0)
++				kprintf("\n    %04" B_PRIx32 ":", kRanges[r].first + i);
++			kprintf(" %08" B_PRIx32, _Vpu(kRanges[r].first + i));
++		}
++		kprintf("\n");
++	}
++	kprintf("  OSD1 W0 %#" B_PRIx32 ", stat2 %#" B_PRIx32 "\n",
++		_Vpu(VIU_OSD1_BLK0_CFG_W0), _Vpu(VIU_OSD1_CTRL_STAT2));
++}
++
++
+ /*!	The ports take an address, then data. On GXBB the address has to be
+ 	written twice, and the data read twice (the first read returns stale
+ 	data). One spinlock covers both ports.
+@@ -1128,6 +1596,26 @@ dump_meson_hdmi(int argc, char** argv)
+ 		kprintf("meson_hdmi: boot mode restored (U-Boot's frame buffer)\n");
+ 		return 0;
+ 	}
++	if (argc > 1 && strcmp(argv[1], "overlay") == 0) {
++		sDevice->DumpOverlay();
++		return 0;
++	}
++	if (argc > 2 && strcmp(argv[1], "endian") == 0) {
++		sDevice->SetOverlayEndian(parse_expression(argv[2]));
++		return 0;
++	}
++	if (argc > 2 && strcmp(argv[1], "vpu") == 0) {
++		uint32 word = parse_expression(argv[2]);
++		if (word >= kVpuSize / 4) {
++			kprintf("meson_hdmi: register word out of range\n");
++			return 0;
++		}
++		if (argc > 3)
++			sDevice->WriteVpu(word, parse_expression(argv[3]));
++		kprintf("VPU %#" B_PRIx32 ": %#" B_PRIx32 "\n", word,
++			sDevice->ReadVpu(word));
++		return 0;
++	}
+ 	sDevice->DumpState();
+ 	return 0;
+ }
+@@ -1179,8 +1667,12 @@ init_driver(device_node* node, void** _cookie)
+ 		return status;
+ 	}
+ 	sDevice = device;
+-	add_debugger_command("meson_hdmi", &dump_meson_hdmi,
+-		"Show the Meson HDMI display state; \"restore\": U-Boot's mode");
++	add_debugger_command_etc("meson_hdmi", &dump_meson_hdmi,
++		"Show the Meson HDMI display state",
++		"[restore | overlay | endian <n> | vpu <word> [<value>]]\n"
++		"Shows the display state; or puts U-Boot's mode back, shows the\n"
++		"video overlay, sets its canvas byte order (0-15), or reads or\n"
++		"writes a VPU register.\n", 0);
+ 	*_cookie = device;
+ 	return B_OK;
+ }
+@@ -1301,6 +1793,40 @@ device_control(void* cookie, uint32 op, void* buffer, size_t length)
+ 		case MESON_HDMI_GET_DEVICE_NAME:
+ 			return user_strlcpy((char*)buffer, "graphics/meson_hdmi/0",
+ 				B_PATH_NAME_LENGTH) < 0 ? B_BAD_ADDRESS : B_OK;
++
++		case MESON_HDMI_ALLOCATE_OVERLAY_BUFFER:
++		{
++			meson_hdmi_overlay_buffer overlayBuffer;
++			if (user_memcpy(&overlayBuffer, buffer, sizeof(overlayBuffer))
++					!= B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			status_t status = device->AllocateOverlayBuffer(overlayBuffer);
++			if (status != B_OK)
++				return status;
++			if (user_memcpy(buffer, &overlayBuffer, sizeof(overlayBuffer))
++					!= B_OK) {
++				device->FreeOverlayBuffer(overlayBuffer.area);
++				return B_BAD_ADDRESS;
++			}
++			return B_OK;
++		}
++
++		case MESON_HDMI_FREE_OVERLAY_BUFFER:
++		{
++			area_id area;
++			if (user_memcpy(&area, buffer, sizeof(area)) != B_OK)
++				return B_BAD_ADDRESS;
++			return device->FreeOverlayBuffer(area);
++		}
++
++		case MESON_HDMI_CONFIGURE_OVERLAY:
++		{
++			meson_hdmi_overlay_config config;
++			if (user_memcpy(&config, buffer, sizeof(config)) != B_OK)
++				return B_BAD_ADDRESS;
++			return device->ConfigureOverlay(config);
++		}
+ 	}
+ 	return B_DEV_INVALID_IOCTL;
+ }

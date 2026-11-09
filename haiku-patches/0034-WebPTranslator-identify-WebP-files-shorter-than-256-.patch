@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 19:45:20 -0400
+Subject: [PATCH 034/342] WebPTranslator: identify WebP files shorter than 256
+ bytes
+
+DerivedIdentify() read a fixed 256 byte header and gave up when the
+file was shorter, which small lossless (VP8L) images are.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/translators/webp/WebPTranslator.cpp | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/src/add-ons/translators/webp/WebPTranslator.cpp b/src/add-ons/translators/webp/WebPTranslator.cpp
+index 54447049c5..6eb5e9b22c 100644
+--- a/src/add-ons/translators/webp/WebPTranslator.cpp
++++ b/src/add-ons/translators/webp/WebPTranslator.cpp
+@@ -137,10 +137,13 @@ WebPTranslator::DerivedIdentify(BPositionIO* stream,
+ 	if (outType != B_TRANSLATOR_BITMAP)
+ 		return B_NO_TRANSLATOR;
+ 
+-	// Read header and first chunck bytes...
++	// Read header and first chunck bytes (a small lossless image can be
++	// shorter than the buffer)...
+ 	uint32 buf[64];
+-	ssize_t size = sizeof(buf);
+-	if (stream->Read(buf, size) != size)
++	ssize_t size = stream->Read(buf, sizeof(buf));
++	if (size < 0)
++		return size;
++	if (size < 16)
+ 		return B_IO_ERROR;
+ 
+ 	// Check it's a valid WebP format

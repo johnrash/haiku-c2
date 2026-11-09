@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 11:04:15 -0400
+Subject: [PATCH 058/342] dwc2: power the USB ports anew at every start
+
+VBUS stayed on across a warm reboot, so a device that had got stuck
+stayed stuck: a USB audio adapter, unplugged and replugged while in use,
+answered no control transfer any more, through the reboot. VBUS is now
+off for half a second before the hub comes out of reset, as after
+powering on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/busses/usb/dwc2.cpp | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.cpp b/src/add-ons/kernel/busses/usb/dwc2.cpp
+index 5a18629cd8..09212b2ba4 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2.cpp
+@@ -304,12 +304,17 @@ DWC2::_InitPlatform()
+ 	snooze(1000);
+ 
+ 	// GPIOAO_4 (hub reset) and GPIOAO_5 (VBUS) as plain outputs: hub held
+-	// in reset, VBUS on. Only these two bits are touched: GPIOAO_3 in the
+-	// same register selects the SD card's I/O voltage.
++	// in reset, VBUS off for a while, then on. After a warm reboot VBUS was
++	// still on: a device that got stuck before (a USB audio adapter
++	// unplugged and replugged while in use) would stay stuck, as it would
++	// not be powered up anew. Only these two bits are touched: GPIOAO_3 in
++	// the same register selects the SD card's I/O voltage.
+ 	ao.Clear(kAoPinMux, kAoPinMuxGpioAo45);
+ 	uint32 gpio = ao.Read(kAoGpioOutput);
+ 	gpio &= ~((1 << kGpioAoHubReset) | (1 << kGpioAoVbus));
+-	gpio &= ~(1 << (16 + kGpioAoHubReset));
++	gpio &= ~((1 << (16 + kGpioAoHubReset)) | (1 << (16 + kGpioAoVbus)));
++	ao.Write(kAoGpioOutput, gpio);
++	snooze(500000);
+ 	gpio |= 1 << (16 + kGpioAoVbus);
+ 	ao.Write(kAoGpioOutput, gpio);
+ 	snooze(1000);

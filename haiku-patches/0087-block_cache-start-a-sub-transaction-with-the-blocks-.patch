@@ -1,0 +1,254 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 09:07:48 -0400
+Subject: [PATCH 087/342] block_cache: start a sub transaction with the blocks
+ changed since
+
+cache_start_sub_transaction() walked every block of the transaction to
+move the previous sub transaction's changes up to the parent. BFS starts
+a sub transaction for every change it combines into a transaction, which
+grows to thousands of blocks while many small files are created: 11% of
+the kernel's time creating 4000 files on the ODROID-C2.
+
+A block the previous sub transaction didn't change, add or discard is
+already as the walk leaves it (its parent data is its current data, or a
+discarded block has neither parent nor original data). The transaction
+now keeps a list of the blocks that were (cached_block's
+sub_transaction_next), and only the first sub transaction walks all
+blocks. Ending, aborting or detaching empties the list first.
+
+BLOCK_CACHE_DEBUG_SUB_TRANSACTIONS checks that every block left out is
+in that state; it is on in this commit for testing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/kernel/cache/block_cache.cpp | 115 +++++++++++++++++++++++-
+ 1 file changed, 112 insertions(+), 3 deletions(-)
+
+diff --git a/src/system/kernel/cache/block_cache.cpp b/src/system/kernel/cache/block_cache.cpp
+index 4f684ee998..0a515f3f01 100644
+--- a/src/system/kernel/cache/block_cache.cpp
++++ b/src/system/kernel/cache/block_cache.cpp
+@@ -56,6 +56,10 @@
+ // system, like out of memory situations - should only panic for debugging.
+ #define FATAL(x) panic x
+ 
++// Checks at every cache_start_sub_transaction() that the blocks it leaves out
++// need nothing done (check_sub_transaction_list()); walks all blocks.
++#define BLOCK_CACHE_DEBUG_SUB_TRANSACTIONS 1
++
+ static const bigtime_t kTransactionIdleTime = 2000000LL;
+ 	// a transaction is considered idle after 2 seconds of inactivity
+ 
+@@ -70,6 +74,9 @@ typedef DoublyLinkedListLink<cached_block> block_link;
+ struct cached_block {
+ 	cached_block*	next;			// next in hash
+ 	cached_block*	transaction_next;
++	cached_block*	sub_transaction_next;
++		// next of the blocks changed in the current sub transaction, see
++		// add_to_sub_transaction_list()
+ 	block_link		link;
+ 	off_t			block_number;
+ 	void*			current_data;
+@@ -101,6 +108,7 @@ struct cached_block {
+ 	bool			discard : 1;
+ 	bool			busy_reading_waiters : 1;
+ 	bool			busy_writing_waiters : 1;
++	bool			in_sub_transaction_list : 1;
+ 	cache_transaction* transaction;
+ 		// This is the current active transaction, if any, the block is
+ 		// currently in (meaning was changed as a part of it).
+@@ -278,6 +286,9 @@ struct cache_transaction {
+ 	int32			main_num_blocks;
+ 	int32			sub_num_blocks;
+ 	cached_block*	first_block;
++	cached_block*	first_sub_block;
++		// the blocks changed, added or discarded since the sub transaction
++		// started
+ 	block_list		blocks;
+ 	ListenerList	listeners;
+ 	bool			open;
+@@ -1055,6 +1066,7 @@ cache_transaction::cache_transaction()
+ 	main_num_blocks = 0;
+ 	sub_num_blocks = 0;
+ 	first_block = NULL;
++	first_sub_block = NULL;
+ 	open = true;
+ 	has_sub_transaction = false;
+ 	last_used = system_time();
+@@ -1062,6 +1074,79 @@ cache_transaction::cache_transaction()
+ }
+ 
+ 
++/*!	Remembers that \a block was changed, added or discarded in the current
++	sub transaction of \a transaction. cache_start_sub_transaction() only
++	needs to visit those blocks: it leaves every block with its parent data
++	being its current data (or, if discarded, with none), and a block not
++	touched since is still that way.
++*/
++static inline void
++add_to_sub_transaction_list(cache_transaction* transaction,
++	cached_block* block)
++{
++	if (!transaction->has_sub_transaction || block->in_sub_transaction_list)
++		return;
++
++	block->sub_transaction_next = transaction->first_sub_block;
++	transaction->first_sub_block = block;
++	block->in_sub_transaction_list = true;
++}
++
++
++#if BLOCK_CACHE_DEBUG_SUB_TRANSACTIONS
++/*!	Panics if a block of \a transaction that is not in the list of blocks
++	changed in the current sub transaction is not as
++	cache_start_sub_transaction() leaves it. Walks all blocks: slow.
++*/
++static void
++check_sub_transaction_list(cache_transaction* transaction)
++{
++	int32 checked = 0;
++	for (cached_block* block = transaction->first_block; block != NULL;
++			block = block->transaction_next) {
++		if (block->in_sub_transaction_list)
++			continue;
++		checked++;
++		bool asLeft = block->discard
++			? block->parent_data == NULL && block->original_data == NULL
++			: block->parent_data == block->current_data;
++		if (!asLeft) {
++			panic("block %" B_PRIdOFF " (%p) changed in the sub transaction "
++				"but not listed: parent %p, current %p, original %p, "
++				"discard %d", block->block_number, block, block->parent_data,
++				block->current_data, block->original_data, block->discard);
++		}
++	}
++#ifdef _KERNEL_MODE
++	static int32 sChecks = 0;
++	if ((++sChecks % 5000) == 0) {
++		dprintf("block cache: sub transaction check %" B_PRId32 ": %" B_PRId32
++			" blocks as left\n", sChecks, checked);
++	}
++#else
++	(void)checked;
++#endif
++}
++#endif	// BLOCK_CACHE_DEBUG_SUB_TRANSACTIONS
++
++
++/*!	Empties the list of blocks changed in the current sub transaction; before
++	blocks can leave the transaction.
++*/
++static void
++clear_sub_transaction_list(cache_transaction* transaction)
++{
++	cached_block* block = transaction->first_sub_block;
++	while (block != NULL) {
++		cached_block* next = block->sub_transaction_next;
++		block->sub_transaction_next = NULL;
++		block->in_sub_transaction_list = false;
++		block = next;
++	}
++	transaction->first_sub_block = NULL;
++}
++
++
+ static void
+ delete_transaction(block_cache* cache, cache_transaction* transaction)
+ {
+@@ -1786,6 +1871,8 @@ block_cache::NewBlock(off_t blockNumber)
+ 	block->discard = false;
+ 	block->busy_reading_waiters = false;
+ 	block->busy_writing_waiters = false;
++	block->sub_transaction_next = NULL;
++	block->in_sub_transaction_list = false;
+ #if BLOCK_CACHE_DEBUG_CHANGED
+ 	block->compare = NULL;
+ #endif
+@@ -2381,6 +2468,9 @@ get_writable_cached_block(block_cache* cache, off_t blockNumber,
+ 		&& block->parent_data == NULL && wasUnchanged)
+ 		transaction->sub_num_blocks++;
+ 
++	if (transaction != NULL)
++		add_to_sub_transaction_list(transaction, block);
++
+ 	if (cleared) {
+ 		mark_block_busy_reading(cache, block);
+ 		rw_lock_write_unlock(&cache->lock);
+@@ -3187,6 +3277,7 @@ cache_end_transaction(void* _cache, int32 id,
+ 	// iterate through all blocks and free the unchanged original contents
+ 
+ 	cached_block* next;
++	clear_sub_transaction_list(transaction);
+ 	for (cached_block* block = transaction->first_block; block != NULL;
+ 			block = next) {
+ 		next = block->transaction_next;
+@@ -3240,6 +3331,7 @@ cache_abort_transaction(void* _cache, int32 id)
+ 
+ 	// iterate through all blocks and restore their original contents
+ 
++	clear_sub_transaction_list(transaction);
+ 	cached_block* block = transaction->first_block;
+ 	cached_block* next;
+ 	for (; block != NULL; block = next) {
+@@ -3314,6 +3406,7 @@ cache_detach_sub_transaction(void* _cache, int32 id,
+ 
+ 	cached_block* last = NULL;
+ 	cached_block* next;
++	clear_sub_transaction_list(transaction);
+ 	for (cached_block* block = transaction->first_block; block != NULL;
+ 			block = next) {
+ 		next = block->transaction_next;
+@@ -3398,6 +3491,7 @@ cache_abort_sub_transaction(void* _cache, int32 id)
+ 
+ 	// revert all changes back to the version of the parent
+ 
++	clear_sub_transaction_list(transaction);
+ 	cached_block* block = transaction->first_block;
+ 	cached_block* last = NULL;
+ 	cached_block* next;
+@@ -3479,12 +3573,24 @@ cache_start_sub_transaction(void* _cache, int32 id)
+ 
+ 	notify_transaction_listeners(cache, transaction, TRANSACTION_ENDED);
+ 
+-	// move all changed blocks up to the parent
++	// move all changed blocks up to the parent: all blocks when the first sub
++	// transaction starts, then only those changed in the sub transaction
++	// before (the others are as this leaves them). BFS starts one for every
++	// change it combines into a transaction, which can grow to thousands of
++	// blocks.
+ 
+-	cached_block* block = transaction->first_block;
++#if BLOCK_CACHE_DEBUG_SUB_TRANSACTIONS
++	if (transaction->has_sub_transaction)
++		check_sub_transaction_list(transaction);
++#endif
++
++	const bool allBlocks = !transaction->has_sub_transaction;
++	cached_block* block = allBlocks
++		? transaction->first_block : transaction->first_sub_block;
+ 	cached_block* next;
+ 	for (; block != NULL; block = next) {
+-		next = block->transaction_next;
++		next = allBlocks
++			? block->transaction_next : block->sub_transaction_next;
+ 
+ 		if (block->parent_data != NULL) {
+ 			// There already is an older sub transaction - we acknowledge
+@@ -3511,6 +3617,7 @@ cache_start_sub_transaction(void* _cache, int32 id)
+ 		// the data (and allocate memory for it) until we need to
+ 		block->parent_data = block->current_data;
+ 	}
++	clear_sub_transaction_list(transaction);
+ 
+ 	// all subsequent changes will go into the sub transaction
+ 	transaction->has_sub_transaction = true;
+@@ -3857,6 +3964,8 @@ block_cache_discard(void* _cache, off_t blockNumber, size_t numBlocks)
+ 
+ 			// mark it as discarded (in the current transaction only, if any)
+ 			block->discard = true;
++			if (block->transaction != NULL)
++				add_to_sub_transaction_list(block->transaction, block);
+ 		}
+ 	}
+ }

@@ -1,0 +1,129 @@
+diff --git a/drivers/video/meson/meson_dw_hdmi.c b/drivers/video/meson/meson_dw_hdmi.c
+index 1631dc38..7ee69361 100644
+--- a/drivers/video/meson/meson_dw_hdmi.c
++++ b/drivers/video/meson/meson_dw_hdmi.c
+@@ -363,14 +363,24 @@ static int meson_dw_hdmi_wait_hpd(struct dw_hdmi *hdmi)
+ {
+ 	int i;
+ 
+-	/* Poll 1 second for HPD signal */
+-	for (i = 0; i < 10; ++i) {
+-		if (dw_hdmi_top_read(hdmi, HDMITX_TOP_STAT0))
++	/*
++	 * Poll up to 20 seconds for the HPD signal. Some sinks (USB HDMI
++	 * capture dongles) take about 10 s after the source powers up before
++	 * they assert hot-plug; with the stock 1 s U-Boot falls back to CVBS.
++	 */
++	for (i = 0; i < 200; ++i) {
++		if (dw_hdmi_top_read(hdmi, HDMITX_TOP_STAT0)) {
++			if (i >= 10)
++				printf("HDMI: hot-plug after %d ms\n", i * 100);
+ 			return 0;
++		}
+ 
++		if (i == 10)
++			printf("HDMI: waiting for hot-plug...\n");
+ 		mdelay(100);
+ 	}
+ 
++	printf("HDMI: no hot-plug, no HDMI output\n");
+ 	return -ETIMEDOUT;
+ }
+ 
+diff --git a/drivers/video/meson/meson_vpu.c b/drivers/video/meson/meson_vpu.c
+index a686faf9..a4b7ca41 100644
+--- a/drivers/video/meson/meson_vpu.c
++++ b/drivers/video/meson/meson_vpu.c
+@@ -12,6 +12,7 @@
+ #include <fdt_support.h>
+ #include <log.h>
+ #include <part.h>
++#include <linux/delay.h>
+ #include <linux/sizes.h>
+ #include <asm/arch/mem.h>
+ #include <asm/global_data.h>
+@@ -41,6 +42,59 @@ bool meson_vpu_is_compatible(struct meson_vpu_priv *priv,
+ 	return compat == family;
+ }
+ 
++/* Common CEA/DMT sizes the encoder can drive */
++static bool meson_vpu_standard_size(const struct display_timing *t)
++{
++	static const u16 sizes[][2] = {
++		{ 640, 480 }, { 720, 480 }, { 720, 576 }, { 800, 600 },
++		{ 1024, 768 }, { 1280, 720 }, { 1280, 800 }, { 1280, 1024 },
++		{ 1360, 768 }, { 1366, 768 }, { 1440, 900 }, { 1600, 900 },
++		{ 1680, 1050 }, { 1920, 1080 }, { 1920, 1200 },
++	};
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(sizes); i++) {
++		if (t->hactive.typ == sizes[i][0] && t->vactive.typ == sizes[i][1])
++			return true;
++	}
++	return false;
++}
++
++/*
++ * Right after power-up some sinks (USB HDMI capture dongles) do not answer
++ * EDID reads yet, or answer with a half-initialised EDID that decodes to a
++ * nonsense mode (seen: 1100x1100 at 195 MHz). Accept a mode only when two
++ * reads 500 ms apart agree and it has a standard size; retry for up to 10 s.
++ */
++static int meson_vpu_read_stable_timing(struct udevice *disp,
++					struct display_timing *timing)
++{
++	struct display_timing prev;
++	bool have_prev = false;
++	int tries, ret = -ENODEV;
++
++	for (tries = 0; tries < 20; tries++) {
++		if (tries)
++			mdelay(500);
++		ret = display_read_timing(disp, timing);
++		if (ret || !meson_vpu_standard_size(timing)) {
++			have_prev = false;
++			continue;
++		}
++		if (have_prev && prev.hactive.typ == timing->hactive.typ
++		    && prev.vactive.typ == timing->vactive.typ
++		    && prev.pixelclock.typ == timing->pixelclock.typ) {
++			printf("HDMI: %dx%d, %d Hz pixel clock, after %d EDID reads\n",
++			       timing->hactive.typ, timing->vactive.typ,
++			       timing->pixelclock.typ, tries + 1);
++			return 0;
++		}
++		prev = *timing;
++		have_prev = true;
++	}
++	return ret ? ret : -EINVAL;
++}
++
+ static int meson_vpu_setup_mode(struct udevice *dev, struct udevice *disp)
+ {
+ 	struct video_uc_plat *uc_plat = dev_get_uclass_plat(dev);
+@@ -50,9 +104,9 @@ static int meson_vpu_setup_mode(struct udevice *dev, struct udevice *disp)
+ 	int ret = 0;
+ 
+ 	if (disp) {
+-		ret = display_read_timing(disp, &timing);
++		ret = meson_vpu_read_stable_timing(disp, &timing);
+ 		if (ret) {
+-			debug("%s: Failed to read timings\n", __func__);
++			printf("HDMI: no stable EDID mode (%d), using CVBS\n", ret);
+ 			goto cvbs;
+ 		}
+ 
+@@ -60,8 +114,11 @@ static int meson_vpu_setup_mode(struct udevice *dev, struct udevice *disp)
+ 		uc_priv->ysize = timing.vactive.typ;
+ 
+ 		ret = display_enable(disp, 0, &timing);
+-		if (ret)
++		if (ret) {
++			printf("HDMI: enabling %dx%d failed (%d), using CVBS\n",
++			       timing.hactive.typ, timing.vactive.typ, ret);
+ 			goto cvbs;
++		}
+ 	} else {
+ cvbs:
+ 		/* CVBS has a fixed 720x480i (NTSC) and 720x576i (PAL) */

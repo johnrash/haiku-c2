@@ -1,0 +1,1880 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Mon, 2 Nov 2026 12:38:15 -0500
+Subject: [PATCH 258/342] meson_gpio: Hardkernel's 16x2 LCD + IO Shield as
+ /dev/misc/shield
+
+With "lcd_io_shield true" in meson_gpio's driver settings (the shield
+can't be detected), three devices on the header's pins, as the shield's
+schematic has them (headers/private/drivers/lcd_shield.h):
+
+- lcd: the HD44780 display in 4-bit mode, written only (its R/W is
+  tied low), with the datasheet's times instead of the busy flag. Text
+  in UTF-8, mapped to the A00 character set; '\n' goes to the next line
+  and clears it, scrolling from the second, once something follows it;
+  '\r', '\f', '\b', '\t'; eight user characters. Reading it gives the
+  two lines. ioctls for the cursor, the position, clearing, the display
+  and the codes shown.
+- leds: D1 to D7, written and read as "1010101".
+- buttons: SW1 and SW2 with the pins' pull-ups, sampled every 10 ms
+  while open and debounced over two samples; reading gives "SW1
+  pressed" lines, every open file all events; an ioctl waits for one.
+
+The pins are claimed from meson_header as "LCD shield" when a device is
+first opened and kept. The shield uses meson_gpio through new in-kernel
+calls (ClaimPins, SetOutputs, WriteLevels, ReadLevels, SetPulls); the
+class moved to MesonGpio.h for it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/drivers/lcd_shield.h          |  111 ++
+ .../kernel/drivers/misc/meson_gpio/Jamfile    |    1 +
+ .../drivers/misc/meson_gpio/LcdShield.h       |  139 +++
+ .../drivers/misc/meson_gpio/MesonGpio.h       |  176 +++
+ .../drivers/misc/meson_gpio/lcd_shield.cpp    | 1059 +++++++++++++++++
+ .../drivers/misc/meson_gpio/meson_gpio.cpp    |  228 ++--
+ 6 files changed, 1575 insertions(+), 139 deletions(-)
+ create mode 100644 headers/private/drivers/lcd_shield.h
+ create mode 100644 src/add-ons/kernel/drivers/misc/meson_gpio/LcdShield.h
+ create mode 100644 src/add-ons/kernel/drivers/misc/meson_gpio/MesonGpio.h
+ create mode 100644 src/add-ons/kernel/drivers/misc/meson_gpio/lcd_shield.cpp
+
+diff --git a/headers/private/drivers/lcd_shield.h b/headers/private/drivers/lcd_shield.h
+new file mode 100644
+index 0000000000..78d796dd14
+--- /dev/null
++++ b/headers/private/drivers/lcd_shield.h
+@@ -0,0 +1,111 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef _LCD_SHIELD_H
++#define _LCD_SHIELD_H
++
++
++#include <Drivers.h>
++
++
++/*!	Hardkernel's 16x2 LCD + IO Shield on the ODROID-C2's header, driven by
++	meson_gpio when "lcd_io_shield true" is in its driver settings
++	(~/config/settings/kernel/drivers/meson_gpio): the shield can't be
++	detected. Three devices; each takes its pins from GPIO when it is first
++	opened and keeps them.
++
++	lcd: the HD44780 character display, two lines of 16. Text written to it
++	appears at the cursor, UTF-8 mapped to the display's character set
++	(ASCII, and the few others it has: ° µ π Ω Σ √ ∞ ÷ ä ö ü ñ α β ε θ σ
++	ρ ¢ ¥ → ← █; anything else is '?'). Bytes 0 to 7 are the characters
++	defined with LCD_SHIELD_DEFINE_CHARACTER. '\n' goes to the start of the
++	next line and clears it, scrolling the display up from the second one,
++	but only once something follows (so that echo's newline doesn't scroll
++	the text away); '\r' to the start of the line, '\f' clears the display,
++	'\b' goes back one, '\t' to the next multiple of four. Text past the end
++	of a line goes on to the next. Reading it gives the two lines.
++
++	leds: the seven LEDs D1 to D7. Write '0' and '1', D1 first ("1010101");
++	other characters are skipped, and fewer than seven set the first ones.
++	Reading gives the same form. They stay as set when the file is closed.
++
++	buttons: SW1 and SW2. Reading waits for a press or a release and gives
++	a line for each ("SW1 pressed", "SW2 released"); every open file sees
++	every event from its open on. O_NONBLOCK reads return B_WOULD_BLOCK when
++	there is none. The buttons are sampled every 10 ms while the device is
++	open, and a change counts once it holds for two samples.
++*/
++
++
++#define LCD_SHIELD_LCD_DEVICE		"/dev/misc/shield/lcd"
++#define LCD_SHIELD_LEDS_DEVICE		"/dev/misc/shield/leds"
++#define LCD_SHIELD_BUTTONS_DEVICE	"/dev/misc/shield/buttons"
++
++#define LCD_SHIELD_COLUMNS			16
++#define LCD_SHIELD_ROWS				2
++#define LCD_SHIELD_LEDS				7
++#define LCD_SHIELD_BUTTONS			2
++
++
++enum {
++	// lcd
++	LCD_SHIELD_CLEAR = B_DEVICE_OP_CODES_END + 0x4c43,
++		// no argument: clear, cursor home
++	LCD_SHIELD_SET_POSITION,
++		// lcd_shield_position: where the next character goes
++	LCD_SHIELD_GET_POSITION,
++		// lcd_shield_position
++	LCD_SHIELD_SET_CURSOR,
++		// uint32: LCD_SHIELD_CURSOR_*
++	LCD_SHIELD_SET_DISPLAY,
++		// uint32: 0 off (the text is kept), 1 on
++	LCD_SHIELD_DEFINE_CHARACTER,
++		// lcd_shield_character: one of the eight user characters
++	LCD_SHIELD_GET_TEXT,
++		// lcd_shield_text: the display's character codes, as shown
++
++	// leds
++	LCD_SHIELD_SET_LEDS,
++		// uint32: bit 0 D1 to bit 6 D7, 1 lit
++	LCD_SHIELD_GET_LEDS,
++		// uint32
++
++	// buttons
++	LCD_SHIELD_GET_BUTTONS,
++		// uint32: bit 0 SW1, bit 1 SW2, 1 pressed
++	LCD_SHIELD_WAIT_BUTTON,
++		// lcd_shield_button_event: in timeout, out the next event of this
++		// file; B_TIMED_OUT, B_INTERRUPTED
++};
++
++enum {
++	LCD_SHIELD_CURSOR_OFF,
++	LCD_SHIELD_CURSOR_UNDERLINE,
++	LCD_SHIELD_CURSOR_BLINK,
++};
++
++struct lcd_shield_position {
++	uint32		row;			// 0 or 1
++	uint32		column;			// 0 to 15
++};
++
++struct lcd_shield_character {
++	uint32		code;			// 0 to 7
++	uint8		rows[8];		// five pixels each, bit 4 the left one
++};
++
++struct lcd_shield_text {
++	uint8		codes[LCD_SHIELD_ROWS][LCD_SHIELD_COLUMNS];
++};
++
++struct lcd_shield_button_event {
++	bigtime_t	timeout;		// in: relative, or B_INFINITE_TIMEOUT
++	uint32		button;			// 0 SW1, 1 SW2
++	uint32		pressed;
++	bigtime_t	when;			// system_time() of the change
++	uint32		missed;			// events lost before it (32 kept)
++};
++
++
++#endif	// _LCD_SHIELD_H
+diff --git a/src/add-ons/kernel/drivers/misc/meson_gpio/Jamfile b/src/add-ons/kernel/drivers/misc/meson_gpio/Jamfile
+index e66c0f0676..dfd15c53e2 100644
+--- a/src/add-ons/kernel/drivers/misc/meson_gpio/Jamfile
++++ b/src/add-ons/kernel/drivers/misc/meson_gpio/Jamfile
+@@ -6,5 +6,6 @@ UsePrivateHeaders drivers ;
+ if $(TARGET_ARCH) = arm64 {
+ 	KernelAddon meson_gpio :
+ 		meson_gpio.cpp
++		lcd_shield.cpp
+ 	;
+ }
+diff --git a/src/add-ons/kernel/drivers/misc/meson_gpio/LcdShield.h b/src/add-ons/kernel/drivers/misc/meson_gpio/LcdShield.h
+new file mode 100644
+index 0000000000..ad84114048
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/misc/meson_gpio/LcdShield.h
+@@ -0,0 +1,139 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef LCD_SHIELD_PRIVATE_H
++#define LCD_SHIELD_PRIVATE_H
++
++
++#include <condition_variable.h>
++#include <device_manager.h>
++#include <lock.h>
++
++#include <lcd_shield.h>
++
++#include "MesonGpio.h"
++
++
++#define LCD_SHIELD_DEVICE_MODULE_NAME \
++	"drivers/misc/meson_gpio/lcd_shield/device_v1"
++
++extern struct device_module_info gLcdShieldDevice;
++
++
++enum {
++	LCD_SHIELD_PART_LCD,
++	LCD_SHIELD_PART_LEDS,
++	LCD_SHIELD_PART_BUTTONS,
++};
++
++
++/*!	An open file of one of the shield's devices. */
++struct lcd_shield_cookie {
++	class LcdShield*	shield;
++	uint32				part;
++	int					openMode;
++	uint32				nextEvent;		// buttons: the next one to read
++	bool				closed;
++};
++
++
++/*!	Hardkernel's 16x2 LCD + IO Shield on the header (see lcd_shield.h): its
++	HD44780 display, LEDs and buttons, through meson_gpio's pins.
++*/
++class LcdShield {
++public:
++	static	const char* const	kDevicePaths[];
++	static	bool				Configured();
++
++								LcdShield(MesonGpio* gpio);
++								~LcdShield();
++
++			status_t			Open(lcd_shield_cookie* cookie);
++			void				Close(lcd_shield_cookie* cookie);
++			void				Free(lcd_shield_cookie* cookie);
++			status_t			Read(lcd_shield_cookie* cookie,
++									off_t position, void* buffer,
++									size_t* _length);
++			status_t			Write(lcd_shield_cookie* cookie,
++									const void* buffer, size_t* _length);
++			status_t			Control(lcd_shield_cookie* cookie, uint32 op,
++									void* buffer, size_t length);
++
++private:
++	struct ButtonEvent {
++		uint8		button;
++		bool		pressed;
++		bigtime_t	when;
++	};
++
++	enum { kEventCount = 32 };
++
++			// lcd
++			status_t			_LcdStart();
++			void				_Nibble(uint8 value, bool data);
++			void				_Send(uint8 value, bool data,
++									bigtime_t wait = 50);
++			void				_GoTo(uint32 row, uint32 column);
++			void				_PutCode(uint8 code);
++			void				_NewLine();
++			void				_Clear();
++			void				_ShowCursor();
++			void				_DisplayControl();
++			void				_Character(uint32 character);
++			status_t			_LcdWrite(const char* buffer, size_t length);
++			status_t			_LcdRead(off_t position, void* buffer,
++									size_t* _length);
++			status_t			_LcdControl(uint32 op, void* buffer,
++									size_t length);
++
++			// leds
++			status_t			_LedsStart();
++			status_t			_LedsWrite(const char* buffer, size_t length);
++			status_t			_LedsRead(off_t position, void* buffer,
++									size_t* _length);
++
++			// buttons
++			status_t			_ButtonsStart();
++			void				_ButtonsStop();
++	static	status_t			_ButtonThread(void* self);
++			void				_SampleButtons();
++			status_t			_WaitButton(lcd_shield_cookie* cookie,
++									bigtime_t timeout,
++									lcd_shield_button_event& event);
++			status_t			_ButtonsRead(lcd_shield_cookie* cookie,
++									void* buffer, size_t* _length);
++
++			MesonGpio*			fGpio;
++			mutex				fLock;
++
++			gpio_cookie			fLcdPins;
++			bool				fLcdStarted;
++			uint8				fText[LCD_SHIELD_ROWS][LCD_SHIELD_COLUMNS];
++			uint32				fRow;
++			uint32				fColumn;
++			int32				fAddress;	// the display's next one, -1
++			bool				fPendingNewline;
++			uint32				fCursor;
++			bool				fDisplayOn;
++			uint32				fUtf8Value;
++			uint32				fUtf8Remaining;
++
++			gpio_cookie			fLedPins;
++			bool				fLedsStarted;
++			uint32				fLeds;
++
++			gpio_cookie			fButtonPins;
++			bool				fButtonsClaimed;
++			int32				fButtonUsers;
++			thread_id			fButtonThread;
++			volatile bool		fButtonQuit;
++			uint32				fButtonsDown;	// stable state
++			uint32				fButtonsLast;	// the last sample
++			ButtonEvent			fEvents[kEventCount];
++			uint32				fEventCount;	// ever
++			ConditionVariable	fButtonCondition;
++};
++
++
++#endif	// LCD_SHIELD_PRIVATE_H
+diff --git a/src/add-ons/kernel/drivers/misc/meson_gpio/MesonGpio.h b/src/add-ons/kernel/drivers/misc/meson_gpio/MesonGpio.h
+new file mode 100644
+index 0000000000..f64bdbb29f
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/misc/meson_gpio/MesonGpio.h
+@@ -0,0 +1,176 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef MESON_GPIO_PRIVATE_H
++#define MESON_GPIO_PRIVATE_H
++
++
++#include <KernelExport.h>
++
++#include <condition_variable.h>
++#include <device_manager.h>
++#include <lock.h>
++
++#include <meson_gpio.h>
++
++
++static const uint32 kChannelCount = 8;
++static const uint32 kEdgeQueueSize = 32;
++static const uint32 kMaxPins = 32;
++
++static const uint32 kInterruptBlock = 0x880;
++
++
++class LcdShield;
++class MesonGpio;
++struct PwmPin;
++
++/*!	An open file: the pins it claimed (indexes into the header module's
++	table), in the order of their bits.
++*/
++struct gpio_cookie {
++	MesonGpio*	gpio;
++	uint32		count;
++	uint8		pins[32];
++};
++
++
++struct EdgeEvent {
++	bigtime_t	when;
++	uint8		edge;
++	uint8		level;
++};
++
++/*!	A pin whose edges are recorded: its channels, rising and falling, and
++	the edges waiting to be read.
++*/
++struct EdgeRecorder {
++	gpio_cookie*		owner;
++	uint8				edges;
++	uint8				channels[2];
++	bool				settling;
++	uint32				first;
++	uint32				count;
++	uint32				missed;
++	EdgeEvent			queue[kEdgeQueueSize];
++	ConditionVariable	condition;
++};
++
++struct EdgeChannel {
++	MesonGpio*	gpio;
++	bool		used;
++	uint8		index;		// the pin's
++	uint8		edge;		// MESON_GPIO_EDGE_*
++};
++
++
++class MesonGpio {
++public:
++								MesonGpio(device_node* node);
++								~MesonGpio();
++
++			status_t			Init();
++			device_node*		Node() const { return fNode; }
++
++			status_t			Read(off_t position, char* buffer,
++									size_t* _length);
++			status_t			Write(const char* buffer, size_t length);
++			status_t			Control(gpio_cookie* cookie, uint32 op,
++									void* buffer, size_t length);
++			void				Close(gpio_cookie* cookie);
++			void				Free(gpio_cookie* cookie);
++
++			// for users in the kernel (the LCD + IO shield): what the ioctls
++			// do, with kernel memory; a pin's bit is its place in the claim
++			status_t			ClaimPins(gpio_cookie* cookie,
++									const uint8* pins, uint32 count,
++									const char* use);
++			void				SetOutputs(gpio_cookie* cookie,
++									uint32 outputs);
++			void				WriteLevels(gpio_cookie* cookie,
++									uint32 levels);
++			uint32				ReadLevels(gpio_cookie* cookie);
++			void				SetPulls(gpio_cookie* cookie, uint32 bits,
++									uint32 pull);
++
++			LcdShield*			Shield() const { return fShield; }
++			void				SetShield(LcdShield* shield)
++									{ fShield = shield; }
++
++private:
++	struct SavedPin {
++		bool		saved;
++		const char*	function;
++		bool		input, output, pull, pullEnable;
++	};
++
++	struct PwmState {
++		bool		active;		// a PWM output, or a constant level for one
++		uint8		duty;		// the 8-bit duty cycle, last set or nearest
++		uint32		period;		// nanoseconds
++		uint32		high;
++	};
++
++			volatile uint32&	_Word(uint32 offset, uint32 word)
++									{ return fRegisters[(offset + word * 4)
++										/ 4]; }
++			bool				_Get(uint32 offset, uint32 word, uint32 bit)
++									{ return (_Word(offset, word) >> bit) & 1; }
++			void				_Set(uint32 offset, uint32 word, uint32 bit,
++									bool value);
++			bool				_Input(uint32 index);
++			bool				_Level(uint32 index);
++
++			status_t			_Command(char* line);
++			status_t			_Configure(uint32 index, bool output,
++									bool level, int pull);
++			status_t			_Release(uint32 index);
++			void				_Save(uint32 index);
++			void				_SetDirection(uint32 index, bool output);
++			void				_SetPull(uint32 index, uint32 pull);
++			void				_SetOutputLevel(uint32 index, bool level);
++			const PwmPin*		_PwmPin(uint32 index);
++			void				_DisablePwm(uint32 index);
++			status_t			_SetPwm(uint32 index, uint32 divider,
++									uint32 cycles, uint32 high);
++			status_t			_SetPwmPeriod(uint32 index, uint32 period,
++									uint32 high);
++			status_t			_Claim(gpio_cookie* cookie,
++									const meson_gpio_pins& pins,
++									const char* use);
++			status_t			_PinInfo(meson_gpio_pin_info& info);
++
++			volatile uint32&	_InterruptWord(uint32 word)
++									{ return fInterruptRegisters[
++										kInterruptBlock / 4 + word]; }
++			void				_SetChannel(uint32 channel, uint32 input,
++									bool falling);
++			status_t			_SetEdges(gpio_cookie* cookie, uint32 index,
++									uint32 edges);
++			void				_StopEdges(uint32 index);
++			status_t			_WaitEdge(gpio_cookie* cookie,
++									meson_gpio_edge& edge);
++	static	int32				_EdgeInterrupt(void* data);
++
++			device_node*		fNode;
++			area_id				fArea;
++			volatile uint32*	fRegisters;
++			area_id				fPwmArea;
++			volatile uint32*	fPwmRegisters;
++			area_id				fInterruptArea;
++			volatile uint32*	fInterruptRegisters;
++			mutex				fLock;
++			spinlock			fEdgeLock;
++				// the recorders, the channels and the interrupt block
++			uint32				fPinCount;
++			SavedPin			fSaved[kMaxPins];
++			PwmState			fPwm[kMaxPins];
++			EdgeRecorder		fRecorders[kMaxPins];
++			EdgeChannel			fChannels[kChannelCount];
++			LcdShield*			fShield;
++};
++
++
++
++#endif	// MESON_GPIO_PRIVATE_H
+diff --git a/src/add-ons/kernel/drivers/misc/meson_gpio/lcd_shield.cpp b/src/add-ons/kernel/drivers/misc/meson_gpio/lcd_shield.cpp
+new file mode 100644
+index 0000000000..c0d1e3ebcb
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/misc/meson_gpio/lcd_shield.cpp
+@@ -0,0 +1,1059 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * Hardkernel's 16x2 LCD + IO Shield ("ODROID-C 16x2 LCD + IO Kit", 2014) on
++ * the ODROID-C2's header: /dev/misc/shield/lcd, leds and buttons, published
++ * by meson_gpio when its driver settings have "lcd_io_shield true". The
++ * devices are described in headers/private/drivers/lcd_shield.h.
++ *
++ * The shield's schematic (header pins):
++ *   - the LCD, an HD44780 compatible SCM1602A on 5 V, in 4-bit mode: RS 7,
++ *     E 11, D4 13, D5 15, D6 12, D7 16; its R/W is tied low, so it is only
++ *     written, and its busy flag can't be read: commands get the
++ *     datasheet's time instead (37 us, 1.52 ms to clear or go home);
++ *   - LEDs D1 to D7 on pins 29, 31, 33, 35, 36, 32, 26, each through
++ *     3.9 kOhm to ground: high is lit;
++ *   - SW1 on pin 18, SW2 on pin 22, closing to ground, with no resistor:
++ *     the pins' pull-ups are turned on.
++ *
++ * The pins are claimed from meson_header (as "LCD shield") when a device is
++ * first opened, and kept until the driver goes: the LCD's E line must not
++ * float, and the LEDs keep what was written. The LCD is started then, by
++ * the datasheet's initialization by instruction into 4-bit mode.
++ *
++ * The HD44780's A00 character set is ASCII from 0x20 to 0x7d (but 0x5c is
++ * a yen sign, 0x7e and 0x7f arrows), katakana, and a few Greek and
++ * accented letters and symbols at 0xdf to 0xff: the UTF-8 written is mapped
++ * onto them (kCharacters), anything else becomes '?'.
++ */
++
++
++#include "LcdShield.h"
++
++#include <fcntl.h>
++#include <new>
++#include <stdio.h>
++#include <string.h>
++
++#include <KernelExport.h>
++#include <driver_settings.h>
++#include <util/AutoLock.h>
++
++
++#define INFO(x...) dprintf("meson_gpio: shield: " x)
++
++
++// the LCD's pins, in the order of their bits
++static const uint8 kLcdPins[] = { 7, 11, 13, 15, 12, 16 };
++static const uint32 kRS = 1 << 0;
++static const uint32 kE = 1 << 1;
++static const uint32 kDataShift = 2;
++
++static const uint8 kLedPins[] = { 29, 31, 33, 35, 36, 32, 26 };
++static const uint8 kButtonPins[] = { 18, 22 };
++
++static const bigtime_t kButtonPeriod = 10000;
++
++// HD44780 instructions
++enum {
++	LCD_CLEAR			= 0x01,
++	LCD_ENTRY_MODE		= 0x04,
++		LCD_ENTRY_INCREMENT	= 0x02,
++	LCD_DISPLAY_CONTROL	= 0x08,
++		LCD_DISPLAY_ON		= 0x04,
++		LCD_CURSOR_ON		= 0x02,
++		LCD_BLINK_ON		= 0x01,
++	LCD_FUNCTION_SET	= 0x20,
++		LCD_TWO_LINES		= 0x08,
++	LCD_SET_CGRAM		= 0x40,
++	LCD_SET_DDRAM		= 0x80,
++};
++
++static const bigtime_t kLongInstruction = 2000;
++	// clear and home: 1.52 ms
++
++static const uint8 kUnknown = '?';
++
++
++// characters outside ASCII that the A00 character set has, and its codes
++// that aren't ASCII's characters
++struct Character {
++	uint32	unicode;
++	uint8	code;
++};
++
++static const Character kCharacters[] = {
++	{ 0x00a5, 0x5c },	// ¥ (where ASCII has '\')
++	{ 0x2192, 0x7e },	// →
++	{ 0x2190, 0x7f },	// ←
++	{ 0x00b7, 0xa5 },	// ·
++	{ 0x00b0, 0xdf },	// °
++	{ 0x03b1, 0xe0 },	// α
++	{ 0x00e4, 0xe1 },	// ä
++	{ 0x03b2, 0xe2 },	// β
++	{ 0x00df, 0xe2 },	// ß, the same picture
++	{ 0x03b5, 0xe3 },	// ε
++	{ 0x00b5, 0xe4 },	// µ
++	{ 0x03bc, 0xe4 },	// μ
++	{ 0x03c3, 0xe5 },	// σ
++	{ 0x03c1, 0xe6 },	// ρ
++	{ 0x221a, 0xe8 },	// √
++	{ 0x00a2, 0xec },	// ¢
++	{ 0x00f1, 0xee },	// ñ
++	{ 0x00f6, 0xef },	// ö
++	{ 0x03b8, 0xf2 },	// θ
++	{ 0x221e, 0xf3 },	// ∞
++	{ 0x03a9, 0xf4 },	// Ω
++	{ 0x00fc, 0xf5 },	// ü
++	{ 0x03a3, 0xf6 },	// Σ
++	{ 0x03c0, 0xf7 },	// π
++	{ 0x00f7, 0xfd },	// ÷
++	{ 0x2588, 0xff },	// █
++};
++
++
++static uint8
++code_for(uint32 unicode)
++{
++	if (unicode >= 0x20 && unicode <= 0x7d && unicode != '\\')
++		return (uint8)unicode;
++	for (size_t i = 0; i < B_COUNT_OF(kCharacters); i++) {
++		if (kCharacters[i].unicode == unicode)
++			return kCharacters[i].code;
++	}
++	return kUnknown;
++}
++
++
++/*!	What a code shows, as UTF-8 (the user characters as '?'). */
++static size_t
++utf8_for(uint8 code, char* buffer)
++{
++	uint32 unicode = kUnknown;
++	if (code >= 0x20 && code <= 0x7d && code != 0x5c)
++		unicode = code;
++	else {
++		for (size_t i = 0; i < B_COUNT_OF(kCharacters); i++) {
++			if (kCharacters[i].code == code) {
++				unicode = kCharacters[i].unicode;
++				break;
++			}
++		}
++	}
++	if (unicode < 0x80) {
++		buffer[0] = (char)unicode;
++		return 1;
++	}
++	if (unicode < 0x800) {
++		buffer[0] = (char)(0xc0 | (unicode >> 6));
++		buffer[1] = (char)(0x80 | (unicode & 0x3f));
++		return 2;
++	}
++	buffer[0] = (char)(0xe0 | (unicode >> 12));
++	buffer[1] = (char)(0x80 | ((unicode >> 6) & 0x3f));
++	buffer[2] = (char)(0x80 | (unicode & 0x3f));
++	return 3;
++}
++
++
++/*!	Copies what remains of \a text from \a position to the user's buffer. */
++static status_t
++read_text(const char* text, size_t textLength, off_t position, void* buffer,
++	size_t* _length)
++{
++	if (position >= (off_t)textLength) {
++		*_length = 0;
++		return B_OK;
++	}
++	size_t length = min_c(*_length, textLength - (size_t)position);
++	if (user_memcpy(buffer, text + position, length) != B_OK)
++		return B_BAD_ADDRESS;
++	*_length = length;
++	return B_OK;
++}
++
++
++const char* const LcdShield::kDevicePaths[] = {
++	"misc/shield/lcd",
++	"misc/shield/leds",
++	"misc/shield/buttons",
++	NULL
++};
++
++
++/*static*/ bool
++LcdShield::Configured()
++{
++	void* settings = load_driver_settings("meson_gpio");
++	if (settings == NULL)
++		return false;
++	bool configured = get_driver_boolean_parameter(settings, "lcd_io_shield",
++		false, true);
++	unload_driver_settings(settings);
++	return configured;
++}
++
++
++LcdShield::LcdShield(MesonGpio* gpio)
++	:
++	fGpio(gpio),
++	fLcdStarted(false),
++	fRow(0),
++	fColumn(0),
++	fAddress(-1),
++	fPendingNewline(false),
++	fCursor(LCD_SHIELD_CURSOR_OFF),
++	fDisplayOn(true),
++	fUtf8Value(0),
++	fUtf8Remaining(0),
++	fLedsStarted(false),
++	fLeds(0),
++	fButtonsClaimed(false),
++	fButtonUsers(0),
++	fButtonThread(-1),
++	fButtonQuit(false),
++	fButtonsDown(0),
++	fButtonsLast(0),
++	fEventCount(0)
++{
++	mutex_init(&fLock, "lcd shield");
++	fButtonCondition.Init(this, "lcd shield buttons");
++	fLcdPins.gpio = fLedPins.gpio = fButtonPins.gpio = gpio;
++	fLcdPins.count = fLedPins.count = fButtonPins.count = 0;
++	memset(fText, ' ', sizeof(fText));
++}
++
++
++LcdShield::~LcdShield()
++{
++	_ButtonsStop();
++	// the pins become inputs again; the LCD keeps its text
++	fGpio->Free(&fLcdPins);
++	fGpio->Free(&fLedPins);
++	fGpio->Free(&fButtonPins);
++	mutex_destroy(&fLock);
++}
++
++
++status_t
++LcdShield::Open(lcd_shield_cookie* cookie)
++{
++	MutexLocker locker(fLock);
++	switch (cookie->part) {
++		case LCD_SHIELD_PART_LCD:
++			return _LcdStart();
++		case LCD_SHIELD_PART_LEDS:
++			return _LedsStart();
++		case LCD_SHIELD_PART_BUTTONS:
++		{
++			status_t status = _ButtonsStart();
++			if (status != B_OK)
++				return status;
++			fButtonUsers++;
++			cookie->nextEvent = fEventCount;
++			return B_OK;
++		}
++	}
++	return B_BAD_VALUE;
++}
++
++
++void
++LcdShield::Close(lcd_shield_cookie* cookie)
++{
++	if (cookie->part != LCD_SHIELD_PART_BUTTONS)
++		return;
++	// a read waiting for this file returns
++	MutexLocker locker(fLock);
++	cookie->closed = true;
++	fButtonCondition.NotifyAll();
++}
++
++
++void
++LcdShield::Free(lcd_shield_cookie* cookie)
++{
++	if (cookie->part != LCD_SHIELD_PART_BUTTONS)
++		return;
++	bool last;
++	{
++		MutexLocker locker(fLock);
++		last = --fButtonUsers == 0;
++	}
++	if (last)
++		_ButtonsStop();
++}
++
++
++status_t
++LcdShield::Read(lcd_shield_cookie* cookie, off_t position, void* buffer,
++	size_t* _length)
++{
++	switch (cookie->part) {
++		case LCD_SHIELD_PART_LCD:
++		{
++			MutexLocker locker(fLock);
++			return _LcdRead(position, buffer, _length);
++		}
++		case LCD_SHIELD_PART_LEDS:
++		{
++			MutexLocker locker(fLock);
++			return _LedsRead(position, buffer, _length);
++		}
++		case LCD_SHIELD_PART_BUTTONS:
++			return _ButtonsRead(cookie, buffer, _length);
++	}
++	return B_BAD_VALUE;
++}
++
++
++status_t
++LcdShield::Write(lcd_shield_cookie* cookie, const void* buffer,
++	size_t* _length)
++{
++	char chunk[128];
++	size_t done = 0;
++	while (done < *_length) {
++		size_t length = min_c(*_length - done, sizeof(chunk));
++		if (user_memcpy(chunk, (const char*)buffer + done, length) != B_OK)
++			return B_BAD_ADDRESS;
++		MutexLocker locker(fLock);
++		status_t status;
++		switch (cookie->part) {
++			case LCD_SHIELD_PART_LCD:
++				status = _LcdWrite(chunk, length);
++				break;
++			case LCD_SHIELD_PART_LEDS:
++				status = _LedsWrite(chunk, length);
++				break;
++			default:
++				status = B_NOT_ALLOWED;
++				break;
++		}
++		if (status != B_OK)
++			return status;
++		done += length;
++	}
++	return B_OK;
++}
++
++
++status_t
++LcdShield::Control(lcd_shield_cookie* cookie, uint32 op, void* buffer,
++	size_t length)
++{
++	switch (cookie->part) {
++		case LCD_SHIELD_PART_LCD:
++		{
++			MutexLocker locker(fLock);
++			return _LcdControl(op, buffer, length);
++		}
++
++		case LCD_SHIELD_PART_LEDS:
++		{
++			MutexLocker locker(fLock);
++			if (op == LCD_SHIELD_SET_LEDS) {
++				uint32 leds;
++				if (user_memcpy(&leds, buffer, sizeof(leds)) != B_OK)
++					return B_BAD_ADDRESS;
++				fLeds = leds & ((1u << LCD_SHIELD_LEDS) - 1);
++				fGpio->WriteLevels(&fLedPins, fLeds);
++				return B_OK;
++			}
++			if (op == LCD_SHIELD_GET_LEDS)
++				return user_memcpy(buffer, &fLeds, sizeof(fLeds));
++			return B_DEV_INVALID_IOCTL;
++		}
++
++		case LCD_SHIELD_PART_BUTTONS:
++		{
++			if (op == LCD_SHIELD_GET_BUTTONS) {
++				MutexLocker locker(fLock);
++				return user_memcpy(buffer, &fButtonsDown,
++					sizeof(fButtonsDown));
++			}
++			if (op == LCD_SHIELD_WAIT_BUTTON) {
++				lcd_shield_button_event event;
++				if (user_memcpy(&event, buffer, sizeof(event)) != B_OK)
++					return B_BAD_ADDRESS;
++				status_t status = _WaitButton(cookie, event.timeout, event);
++				if (status != B_OK)
++					return status;
++				return user_memcpy(buffer, &event, sizeof(event));
++			}
++			return B_DEV_INVALID_IOCTL;
++		}
++	}
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++//	#pragma mark - LCD
++
++
++status_t
++LcdShield::_LcdStart()
++{
++	if (fLcdStarted)
++		return B_OK;
++	status_t status = fGpio->ClaimPins(&fLcdPins, kLcdPins,
++		B_COUNT_OF(kLcdPins), "LCD shield");
++	if (status != B_OK)
++		return status;
++	fGpio->WriteLevels(&fLcdPins, 0);
++	fGpio->SetOutputs(&fLcdPins, (1u << B_COUNT_OF(kLcdPins)) - 1);
++	snooze(50000);
++
++	// initialization by instruction: three times 8-bit mode, whatever mode
++	// the display was in, then 4-bit
++	_Nibble(0x3, false);
++	snooze(4500);
++	_Nibble(0x3, false);
++	snooze(150);
++	_Nibble(0x3, false);
++	snooze(150);
++	_Nibble(0x2, false);
++	snooze(150);
++	_Send(LCD_FUNCTION_SET | LCD_TWO_LINES, false);
++	_Send(LCD_DISPLAY_CONTROL, false);
++	_Clear();
++	_Send(LCD_ENTRY_MODE | LCD_ENTRY_INCREMENT, false);
++	fDisplayOn = true;
++	fCursor = LCD_SHIELD_CURSOR_OFF;
++	_DisplayControl();
++	fLcdStarted = true;
++	INFO("LCD started\n");
++	return B_OK;
++}
++
++
++void
++LcdShield::_Nibble(uint8 value, bool data)
++{
++	uint32 levels = (data ? kRS : 0) | ((uint32)(value & 0xf) << kDataShift);
++	fGpio->WriteLevels(&fLcdPins, levels);
++	fGpio->WriteLevels(&fLcdPins, levels | kE);
++	spin(1);
++		// E high for at least 450 ns
++	fGpio->WriteLevels(&fLcdPins, levels);
++		// taken on its falling edge
++}
++
++
++void
++LcdShield::_Send(uint8 value, bool data, bigtime_t wait)
++{
++	_Nibble(value >> 4, data);
++	_Nibble(value, data);
++	if (wait >= 1000)
++		snooze(wait);
++	else
++		spin(wait);
++}
++
++
++void
++LcdShield::_GoTo(uint32 row, uint32 column)
++{
++	int32 address = (row == 0 ? 0x00 : 0x40) + column;
++	if (address == fAddress)
++		return;
++	_Send(LCD_SET_DDRAM | address, false);
++	fAddress = address;
++}
++
++
++void
++LcdShield::_PutCode(uint8 code)
++{
++	if (fPendingNewline) {
++		fPendingNewline = false;
++		_NewLine();
++	}
++	if (fColumn >= LCD_SHIELD_COLUMNS)
++		_NewLine();
++	_GoTo(fRow, fColumn);
++	_Send(code, true);
++	fAddress++;
++	fText[fRow][fColumn++] = code;
++}
++
++
++/*!	The start of the next line, cleared; from the second line, the display
++	scrolls up.
++*/
++void
++LcdShield::_NewLine()
++{
++	if (fRow == 0)
++		fRow = 1;
++	else {
++		memcpy(fText[0], fText[1], LCD_SHIELD_COLUMNS);
++		_GoTo(0, 0);
++		for (uint32 column = 0; column < LCD_SHIELD_COLUMNS; column++) {
++			_Send(fText[0][column], true);
++			fAddress++;
++		}
++	}
++	memset(fText[fRow], ' ', LCD_SHIELD_COLUMNS);
++	_GoTo(fRow, 0);
++	for (uint32 column = 0; column < LCD_SHIELD_COLUMNS; column++) {
++		_Send(' ', true);
++		fAddress++;
++	}
++	fColumn = 0;
++}
++
++
++void
++LcdShield::_Clear()
++{
++	_Send(LCD_CLEAR, false, kLongInstruction);
++	memset(fText, ' ', sizeof(fText));
++	fRow = fColumn = 0;
++	fAddress = 0;
++	fPendingNewline = false;
++}
++
++
++/*!	A visible cursor stands where the next character goes. */
++void
++LcdShield::_ShowCursor()
++{
++	if (fCursor == LCD_SHIELD_CURSOR_OFF)
++		return;
++	uint32 row = fRow;
++	uint32 column = fColumn;
++	if (fPendingNewline) {
++		row = 1;
++		column = 0;
++	}
++	_GoTo(row, min_c(column, (uint32)LCD_SHIELD_COLUMNS - 1));
++}
++
++
++void
++LcdShield::_DisplayControl()
++{
++	uint8 control = LCD_DISPLAY_CONTROL;
++	if (fDisplayOn)
++		control |= LCD_DISPLAY_ON;
++	if (fCursor != LCD_SHIELD_CURSOR_OFF)
++		control |= LCD_CURSOR_ON;
++	if (fCursor == LCD_SHIELD_CURSOR_BLINK)
++		control |= LCD_BLINK_ON;
++	_Send(control, false);
++}
++
++
++void
++LcdShield::_Character(uint32 character)
++{
++	switch (character) {
++		case '\n':
++			if (fPendingNewline)
++				_NewLine();
++			fPendingNewline = true;
++			return;
++		case '\r':
++			fPendingNewline = false;
++			fColumn = 0;
++			return;
++		case '\f':
++			_Clear();
++			return;
++		case '\b':
++			if (fPendingNewline)
++				fPendingNewline = false;
++			else if (fColumn > 0)
++				fColumn--;
++			return;
++		case '\t':
++			do {
++				_PutCode(' ');
++			} while (fColumn % 4 != 0 && fColumn < LCD_SHIELD_COLUMNS);
++			return;
++	}
++	if (character < 8) {
++		// a user character
++		_PutCode((uint8)character);
++		return;
++	}
++	if (character < 0x20 || character == 0x7f)
++		return;
++	_PutCode(code_for(character));
++}
++
++
++status_t
++LcdShield::_LcdWrite(const char* buffer, size_t length)
++{
++	for (size_t i = 0; i < length; i++) {
++		uint8 byte = buffer[i];
++		if (fUtf8Remaining > 0) {
++			if ((byte & 0xc0) == 0x80) {
++				fUtf8Value = (fUtf8Value << 6) | (byte & 0x3f);
++				if (--fUtf8Remaining == 0)
++					_Character(fUtf8Value);
++				continue;
++			}
++			// a broken sequence
++			fUtf8Remaining = 0;
++			_Character(kUnknown);
++		}
++		if (byte < 0x80)
++			_Character(byte);
++		else if ((byte & 0xe0) == 0xc0) {
++			fUtf8Value = byte & 0x1f;
++			fUtf8Remaining = 1;
++		} else if ((byte & 0xf0) == 0xe0) {
++			fUtf8Value = byte & 0x0f;
++			fUtf8Remaining = 2;
++		} else if ((byte & 0xf8) == 0xf0) {
++			fUtf8Value = byte & 0x07;
++			fUtf8Remaining = 3;
++		} else
++			_Character(kUnknown);
++	}
++	_ShowCursor();
++	return B_OK;
++}
++
++
++status_t
++LcdShield::_LcdRead(off_t position, void* buffer, size_t* _length)
++{
++	char text[LCD_SHIELD_ROWS * (LCD_SHIELD_COLUMNS * 3 + 1)];
++	size_t length = 0;
++	for (uint32 row = 0; row < LCD_SHIELD_ROWS; row++) {
++		for (uint32 column = 0; column < LCD_SHIELD_COLUMNS; column++)
++			length += utf8_for(fText[row][column], text + length);
++		text[length++] = '\n';
++	}
++	return read_text(text, length, position, buffer, _length);
++}
++
++
++status_t
++LcdShield::_LcdControl(uint32 op, void* buffer, size_t length)
++{
++	switch (op) {
++		case LCD_SHIELD_CLEAR:
++			_Clear();
++			_ShowCursor();
++			return B_OK;
++
++		case LCD_SHIELD_SET_POSITION:
++		{
++			lcd_shield_position position;
++			if (user_memcpy(&position, buffer, sizeof(position)) != B_OK)
++				return B_BAD_ADDRESS;
++			if (position.row >= LCD_SHIELD_ROWS
++				|| position.column >= LCD_SHIELD_COLUMNS) {
++				return B_BAD_VALUE;
++			}
++			fRow = position.row;
++			fColumn = position.column;
++			fPendingNewline = false;
++			_ShowCursor();
++			return B_OK;
++		}
++
++		case LCD_SHIELD_GET_POSITION:
++		{
++			lcd_shield_position position;
++			position.row = fPendingNewline ? 1 : fRow;
++			position.column = fPendingNewline ? 0
++				: min_c(fColumn, (uint32)LCD_SHIELD_COLUMNS - 1);
++			return user_memcpy(buffer, &position, sizeof(position));
++		}
++
++		case LCD_SHIELD_SET_CURSOR:
++		{
++			uint32 cursor;
++			if (user_memcpy(&cursor, buffer, sizeof(cursor)) != B_OK)
++				return B_BAD_ADDRESS;
++			if (cursor > LCD_SHIELD_CURSOR_BLINK)
++				return B_BAD_VALUE;
++			fCursor = cursor;
++			_DisplayControl();
++			_ShowCursor();
++			return B_OK;
++		}
++
++		case LCD_SHIELD_SET_DISPLAY:
++		{
++			uint32 on;
++			if (user_memcpy(&on, buffer, sizeof(on)) != B_OK)
++				return B_BAD_ADDRESS;
++			fDisplayOn = on != 0;
++			_DisplayControl();
++			return B_OK;
++		}
++
++		case LCD_SHIELD_DEFINE_CHARACTER:
++		{
++			lcd_shield_character character;
++			if (user_memcpy(&character, buffer, sizeof(character)) != B_OK)
++				return B_BAD_ADDRESS;
++			if (character.code > 7)
++				return B_BAD_VALUE;
++			_Send(LCD_SET_CGRAM | (character.code << 3), false);
++			for (uint32 i = 0; i < 8; i++)
++				_Send(character.rows[i] & 0x1f, true);
++			// the address counter is in CGRAM now
++			fAddress = -1;
++			_ShowCursor();
++			return B_OK;
++		}
++
++		case LCD_SHIELD_GET_TEXT:
++		{
++			lcd_shield_text text;
++			memcpy(text.codes, fText, sizeof(text.codes));
++			return user_memcpy(buffer, &text, sizeof(text));
++		}
++	}
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++//	#pragma mark - LEDs
++
++
++status_t
++LcdShield::_LedsStart()
++{
++	if (fLedsStarted)
++		return B_OK;
++	status_t status = fGpio->ClaimPins(&fLedPins, kLedPins,
++		B_COUNT_OF(kLedPins), "LCD shield");
++	if (status != B_OK)
++		return status;
++	fGpio->WriteLevels(&fLedPins, fLeds);
++	fGpio->SetOutputs(&fLedPins, (1u << B_COUNT_OF(kLedPins)) - 1);
++	fLedsStarted = true;
++	return B_OK;
++}
++
++
++status_t
++LcdShield::_LedsWrite(const char* buffer, size_t length)
++{
++	// each write, and each line, starts at D1
++	uint32 next = 0;
++	for (size_t i = 0; i < length; i++) {
++		char c = buffer[i];
++		if (c == '\n') {
++			next = 0;
++			continue;
++		}
++		if ((c != '0' && c != '1') || next >= LCD_SHIELD_LEDS)
++			continue;
++		if (c == '1')
++			fLeds |= 1u << next;
++		else
++			fLeds &= ~(1u << next);
++		next++;
++	}
++	fGpio->WriteLevels(&fLedPins, fLeds);
++	return B_OK;
++}
++
++
++status_t
++LcdShield::_LedsRead(off_t position, void* buffer, size_t* _length)
++{
++	char text[LCD_SHIELD_LEDS + 1];
++	for (uint32 i = 0; i < LCD_SHIELD_LEDS; i++)
++		text[i] = (fLeds >> i) & 1 ? '1' : '0';
++	text[LCD_SHIELD_LEDS] = '\n';
++	return read_text(text, sizeof(text), position, buffer, _length);
++}
++
++
++//	#pragma mark - buttons
++
++
++status_t
++LcdShield::_ButtonsStart()
++{
++	if (!fButtonsClaimed) {
++		status_t status = fGpio->ClaimPins(&fButtonPins, kButtonPins,
++			B_COUNT_OF(kButtonPins), "LCD shield");
++		if (status != B_OK)
++			return status;
++		fGpio->SetOutputs(&fButtonPins, 0);
++		fGpio->SetPulls(&fButtonPins, (1u << B_COUNT_OF(kButtonPins)) - 1,
++			MESON_GPIO_PULL_UP);
++		fButtonsClaimed = true;
++	}
++	if (fButtonThread >= 0)
++		return B_OK;
++
++	snooze(1000);
++		// for the pull-ups
++	fButtonsDown = fButtonsLast = ~fGpio->ReadLevels(&fButtonPins)
++		& ((1u << B_COUNT_OF(kButtonPins)) - 1);
++	fButtonQuit = false;
++	fButtonThread = spawn_kernel_thread(_ButtonThread, "lcd shield buttons",
++		B_NORMAL_PRIORITY, this);
++	if (fButtonThread < 0)
++		return fButtonThread;
++	resume_thread(fButtonThread);
++	return B_OK;
++}
++
++
++void
++LcdShield::_ButtonsStop()
++{
++	thread_id thread;
++	{
++		MutexLocker locker(fLock);
++		if (fButtonUsers > 0 || fButtonThread < 0)
++			return;
++		thread = fButtonThread;
++		fButtonThread = -1;
++		fButtonQuit = true;
++	}
++	status_t result;
++	wait_for_thread(thread, &result);
++}
++
++
++/*static*/ status_t
++LcdShield::_ButtonThread(void* self)
++{
++	LcdShield* shield = (LcdShield*)self;
++	while (!shield->fButtonQuit) {
++		shield->_SampleButtons();
++		snooze(kButtonPeriod);
++	}
++	return B_OK;
++}
++
++
++/*!	A change counts once two samples in a row agree on it. */
++void
++LcdShield::_SampleButtons()
++{
++	uint32 down = ~fGpio->ReadLevels(&fButtonPins)
++		& ((1u << B_COUNT_OF(kButtonPins)) - 1);
++	MutexLocker locker(fLock);
++	if (down == fButtonsLast && down != fButtonsDown) {
++		bigtime_t now = system_time();
++		for (uint32 button = 0; button < B_COUNT_OF(kButtonPins); button++) {
++			uint32 bit = 1u << button;
++			if (((down ^ fButtonsDown) & bit) == 0)
++				continue;
++			ButtonEvent& event = fEvents[fEventCount % kEventCount];
++			event.button = button;
++			event.pressed = (down & bit) != 0;
++			event.when = now;
++			fEventCount++;
++		}
++		fButtonsDown = down;
++		fButtonCondition.NotifyAll();
++	}
++	fButtonsLast = down;
++}
++
++
++status_t
++LcdShield::_WaitButton(lcd_shield_cookie* cookie, bigtime_t timeout,
++	lcd_shield_button_event& _event)
++{
++	bool forever = timeout == B_INFINITE_TIMEOUT;
++	bigtime_t deadline = forever ? 0 : system_time() + max_c(timeout,
++		(bigtime_t)0);
++
++	MutexLocker locker(fLock);
++	while (cookie->nextEvent == fEventCount) {
++		if (cookie->closed)
++			return B_FILE_ERROR;
++		if (!forever && system_time() >= deadline)
++			return B_TIMED_OUT;
++		ConditionVariableEntry entry;
++		fButtonCondition.Add(&entry);
++		locker.Unlock();
++		status_t status = entry.Wait(forever ? B_CAN_INTERRUPT
++			: B_CAN_INTERRUPT | B_ABSOLUTE_TIMEOUT, deadline);
++		locker.Lock();
++		if (status == B_INTERRUPTED)
++			return status;
++	}
++
++	uint32 missed = 0;
++	if (fEventCount - cookie->nextEvent > kEventCount) {
++		missed = fEventCount - kEventCount - cookie->nextEvent;
++		cookie->nextEvent = fEventCount - kEventCount;
++	}
++	const ButtonEvent& event = fEvents[cookie->nextEvent % kEventCount];
++	cookie->nextEvent++;
++	_event.button = event.button;
++	_event.pressed = event.pressed;
++	_event.when = event.when;
++	_event.missed = missed;
++	return B_OK;
++}
++
++
++status_t
++LcdShield::_ButtonsRead(lcd_shield_cookie* cookie, void* buffer,
++	size_t* _length)
++{
++	static const size_t kLineLength = 16;
++	if (*_length < kLineLength)
++		return B_BAD_VALUE;
++
++	// wait for one event, then take those that are there and fit
++	size_t length = 0;
++	char text[256];
++	bool nonBlocking = (cookie->openMode & O_NONBLOCK) != 0;
++	while (length + kLineLength <= min_c(*_length, sizeof(text))) {
++		lcd_shield_button_event event;
++		status_t status = _WaitButton(cookie,
++			length > 0 || nonBlocking ? 0 : B_INFINITE_TIMEOUT, event);
++		if (status == B_TIMED_OUT && length == 0 && nonBlocking)
++			return B_WOULD_BLOCK;
++		if (status != B_OK) {
++			if (length > 0)
++				break;
++			return status;
++		}
++		length += snprintf(text + length, sizeof(text) - length, "SW%u %s\n",
++			(unsigned)event.button + 1, event.pressed ? "pressed" : "released");
++	}
++	if (user_memcpy(buffer, text, length) != B_OK)
++		return B_BAD_ADDRESS;
++	*_length = length;
++	return B_OK;
++}
++
++
++//	#pragma mark - device module
++
++
++static status_t
++shield_init_device(void* driverCookie, void** _deviceCookie)
++{
++	*_deviceCookie = driverCookie;
++	return B_OK;
++}
++
++
++static void
++shield_uninit_device(void* deviceCookie)
++{
++}
++
++
++static status_t
++shield_open(void* deviceCookie, const char* path, int openMode,
++	void** _cookie)
++{
++	LcdShield* shield = ((MesonGpio*)deviceCookie)->Shield();
++	if (shield == NULL)
++		return B_NO_INIT;
++
++	const char* name = strrchr(path, '/');
++	name = name != NULL ? name + 1 : path;
++	uint32 part;
++	if (strcmp(name, "lcd") == 0)
++		part = LCD_SHIELD_PART_LCD;
++	else if (strcmp(name, "leds") == 0)
++		part = LCD_SHIELD_PART_LEDS;
++	else if (strcmp(name, "buttons") == 0)
++		part = LCD_SHIELD_PART_BUTTONS;
++	else
++		return B_ENTRY_NOT_FOUND;
++
++	lcd_shield_cookie* cookie = new(std::nothrow) lcd_shield_cookie;
++	if (cookie == NULL)
++		return B_NO_MEMORY;
++	cookie->shield = shield;
++	cookie->part = part;
++	cookie->openMode = openMode;
++	cookie->nextEvent = 0;
++	cookie->closed = false;
++	status_t status = shield->Open(cookie);
++	if (status != B_OK) {
++		delete cookie;
++		return status;
++	}
++	*_cookie = cookie;
++	return B_OK;
++}
++
++
++static status_t
++shield_close(void* _cookie)
++{
++	lcd_shield_cookie* cookie = (lcd_shield_cookie*)_cookie;
++	cookie->shield->Close(cookie);
++	return B_OK;
++}
++
++
++static status_t
++shield_free(void* _cookie)
++{
++	lcd_shield_cookie* cookie = (lcd_shield_cookie*)_cookie;
++	cookie->shield->Free(cookie);
++	delete cookie;
++	return B_OK;
++}
++
++
++static status_t
++shield_read(void* _cookie, off_t position, void* buffer, size_t* _length)
++{
++	lcd_shield_cookie* cookie = (lcd_shield_cookie*)_cookie;
++	return cookie->shield->Read(cookie, position, buffer, _length);
++}
++
++
++static status_t
++shield_write(void* _cookie, off_t position, const void* buffer,
++	size_t* _length)
++{
++	lcd_shield_cookie* cookie = (lcd_shield_cookie*)_cookie;
++	status_t status = cookie->shield->Write(cookie, buffer, _length);
++	if (status != B_OK)
++		*_length = 0;
++	return status;
++}
++
++
++static status_t
++shield_control(void* _cookie, uint32 op, void* buffer, size_t length)
++{
++	lcd_shield_cookie* cookie = (lcd_shield_cookie*)_cookie;
++	return cookie->shield->Control(cookie, op, buffer, length);
++}
++
++
++struct device_module_info gLcdShieldDevice = {
++	{
++		LCD_SHIELD_DEVICE_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	shield_init_device,
++	shield_uninit_device,
++	NULL,	// remove
++
++	shield_open,
++	shield_close,
++	shield_free,
++	shield_read,
++	shield_write,
++	NULL,	// io
++	shield_control,
++
++	NULL,	// select
++	NULL,	// deselect
++};
+diff --git a/src/add-ons/kernel/drivers/misc/meson_gpio/meson_gpio.cpp b/src/add-ons/kernel/drivers/misc/meson_gpio/meson_gpio.cpp
+index d279c3d98e..a2849809c6 100644
+--- a/src/add-ons/kernel/drivers/misc/meson_gpio/meson_gpio.cpp
++++ b/src/add-ons/kernel/drivers/misc/meson_gpio/meson_gpio.cpp
+@@ -71,6 +71,9 @@
+ #include <meson_gpio.h>
+ #include <meson_header.h>
+ 
++#include "LcdShield.h"
++#include "MesonGpio.h"
++
+ 
+ #define DRIVER_MODULE_NAME	"drivers/misc/meson_gpio/driver_v1"
+ #define DEVICE_MODULE_NAME	"drivers/misc/meson_gpio/device_v1"
+@@ -98,13 +101,10 @@ static const uint32 kDutyPeriod = 255;
+ // the GPIO interrupt block: edge bits [7:0] and polarity bits [23:16], then
+ // two words of 8-bit input numbers (channels 0 to 3, 4 to 7), then filters
+ static const phys_addr_t kInterruptPage = 0xc1109000;
+-static const uint32 kInterruptBlock = 0x880;
+-static const uint32 kChannelCount = 8;
+ static const int32 kFirstChannelVector = 96;
+ static const uint32 kNoInput = 255;
+ static const uint8 kFirstInput[] = { 106, 89, 59 };
+ 	// MESON_HEADER_BANK_X, _Y, _DV
+-static const uint32 kEdgeQueueSize = 32;
+ static const bigtime_t kEdgeSettle = 50;
+ 	// after a channel's setup, for the edge its switch may make
+ 
+@@ -136,7 +136,6 @@ static const PwmPin kPwmPins[] = {
+ 	{ 19, true, "PWM F" },
+ };
+ 
+-static const uint32 kMaxPins = 32;
+ static const uint8 kNoChannel = 0xff;
+ 
+ 
+@@ -144,135 +143,6 @@ static device_manager_info* gDeviceManager;
+ static meson_header_module_info* gHeader;
+ 
+ 
+-class MesonGpio;
+-
+-/*!	An open file: the pins it claimed (indexes into the header module's
+-	table), in the order of their bits.
+-*/
+-struct gpio_cookie {
+-	MesonGpio*	gpio;
+-	uint32		count;
+-	uint8		pins[32];
+-};
+-
+-
+-struct EdgeEvent {
+-	bigtime_t	when;
+-	uint8		edge;
+-	uint8		level;
+-};
+-
+-/*!	A pin whose edges are recorded: its channels, rising and falling, and
+-	the edges waiting to be read.
+-*/
+-struct EdgeRecorder {
+-	gpio_cookie*		owner;
+-	uint8				edges;
+-	uint8				channels[2];
+-	bool				settling;
+-	uint32				first;
+-	uint32				count;
+-	uint32				missed;
+-	EdgeEvent			queue[kEdgeQueueSize];
+-	ConditionVariable	condition;
+-};
+-
+-struct EdgeChannel {
+-	MesonGpio*	gpio;
+-	bool		used;
+-	uint8		index;		// the pin's
+-	uint8		edge;		// MESON_GPIO_EDGE_*
+-};
+-
+-
+-class MesonGpio {
+-public:
+-								MesonGpio(device_node* node);
+-								~MesonGpio();
+-
+-			status_t			Init();
+-			device_node*		Node() const { return fNode; }
+-
+-			status_t			Read(off_t position, char* buffer,
+-									size_t* _length);
+-			status_t			Write(const char* buffer, size_t length);
+-			status_t			Control(gpio_cookie* cookie, uint32 op,
+-									void* buffer, size_t length);
+-			void				Close(gpio_cookie* cookie);
+-			void				Free(gpio_cookie* cookie);
+-
+-private:
+-	struct SavedPin {
+-		bool		saved;
+-		const char*	function;
+-		bool		input, output, pull, pullEnable;
+-	};
+-
+-	struct PwmState {
+-		bool		active;		// a PWM output, or a constant level for one
+-		uint8		duty;		// the 8-bit duty cycle, last set or nearest
+-		uint32		period;		// nanoseconds
+-		uint32		high;
+-	};
+-
+-			volatile uint32&	_Word(uint32 offset, uint32 word)
+-									{ return fRegisters[(offset + word * 4)
+-										/ 4]; }
+-			bool				_Get(uint32 offset, uint32 word, uint32 bit)
+-									{ return (_Word(offset, word) >> bit) & 1; }
+-			void				_Set(uint32 offset, uint32 word, uint32 bit,
+-									bool value);
+-			bool				_Input(uint32 index);
+-			bool				_Level(uint32 index);
+-
+-			status_t			_Command(char* line);
+-			status_t			_Configure(uint32 index, bool output,
+-									bool level, int pull);
+-			status_t			_Release(uint32 index);
+-			void				_Save(uint32 index);
+-			void				_SetDirection(uint32 index, bool output);
+-			void				_SetPull(uint32 index, uint32 pull);
+-			void				_SetOutputLevel(uint32 index, bool level);
+-			const PwmPin*		_PwmPin(uint32 index);
+-			void				_DisablePwm(uint32 index);
+-			status_t			_SetPwm(uint32 index, uint32 divider,
+-									uint32 cycles, uint32 high);
+-			status_t			_SetPwmPeriod(uint32 index, uint32 period,
+-									uint32 high);
+-			status_t			_Claim(gpio_cookie* cookie,
+-									const meson_gpio_pins& pins);
+-			status_t			_PinInfo(meson_gpio_pin_info& info);
+-
+-			volatile uint32&	_InterruptWord(uint32 word)
+-									{ return fInterruptRegisters[
+-										kInterruptBlock / 4 + word]; }
+-			void				_SetChannel(uint32 channel, uint32 input,
+-									bool falling);
+-			status_t			_SetEdges(gpio_cookie* cookie, uint32 index,
+-									uint32 edges);
+-			void				_StopEdges(uint32 index);
+-			status_t			_WaitEdge(gpio_cookie* cookie,
+-									meson_gpio_edge& edge);
+-	static	int32				_EdgeInterrupt(void* data);
+-
+-			device_node*		fNode;
+-			area_id				fArea;
+-			volatile uint32*	fRegisters;
+-			area_id				fPwmArea;
+-			volatile uint32*	fPwmRegisters;
+-			area_id				fInterruptArea;
+-			volatile uint32*	fInterruptRegisters;
+-			mutex				fLock;
+-			spinlock			fEdgeLock;
+-				// the recorders, the channels and the interrupt block
+-			uint32				fPinCount;
+-			SavedPin			fSaved[kMaxPins];
+-			PwmState			fPwm[kMaxPins];
+-			EdgeRecorder		fRecorders[kMaxPins];
+-			EdgeChannel			fChannels[kChannelCount];
+-};
+-
+-
+ MesonGpio::MesonGpio(device_node* node)
+ 	:
+ 	fNode(node),
+@@ -282,7 +152,8 @@ MesonGpio::MesonGpio(device_node* node)
+ 	fPwmRegisters(NULL),
+ 	fInterruptArea(-1),
+ 	fInterruptRegisters(NULL),
+-	fPinCount(0)
++	fPinCount(0),
++	fShield(NULL)
+ {
+ 	mutex_init(&fLock, "meson gpio");
+ 	B_INITIALIZE_SPINLOCK(&fEdgeLock);
+@@ -306,6 +177,9 @@ MesonGpio::MesonGpio(device_node* node)
+ 
+ MesonGpio::~MesonGpio()
+ {
++	// the shield frees its claims through this object
++	delete fShield;
++	fShield = NULL;
+ 	if (fArea >= 0)
+ 		delete_area(fArea);
+ 	if (fPwmArea >= 0)
+@@ -657,7 +531,8 @@ MesonGpio::_Command(char* line)
+ 
+ 
+ status_t
+-MesonGpio::_Claim(gpio_cookie* cookie, const meson_gpio_pins& pins)
++MesonGpio::_Claim(gpio_cookie* cookie, const meson_gpio_pins& pins,
++	const char* use)
+ {
+ 	if (cookie->count != 0 || pins.count == 0
+ 		|| pins.count > B_COUNT_OF(pins.pins)) {
+@@ -680,7 +555,7 @@ MesonGpio::_Claim(gpio_cookie* cookie, const meson_gpio_pins& pins)
+ 	}
+ 	// all or none
+ 	for (uint32 i = 0; i < pins.count; i++) {
+-		if (gHeader->claim(indexes[i], cookie, "program") != B_OK) {
++		if (gHeader->claim(indexes[i], cookie, use) != B_OK) {
+ 			for (uint32 j = 0; j < i; j++)
+ 				gHeader->release(indexes[j], cookie);
+ 			return B_BUSY;
+@@ -983,7 +858,7 @@ MesonGpio::Control(gpio_cookie* cookie, uint32 op, void* buffer,
+ 			meson_gpio_pins pins;
+ 			if (user_memcpy(&pins, buffer, sizeof(pins)) != B_OK)
+ 				return B_BAD_ADDRESS;
+-			return _Claim(cookie, pins);
++			return _Claim(cookie, pins, "program");
+ 		}
+ 
+ 		case MESON_GPIO_SET_OUTPUTS:
+@@ -1131,6 +1006,62 @@ MesonGpio::Free(gpio_cookie* cookie)
+ }
+ 
+ 
++status_t
++MesonGpio::ClaimPins(gpio_cookie* cookie, const uint8* pins, uint32 count,
++	const char* use)
++{
++	meson_gpio_pins claim;
++	if (count > B_COUNT_OF(claim.pins))
++		return B_BAD_VALUE;
++	claim.count = count;
++	memcpy(claim.pins, pins, count);
++	MutexLocker locker(fLock);
++	return _Claim(cookie, claim, use);
++}
++
++
++void
++MesonGpio::SetOutputs(gpio_cookie* cookie, uint32 outputs)
++{
++	MutexLocker locker(fLock);
++	for (uint32 i = 0; i < cookie->count; i++)
++		_SetDirection(cookie->pins[i], (outputs >> i) & 1);
++}
++
++
++void
++MesonGpio::WriteLevels(gpio_cookie* cookie, uint32 levels)
++{
++	MutexLocker locker(fLock);
++	for (uint32 i = 0; i < cookie->count; i++)
++		_SetOutputLevel(cookie->pins[i], (levels >> i) & 1);
++}
++
++
++uint32
++MesonGpio::ReadLevels(gpio_cookie* cookie)
++{
++	MutexLocker locker(fLock);
++	uint32 bits = 0;
++	for (uint32 i = 0; i < cookie->count; i++) {
++		if (_Level(cookie->pins[i]))
++			bits |= 1u << i;
++	}
++	return bits;
++}
++
++
++void
++MesonGpio::SetPulls(gpio_cookie* cookie, uint32 bits, uint32 pull)
++{
++	MutexLocker locker(fLock);
++	for (uint32 i = 0; i < cookie->count; i++) {
++		if ((bits >> i) & 1)
++			_SetPull(cookie->pins[i], pull);
++	}
++}
++
++
+ status_t
+ MesonGpio::Write(const char* buffer, size_t length)
+ {
+@@ -1261,8 +1192,26 @@ static status_t
+ register_child_devices(void* cookie)
+ {
+ 	MesonGpio* gpio = (MesonGpio*)cookie;
+-	return gDeviceManager->publish_device(gpio->Node(), "misc/gpio",
+-		DEVICE_MODULE_NAME);
++	status_t status = gDeviceManager->publish_device(gpio->Node(),
++		"misc/gpio", DEVICE_MODULE_NAME);
++	if (status != B_OK)
++		return status;
++
++	// Hardkernel's 16x2 LCD + IO Shield, when the driver settings say it is
++	// on the header (it can't be detected)
++	if (LcdShield::Configured()) {
++		LcdShield* shield = new(std::nothrow) LcdShield(gpio);
++		if (shield == NULL)
++			return B_OK;
++		gpio->SetShield(shield);
++		for (const char* const* path = LcdShield::kDevicePaths; *path != NULL;
++				path++) {
++			gDeviceManager->publish_device(gpio->Node(), *path,
++				LCD_SHIELD_DEVICE_MODULE_NAME);
++		}
++		INFO("the 16x2 LCD + IO Shield at /dev/misc/shield\n");
++	}
++	return B_OK;
+ }
+ 
+ 
+@@ -1395,5 +1344,6 @@ static struct driver_module_info sMesonGpioDriver = {
+ module_info* modules[] = {
+ 	(module_info*)&sMesonGpioDriver,
+ 	(module_info*)&sMesonGpioDevice,
++	(module_info*)&gLcdShieldDevice,
+ 	NULL
+ };

@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 02:13:27 -0400
+Subject: [PATCH 046/342] app_server, kernel console: write an alpha into 32
+ bit frame buffers
+
+Graphics hardware that keys a video overlay by the frame buffer's alpha
+(meson_hdmi) needs the alpha byte to be meaningful; everything else
+ignores it.
+
+- HWInterface::_DrawCursor() left the alpha of its blending buffer
+  uninitialized, so the cursor came out partly transparent over an
+  overlay. It now blends the alpha like the colour channels (the cursor
+  bitmap is premultiplied): opaque cursor pixels are opaque, and around
+  them the alpha of the frame buffer is kept.
+- The frame buffer console used alpha 0 for its 32 bit colours, so KDL
+  text was invisible over an overlay. 24 bit takes only the low three
+  bytes of the palette, so it is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/servers/app/drawing/HWInterface.cpp        |  4 ++++
+ .../kernel/debug/frame_buffer_console.cpp      | 18 ++++++++++--------
+ 2 files changed, 14 insertions(+), 8 deletions(-)
+
+diff --git a/src/servers/app/drawing/HWInterface.cpp b/src/servers/app/drawing/HWInterface.cpp
+index 35b431f8c0..503d4508b9 100644
+--- a/src/servers/app/drawing/HWInterface.cpp
++++ b/src/servers/app/drawing/HWInterface.cpp
+@@ -603,6 +603,9 @@ HWInterface::_DrawCursor(IntRect area) const
+ 					d[0] = ((int)(b[0] * a + 255) >> 8) + c[0];
+ 					d[1] = ((int)(b[1] * a + 255) >> 8) + c[1];
+ 					d[2] = ((int)(b[2] * a + 255) >> 8) + c[2];
++					// the alpha too: where the frame buffer's alpha keys a
++					// video overlay (0), the cursor must stay visible
++					d[3] = ((int)(b[3] * a + 255) >> 8) + c[3];
+ 
+ 					s += 4;
+ 					c += 4;
+@@ -628,6 +631,7 @@ HWInterface::_DrawCursor(IntRect area) const
+ 					d[0] = ((s[0] * a + 255) >> 8) + c[0];
+ 					d[1] = ((s[1] * a + 255) >> 8) + c[1];
+ 					d[2] = ((s[2] * a + 255) >> 8) + c[2];
++					d[3] = ((s[3] * a + 255) >> 8) + c[3];
+ 
+ 					s += 4;
+ 					c += 4;
+diff --git a/src/system/kernel/debug/frame_buffer_console.cpp b/src/system/kernel/debug/frame_buffer_console.cpp
+index cafc23f776..1783f118db 100644
+--- a/src/system/kernel/debug/frame_buffer_console.cpp
++++ b/src/system/kernel/debug/frame_buffer_console.cpp
+@@ -79,14 +79,16 @@ static uint16 sPalette16[] = {
+ 	0xffff, 0x3333, 0x4cc0, 0x04d3, 0xc800, 0x722f, 0xdd40, 0x0000,
+ };
+ static uint32 sPalette24[] = {
+-	0xffffff,	// white
+-	0x336698,	// blue
+-	0x4e9a00,	// green
+-	0x06989a,	// cyan
+-	0xcc0000,	// red
+-	0x73447b,	// magenta
+-	0xdaa800,	// yellow
+-	0x000000,	// black
++	// also used for 32 bit: opaque, for displays that blend the frame buffer
++	// by its alpha (over a video overlay); 24 bit takes the low three bytes
++	0xffffffff,	// white
++	0xff336698,	// blue
++	0xff4e9a00,	// green
++	0xff06989a,	// cyan
++	0xffcc0000,	// red
++	0xff73447b,	// magenta
++	0xffdaa800,	// yellow
++	0xff000000,	// black
+ };
+ static uint32 sPalette30[] = {
+ 	0x3fcff3fc,	// white

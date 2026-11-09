@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 28 Oct 2026 22:22:10 -0400
+Subject: [PATCH 039/342] Tracker: drop items from list views where the mouse
+ is
+
+BPoseView::GetDropPointList() placed a pose without a location (dragged
+from a list view) by auto-placing it in the destination and then adding
+the drop point minus the drag start, which is in the source view's
+coordinates. The icon landed at a seemingly random spot, often far from
+the drop point or off the screen; a location a list view pose did have
+(from an icon view of its folder) was mixed with list view coordinates
+the same way. It also moved the source pose.
+
+Poses from list views, and poses without a location, now land at the
+drop point: the first one centered under the mouse, the others next to
+it in the destination's grid, four in a row (as for dropped refs).
+Poses from icon views keep their position relative to the mouse.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kits/tracker/PoseView.cpp | 18 ++++++++++++------
+ 1 file changed, 12 insertions(+), 6 deletions(-)
+
+diff --git a/src/kits/tracker/PoseView.cpp b/src/kits/tracker/PoseView.cpp
+index 3c31cf54d2..c7568e2d14 100644
+--- a/src/kits/tracker/PoseView.cpp
++++ b/src/kits/tracker/PoseView.cpp
+@@ -6119,6 +6119,7 @@ BPoseView::GetDropPointList(BPoint dropStart, BPoint dropEnd, const PoseList* po
+ 
+ 	int32 poseCount = poseList->CountItems();
+ 	BList* pointList = new BList(poseCount);
++	int32 gridIndex = 0;
+ 	for (int32 index = 0; index < poseCount; index++) {
+ 		BPose* pose = poseList->ItemAt(index);
+ 		if (pose == NULL)
+@@ -6129,14 +6130,19 @@ BPoseView::GetDropPointList(BPoint dropStart, BPoint dropEnd, const PoseList* po
+ 			// drop poses at the end of the list
+ 			poseLoc = dropEnd + BPoint(0, index * fListElemHeight);
+ 		} else {
+-			if (pose->HasLocation()) {
+-				// copy the source location
++			if (sourcePoseView->ViewMode() != kListMode && pose->HasLocation()) {
++				// keep the poses where they are relative to the mouse
+ 				poseLoc = dropEnd + (pose->Location(sourcePoseView) - dropStart);
+ 			} else {
+-				// no source location, auto-place the pose in the destination
+-				BRect destViewBounds(Bounds());
+-				const_cast<BPoseView*>(this)->PlacePose(pose, destViewBounds);
+-				poseLoc = dropEnd + (pose->Location(this) - dropStart);
++				// A list view has no icon positions (a location a pose may
++				// have is from an icon view of its folder, unrelated to
++				// dropStart). Drop the poses at the mouse: the first one
++				// centered there, the others next to it in our grid, four in
++				// a row.
++				float halfIcon = IconSizeInt() / 2.0f;
++				poseLoc = dropEnd - BPoint(halfIcon, halfIcon)
++					+ BPoint((gridIndex % 4) * fGrid.x, (gridIndex / 4) * fGrid.y);
++				gridIndex++;
+ 			}
+ 			if (pinToGrid)
+ 				poseLoc = PinToGrid(poseLoc, fGrid, fOffset);

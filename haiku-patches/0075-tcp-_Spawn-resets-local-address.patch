@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Axel=20D=C3=B6rfler?= <axeld@pinc-software.de>
+Date: Mon, 26 Oct 2026 17:03:15 +0100
+Subject: [PATCH 075/342] tcp: _Spawn() resets local address
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+* That means if _Bind() fails (or the socket is dropped before), the
+  EndpointManager will not assume this endpoint has been added to the
+  connection hash yet.
+* Otherwise, Unbind() would then have tried to remove it from the
+  connection hash which led to a panic.
+
+Change-Id: Id7ab18174fd9874fef5e7c5aa6a9f9328c1b89ca
+Reviewed-on: https://review.haiku-os.org/c/haiku/+/12744
+Reviewed-by: Axel Dörfler <axeld@pinc-software.de>
+Tested-by: Commit checker robot <no-reply+buildbot@haiku-os.org>
+Haiku-Format: Haiku-format Bot <no-reply+haikuformatbot@haiku-os.org>
+Reviewed-by: waddlesplash <waddlesplash@gmail.com>
+(cherry picked from commit ad3afc3a2f1b4b10a3e918dec40d9b4d78f303e3)
+
+Fork: fixes the "bound endpoint ... not in hash!" panic when sshd closed
+its listening socket at shutdown on a C2 (a SYN that came in while
+DHCP was still configuring the interface left a child that failed to bind).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp b/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+index b82fb00535..8cd1fa0b58 100644
+--- a/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
++++ b/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2006-2010, Haiku, Inc. All Rights Reserved.
++ * Copyright 2006-2026, Haiku, Inc. All Rights Reserved.
+  * Distributed under the terms of the MIT License.
+  *
+  * Authors:
+@@ -1551,6 +1551,8 @@ TCPEndpoint::_Spawn(TCPEndpoint* parent, tcp_segment_header& segment,
+ 	MutexLocker _(fLock);
+ 
+ 	TRACE("Spawn()");
++	// Reset local address, so we don't end up with an invalid address in case of failure
++	(*LocalAddress())->sa_len = 0;
+ 
+ 	// TODO: proper error handling!
+ 	if (ProtocolSocket::Open() != B_OK) {

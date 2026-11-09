@@ -1,0 +1,248 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 14:11:33 -0500
+Subject: [PATCH 221/342] dwc2: high speed isochronous IN at any service
+ interval, two streams
+
+High speed isochronous endpoints with bInterval 2 to 16 (a packet every
+2^(bInterval-1) microframes, as a webcam's microphone has, 4: once a
+millisecond): a packet at most two microframes away is armed from the
+halt of the one before, a later one by the timer in the microframe
+before its own. A stream that falls behind goes on from the next
+microframe and counts the ones it missed. A second high speed stream
+(channels 4 and 5), so a webcam's video and microphone run together.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/busses/usb/dwc2.cpp        |  4 +-
+ src/add-ons/kernel/busses/usb/dwc2.h          | 23 +++--
+ .../kernel/busses/usb/dwc2_isochronous.cpp    | 94 +++++++++++++++----
+ 3 files changed, 94 insertions(+), 27 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.cpp b/src/add-ons/kernel/busses/usb/dwc2.cpp
+index c5ea567abb..bdb8829a7d 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2.cpp
+@@ -212,8 +212,8 @@ DWC2::DWC2(Stack* stack, device_node* node, phys_addr_t registers,
+ 	uint8* bounce;
+ 	fBounceArea = create_area("dwc2 bounce", (void**)&bounce,
+ 		B_ANY_KERNEL_ADDRESS, kBounceSize + kInterruptBounceSize
+-			+ (kIsoStreamCount - 1) * kIsoSlotCount * kIsoSlotSize
+-			+ kIsoSlotCount * kIsoHighSpeedSlotSize,
++			+ kIsoFirstHighSpeedStream * kIsoSlotCount * kIsoSlotSize
++			+ kIsoHighSpeedStreams * kIsoSlotCount * kIsoHighSpeedSlotSize,
+ 		B_32_BIT_CONTIGUOUS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
+ 	if (fBounceArea < 0)
+ 		return;
+diff --git a/src/add-ons/kernel/busses/usb/dwc2.h b/src/add-ons/kernel/busses/usb/dwc2.h
+index 7809de5c39..2ac0d40b52 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2.h
++++ b/src/add-ons/kernel/busses/usb/dwc2.h
+@@ -29,9 +29,12 @@ typedef DoublyLinkedList<dwc2_transfer> dwc2_transfer_list;
+ 
+ 
+ static const uint32 kLaneCount = 2;		// channels 0, 1
+-static const uint32 kIsoStreamCount = 3;	// channels 2, 3, 4
+-static const uint32 kIsoHighSpeedStream = 2;
+-	// the others: full speed devices behind the hub
++static const uint32 kIsoStreamCount = 4;	// channels 2 to 5
++static const uint32 kIsoFirstHighSpeedStream = 2;
++	// 2, 3: high speed devices (a webcam's video and its microphone at
++	// once); 0, 1: full speed devices behind the hub
++static const uint32 kIsoHighSpeedStreams
++	= kIsoStreamCount - kIsoFirstHighSpeedStream;
+ static const uint32 kIsoSlotCount = 4;
+ static const size_t kIsoSlotSize = 16 * 1024;
+ static const size_t kIsoHighSpeedSlotSize = 256 * 1024;
+@@ -91,9 +94,11 @@ struct dwc2_iso_statistics {
+ 	device behind the high speed hub, where each frame a timer arms the
+ 	channel for the frame's packet and its start-split parts (and
+ 	complete-splits, IN) follow from the channel's halt interrupt; or of a
+-	high speed device (kIsoHighSpeedStream), one packet per microframe, each
+-	armed from the halt of the one before. State changes under
+-	DWC2::fIsoLock.
++	high speed device (kIsoFirstHighSpeedStream on), a packet every
++	2^(bInterval-1) microframes, armed from the halt of the one before
++	(every microframe or every other one) or by the timer in the microframe
++	before its own.
++	State changes under DWC2::fIsoLock.
+ */
+ struct dwc2_iso_stream {
+ 	timer					armTimer;		// first: the hook's argument
+@@ -106,6 +111,10 @@ struct dwc2_iso_stream {
+ 											// microframe
+ 	uint32					targetFrame;	// high speed: of the running
+ 											// packet
++	uint32					period;			// high speed: microframes from
++											// one packet to the next
++	uint32					pendingFrame;	// high speed: the timer arms
++											// the packet of this microframe
+ 	size_t					slotSize;
+ 	uint8*					bounce;
+ 	phys_addr_t				bouncePhysical;
+@@ -230,6 +239,8 @@ private:
+ 			void				_IsoPacketDone(dwc2_iso_stream* stream,
+ 										status_t status, uint32 actual);
+ 			void				_IsoScheduleTimer(dwc2_iso_stream* stream);
++			void				_IsoScheduleFrameTimer(dwc2_iso_stream* stream,
++									uint32 ahead);
+ 	static	int32				_IsoTimer(timer* timer);
+ 	static	status_t			_IsoThread(void* data);
+ 			void				_IsoWorker();
+diff --git a/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp b/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
+index 03079b814b..0217ef0d1c 100644
+--- a/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
++++ b/src/add-ons/kernel/busses/usb/dwc2_isochronous.cpp
+@@ -33,14 +33,17 @@
+  * descriptors and finishes the transfers.
+  *
+  * High speed (docs/m45-uvc-facts.md §A.3, A.6): a packet descriptor per
+- * microframe (bInterval 1), up to wMaxPacketSize times the endpoint's
+- * transactions per microframe (1 to 3, "high bandwidth"). The channel runs
+- * all of a microframe's transactions from one enable (HCCHAR.MC, PKTCNT;
+- * IN starts at DATA0, DATA1 or DATA2 for 1, 2 or 3) and halts when they
+- * are done. Each packet is armed from the halt of the one before, for the
+- * next microframe (ODDFRM: its parity), so no timer runs; a microframe the
+- * chain could not catch is counted as missed. The timer only starts the
+- * chain.
++ * service interval, every 2^(bInterval-1) microframes (a webcam's video
++ * every microframe, its microphone every 8th: once a millisecond), up to
++ * wMaxPacketSize times the endpoint's transactions per microframe (1 to 3,
++ * "high bandwidth"). The channel runs all of a microframe's transactions
++ * from one enable (HCCHAR.MC, PKTCNT; IN starts at DATA0, DATA1 or DATA2
++ * for 1, 2 or 3) and halts when they are done. Each packet is armed from
++ * the halt of the one before (ODDFRM: the parity of its microframe) when
++ * its microframe is at most two away; otherwise the timer arms it in the
++ * microframe before, as for full speed. A microframe the stream could not
++ * catch is counted as missed, and the stream goes on from the next one.
++ * HS isochronous OUT is not done yet.
+  */
+ 
+ 
+@@ -100,9 +103,11 @@ DWC2::_InitIsochronous(uint8* bounce, phys_addr_t physical)
+ 		stream.pipe = NULL;
+ 		stream.channel = kLaneCount + i;
+ 		stream.in = false;
+-		stream.highSpeed = i == kIsoHighSpeedStream;
++		stream.highSpeed = i >= kIsoFirstHighSpeedStream;
+ 		stream.mult = 1;
+ 		stream.targetFrame = UINT32_MAX;
++		stream.pendingFrame = UINT32_MAX;
++		stream.period = 1;
+ 		stream.slotSize = stream.highSpeed
+ 			? kIsoHighSpeedSlotSize : kIsoSlotSize;
+ 		stream.bounce = bounce + offset;
+@@ -146,6 +151,10 @@ DWC2::_IsoStreamFor(Pipe* pipe, bool create)
+ 	unused->in = pipe->Direction() == Pipe::In;
+ 	unused->mult = highSpeed ? pipe->MaxBurst() + 1 : 1;
+ 	unused->targetFrame = UINT32_MAX;
++	unused->pendingFrame = UINT32_MAX;
++	// bInterval 1 to 16: every 2^(bInterval-1) microframes
++	unused->period = highSpeed
++		? 1 << (min_c(max_c(pipe->Interval(), 1), 16) - 1) : 8;
+ 	unused->freeSlots = (1 << kIsoSlotCount) - 1;
+ 	unused->packet = 0;
+ 	unused->part = 0;
+@@ -162,12 +171,10 @@ DWC2::_SubmitIsochronous(Transfer* transfer)
+ 	if (!fIsoAvailable || isochronousData == NULL)
+ 		return B_NOT_SUPPORTED;
+ 	bool highSpeed = !_NeedsSplit(pipe);
+-	if (highSpeed && (pipe->Interval() != 1
+-			|| pipe->Direction() != Pipe::In)) {
+-		// so far a packet every microframe, IN: a webcam's video
++	if (highSpeed && pipe->Direction() != Pipe::In) {
++		// so far IN: a webcam's video and microphone
+ 		if (!fWarnedIso) {
+-			INFO("high speed isochronous endpoints other than IN every"
+-				" microframe are not supported\n");
++			INFO("high speed isochronous OUT endpoints are not supported\n");
+ 			fWarnedIso = true;
+ 		}
+ 		return B_NOT_SUPPORTED;
+@@ -337,6 +344,7 @@ DWC2::_CancelIsochronous(Pipe* pipe, bool force)
+ 	stream->timerPending = false;
+ 	stream->stopping = false;
+ 	stream->targetFrame = UINT32_MAX;
++	stream->pendingFrame = UINT32_MAX;
+ 	bool in = stream->in;
+ 	bool highSpeed = stream->highSpeed;
+ 	dwc2_iso_statistics stats = stream->stats;
+@@ -501,11 +509,39 @@ DWC2::_IsoStartHighSpeed(dwc2_iso_stream* stream)
+ 	uint32 pid = stream->mult == 3 ? PID_DATA2
+ 		: stream->mult == 2 ? PID_DATA1 : PID_DATA0;
+ 
+-	// the next microframe: the channel waits for one of its parity; if the
+-	// microframe changes meanwhile, it runs in that one at once
+-	uint32 frame = (_Read(kHfnum) + 1) & 0x3fff;
+-	if (stream->targetFrame != UINT32_MAX)
+-		stream->stats.missed += (frame - stream->targetFrame - 1) & 0x3fff;
++	uint32 now = _Read(kHfnum) & 0x3fff;
++	uint32 frame;
++	if (stream->period == 1) {
++		// the next microframe: the channel waits for one of its parity; if
++		// the microframe changes meanwhile, it runs in that one at once
++		frame = (now + 1) & 0x3fff;
++		if (stream->targetFrame != UINT32_MAX)
++			stream->stats.missed += (frame - stream->targetFrame - 1) & 0x3fff;
++	} else {
++		// the service interval after the last packet's (or the one the
++		// timer was set for)
++		if (stream->pendingFrame != UINT32_MAX)
++			frame = stream->pendingFrame;
++		else if (stream->targetFrame == UINT32_MAX)
++			frame = now + 1;
++		else
++			frame = stream->targetFrame + stream->period;
++		frame &= 0x3fff;
++		stream->pendingFrame = UINT32_MAX;
++		uint32 ahead = (frame - now) & 0x3fff;
++		if (ahead == 0 || ahead > 0x2000) {
++			// its microframe is over: on from the next one
++			stream->stats.missed += ((now - frame) & 0x3fff) / stream->period
++				+ 1;
++			frame = (now + 1) & 0x3fff;
++			ahead = 1;
++		}
++		if (ahead > 2) {
++			stream->pendingFrame = frame;
++			_IsoScheduleFrameTimer(stream, ahead);
++			return;
++		}
++	}
+ 	stream->targetFrame = frame;
+ 	stream->size = size;
+ 
+@@ -658,6 +694,7 @@ DWC2::_IsoPacketDone(dwc2_iso_stream* stream, status_t status,
+ 		if (stream->queue.IsEmpty()) {
+ 			stream->stats.underruns++;
+ 			stream->targetFrame = UINT32_MAX;
++			stream->pendingFrame = UINT32_MAX;
+ 				// the chain breaks: no missed microframes counted
+ 		}
+ 	}
+@@ -694,6 +731,25 @@ DWC2::_IsoScheduleTimer(dwc2_iso_stream* stream)
+ }
+ 
+ 
++/*!	Sets the timer for the microframe before a high speed stream's next
++	packet, \a ahead microframes after the current one. Called with fIsoLock
++	held.
++*/
++void
++DWC2::_IsoScheduleFrameTimer(dwc2_iso_stream* stream, uint32 ahead)
++{
++	uint32 hfnum = _Read(kHfnum);
++	uint32 interval = _Read(kHfir) & 0xffff;
++	bigtime_t remaining = interval != 0
++		? (bigtime_t)(hfnum >> HFNUM_FRREM_SHIFT) * 125 / interval : 0;
++	bigtime_t delay = remaining + (bigtime_t)(ahead - 2) * 125 + kIsoArmDelay;
++
++	stream->timerTarget = system_time() + delay;
++	stream->timerPending = true;
++	add_timer(&stream->armTimer, &_IsoTimer, delay, B_ONE_SHOT_RELATIVE_TIMER);
++}
++
++
+ /*static*/ int32
+ DWC2::_IsoTimer(timer* timer)
+ {

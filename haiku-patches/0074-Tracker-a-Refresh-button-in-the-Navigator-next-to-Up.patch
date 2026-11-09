@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 29 Oct 2026 21:11:55 -0400
+Subject: [PATCH 074/342] Tracker: a Refresh button in the Navigator, next to
+ Up
+
+It reads the folder again (BPoseView::Refresh(), as the file panels'
+refresh does): the list is rebuilt from the directory and goes back to
+the top. The icon is "Refresh" by zuMi from https://hvif-store.art/
+(icon 923, MIT License), as R_ResRefreshNav.
+
+The Navigator's buttons now have names ("back", "forward", "up",
+"refresh"), so scripting and tests can reach them.
+
+Tested on the ODROID-C2: a click (real mouse events) in /boot/system/lib,
+scrolled to its end with a file selected, showed the folder from the top
+again; the breadcrumb test still passes all 17 checks.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kits/tracker/Navigator.cpp     | 31 ++++++++++++++++++++++++++++++
+ src/kits/tracker/Navigator.h       |  3 ++-
+ src/kits/tracker/TrackerIcons.h    |  1 +
+ src/kits/tracker/TrackerIcons.rdef | 14 ++++++++++++++
+ 4 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/src/kits/tracker/Navigator.cpp b/src/kits/tracker/Navigator.cpp
+index 3b49a60f38..99ca4cb3e4 100644
+--- a/src/kits/tracker/Navigator.cpp
++++ b/src/kits/tracker/Navigator.cpp
+@@ -37,6 +37,7 @@ All rights reserved.
+ 
+ #include <string.h>
+ 
++#include <Button.h>
+ #include <ControlLook.h>
+ #include <LayoutBuilder.h>
+ #include <TextControl.h>
+@@ -45,7 +46,9 @@ All rights reserved.
+ #include "Bitmaps.h"
+ #include "BreadcrumbBar.h"
+ #include "Commands.h"
++#include "ContainerWindow.h"
+ #include "FSUtils.h"
++#include "PoseView.h"
+ #include "Tracker.h"
+ 
+ 
+@@ -115,6 +118,25 @@ BNavigator::AttachedToWindow()
+ 	SetActionEnabled(kNavigatorCommandUp, false);
+ 	delete bmpUp;
+ 
++	// reads the folder again
++	BBitmap* bmpRefresh = new BBitmap(iconRect, B_RGBA32);
++	GetTrackerResources()->GetIconResource(R_ResRefreshNav, B_MINI_ICON,
++		bmpRefresh);
++	AddAction(kNavigatorCommandRefresh, this, bmpRefresh);
++	delete bmpRefresh;
++
++	// names for scripting ("hey Tracker ... of View refresh of Window ...")
++	static const struct { uint32 command; const char* name; } kButtons[] = {
++		{ kNavigatorCommandBackward, "back" },
++		{ kNavigatorCommandForward, "forward" },
++		{ kNavigatorCommandUp, "up" },
++		{ kNavigatorCommandRefresh, "refresh" }
++	};
++	for (size_t i = 0; i < sizeof(kButtons) / sizeof(kButtons[0]); i++) {
++		if (BButton* button = FindButton(kButtons[i].command))
++			button->SetName(kButtons[i].name);
++	}
++
+ 	// One button per path component right above the location, like the
+ 	// path buttons of the IRIX file manager.
+ 	BLayoutBuilder::Group<>(GroupLayout())
+@@ -165,6 +187,15 @@ BNavigator::MessageReceived(BMessage* message)
+ 			GoUp((modifiers() & B_OPTION_KEY) == B_OPTION_KEY);
+ 			break;
+ 
++		case kNavigatorCommandRefresh:
++		{
++			BContainerWindow* window
++				= dynamic_cast<BContainerWindow*>(Window());
++			if (window != NULL && window->PoseView() != NULL)
++				window->PoseView()->Refresh();
++			break;
++		}
++
+ 		case kNavigatorCommandLocation:
+ 			GoTo();
+ 			break;
+diff --git a/src/kits/tracker/Navigator.h b/src/kits/tracker/Navigator.h
+index eb33c83079..c23de8c284 100644
+--- a/src/kits/tracker/Navigator.h
++++ b/src/kits/tracker/Navigator.h
+@@ -62,7 +62,8 @@ enum NavigationAction
+ 	kNavigatorCommandUp = 'NVUP',
+ 	kNavigatorCommandLocation = 'NVLC',
+ 	kNavigatorCommandSetFocus = 'NVSF',
+-	kNavigatorCommandBreadcrumb = 'NVBC'
++	kNavigatorCommandBreadcrumb = 'NVBC',
++	kNavigatorCommandRefresh = 'NVRF'
+ };
+ 
+ 
+diff --git a/src/kits/tracker/TrackerIcons.h b/src/kits/tracker/TrackerIcons.h
+index 2c6d71b1c7..83df3bdf07 100644
+--- a/src/kits/tracker/TrackerIcons.h
++++ b/src/kits/tracker/TrackerIcons.h
+@@ -72,5 +72,6 @@ enum {
+ 	R_ResBackNav = 1042,
+ 	R_ResForwNav = 1043,
+ 	R_ResUpNav = 1044,
++	R_ResRefreshNav = 1045,
+ 	R_ShareIcon = 1051
+ };
+diff --git a/src/kits/tracker/TrackerIcons.rdef b/src/kits/tracker/TrackerIcons.rdef
+index a69d47c6c4..fadf689401 100644
+--- a/src/kits/tracker/TrackerIcons.rdef
++++ b/src/kits/tracker/TrackerIcons.rdef
+@@ -760,6 +760,20 @@ resource(R_ResUpNav) #'VICN' array {
+ 	$"000040A32D42FD7242FA12"
+ };
+ 
++// "Refresh" icon by zuMi (https://hvif-store.art/, icon 923).
++// Distributed under the terms of the MIT License.
++resource(R_ResRefreshNav) #'VICN' array {
++	$"6E6369660404006603004080020006020000003A0000C000000000004C000046"
++	$"7FFF00ABD5FFFF006CD9020006020000003A0000C000000000004C0000467FFF"
++	$"00006CD9FFAAD4FF010606C60F482232383D2D3D2D3826222A2B2329224327BC"
++	$"B7B25A4327060A0001001240AAAA00000000000040AAAA44AAAA44AAAA011784"
++	$"22040A0101001240AAAA00000000000040AAAA42AAAA42AAAA01178422040A02"
++	$"01000240AAAA00000000000040AAAA42AAAA42AAAA0A00010012C0AAAA000000"
++	$"000000C0AAAA4BD5CA4BD5A201178422040A01010012C0AAAA000000000000C0"
++	$"AAAA4BAB204BAAF701178422040A03010002C0AAAA000000000000C0AAAA4BAB"
++	$"204BAAF7"
++};
++
+ resource(2, "BEOS:L:application/x-vnd.Be-query") #'ICON' array {
+ 	$"FFFFFFFFFFFFFFFFFFFFFFFFFFFF0400FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
+ 	$"FFFFFFFFFFFFFFFFFFFFFFFFFFFF041B0908FFFFFFFFFFFFFFFFFFFFFFFFFFFF"

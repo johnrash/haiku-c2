@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 7 Nov 2026 02:18:56 -0500
+Subject: [PATCH 334/342] mixer: log an input whose data came too late, and the
+ late notices sent
+
+Stutters were still heard on a C2 on Wi-Fi with +342, 2-3 a song, more when
+menus opened or Terminal tabs switched, with the multi_audio node logging
+no lost buffer and the USB stream no lost packet. The mixer leaves an
+input out of a mix buffer when its data hasn't come yet
+(GetMixerChannelInfo(), checked only in debug builds), and asks a late
+producer to catch up, both silently. It now counts the mix buffers made
+without an input's data and logs them when the data comes (a short gap,
+not a stopped stream), with the buffer's lateness, and logs the late
+notices it sends (at most once a second).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../media/media-add-ons/mixer/AudioMixer.cpp     |  7 +++++++
+ .../media/media-add-ons/mixer/MixerCore.cpp      |  2 +-
+ .../media/media-add-ons/mixer/MixerInput.cpp     | 16 +++++++++++++++-
+ .../media/media-add-ons/mixer/MixerInput.h       | 12 ++++++++++--
+ 4 files changed, 33 insertions(+), 4 deletions(-)
+
+diff --git a/src/add-ons/media/media-add-ons/mixer/AudioMixer.cpp b/src/add-ons/media/media-add-ons/mixer/AudioMixer.cpp
+index 402fce3b50..a8b6b70109 100644
+--- a/src/add-ons/media/media-add-ons/mixer/AudioMixer.cpp
++++ b/src/add-ons/media/media-add-ons/mixer/AudioMixer.cpp
+@@ -330,6 +330,13 @@ AudioMixer::HandleInputBuffer(BBuffer* buffer, bigtime_t lateness)
+ 	if (variation > kMaxJitter) {
+ 		TRACE("AudioMixer: Dequeued input buffer %" B_PRIdBIGTIME
+ 			" usec late\n", lateness);
++		static bigtime_t sLastLogged;
++		if (system_time() - sLastLogged > 1000000) {
++			syslog(LOG_WARNING, "mixer: input buffer %" B_PRIdBIGTIME " us late,"
++				" %" B_PRIdBIGTIME " us more than the one before\n", lateness,
++				variation);
++			sLastLogged = system_time();
++		}
+ 		if (RunMode() == B_DROP_DATA || RunMode() == B_DECREASE_PRECISION
+ 			|| RunMode() == B_INCREASE_LATENCY) {
+ 			TRACE("AudioMixer: sending notify\n");
+diff --git a/src/add-ons/media/media-add-ons/mixer/MixerCore.cpp b/src/add-ons/media/media-add-ons/mixer/MixerCore.cpp
+index f78a4d9176..f827f78ef2 100644
+--- a/src/add-ons/media/media-add-ons/mixer/MixerCore.cpp
++++ b/src/add-ons/media/media-add-ons/mixer/MixerCore.cpp
+@@ -245,7 +245,7 @@ MixerCore::BufferReceived(BBuffer *buffer, bigtime_t lateness)
+ 	int32 id = buffer->Header()->destination;
+ 	for (int i = 0; (input = Input(i)) != 0; i++) {
+ 		if (input->ID() == id) {
+-			input->BufferReceived(buffer);
++			input->BufferReceived(buffer, lateness);
+ 			return;
+ 		}
+ 	}
+diff --git a/src/add-ons/media/media-add-ons/mixer/MixerInput.cpp b/src/add-ons/media/media-add-ons/mixer/MixerInput.cpp
+index 8b6ff2c2cb..d15f649dd9 100644
+--- a/src/add-ons/media/media-add-ons/mixer/MixerInput.cpp
++++ b/src/add-ons/media/media-add-ons/mixer/MixerInput.cpp
+@@ -38,6 +38,8 @@ MixerInput::MixerInput(MixerCore* core, const media_input& input,
+ 	fMixBufferFrameCount(0),
+ 	fLastDataFrameWritten(-1),
+ 	fLastDataAvailableTime(-1),
++	fStarvedMixes(0),
++	fStarvedSince(0),
+ 	fFractionalFrames(0.0),
+ 	fResampler(NULL),
+ 	fRtmPool(NULL),
+@@ -119,7 +121,7 @@ MixerInput::MediaInput()
+ 
+ 
+ void
+-MixerInput::BufferReceived(BBuffer* buffer)
++MixerInput::BufferReceived(BBuffer* buffer, bigtime_t lateness)
+ {
+ 	void* data;
+ 	size_t size;
+@@ -305,6 +307,18 @@ MixerInput::BufferReceived(BBuffer* buffer)
+ 				out_frames, fInputChannelInfo[i].gain);
+ 		}
+ 	}
++	if (fStarvedMixes > 0) {
++		// A short gap, not a stream that had stopped: this input's data came
++		// too late for that many mix buffers, heard as a dropout.
++		if (fStarvedMixes < 25 && fLastDataAvailableTime > 0) {
++			syslog(LOG_WARNING, "mixer: input \"%s\" too late, %" B_PRId32
++				" mix buffers without it from %" B_PRIdBIGTIME ", its data"
++				" came for %" B_PRIdBIGTIME " (lateness %" B_PRIdBIGTIME
++				" us)\n", fInput.name, fStarvedMixes, fStarvedSince, start,
++				lateness);
++		}
++		fStarvedMixes = 0;
++	}
+ 	fLastDataAvailableTime = start + buffer_duration;
+ }
+ 
+diff --git a/src/add-ons/media/media-add-ons/mixer/MixerInput.h b/src/add-ons/media/media-add-ons/mixer/MixerInput.h
+index c9c1fe080d..7617eba2a9 100644
+--- a/src/add-ons/media/media-add-ons/mixer/MixerInput.h
++++ b/src/add-ons/media/media-add-ons/mixer/MixerInput.h
+@@ -31,7 +31,8 @@ public:
+ 			int32				ID();
+ 			media_input&		MediaInput();
+ 
+-			void				BufferReceived(BBuffer* buffer);
++			void				BufferReceived(BBuffer* buffer,
++									bigtime_t lateness);
+ 
+ 			void				UpdateResamplingAlgorithm();
+ 
+@@ -107,6 +108,10 @@ private:
+ 			int					fMixBufferFrameCount;
+ 			int32				fLastDataFrameWritten;
+ 			bigtime_t			fLastDataAvailableTime;
++			int32				fStarvedMixes;
++				// mix buffers made without this input's data, it not
++				// having come yet (logged when it comes)
++			bigtime_t			fStarvedSince;
+ 			double				fFractionalFrames;
+ 			Resampler**			fResampler; // array
+ 			rtm_pool*			fRtmPool;
+@@ -150,8 +155,11 @@ MixerInput::GetMixerChannelInfo(int mixerChannel, int64 framepos,
+ 	}
+ #endif
+ 
+-	if (time > fLastDataAvailableTime)
++	if (time > fLastDataAvailableTime) {
++		if (mixerChannel == 0 && fStarvedMixes++ == 0)
++			fStarvedSince = time;
+ 		return false;
++	}
+ 
+ 	int32 offset = framepos % fMixBufferFrameCount;
+ 	if (mixerChannel == 0) {

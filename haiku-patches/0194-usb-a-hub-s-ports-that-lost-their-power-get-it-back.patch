@@ -1,0 +1,177 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sun, 1 Nov 2026 01:34:28 -0500
+Subject: [PATCH 194/342] usb: a hub's ports that lost their power get it back
+
+The C920 webcam on the ODROID-C2 sometimes tripped the board's USB
+over-current protection, seconds after it was enumerated: the onboard
+hub (global over-current protection, ganged power switching) switched
+all its ports off and set C_HUB_OVER_CURRENT in its own status. Its ports
+then read 0 (no power, no connection, no change), so Hub::Explore() never
+noticed: the camera stayed listed while it had no power, and every
+request to it failed with transaction errors.
+
+Explore() now reads and clears the hub's own changes (over current,
+local power), removes the device of a port that has no power, and
+switches such ports on again, so devices still there are enumerated
+anew; after five times within a minute it leaves them off for a minute.
+Not for root hubs (their ports are emulated) or SuperSpeed hubs (another
+power bit).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/bus_managers/usb/Hub.cpp   | 93 ++++++++++++++++++-
+ .../kernel/bus_managers/usb/usb_private.h     |  6 ++
+ 2 files changed, 98 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/bus_managers/usb/Hub.cpp b/src/add-ons/kernel/bus_managers/usb/Hub.cpp
+index ce547d7772..37bf887dcb 100644
+--- a/src/add-ons/kernel/bus_managers/usb/Hub.cpp
++++ b/src/add-ons/kernel/bus_managers/usb/Hub.cpp
+@@ -22,7 +22,9 @@ Hub::Hub(Object *parent, int8 hubAddress, uint8 hubPort,
+ 			depth, controllerCookie),
+ 		fInterruptPipe(NULL),
+ 		fPortCount(0),
+-		fPowerOnToPowerGood(0)
++		fPowerOnToPowerGood(0),
++		fPowerRestored(0),
++		fPowerRestoreCount(0)
+ {
+ 	TRACE("creating hub\n");
+ 
+@@ -244,11 +246,34 @@ Hub::DisablePort(uint8 index)
+ void
+ Hub::Explore(change_item **changeList)
+ {
++	// Over-current protection (or a lost local power supply) can switch the
++	// ports off. A hub with global protection says so only in its own status,
++	// and its ports then show neither a connection nor a change: a device on
++	// a port without power is gone, and the ports get power again below.
++	// (A webcam that tripped the ODROID-C2's limit stayed listed, without
++	// power, for good.) Not on root hubs, whose ports a host controller
++	// emulates; nor on SuperSpeed hubs, whose power bit is another one.
++	bool checkPower = Depth() > 0 && Speed() < USB_SPEED_SUPERSPEED;
++	bool unpowered = false;
++	if (checkPower)
++		_CheckHubStatus();
++
+ 	for (int32 i = 0; i < fPortCount; i++) {
+ 		status_t result = UpdatePortStatus(i);
+ 		if (result < B_OK)
+ 			continue;
+ 
++		if (checkPower && (fPortStatus[i].status & PORT_STATUS_POWER) == 0) {
++			unpowered = true;
++			if (fChildren[i] != NULL) {
++				TRACE_ALWAYS("port %" B_PRId32 ": no power, device removed\n",
++					i);
++				fChildren[i]->Changed(changeList, false);
++				fChildren[i] = NULL;
++			}
++			continue;
++		}
++
+ #ifdef TRACE_USB
+ 		if (fPortStatus[i].change) {
+ 			TRACE("port %" B_PRId32 ": status: 0x%04x; change: 0x%04x\n", i,
+@@ -411,6 +436,9 @@ Hub::Explore(change_item **changeList)
+ 
+ 	}
+ 
++	if (unpowered)
++		_RestorePortPower();
++
+ 	// explore down the tree if we have hubs connected
+ 	for (int32 i = 0; i < fPortCount; i++) {
+ 		if (!fChildren[i] || (fChildren[i]->Type() & USB_OBJECT_HUB) == 0)
+@@ -421,6 +449,69 @@ Hub::Explore(change_item **changeList)
+ }
+ 
+ 
++/*!	Reports and clears the hub's own changes: its local power supply and its
++	over-current state (USB 2.0 11.24.2.6).
++*/
++void
++Hub::_CheckHubStatus()
++{
++	uint16 hubStatus[2];
++	size_t actualLength = 0;
++	if (DefaultPipe()->SendRequest(USB_REQTYPE_CLASS | USB_REQTYPE_DEVICE_IN,
++			USB_REQUEST_GET_STATUS, 0, 0, sizeof(hubStatus), hubStatus,
++			sizeof(hubStatus), &actualLength) < B_OK
++		|| actualLength < sizeof(hubStatus)) {
++		return;
++	}
++
++	// change bit 0: local power (C_HUB_LOCAL_POWER, feature 0); bit 1: over
++	// current (C_HUB_OVER_CURRENT, feature 1)
++	for (uint16 feature = 0; feature < 2; feature++) {
++		if ((hubStatus[1] & (1 << feature)) == 0)
++			continue;
++		bool on = (hubStatus[0] & (1 << feature)) != 0;
++		if (feature == 0) {
++			TRACE_ALWAYS("local power %s\n", on ? "lost" : "back");
++		} else {
++			TRACE_ALWAYS("%sin an over current state\n",
++				on ? "" : "no longer ");
++		}
++		DefaultPipe()->SendRequest(USB_REQTYPE_CLASS | USB_REQTYPE_DEVICE_OUT,
++			USB_REQUEST_CLEAR_FEATURE, feature, 0, 0, NULL, 0, NULL);
++	}
++}
++
++
++/*!	Switches the power of the ports that lost it on again; devices still
++	plugged in show up as new ones at the next explore. After five times
++	within a minute (a device that keeps tripping the protection), the ports
++	stay off until a minute has passed.
++*/
++void
++Hub::_RestorePortPower()
++{
++	bigtime_t now = system_time();
++	if (now - fPowerRestored > 60000000)
++		fPowerRestoreCount = 0;
++	if (fPowerRestoreCount >= 5)
++		return;
++	if (++fPowerRestoreCount == 5) {
++		TRACE_ALWAYS("ports without power five times within a minute: off for"
++			" a minute\n");
++	}
++	fPowerRestored = now;
++
++	for (int32 i = 0; i < fPortCount; i++) {
++		if ((fPortStatus[i].status & PORT_STATUS_POWER) != 0)
++			continue;
++		TRACE_ALWAYS("port %" B_PRId32 ": power on again\n", i);
++		DefaultPipe()->SendRequest(USB_REQTYPE_CLASS | USB_REQTYPE_OTHER_OUT,
++			USB_REQUEST_SET_FEATURE, PORT_POWER, i + 1, 0, NULL, 0, NULL);
++	}
++	snooze(fPowerOnToPowerGood * 2000);
++}
++
++
+ void
+ Hub::InterruptCallback(void *cookie, status_t status, void *data,
+ 	size_t actualLength)
+diff --git a/src/add-ons/kernel/bus_managers/usb/usb_private.h b/src/add-ons/kernel/bus_managers/usb/usb_private.h
+index 9f686351aa..ab7ac63c70 100644
+--- a/src/add-ons/kernel/bus_managers/usb/usb_private.h
++++ b/src/add-ons/kernel/bus_managers/usb/usb_private.h
+@@ -678,10 +678,16 @@ virtual	status_t						BuildDeviceName(char *string,
+ 
+ private:
+ 		status_t						_DebouncePort(uint8 index);
++		void							_CheckHubStatus();
++		void							_RestorePortPower();
+ 
+ 		InterruptPipe *					fInterruptPipe;
+ 		uint8							fPortCount;
+ 		uint8							fPowerOnToPowerGood;
++		bigtime_t						fPowerRestored;
++		uint32							fPowerRestoreCount;
++			// ports powered again after over-current: since fPowerRestored
++			// minus a minute
+ 
+ 		usb_port_status					fInterruptStatus[USB_MAX_PORT_COUNT];
+ 		usb_port_status					fPortStatus[USB_MAX_PORT_COUNT];

@@ -1,0 +1,1208 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 22:21:22 -0400
+Subject: [PATCH 186/342] meson_mali: bring-up driver for the ODROID-C2's
+ Mali-450 MP3
+
+PLAN.md M43 stage 2: the core clock at 666 MHz (glitch-free when one runs),
+the GPU's PMU powering its domains, the GP and PP version registers, both
+L2 caches, the GP's and PPs' soft resets, the four MMUs on an empty address
+space with the DLBU page at its fixed address, the DLBU and broadcast units,
+and the ten interrupts, checked with the reset-completed interrupts. A
+"mali" KDL command shows the registers. Jobs and lima's interface come in
+stage 3. From the port's docs/m43-mali-facts.md and
+docs/m43-gxbb-mali-integration-facts.md.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/jam/packages/Haiku                      |    3 +-
+ src/add-ons/kernel/drivers/misc/Jamfile       |    1 +
+ .../kernel/drivers/misc/meson_mali/Jamfile    |   10 +
+ .../drivers/misc/meson_mali/meson_mali.cpp    | 1137 +++++++++++++++++
+ 4 files changed, 1150 insertions(+), 1 deletion(-)
+ create mode 100644 src/add-ons/kernel/drivers/misc/meson_mali/Jamfile
+ create mode 100644 src/add-ons/kernel/drivers/misc/meson_mali/meson_mali.cpp
+
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index ce1d6526af..d5eca0c0a3 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -147,7 +147,8 @@ AddNewDriversToPackage power
+ 	: $(SYSTEM_ADD_ONS_DRIVERS_POWER) ;
+ AddNewDriversToPackage power : meson_scpi@arm64 ;
+ AddNewDriversToPackage rtc : pcf8563@arm64 ;
+-AddNewDriversToPackage misc : meson_gpio@arm64 meson_saradc@arm64 ;
++AddNewDriversToPackage misc : meson_gpio@arm64 meson_mali@arm64
++	meson_saradc@arm64 ;
+ AddNewDriversToPackage ports : meson_uart@arm64 ;
+ AddNewDriversToPackage video : meson_vdec@arm64 ;
+ AddNewDriversToPackage sensor
+diff --git a/src/add-ons/kernel/drivers/misc/Jamfile b/src/add-ons/kernel/drivers/misc/Jamfile
+index 3f895da5f0..b1e24d543b 100644
+--- a/src/add-ons/kernel/drivers/misc/Jamfile
++++ b/src/add-ons/kernel/drivers/misc/Jamfile
+@@ -20,4 +20,5 @@ KernelAddon <driver>test :
+ 	;
+ 
+ SubInclude HAIKU_TOP src add-ons kernel drivers misc meson_gpio ;
++SubInclude HAIKU_TOP src add-ons kernel drivers misc meson_mali ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers misc meson_saradc ;
+diff --git a/src/add-ons/kernel/drivers/misc/meson_mali/Jamfile b/src/add-ons/kernel/drivers/misc/meson_mali/Jamfile
+new file mode 100644
+index 0000000000..86971ed3c2
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/misc/meson_mali/Jamfile
+@@ -0,0 +1,10 @@
++SubDir HAIKU_TOP src add-ons kernel drivers misc meson_mali ;
++
++UsePrivateKernelHeaders ;
++UsePrivateHeaders drivers ;
++
++if $(TARGET_ARCH) = arm64 {
++	KernelAddon meson_mali :
++		meson_mali.cpp
++	;
++}
+diff --git a/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali.cpp b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali.cpp
+new file mode 100644
+index 0000000000..ed860fad83
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/misc/meson_mali/meson_mali.cpp
+@@ -0,0 +1,1137 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * meson_mali: the ODROID-C2's Mali-450 MP3 GPU, for Mesa's lima driver
++ * (PLAN.md M43). This is stage 2, the bring-up: the clock, the GPU's own
++ * power management unit, the version registers, the two L2 caches, the
++ * geometry processor's (GP) and pixel processors' (PP) soft resets, the four
++ * MMUs on an empty address space (the load balancer's page mapped at its
++ * fixed address), the load balancer (DLBU) and broadcast units, and the ten
++ * interrupts, checked with the reset-completed interrupts. Jobs and lima's
++ * interface come in stage 3.
++ *
++ * The facts are in the port's docs/m43-mali-facts.md (the GPU) and
++ * docs/m43-gxbb-mali-integration-facts.md (its clock and interrupts on the
++ * S905). On the GXBB the GPU has no reset line or power domain of its own
++ * that Linux uses: the clock is all, and the GPU's PMU powers its parts.
++ */
++
++
++#include <new>
++#include <stdio.h>
++#include <string.h>
++
++#include <AutoDeleterDrivers.h>
++#include <ByteOrder.h>
++#include <KernelExport.h>
++#include <bus/FDT.h>
++#include <device_manager.h>
++#include <kernel.h>
++#include <lock.h>
++#include <util/AutoLock.h>
++#include <vm/vm.h>
++
++
++#define DRIVER_MODULE_NAME	"drivers/misc/meson_mali/driver_v1"
++#define DEVICE_MODULE_NAME	"drivers/misc/meson_mali/device_v1"
++
++#define INFO(x...)	dprintf("meson_mali: " x)
++
++
++static device_manager_info* gDeviceManager;
++
++
++// the blocks, from the GPU's base (Mali-450)
++static const uint32 kGp = 0x00000;
++static const uint32 kPpL2 = 0x01000;
++static const uint32 kPmu = 0x02000;
++static const uint32 kGpMmu = 0x03000;
++static const uint32 kPpMmu[] = { 0x04000, 0x05000, 0x06000 };
++static const uint32 kPp[] = { 0x08000, 0x0a000, 0x0c000 };
++static const uint32 kGpL2 = 0x10000;
++static const uint32 kBcast = 0x13000;
++static const uint32 kDlbu = 0x14000;
++static const uint32 kPpBroadcast = 0x16000;
++static const size_t kWindowSize = 0x40000;
++static const uint32 kPpCount = 3;
++
++// GP
++enum {
++	GP_CMD				= 0x20,
++	GP_INT_RAWSTAT		= 0x24,
++	GP_INT_CLEAR		= 0x28,
++	GP_INT_MASK			= 0x2c,
++	GP_INT_STAT			= 0x30,
++	GP_STATUS			= 0x68,
++	GP_VERSION			= 0x6c,
++};
++static const uint32 kGpSoftReset = 0x400;
++static const uint32 kGpResetCompleted = 1 << 19;
++static const uint32 kGpInterruptsAll = 0x00787fff;
++static const uint32 kGpInterruptsUsed = 0x00706e47;
++
++// PP
++enum {
++	PP_VERSION			= 0x1000,
++	PP_STATUS			= 0x1008,
++	PP_CTRL				= 0x100c,
++	PP_INT_RAWSTAT		= 0x1020,
++	PP_INT_CLEAR		= 0x1024,
++	PP_INT_MASK			= 0x1028,
++	PP_INT_STATUS		= 0x102c,
++};
++static const uint32 kPpSoftReset = 0x80;
++static const uint32 kPpResetCompleted = 1 << 12;
++static const uint32 kPpInterruptsAll = 0x1fff;
++static const uint32 kPpInterruptsUsed = 0x0f19;
++
++// MMU
++enum {
++	MMU_DTE_ADDR		= 0x00,
++	MMU_STATUS			= 0x04,
++	MMU_COMMAND			= 0x08,
++	MMU_PAGE_FAULT_ADDR	= 0x0c,
++	MMU_INT_RAWSTAT		= 0x14,
++	MMU_INT_CLEAR		= 0x18,
++	MMU_INT_MASK		= 0x1c,
++	MMU_INT_STATUS		= 0x20,
++};
++enum {
++	MMU_ENABLE_PAGING	= 0,
++	MMU_HARD_RESET		= 6,
++};
++static const uint32 kMmuPagingEnabled = 1 << 0;
++static const uint32 kMmuInterrupts = 0x3;
++	// page fault, read bus error
++
++// L2 cache
++enum {
++	L2_SIZE				= 0x04,
++	L2_STATUS			= 0x08,
++	L2_COMMAND			= 0x10,
++	L2_MAX_READS		= 0x18,
++	L2_ENABLE			= 0x1c,
++};
++
++// PMU: STATUS has a bit per domain, 1 = off
++enum {
++	PMU_POWER_UP		= 0x00,
++	PMU_STATUS			= 0x08,
++	PMU_INT_MASK		= 0x0c,
++	PMU_INT_RAWSTAT		= 0x10,
++	PMU_INT_CLEAR		= 0x18,
++	PMU_SW_DELAY		= 0x1c,
++};
++static const uint32 kPmuDomains = 0x7;
++	// GP, PP0, PP1-PP3
++
++// DLBU, BCAST
++enum {
++	DLBU_MASTER_TLLIST_PHYS_ADDR	= 0x00,
++	DLBU_MASTER_TLLIST_VADDR		= 0x04,
++	BCAST_BROADCAST_MASK			= 0x00,
++	BCAST_INTERRUPT_MASK			= 0x04,
++};
++
++// page tables: two levels of 4 KiB; the DLBU page at a fixed address
++static const uint32 kPageDirectoryPresent = 0x1;
++static const uint32 kPageFlags = 0x1df;
++static const uint32 kDlbuAddress = 0xfff00000;
++
++// the clock (HHI_MALI_CLK_CNTL): two halves, [11:0] and [27:16] (source
++// [11:9], gate [8], divider [6:0]); bit 31 selects the second
++static const phys_addr_t kHhiBase = 0xc883c000;
++static const uint32 kHhiMaliClock = 0x1b0;
++static const uint32 kHhiGp0Pll = 0x040;
++static const uint32 kHhiMpll6 = 0x294;
++static const uint32 kClockSecondHalf = 1u << 31;
++static const uint32 kClockGate = 1 << 8;
++static const uint32 kClockSourceShift = 9;
++static const uint32 kClockSourceFclkDiv3 = 6;
++	// 666.67 MHz, always running
++static const uint32 kClockRates[] = {
++	24000, 0, 0, 0, 285714, 500000, 666667, 400000
++};	// kHz by source (0: xtal, 1: GP0 PLL, 2/3: audio PLLs, 4: fclk/7, ...)
++
++
++static const char* const kInterruptNames[] = {
++	"gp", "gpmmu", "pp", "pmu", "pp0", "ppmmu0", "pp1", "ppmmu1", "pp2",
++	"ppmmu2"
++};
++enum {
++	kIrqGp, kIrqGpMmu, kIrqPp, kIrqPmu, kIrqPp0, kIrqPpMmu0, kIrqPp1,
++	kIrqPpMmu1, kIrqPp2, kIrqPpMmu2, kIrqCount
++};
++
++
++struct dma_buffer {
++	area_id		area;
++	uint32*		address;
++	phys_addr_t	physical;
++
++	dma_buffer() : area(-1), address(NULL), physical(0) {}
++};
++
++
++class MesonMali;
++
++struct interrupt_line {
++	MesonMali*	device;
++	int32		index;		// kIrq*
++	int32		vector;
++	int32		count;
++};
++
++
++class MesonMali {
++public:
++								MesonMali(device_node* node);
++								~MesonMali();
++
++			status_t			Init(phys_addr_t base,
++									const int32* interrupts);
++			device_node*		Node() const { return fNode; }
++			void				Dump();
++
++private:
++			uint32				_Read(uint32 offset) const
++									{ return fRegisters[offset / 4]; }
++			void				_Write(uint32 offset, uint32 value)
++									{ fRegisters[offset / 4] = value; }
++			uint32				_Hhi(uint32 offset) const
++									{ return fHhi[offset / 4]; }
++			void				_SetHhi(uint32 offset, uint32 value)
++									{ fHhi[offset / 4] = value; }
++
++			bool				_Poll(uint32 offset, uint32 mask,
++									uint32 value, bigtime_t timeout,
++									bigtime_t interval = 0) const;
++			void				_SetClock();
++			uint32				_ClockRate() const;
++			status_t			_PowerUp();
++			void				_InitL2(uint32 base, const char* name);
++			status_t			_ResetGp();
++			status_t			_ResetPp(uint32 index);
++			status_t			_InitMmu(uint32 base, const char* name);
++			status_t			_AllocatePage(const char* name,
++									dma_buffer& buffer);
++			void				_FreePage(dma_buffer& buffer);
++			void				_InstallInterrupts(const int32* vectors);
++			void				_TestInterrupts();
++
++	static	int32				_Interrupt(void* data);
++			int32				_HandleInterrupt(interrupt_line& line);
++
++			device_node*		fNode;
++			area_id				fArea;
++			volatile uint32*	fRegisters;
++			area_id				fHhiArea;
++			volatile uint32*	fHhi;
++			phys_addr_t			fBase;
++			dma_buffer			fPageDirectory;
++			dma_buffer			fPageTable;
++			dma_buffer			fDlbuPage;
++			interrupt_line		fLines[kIrqCount];
++			uint32				fGpVersion;
++			uint32				fPpVersion[kPpCount];
++};
++
++
++static MesonMali* sDevice;
++
++
++/*!	Writes back and invalidates the CPU's lines of [physical, +size): the
++	GPU doesn't snoop the CPU's caches. Through the kernel's map of all
++	memory.
++*/
++static void
++flush_cache_range(phys_addr_t physical, size_t size)
++{
++	uint64 ctr;
++	asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
++	const addr_t lineSize = 4 << ((ctr >> 16) & 0xf);
++	for (addr_t line = KERNEL_PMAP_BASE + physical;
++			line < KERNEL_PMAP_BASE + physical + size; line += lineSize) {
++		asm volatile("dc civac, %0" : : "r"(line) : "memory");
++	}
++	asm volatile("dsb sy" : : : "memory");
++}
++
++
++static status_t
++map_registers(const char* name, phys_addr_t base, size_t size, area_id& area,
++	volatile uint32*& registers)
++{
++	phys_addr_t page = base & ~(phys_addr_t)(B_PAGE_SIZE - 1);
++	size_t mapSize = ROUNDUP(base + size - page, B_PAGE_SIZE);
++	void* address;
++	area = map_physical_memory(name, page, mapSize, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++	if (area < 0)
++		return area;
++	registers = (volatile uint32*)((addr_t)address + (base - page));
++	return B_OK;
++}
++
++
++MesonMali::MesonMali(device_node* node)
++	:
++	fNode(node),
++	fArea(-1),
++	fRegisters(NULL),
++	fHhiArea(-1),
++	fHhi(NULL),
++	fBase(0),
++	fGpVersion(0)
++{
++	for (int32 i = 0; i < kIrqCount; i++) {
++		fLines[i].device = this;
++		fLines[i].index = i;
++		fLines[i].vector = -1;
++		fLines[i].count = 0;
++	}
++	memset(fPpVersion, 0, sizeof(fPpVersion));
++}
++
++
++MesonMali::~MesonMali()
++{
++	if (fRegisters != NULL) {
++		// quiet: no interrupts from the blocks
++		_Write(kGp + GP_INT_MASK, 0);
++		for (uint32 i = 0; i < kPpCount; i++)
++			_Write(kPp[i] + PP_INT_MASK, 0);
++		_Write(kGpMmu + MMU_INT_MASK, 0);
++		for (uint32 i = 0; i < kPpCount; i++)
++			_Write(kPpMmu[i] + MMU_INT_MASK, 0);
++	}
++	for (int32 i = 0; i < kIrqCount; i++) {
++		if (fLines[i].vector >= 0) {
++			remove_io_interrupt_handler(fLines[i].vector, &_Interrupt,
++				&fLines[i]);
++		}
++	}
++	_FreePage(fDlbuPage);
++	_FreePage(fPageTable);
++	_FreePage(fPageDirectory);
++	if (fHhiArea >= 0)
++		delete_area(fHhiArea);
++	if (fArea >= 0)
++		delete_area(fArea);
++}
++
++
++/*!	Polls until (register & mask) == value, every \a interval (0: without
++	sleeping), for at most \a timeout.
++*/
++bool
++MesonMali::_Poll(uint32 offset, uint32 mask, uint32 value, bigtime_t timeout,
++	bigtime_t interval) const
++{
++	bigtime_t deadline = system_time() + timeout;
++	while (true) {
++		if ((_Read(offset) & mask) == value)
++			return true;
++		if (system_time() > deadline)
++			return false;
++		if (interval > 0)
++			snooze(interval);
++		else
++			cpu_pause();
++	}
++}
++
++
++status_t
++MesonMali::_AllocatePage(const char* name, dma_buffer& buffer)
++{
++	virtual_address_restrictions virtualRestrictions = {};
++	virtualRestrictions.address_specification = B_ANY_KERNEL_ADDRESS;
++	physical_address_restrictions physicalRestrictions = {};
++	physicalRestrictions.high_address = (phys_addr_t)1 << 32;
++	void* address;
++	buffer.area = create_area_etc(B_SYSTEM_TEAM, name, B_PAGE_SIZE,
++		B_CONTIGUOUS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, 0, 0,
++		&virtualRestrictions, &physicalRestrictions, &address);
++	if (buffer.area < 0)
++		return buffer.area;
++	physical_entry entry;
++	get_memory_map(address, B_PAGE_SIZE, &entry, 1);
++	buffer.address = (uint32*)address;
++	buffer.physical = entry.address;
++	memset(address, 0, B_PAGE_SIZE);
++	flush_cache_range(buffer.physical, B_PAGE_SIZE);
++	return B_OK;
++}
++
++
++void
++MesonMali::_FreePage(dma_buffer& buffer)
++{
++	if (buffer.area >= 0)
++		delete_area(buffer.area);
++	buffer = dma_buffer();
++}
++
++
++/*!	The core clock at 666 MHz from fclk_div3, which always runs. A running
++	clock is switched without a glitch: the half not in use gets the new
++	setting and its gate, then bit 31 selects it, then the old half's gate
++	goes off.
++*/
++void
++MesonMali::_SetClock()
++{
++	uint32 control = _Hhi(kHhiMaliClock);
++	uint32 setting = kClockSourceFclkDiv3 << kClockSourceShift;
++		// divider 0: /1
++	bool second = (control & kClockSecondHalf) != 0;
++	uint32 activeShift = second ? 16 : 0;
++	bool running = (control & (kClockGate << activeShift)) != 0;
++	if (running && ((control >> activeShift) & 0xeff) == setting)
++		return;
++
++	uint32 shift = running ? (second ? 0 : 16) : activeShift;
++	control &= ~(0xfffu << shift);
++	control |= setting << shift;
++	_SetHhi(kHhiMaliClock, control);
++	control |= kClockGate << shift;
++	_SetHhi(kHhiMaliClock, control);
++	spin(1);
++	if (running) {
++		control ^= kClockSecondHalf;
++		_SetHhi(kHhiMaliClock, control);
++		control &= ~(kClockGate << activeShift);
++		_SetHhi(kHhiMaliClock, control);
++	}
++}
++
++
++uint32
++MesonMali::_ClockRate() const
++{
++	uint32 control = _Hhi(kHhiMaliClock);
++	uint32 half = (control >> ((control & kClockSecondHalf) != 0 ? 16 : 0))
++		& 0xfff;
++	if ((half & kClockGate) == 0)
++		return 0;
++	uint32 rate = kClockRates[(half >> kClockSourceShift) & 7];
++	return rate / ((half & 0x7f) + 1);
++}
++
++
++/*!	The GPU's PMU powers up every domain that is off (the GP, PP0, and
++	PP1-PP3 with the L2 caches).
++*/
++status_t
++MesonMali::_PowerUp()
++{
++	_Write(kPmu + PMU_INT_MASK, 0);
++	_Write(kPmu + PMU_SW_DELAY, 0xffff);
++	uint32 off = _Read(kPmu + PMU_STATUS) & kPmuDomains;
++	if (off == 0)
++		return B_OK;
++	_Write(kPmu + PMU_POWER_UP, off);
++	bool done = _Poll(kPmu + PMU_INT_RAWSTAT, 1, 1, 100000, 100);
++	_Write(kPmu + PMU_INT_CLEAR, 1);
++	if (!done || (_Read(kPmu + PMU_STATUS) & kPmuDomains) != 0) {
++		INFO("power up: status %#" B_PRIx32 " after 100 ms\n",
++			_Read(kPmu + PMU_STATUS));
++		return B_TIMED_OUT;
++	}
++	return B_OK;
++}
++
++
++void
++MesonMali::_InitL2(uint32 base, const char* name)
++{
++	_Write(base + L2_COMMAND, 1);
++		// clear all: flush and invalidate
++	if (!_Poll(base + L2_STATUS, 1, 0, 1000))
++		INFO("%s L2: still busy after a flush\n", name);
++	_Write(base + L2_ENABLE, 0x3);
++		// access, read allocate
++	_Write(base + L2_MAX_READS, 0x1c);
++	uint32 size = _Read(base + L2_SIZE);
++	INFO("%s L2: %" B_PRIu32 " KiB, %" B_PRIu32 "-way, %" B_PRIu32
++		"-byte lines, %" B_PRIu32 "-bit bus (%#" B_PRIx32 ")\n", name,
++		(uint32)1 << (((size >> 16) & 0xff) - 10), (uint32)1
++			<< ((size >> 8) & 0xff), (uint32)1 << (size & 0xff),
++		(uint32)1 << ((size >> 24) & 0xff), size);
++}
++
++
++status_t
++MesonMali::_ResetGp()
++{
++	_Write(kGp + GP_INT_MASK, 0);
++	_Write(kGp + GP_INT_CLEAR, kGpResetCompleted);
++	_Write(kGp + GP_CMD, kGpSoftReset);
++	bool done = _Poll(kGp + GP_INT_RAWSTAT, kGpResetCompleted,
++		kGpResetCompleted, 100);
++	_Write(kGp + GP_INT_CLEAR, kGpInterruptsAll);
++	_Write(kGp + GP_INT_MASK, kGpInterruptsUsed);
++	return done ? B_OK : B_TIMED_OUT;
++}
++
++
++status_t
++MesonMali::_ResetPp(uint32 index)
++{
++	uint32 base = kPp[index];
++	_Write(base + PP_INT_MASK, 0);
++	_Write(base + PP_INT_RAWSTAT, kPpInterruptsAll);
++	_Write(base + PP_CTRL, kPpSoftReset);
++	bigtime_t deadline = system_time() + 100;
++	bool done;
++	while (true) {
++		done = (_Read(base + PP_STATUS) & 1) == 0
++			&& _Read(base + PP_INT_RAWSTAT) == kPpResetCompleted;
++		if (done || system_time() > deadline)
++			break;
++		cpu_pause();
++	}
++	_Write(base + PP_INT_CLEAR, kPpInterruptsAll);
++	_Write(base + PP_INT_MASK, kPpInterruptsUsed);
++	return done ? B_OK : B_TIMED_OUT;
++}
++
++
++/*!	An MMU on the empty address space: the probe of its address register,
++	a hard reset, its interrupts, the page directory, paging on.
++*/
++status_t
++MesonMali::_InitMmu(uint32 base, const char* name)
++{
++	_Write(base + MMU_DTE_ADDR, 0xcafebabe);
++	uint32 probe = _Read(base + MMU_DTE_ADDR);
++	if (probe != 0xcafeb000) {
++		INFO("%s: address register reads %#" B_PRIx32 "\n", name, probe);
++		return B_DEVICE_NOT_FOUND;
++	}
++	_Write(base + MMU_COMMAND, MMU_HARD_RESET);
++	_Write(base + MMU_COMMAND, MMU_HARD_RESET);
++	if (!_Poll(base + MMU_DTE_ADDR, ~0u, 0, 100)) {
++		INFO("%s: no hard reset\n", name);
++		return B_TIMED_OUT;
++	}
++	_Write(base + MMU_INT_MASK, kMmuInterrupts);
++	_Write(base + MMU_DTE_ADDR, (uint32)fPageDirectory.physical);
++	_Write(base + MMU_COMMAND, MMU_ENABLE_PAGING);
++	if (!_Poll(base + MMU_STATUS, kMmuPagingEnabled, kMmuPagingEnabled,
++			100)) {
++		INFO("%s: paging not enabled (status %#" B_PRIx32 ")\n", name,
++			_Read(base + MMU_STATUS));
++		return B_TIMED_OUT;
++	}
++	return B_OK;
++}
++
++
++status_t
++MesonMali::Init(phys_addr_t base, const int32* interrupts)
++{
++	fBase = base;
++	status_t status = map_registers("meson_mali registers", base,
++		kWindowSize, fArea, fRegisters);
++	if (status == B_OK) {
++		status = map_registers("meson_mali hhi", kHhiBase, B_PAGE_SIZE,
++			fHhiArea, fHhi);
++	}
++	if (status != B_OK)
++		return status;
++
++	// the clock as the firmware left it, then 666 MHz
++	INFO("at %#" B_PRIxPHYSADDR ": clock %#" B_PRIx32 " (%" B_PRIu32
++		" kHz), GP0 PLL %#" B_PRIx32 ", MPLL_CNTL6 %#" B_PRIx32 "\n", base,
++		_Hhi(kHhiMaliClock), _ClockRate(), _Hhi(kHhiGp0Pll),
++		_Hhi(kHhiMpll6));
++	_SetClock();
++
++	uint32 powered = _Read(kPmu + PMU_STATUS);
++	status = _PowerUp();
++	INFO("clock %#" B_PRIx32 " (%" B_PRIu32 " kHz); power status %#"
++		B_PRIx32 " -> %#" B_PRIx32 "\n", _Hhi(kHhiMaliClock), _ClockRate(),
++		powered, _Read(kPmu + PMU_STATUS));
++	if (status != B_OK)
++		return status;
++
++	fGpVersion = _Read(kGp + GP_VERSION);
++	for (uint32 i = 0; i < kPpCount; i++)
++		fPpVersion[i] = _Read(kPp[i] + PP_VERSION);
++	INFO("GP version %#" B_PRIx32 ", PP versions %#" B_PRIx32 " %#" B_PRIx32
++		" %#" B_PRIx32 "\n", fGpVersion, fPpVersion[0], fPpVersion[1],
++		fPpVersion[2]);
++	if ((fGpVersion >> 16) != 0x0d07) {
++		INFO("not a Mali-450 GP\n");
++		return B_DEVICE_NOT_FOUND;
++	}
++
++	_InitL2(kGpL2, "GP");
++	_InitL2(kPpL2, "PP");
++
++	if (_ResetGp() != B_OK)
++		INFO("GP: no soft reset\n");
++	for (uint32 i = 0; i < kPpCount; i++) {
++		if (_ResetPp(i) != B_OK)
++			INFO("PP%" B_PRIu32 ": no soft reset (status %#" B_PRIx32
++				", raw %#" B_PRIx32 ")\n", i, _Read(kPp[i] + PP_STATUS),
++				_Read(kPp[i] + PP_INT_RAWSTAT));
++	}
++
++	// The empty address space the MMUs hold while idle: nothing but the
++	// DLBU's page at its fixed address.
++	if ((status = _AllocatePage("meson_mali page directory", fPageDirectory))
++			!= B_OK
++		|| (status = _AllocatePage("meson_mali page table", fPageTable))
++			!= B_OK
++		|| (status = _AllocatePage("meson_mali dlbu", fDlbuPage)) != B_OK) {
++		return status;
++	}
++	fPageTable.address[(kDlbuAddress >> 12) & 0x3ff]
++		= (uint32)fDlbuPage.physical | kPageFlags;
++	fPageDirectory.address[kDlbuAddress >> 22]
++		= (uint32)fPageTable.physical | kPageDirectoryPresent;
++	flush_cache_range(fPageTable.physical, B_PAGE_SIZE);
++	flush_cache_range(fPageDirectory.physical, B_PAGE_SIZE);
++
++	if ((status = _InitMmu(kGpMmu, "GP MMU")) != B_OK)
++		return status;
++	for (uint32 i = 0; i < kPpCount; i++) {
++		char name[16];
++		snprintf(name, sizeof(name), "PP%" B_PRIu32 " MMU", i);
++		if ((status = _InitMmu(kPpMmu[i], name)) != B_OK)
++			return status;
++	}
++
++	_Write(kDlbu + DLBU_MASTER_TLLIST_PHYS_ADDR,
++		(uint32)fDlbuPage.physical | 1);
++	_Write(kDlbu + DLBU_MASTER_TLLIST_VADDR, kDlbuAddress);
++	_Write(kBcast + BCAST_BROADCAST_MASK, ((1 << kPpCount) - 1) << 16);
++	_Write(kBcast + BCAST_INTERRUPT_MASK, (1 << kPpCount) - 1);
++
++	_InstallInterrupts(interrupts);
++	_TestInterrupts();
++	return B_OK;
++}
++
++
++void
++MesonMali::_InstallInterrupts(const int32* vectors)
++{
++	for (int32 i = 0; i < kIrqCount; i++) {
++		if (vectors[i] <= 0)
++			continue;
++		if (install_io_interrupt_handler(vectors[i], &_Interrupt, &fLines[i],
++				0) == B_OK) {
++			fLines[i].vector = vectors[i];
++		}
++	}
++}
++
++
++/*!	The interrupts, by the reset-completed interrupt each processor raises
++	after a soft reset: the GP's on its line; the PPs', reset through the
++	broadcast window, on whichever lines the broadcast unit routes them to.
++*/
++void
++MesonMali::_TestInterrupts()
++{
++	int32 before[kIrqCount];
++	for (int32 i = 0; i < kIrqCount; i++)
++		before[i] = atomic_get(&fLines[i].count);
++
++	_Write(kGp + GP_INT_CLEAR, kGpInterruptsAll);
++	_Write(kGp + GP_INT_MASK, kGpInterruptsUsed | kGpResetCompleted);
++	_Write(kGp + GP_CMD, kGpSoftReset);
++	snooze(1000);
++	_Write(kGp + GP_INT_MASK, kGpInterruptsUsed);
++
++	for (uint32 i = 0; i < kPpCount; i++) {
++		_Write(kPp[i] + PP_INT_CLEAR, kPpInterruptsAll);
++		_Write(kPp[i] + PP_INT_MASK, kPpInterruptsUsed | kPpResetCompleted);
++	}
++	_Write(kBcast + BCAST_BROADCAST_MASK,
++		(((1 << kPpCount) - 1) << 16) | ((1 << kPpCount) - 1));
++	_Write(kPpBroadcast + PP_CTRL, kPpSoftReset);
++	snooze(1000);
++	_Write(kBcast + BCAST_BROADCAST_MASK, ((1 << kPpCount) - 1) << 16);
++	for (uint32 i = 0; i < kPpCount; i++)
++		_Write(kPp[i] + PP_INT_MASK, kPpInterruptsUsed);
++
++	char counts[128];
++	size_t length = 0;
++	for (int32 i = 0; i < kIrqCount; i++) {
++		length += snprintf(counts + length, sizeof(counts) - length,
++			" %s %" B_PRId32, kInterruptNames[i],
++			atomic_get(&fLines[i].count) - before[i]);
++	}
++	INFO("interrupts after the reset test:%s\n", counts);
++}
++
++
++/*static*/ int32
++MesonMali::_Interrupt(void* data)
++{
++	interrupt_line* line = (interrupt_line*)data;
++	return line->device->_HandleInterrupt(*line);
++}
++
++
++int32
++MesonMali::_HandleInterrupt(interrupt_line& line)
++{
++	uint32 status = 0;
++	switch (line.index) {
++		case kIrqGp:
++			status = _Read(kGp + GP_INT_STAT);
++			if (status != 0)
++				_Write(kGp + GP_INT_CLEAR, status);
++			break;
++
++		case kIrqPp:
++			// the broadcast line: any PP's
++			for (uint32 i = 0; i < kPpCount; i++) {
++				uint32 ppStatus = _Read(kPp[i] + PP_INT_STATUS);
++				if (ppStatus != 0)
++					_Write(kPp[i] + PP_INT_CLEAR, ppStatus);
++				status |= ppStatus;
++			}
++			break;
++
++		case kIrqPp0:
++		case kIrqPp1:
++		case kIrqPp2:
++		{
++			uint32 base = kPp[(line.index - kIrqPp0) / 2];
++			status = _Read(base + PP_INT_STATUS);
++			if (status != 0)
++				_Write(base + PP_INT_CLEAR, status);
++			break;
++		}
++
++		case kIrqGpMmu:
++		case kIrqPpMmu0:
++		case kIrqPpMmu1:
++		case kIrqPpMmu2:
++		{
++			uint32 base = line.index == kIrqGpMmu
++				? kGpMmu : kPpMmu[(line.index - kIrqPpMmu0) / 2];
++			status = _Read(base + MMU_INT_STATUS);
++			if (status == 0)
++				break;
++			// a fault stops the pipe; stage 3 recovers it
++			_Write(base + MMU_INT_MASK, 0);
++			_Write(base + MMU_INT_CLEAR, status);
++			dprintf("meson_mali: %s: %s at %#" B_PRIx32 "\n",
++				kInterruptNames[line.index],
++				(status & 1) != 0 ? "page fault" : "bus error",
++				_Read(base + MMU_PAGE_FAULT_ADDR));
++			break;
++		}
++
++		case kIrqPmu:
++			status = _Read(kPmu + PMU_INT_RAWSTAT) & 1;
++			if (status != 0)
++				_Write(kPmu + PMU_INT_CLEAR, status);
++			break;
++	}
++	if (status == 0)
++		return B_UNHANDLED_INTERRUPT;
++	atomic_add(&line.count, 1);
++	return B_HANDLED_INTERRUPT;
++}
++
++
++void
++MesonMali::Dump()
++{
++	kprintf("meson_mali at %#" B_PRIxPHYSADDR ": clock %#" B_PRIx32 " (%"
++		B_PRIu32 " kHz), power status %#" B_PRIx32 "\n", fBase,
++		_Hhi(kHhiMaliClock), _ClockRate(), _Read(kPmu + PMU_STATUS));
++	kprintf("  GP: version %#" B_PRIx32 ", status %#" B_PRIx32 ", raw %#"
++		B_PRIx32 ", mask %#" B_PRIx32 "\n", _Read(kGp + GP_VERSION),
++		_Read(kGp + GP_STATUS), _Read(kGp + GP_INT_RAWSTAT),
++		_Read(kGp + GP_INT_MASK));
++	for (uint32 i = 0; i < kPpCount; i++) {
++		kprintf("  PP%" B_PRIu32 ": version %#" B_PRIx32 ", status %#"
++			B_PRIx32 ", raw %#" B_PRIx32 ", mask %#" B_PRIx32 "\n", i,
++			_Read(kPp[i] + PP_VERSION), _Read(kPp[i] + PP_STATUS),
++			_Read(kPp[i] + PP_INT_RAWSTAT), _Read(kPp[i] + PP_INT_MASK));
++	}
++	const uint32 mmus[] = { kGpMmu, kPpMmu[0], kPpMmu[1], kPpMmu[2] };
++	for (uint32 i = 0; i < B_COUNT_OF(mmus); i++) {
++		kprintf("  MMU %#" B_PRIx32 ": directory %#" B_PRIx32 ", status %#"
++			B_PRIx32 ", raw %#" B_PRIx32 ", fault at %#" B_PRIx32 "\n",
++			mmus[i], _Read(mmus[i] + MMU_DTE_ADDR),
++			_Read(mmus[i] + MMU_STATUS), _Read(mmus[i] + MMU_INT_RAWSTAT),
++			_Read(mmus[i] + MMU_PAGE_FAULT_ADDR));
++	}
++	kprintf("  L2: GP status %#" B_PRIx32 " enable %#" B_PRIx32
++		", PP status %#" B_PRIx32 " enable %#" B_PRIx32 "\n",
++		_Read(kGpL2 + L2_STATUS), _Read(kGpL2 + L2_ENABLE),
++		_Read(kPpL2 + L2_STATUS), _Read(kPpL2 + L2_ENABLE));
++	kprintf("  interrupts:");
++	for (int32 i = 0; i < kIrqCount; i++) {
++		kprintf(" %s(%" B_PRId32 ") %" B_PRId32, kInterruptNames[i],
++			fLines[i].vector, fLines[i].count);
++	}
++	kprintf("\n");
++}
++
++
++static int
++dump_meson_mali(int argc, char** argv)
++{
++	if (sDevice == NULL)
++		kprintf("meson_mali: no device\n");
++	else
++		sDevice->Dump();
++	return 0;
++}
++
++
++//	#pragma mark - device tree
++
++
++static bool
++fdt_device_enabled(fdt_device_module_info* module, fdt_device* device)
++{
++	int length;
++	const char* status = (const char*)module->get_prop(device, "status",
++		&length);
++	return status == NULL || strcmp(status, "okay") == 0
++		|| strcmp(status, "ok") == 0;
++}
++
++
++static uint32
++get_cell_count(fdt_device_module_info* module, fdt_device* device,
++	const char* name, uint32 defaultValue)
++{
++	int length;
++	const uint32* prop = (const uint32*)module->get_prop(device, name,
++		&length);
++	if (prop == NULL || length < 4)
++		return defaultValue;
++	return B_BENDIAN_TO_HOST_INT32(prop[0]);
++}
++
++
++static uint64
++read_cells(const uint32* cells, uint32 count)
++{
++	uint64 value = 0;
++	for (uint32 i = 0; i < count; i++)
++		value = (value << 32) | B_BENDIAN_TO_HOST_INT32(cells[i]);
++	return value;
++}
++
++
++/*!	The FDT bus gives "reg" relative to the parent bus: through the "ranges"
++	of each ancestor bus to a CPU physical address (the GPU sits in
++	"apb@d0000000").
++*/
++static status_t
++translate_fdt_address(fdt_device_module_info* module, device_node* fdtNode,
++	uint64& address)
++{
++	device_node* busNode = gDeviceManager->get_parent_node(fdtNode);
++	while (busNode != NULL) {
++		DeviceNodePutter<&gDeviceManager> busPutter(busNode);
++
++		driver_module_info* busModule;
++		fdt_device* bus;
++		if (gDeviceManager->get_driver(busNode, &busModule, (void**)&bus)
++				!= B_OK || busModule != (driver_module_info*)module) {
++			return B_OK;
++		}
++
++		int length;
++		const uint32* ranges = (const uint32*)module->get_prop(bus, "ranges",
++			&length);
++		if (ranges == NULL)
++			return B_OK;
++
++		device_node* parentNode = gDeviceManager->get_parent_node(busNode);
++		if (length > 0) {
++			uint32 childCells = get_cell_count(module, bus, "#address-cells",
++				2);
++			uint32 sizeCells = get_cell_count(module, bus, "#size-cells", 1);
++			uint32 parentCells = 2;
++			driver_module_info* parentModule;
++			fdt_device* parentBus;
++			if (parentNode != NULL
++				&& gDeviceManager->get_driver(parentNode, &parentModule,
++					(void**)&parentBus) == B_OK
++				&& parentModule == (driver_module_info*)module) {
++				parentCells = get_cell_count(module, parentBus,
++					"#address-cells", 2);
++			}
++
++			uint32 entryCells = childCells + parentCells + sizeCells;
++			uint32 entries = length / 4 / entryCells;
++			bool found = false;
++			for (uint32 i = 0; i < entries && !found; i++) {
++				const uint32* entry = ranges + i * entryCells;
++				uint64 child = read_cells(entry, childCells);
++				uint64 parent = read_cells(entry + childCells, parentCells);
++				uint64 size = read_cells(entry + childCells + parentCells,
++					sizeCells);
++				if (address >= child && address - child < size) {
++					address = address - child + parent;
++					found = true;
++				}
++			}
++			if (!found) {
++				if (parentNode != NULL)
++					gDeviceManager->put_node(parentNode);
++				return B_ENTRY_NOT_FOUND;
++			}
++		}
++
++		busNode = parentNode;
++	}
++	return B_OK;
++}
++
++
++/*!	The interrupt the node's "interrupt-names" calls \a name, or -1. */
++static int32
++named_interrupt(fdt_device_module_info* module, fdt_device* device,
++	const char* name)
++{
++	int length;
++	const char* names = (const char*)module->get_prop(device,
++		"interrupt-names", &length);
++	if (names == NULL)
++		return -1;
++	int32 index = 0;
++	for (const char* entry = names; entry < names + length;
++			entry += strlen(entry) + 1, index++) {
++		if (strcmp(entry, name) != 0)
++			continue;
++		uint64 vector;
++		if (!module->get_interrupt(device, index, NULL, &vector))
++			return -1;
++		return (int32)vector;
++	}
++	return -1;
++}
++
++
++//	#pragma mark - driver module
++
++
++static float
++supports_device(device_node* parent)
++{
++	const char* bus;
++	const char* compatible;
++	if (gDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false)
++			!= B_OK || strcmp(bus, "fdt") != 0
++		|| gDeviceManager->get_attr_string(parent, "fdt/compatible",
++			&compatible, false) != B_OK
++		|| strcmp(compatible, "amlogic,meson-gxbb-mali") != 0) {
++		return 0.0f;
++	}
++	return 0.8f;
++}
++
++
++static status_t
++register_device(device_node* parent)
++{
++	device_attr attrs[] = {
++		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE,
++			{ .string = "ARM Mali-450 MP3" } },
++		{ NULL }
++	};
++	return gDeviceManager->register_node(parent, DRIVER_MODULE_NAME, attrs,
++		NULL, NULL);
++}
++
++
++static status_t
++init_driver(device_node* node, void** _cookie)
++{
++	DeviceNodePutter<&gDeviceManager> fdtNode(
++		gDeviceManager->get_parent_node(node));
++	fdt_device_module_info* fdtModule;
++	fdt_device* fdtDevice;
++	if (gDeviceManager->get_driver(fdtNode.Get(),
++			(driver_module_info**)&fdtModule, (void**)&fdtDevice) != B_OK) {
++		return B_ERROR;
++	}
++	if (!fdt_device_enabled(fdtModule, fdtDevice))
++		return B_DEVICE_NOT_FOUND;
++
++	uint64 base;
++	uint64 length;
++	if (!fdtModule->get_reg(fdtDevice, 0, &base, &length)
++		|| length < kWindowSize) {
++		return B_ERROR;
++	}
++	status_t status = translate_fdt_address(fdtModule, fdtNode.Get(), base);
++	if (status != B_OK)
++		return status;
++
++	int32 interrupts[kIrqCount];
++	for (int32 i = 0; i < kIrqCount; i++) {
++		interrupts[i] = named_interrupt(fdtModule, fdtDevice,
++			kInterruptNames[i]);
++	}
++
++	MesonMali* device = new(std::nothrow) MesonMali(node);
++	if (device == NULL)
++		return B_NO_MEMORY;
++	status = device->Init(base, interrupts);
++	if (status != B_OK) {
++		INFO("not used: %s\n", strerror(status));
++		delete device;
++		return status;
++	}
++	sDevice = device;
++	add_debugger_command("mali", &dump_meson_mali,
++		"Shows the Mali-450's registers");
++	*_cookie = device;
++	return B_OK;
++}
++
++
++static void
++uninit_driver(void* cookie)
++{
++	remove_debugger_command("mali", &dump_meson_mali);
++	sDevice = NULL;
++	delete (MesonMali*)cookie;
++}
++
++
++static status_t
++register_child_devices(void* cookie)
++{
++	MesonMali* device = (MesonMali*)cookie;
++	return gDeviceManager->publish_device(device->Node(), "misc/mali/0",
++		DEVICE_MODULE_NAME);
++}
++
++
++//	#pragma mark - device module
++
++
++static status_t
++device_init(void* driverCookie, void** _deviceCookie)
++{
++	*_deviceCookie = driverCookie;
++	return B_OK;
++}
++
++
++static void
++device_uninit(void* deviceCookie)
++{
++}
++
++
++static status_t
++device_open(void* deviceCookie, const char* path, int openMode,
++	void** _cookie)
++{
++	*_cookie = deviceCookie;
++	return B_OK;
++}
++
++
++static status_t
++device_close(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++device_free(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++device_read(void* cookie, off_t position, void* buffer, size_t* _length)
++{
++	*_length = 0;
++	return B_NOT_SUPPORTED;
++}
++
++
++static status_t
++device_write(void* cookie, off_t position, const void* buffer,
++	size_t* _length)
++{
++	*_length = 0;
++	return B_NOT_SUPPORTED;
++}
++
++
++static status_t
++device_control(void* cookie, uint32 op, void* buffer, size_t length)
++{
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++module_dependency module_dependencies[] = {
++	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&gDeviceManager },
++	{}
++};
++
++
++static struct device_module_info sMesonMaliDevice = {
++	{
++		DEVICE_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	device_init,
++	device_uninit,
++	NULL,	// remove
++
++	device_open,
++	device_close,
++	device_free,
++	device_read,
++	device_write,
++	NULL,	// io
++	device_control,
++
++	NULL,	// select
++	NULL,	// deselect
++};
++
++
++static struct driver_module_info sMesonMaliDriver = {
++	{
++		DRIVER_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	supports_device,
++	register_device,
++	init_driver,
++	uninit_driver,
++	register_child_devices,
++	NULL,	// rescan
++	NULL,	// removed
++};
++
++
++module_info* modules[] = {
++	(module_info*)&sMesonMaliDriver,
++	(module_info*)&sMesonMaliDevice,
++	NULL
++};

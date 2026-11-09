@@ -1,0 +1,1528 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Sat, 31 Oct 2026 13:27:44 -0400
+Subject: [PATCH 172/342] Remote Control: a profile can send to one
+ application, active or not
+
+A profile follows the active application, as before, or sends to an
+application chosen under "Send to" whether it is active or not (by
+signature; "Start it if it isn't running" launches it on a press).
+
+- A button can have a scripting command instead of its keystroke,
+  written as for hey ("Bply of Window 0", "do TogglePlaying of Window 0",
+  "set Seek of Window 0 to int64(5000000)", "with name=value and ...").
+  ScriptCommand.cpp makes the message, as hey would; the add-on sends it
+  to the target, or to the active application, without waiting. Held,
+  a repeating button sends it again every 0.2 s, as keys repeat.
+- Keystrokes of a profile with a target go straight to the target's
+  first window (its focus view), instead of through the input stream.
+- Templates "MediaPlayer, active or not" (its scripting suite; the volume
+  keys to its window, since the suite only sets the volume) and
+  one for a music player's commands, which set the target.
+- A Test button presses the selected button as if from the remote, for
+  profiles with a target (Control() code 'rcTB').
+
+Profiles of version 1 load unchanged, following the active application.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../devices/remote_control/Jamfile            |   3 +-
+ .../remote_control/RemoteControlDevice.cpp    | 261 ++++++++++++--
+ .../remote_control/RemoteControlDevice.h      |  21 +-
+ .../devices/remote_control/RemoteProfile.cpp  |  16 +
+ .../devices/remote_control/RemoteProfile.h    |  28 +-
+ .../devices/remote_control/ScriptCommand.cpp  | 336 ++++++++++++++++++
+ .../devices/remote_control/ScriptCommand.h    |  40 +++
+ src/preferences/remotecontrol/Jamfile         |   1 +
+ .../remotecontrol/RemoteWindow.cpp            | 237 +++++++++++-
+ src/preferences/remotecontrol/RemoteWindow.h  |   5 +
+ src/preferences/remotecontrol/Templates.cpp   |  40 +++
+ src/preferences/remotecontrol/Templates.h     |   4 +
+ 12 files changed, 948 insertions(+), 44 deletions(-)
+ create mode 100644 src/add-ons/input_server/devices/remote_control/ScriptCommand.cpp
+ create mode 100644 src/add-ons/input_server/devices/remote_control/ScriptCommand.h
+
+diff --git a/src/add-ons/input_server/devices/remote_control/Jamfile b/src/add-ons/input_server/devices/remote_control/Jamfile
+index bec0da81de..16fdfad2f4 100644
+--- a/src/add-ons/input_server/devices/remote_control/Jamfile
++++ b/src/add-ons/input_server/devices/remote_control/Jamfile
+@@ -1,9 +1,10 @@
+ SubDir HAIKU_TOP src add-ons input_server devices remote_control ;
+ 
+-UsePrivateHeaders input drivers shared ;
++UsePrivateHeaders app input drivers shared ;
+ 
+ Addon <input>remote_control :
+ 	Presets.cpp
+ 	RemoteControlDevice.cpp
+ 	RemoteProfile.cpp
++	ScriptCommand.cpp
+ 	: be input_server shared [ TargetLibsupc++ ] ;
+diff --git a/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.cpp b/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.cpp
+index 995c91bc60..6ff42b889d 100644
+--- a/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.cpp
++++ b/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.cpp
+@@ -3,12 +3,17 @@
+  * Distributed under the terms of the MIT License.
+  *
+  * input_server device add-on "Remote Control": the buttons of infrared
+- * remotes (/dev/input/remote/...) as keystrokes. Each button press is
+- * looked up in the enabled profiles (RemoteProfile.h): the protocol and
+- * address say which remote, the command which button. Its keystroke goes
+- * out as from a keyboard, through the current keymap, so any application
+- * and the Shortcuts preferences get it; media key codes (0x0c00e9 volume
+- * up and so on) work as the keyboard's do.
++ * remotes (/dev/input/remote/...) as keystrokes or scripting commands. Each
++ * button press is looked up in the enabled profiles (RemoteProfile.h): the
++ * protocol and address say which remote, the command which button.
++ *
++ * A profile that follows the active application sends keystrokes as from a
++ * keyboard, through the current keymap, so the active application and the
++ * Shortcuts preferences get them; media key codes (0x0c00e9 volume up and
++ * so on) work as the keyboard's do. A profile with a target application
++ * sends them straight to that application's first window instead, whether
++ * it is active or not. A button with a command (ScriptCommand.h) sends it
++ * to the target, or to the active application, as hey would.
+  *
+  * A remote repeats its frame while a button is held: the key stays down
+  * until no repeat came for kRelease, and repeats after kRepeatDelay, every
+@@ -34,7 +39,12 @@
+ #include <Path.h>
+ 
+ #include <AutoDeleter.h>
++#include <MessengerPrivate.h>
+ #include <NodeMonitor.h>
++#include <Roster.h>
++#include <TokenSpace.h>
++
++#include "ScriptCommand.h"
+ 
+ 
+ using RemoteControl::Button;
+@@ -51,6 +61,15 @@ static const bigtime_t kRepeatDelay = 600000;
+ // and then at most this often: remotes repeat their frames 10 to 20 times a
+ // second, too fast for keys like MediaPlayer's 5 s wind
+ static const bigtime_t kRepeatInterval = 200000;
++// how long asking a target application for its window may take
++static const bigtime_t kWindowQueryTimeout = 200000;
++
++// how a held button acts
++enum {
++	kKeystroke,		// a key through the input stream, to the active window
++	kWindowKey,		// a key posted to the target application's window
++	kCommand		// a scripting command
++};
+ 
+ 
+ class RemoteReceiver {
+@@ -77,9 +96,12 @@ private:
+ 			thread_id			fThread;
+ 			volatile bool		fQuit;
+ 
+-			// the key held down (device lock)
++			// the button held down (device lock)
+ 			bool				fHeld;
+ 			Button				fHeldButton;
++			int32				fHeldAction;
++			BString				fHeldTarget;
++			bool				fHeldStartsTarget;
+ 			bigtime_t			fPressed;
+ 			bigtime_t			fReleaseAt;
+ 			bigtime_t			fRepeated;
+@@ -97,6 +119,8 @@ RemoteReceiver::RemoteReceiver(RemoteControlDevice* device, const char* path,
+ 	fThread(-1),
+ 	fQuit(false),
+ 	fHeld(false),
++	fHeldAction(kKeystroke),
++	fHeldStartsTarget(false),
+ 	fPressed(0),
+ 	fReleaseAt(0),
+ 	fRepeated(0),
+@@ -201,7 +225,8 @@ RemoteControlDevice::RemoteControlDevice()
+ 	:
+ 	fLock("remote control"),
+ 	fReceivers(2),
+-	fProfiles(10)
++	fProfiles(10),
++	fWindowTeam(-1)
+ {
+ 	fKeymap.SetToCurrent();
+ 	RemoteControl::InstallPresets();
+@@ -288,7 +313,6 @@ RemoteControlDevice::Control(const char* name, void* cookie, uint32 command,
+ 	BMessage* message)
+ {
+ 	(void)name;
+-	(void)cookie;
+ 	switch (command) {
+ 		case B_NODE_MONITOR:
+ 		{
+@@ -337,6 +361,30 @@ RemoteControlDevice::Control(const char* name, void* cookie, uint32 command,
+ 			fLearner = BMessenger();
+ 			return B_OK;
+ 		}
++
++		case RemoteControl::kMsgTestButton:
++		{
++			// a short press: the receiver's thread lets go of the button
++			// as after a real one
++			if (message == NULL)
++				return B_BAD_VALUE;
++			ir_remote_event event;
++			event.protocol = (uint32)message->GetInt32("protocol", 0);
++			event.address = (uint32)message->GetInt32("address", 0);
++			event.command = (uint32)message->GetInt32("command", 0);
++			event.flags = 0;
++			event.when = system_time();
++			// the device asked: the receiver it is
++			RemoteReceiver* receiver = (RemoteReceiver*)cookie;
++			if (receiver == NULL) {
++				BAutolock locker(fLock);
++				receiver = fReceivers.ItemAt(0);
++			}
++			if (receiver == NULL)
++				return B_DEV_NOT_READY;
++			HandleEvent(receiver, event, true);
++			return B_OK;
++		}
+ 	}
+ 	return B_OK;
+ }
+@@ -344,11 +392,11 @@ RemoteControlDevice::Control(const char* name, void* cookie, uint32 command,
+ 
+ void
+ RemoteControlDevice::HandleEvent(RemoteReceiver* receiver,
+-	const ir_remote_event& event)
++	const ir_remote_event& event, bool test)
+ {
+ 	BAutolock locker(fLock);
+ 
+-	if (fLearner.IsValid()) {
++	if (fLearner.IsValid() && !test) {
+ 		BMessage message(RemoteControl::kMsgButtonEvent);
+ 		message.AddInt32("protocol", event.protocol);
+ 		message.AddInt32("address", event.address);
+@@ -363,18 +411,15 @@ RemoteControlDevice::HandleEvent(RemoteReceiver* receiver,
+ 			return;
+ 	}
+ 
+-	const Button* button = NULL;
+-	for (int32 i = 0; i < fProfiles.CountItems() && button == NULL; i++) {
+-		const Profile* profile = fProfiles.ItemAt(i);
+-		if (profile->Matches(event.protocol, event.address))
+-			button = profile->FindButton(event.command);
+-	}
++	const Profile* profile = NULL;
++	const Button* button = _FindButton(event, &profile);
+ 
+ 	bigtime_t now = system_time();
+ 	bool repeat = (event.flags & IR_REMOTE_REPEAT) != 0;
+ 	if (repeat && receiver->fHeld && button != NULL
+ 		&& button->command == receiver->fHeldButton.command
+-		&& button->key == receiver->fHeldButton.key) {
++		&& button->key == receiver->fHeldButton.key
++		&& button->script == receiver->fHeldButton.script) {
+ 		// still held
+ 		receiver->fReleaseAt = now + kRelease;
+ 		if (button->repeat && now - receiver->fPressed >= kRepeatDelay
+@@ -387,40 +432,179 @@ RemoteControlDevice::HandleEvent(RemoteReceiver* receiver,
+ 
+ 	// a new press (a repeat without its first frame counts as one)
+ 	ReleaseKey(receiver);
+-	if (button == NULL || button->key == 0)
++	if (button == NULL || (button->key == 0 && button->script.IsEmpty()))
+ 		return;
+ 	receiver->fHeld = true;
+ 	receiver->fHeldButton = *button;
++	receiver->fHeldAction = !button->script.IsEmpty() ? kCommand
++		: profile->HasTarget() ? kWindowKey : kKeystroke;
++	receiver->fHeldTarget = profile->Target();
++	receiver->fHeldStartsTarget = profile->StartsTarget();
+ 	receiver->fPressed = now;
+ 	receiver->fReleaseAt = now + kRelease;
+ 	receiver->fRepeated = 0;
+ 	receiver->fRepeats = 1;
+-	if (button->modifiers != 0)
+-		_ModifiersMessage(0, button->modifiers);
+-	_KeyMessage(button->key, button->modifiers, true, 0);
++	_Press(receiver, true, 0);
+ }
+ 
+ 
+-/*!	The held key goes up, if there is one. Called with fLock held. */
++/*!	The held button goes up, if there is one. Called with fLock held. */
+ void
+ RemoteControlDevice::ReleaseKey(RemoteReceiver* receiver)
+ {
+ 	if (!receiver->fHeld)
+ 		return;
+ 	receiver->fHeld = false;
+-	const Button& button = receiver->fHeldButton;
+-	_KeyMessage(button.key, button.modifiers, false, 0);
+-	if (button.modifiers != 0)
+-		_ModifiersMessage(button.modifiers, 0);
++	_Press(receiver, false, 0);
+ }
+ 
+ 
+-/*!	The held key repeats. Called with fLock held. */
++/*!	The held button repeats. Called with fLock held. */
+ void
+ RemoteControlDevice::RepeatKey(RemoteReceiver* receiver)
++{
++	_Press(receiver, true, ++receiver->fRepeats);
++}
++
++
++/*!	The first button of the enabled profiles for the event, and its
++	profile.
++*/
++const Button*
++RemoteControlDevice::_FindButton(const ir_remote_event& event,
++	const Profile** _profile) const
++{
++	for (int32 i = 0; i < fProfiles.CountItems(); i++) {
++		const Profile* profile = fProfiles.ItemAt(i);
++		if (!profile->Matches(event.protocol, event.address))
++			continue;
++		const Button* button = profile->FindButton(event.command);
++		if (button != NULL) {
++			*_profile = profile;
++			return button;
++		}
++	}
++	return NULL;
++}
++
++
++/*!	What the held button does when it goes down (repeat 0), repeats, or goes
++	up. Called with fLock held.
++*/
++void
++RemoteControlDevice::_Press(RemoteReceiver* receiver, bool down, int32 repeat)
+ {
+ 	const Button& button = receiver->fHeldButton;
+-	_KeyMessage(button.key, button.modifiers, true, ++receiver->fRepeats);
++	switch (receiver->fHeldAction) {
++		case kKeystroke:
++			if (down && repeat == 0 && button.modifiers != 0)
++				_ModifiersMessage(0, button.modifiers);
++			_KeyMessage(button.key, button.modifiers, down, repeat);
++			if (!down && button.modifiers != 0)
++				_ModifiersMessage(button.modifiers, 0);
++			break;
++
++		case kWindowKey:
++		{
++			// only the first press starts the target
++			BMessenger window;
++			if (!_TargetWindow(receiver->fHeldTarget,
++					down && repeat == 0 && receiver->fHeldStartsTarget,
++					window))
++				break;
++			BMessage* message = _MakeKeyMessage(button.key, button.modifiers,
++				down, repeat);
++			if (message != NULL) {
++				window.SendMessage(message, BMessenger(), 0);
++				delete message;
++			}
++			break;
++		}
++
++		case kCommand:
++			if (down) {
++				_SendScript(receiver->fHeldTarget,
++					repeat == 0 && receiver->fHeldStartsTarget,
++					button.script);
++			}
++			break;
++	}
++}
++
++
++/*!	The application a profile's commands go to: its target (started when
++	it isn't running and start is set: the press itself is then lost), or
++	the active application. Called with fLock held.
++*/
++bool
++RemoteControlDevice::_TargetApp(const BString& target, bool start,
++	BMessenger& app)
++{
++	if (target.IsEmpty()) {
++		app_info info;
++		if (be_roster->GetActiveAppInfo(&info) != B_OK)
++			return false;
++		app = BMessenger(NULL, info.team);
++		return app.IsValid();
++	}
++	app = BMessenger(target.String());
++	if (app.IsValid())
++		return true;
++	if (start)
++		be_roster->Launch(target.String());
++	return false;
++}
++
++
++/*!	The window of the target application that keystrokes go to: its first,
++	as hey's "Window 0", asked for once while the application runs. The
++	messenger targets the window's preferred handler (its focus view), as
++	keys from the keyboard do. Called with fLock held.
++*/
++bool
++RemoteControlDevice::_TargetWindow(const BString& target, bool start,
++	BMessenger& window)
++{
++	BMessenger app;
++	if (!_TargetApp(target, start, app))
++		return false;
++	if (fWindow.IsValid() && fWindowTeam == app.Team()) {
++		window = fWindow;
++		return true;
++	}
++
++	BMessage query(B_GET_PROPERTY);
++	query.AddSpecifier("Messenger");
++	query.AddSpecifier("Window", (int32)0);
++	BMessage reply;
++	BMessenger handler;
++	if (app.SendMessage(&query, &reply, kWindowQueryTimeout,
++			kWindowQueryTimeout) != B_OK
++		|| reply.FindMessenger("result", &handler) != B_OK)
++		return false;
++	BMessenger::Private privateHandler(handler);
++	BMessenger::Private(fWindow).SetTo(privateHandler.Team(),
++		privateHandler.Port(), B_PREFERRED_TOKEN);
++	fWindowTeam = app.Team();
++	window = fWindow;
++	return window.IsValid();
++}
++
++
++/*!	Sends a button's command, without waiting for it or its reply. Called
++	with fLock held.
++*/
++void
++RemoteControlDevice::_SendScript(const BString& target, bool start,
++	const BString& script)
++{
++	BMessage message;
++	if (RemoteControl::ParseScript(script, message) != B_OK)
++		return;
++			// the preferences don't save commands they can't read
++	BMessenger app;
++	if (_TargetApp(target, start, app))
++		app.SendMessage(&message, BMessenger(), 0);
+ }
+ 
+ 
+@@ -436,9 +620,9 @@ RemoteControlDevice::_LoadProfiles()
+ }
+ 
+ 
+-/*!	A key message as the keyboard add-on sends it. Called with fLock held. */
+-void
+-RemoteControlDevice::_KeyMessage(uint32 key, uint32 modifiers, bool down,
++/*!	A key message as the keyboard add-on sends it. */
++BMessage*
++RemoteControlDevice::_MakeKeyMessage(uint32 key, uint32 modifiers, bool down,
+ 	int32 repeat)
+ {
+ 	char* string = NULL;
+@@ -457,7 +641,7 @@ RemoteControlDevice::_KeyMessage(uint32 key, uint32 modifiers, bool down,
+ 		? (down ? B_KEY_DOWN : B_KEY_UP)
+ 		: (down ? B_UNMAPPED_KEY_DOWN : B_UNMAPPED_KEY_UP));
+ 	if (message == NULL)
+-		return;
++		return NULL;
+ 
+ 	uint8 states[16];
+ 	memset(states, 0, sizeof(states));
+@@ -479,8 +663,17 @@ RemoteControlDevice::_KeyMessage(uint32 key, uint32 modifiers, bool down,
+ 		message->AddInt32("raw_char", (uint32)((uint8)rawString[0] & 0x7f));
+ 	else if (numBytes > 0)
+ 		message->AddInt32("raw_char", (uint32)((uint8)string[0] & 0x7f));
++	return message;
++}
+ 
+-	if (EnqueueMessage(message) != B_OK)
++
++/*!	A key through the input stream. Called with fLock held. */
++void
++RemoteControlDevice::_KeyMessage(uint32 key, uint32 modifiers, bool down,
++	int32 repeat)
++{
++	BMessage* message = _MakeKeyMessage(key, modifiers, down, repeat);
++	if (message != NULL && EnqueueMessage(message) != B_OK)
+ 		delete message;
+ }
+ 
+diff --git a/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.h b/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.h
+index c6301dcde3..e49fc278a7 100644
+--- a/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.h
++++ b/src/add-ons/input_server/devices/remote_control/RemoteControlDevice.h
+@@ -33,7 +33,8 @@ public:
+ 
+ 	// for the receivers' threads
+ 			void				HandleEvent(RemoteReceiver* receiver,
+-									const ir_remote_event& event);
++									const ir_remote_event& event,
++									bool test = false);
+ 			void				ReleaseKey(RemoteReceiver* receiver);
+ 			void				RepeatKey(RemoteReceiver* receiver);
+ 
+@@ -43,16 +44,34 @@ private:
+ 			void				_LoadProfiles();
+ 			void				_ScanDevices(const char* directory);
+ 			status_t			_AddDevice(const char* path);
++			const RemoteControl::Button* _FindButton(
++									const ir_remote_event& event,
++									const RemoteControl::Profile** profile)
++									const;
++			void				_Press(RemoteReceiver* receiver,
++									bool down, int32 repeat);
++			BMessage*			_MakeKeyMessage(uint32 key, uint32 modifiers,
++									bool down, int32 repeat);
+ 			void				_KeyMessage(uint32 key, uint32 modifiers,
+ 									bool down, int32 repeat);
+ 			void				_ModifiersMessage(uint32 oldModifiers,
+ 									uint32 modifiers);
++			bool				_TargetApp(const BString& target, bool start,
++									BMessenger& app);
++			bool				_TargetWindow(const BString& target,
++									bool start, BMessenger& window);
++			void				_SendScript(const BString& target, bool start,
++									const BString& script);
+ 
+ 			BLocker				fLock;
+ 			BObjectList<RemoteReceiver, true> fReceivers;
+ 			BObjectList<RemoteControl::Profile, true> fProfiles;
+ 			BKeymap				fKeymap;
+ 			BMessenger			fLearner;
++
++			// the target's window keystrokes go to, while its team lives
++			team_id				fWindowTeam;
++			BMessenger			fWindow;
+ };
+ 
+ 
+diff --git a/src/add-ons/input_server/devices/remote_control/RemoteProfile.cpp b/src/add-ons/input_server/devices/remote_control/RemoteProfile.cpp
+index 54d70f9c5f..3bb905fd5f 100644
+--- a/src/add-ons/input_server/devices/remote_control/RemoteProfile.cpp
++++ b/src/add-ons/input_server/devices/remote_control/RemoteProfile.cpp
+@@ -22,6 +22,9 @@ namespace RemoteControl {
+ 
+ 
+ static const uint32 kProfileMessage = 'rcPF';
++// 2: the target application and the buttons' scripting commands; version
++// 1 files are read as profiles following the active application
++static const int32 kProfileVersion = 2;
+ static const char* const kDirectoryName = "Remote Control";
+ 
+ 
+@@ -37,6 +40,7 @@ Profile::Profile()
+ 	fEnabled(true),
+ 	fProtocol(0),
+ 	fAddress(0),
++	fStartTarget(false),
+ 	fButtons(20)
+ {
+ }
+@@ -59,6 +63,8 @@ Profile::operator=(const Profile& other)
+ 	fEnabled = other.fEnabled;
+ 	fProtocol = other.fProtocol;
+ 	fAddress = other.fAddress;
++	fTarget = other.fTarget;
++	fStartTarget = other.fStartTarget;
+ 	fButtons.MakeEmpty();
+ 	for (int32 i = 0; i < other.CountButtons(); i++)
+ 		AddButton(*other.ButtonAt(i));
+@@ -71,10 +77,15 @@ Profile::Archive(BMessage* archive) const
+ {
+ 	archive->MakeEmpty();
+ 	archive->what = kProfileMessage;
++	archive->AddInt32("version", kProfileVersion);
+ 	archive->AddString("name", fName);
+ 	archive->AddBool("enabled", fEnabled);
+ 	archive->AddInt32("protocol", fProtocol);
+ 	archive->AddInt32("address", fAddress);
++	if (HasTarget()) {
++		archive->AddString("target", fTarget);
++		archive->AddBool("start target", fStartTarget);
++	}
+ 	for (int32 i = 0; i < CountButtons(); i++) {
+ 		const Button* button = ButtonAt(i);
+ 		BMessage buttonArchive;
+@@ -83,6 +94,8 @@ Profile::Archive(BMessage* archive) const
+ 		buttonArchive.AddInt32("key", button->key);
+ 		buttonArchive.AddInt32("modifiers", button->modifiers);
+ 		buttonArchive.AddBool("repeat", button->repeat);
++		if (!button->script.IsEmpty())
++			buttonArchive.AddString("script", button->script);
+ 		status_t status = archive->AddMessage("button", &buttonArchive);
+ 		if (status != B_OK)
+ 			return status;
+@@ -100,6 +113,8 @@ Profile::Unarchive(const BMessage& archive)
+ 	fEnabled = archive.GetBool("enabled", true);
+ 	fProtocol = (uint32)archive.GetInt32("protocol", 0);
+ 	fAddress = (uint32)archive.GetInt32("address", 0);
++	fTarget = archive.GetString("target", "");
++	fStartTarget = archive.GetBool("start target", false);
+ 	fButtons.MakeEmpty();
+ 	BMessage buttonArchive;
+ 	for (int32 i = 0; archive.FindMessage("button", i, &buttonArchive) == B_OK;
+@@ -110,6 +125,7 @@ Profile::Unarchive(const BMessage& archive)
+ 		button.key = (uint32)buttonArchive.GetInt32("key", 0);
+ 		button.modifiers = (uint32)buttonArchive.GetInt32("modifiers", 0);
+ 		button.repeat = buttonArchive.GetBool("repeat", false);
++		button.script = buttonArchive.GetString("script", "");
+ 		AddButton(button);
+ 	}
+ 	return fName.IsEmpty() ? B_BAD_DATA : B_OK;
+diff --git a/src/add-ons/input_server/devices/remote_control/RemoteProfile.h b/src/add-ons/input_server/devices/remote_control/RemoteProfile.h
+index adc186454f..14b26c8bd1 100644
+--- a/src/add-ons/input_server/devices/remote_control/RemoteProfile.h
++++ b/src/add-ons/input_server/devices/remote_control/RemoteProfile.h
+@@ -7,7 +7,11 @@
+ 
+ 
+ /*!	A remote control's profile: which remote (protocol and address), and
+-	the keystroke each of its buttons sends. One file per profile in
++	what each of its buttons does: a keystroke, or a scripting command (as
++	hey writes them, ScriptCommand.h). A profile follows the active
++	application, or sends to one application whether it is active or not
++	(its target): commands go to it, and keystrokes straight to its window
++	instead of through the input stream. One file per profile in
+ 	~/config/settings/Remote Control/, a flattened BMessage; shared by the
+ 	input_server add-on and the Remote Control preferences.
+ */
+@@ -30,8 +34,10 @@ enum {
+ 	kMsgReloadProfiles	= 'rcRL',	// the profile files changed
+ 	kMsgStartLearning	= 'rcL+',	// "messenger": gets kMsgButtonEvent
+ 	kMsgStopLearning	= 'rcL-',	// keys again
+-	kMsgButtonEvent		= 'rcEV'	// "protocol", "address", "command",
++	kMsgButtonEvent		= 'rcEV',	// "protocol", "address", "command",
+ 									// "flags" (int32), "when" (int64)
++	kMsgTestButton		= 'rcTB'	// "protocol", "address", "command": a
++									// press as if from the remote
+ };
+ 
+ static const char* const kDeviceName = "Remote Control";
+@@ -42,7 +48,9 @@ struct Button {
+ 	uint32		command;
+ 	uint32		key;			// raw key code, 0 for none
+ 	uint32		modifiers;
+-	bool		repeat;			// held: key repeats; else one press
++	bool		repeat;			// held: key or command repeats; else once
++	BString		script;			// a command for the application, instead
++								// of the keystroke; empty for none
+ };
+ 
+ 
+@@ -74,6 +82,18 @@ public:
+ 									  fAddress = address; }
+ 			bool				HasRemote() const { return fProtocol != 0; }
+ 
++	// the application the buttons go to, by signature; empty: the active
++	// application
++			const BString&		Target() const { return fTarget; }
++			void				SetTarget(const char* signature)
++									{ fTarget = signature; }
++			bool				HasTarget() const
++									{ return !fTarget.IsEmpty(); }
++	// whether a press starts the target when it isn't running
++			bool				StartsTarget() const { return fStartTarget; }
++			void				SetStartsTarget(bool start)
++									{ fStartTarget = start; }
++
+ 	// whether an event of this protocol and address is from this remote
+ 			bool				Matches(uint32 protocol,
+ 									uint32 address) const;
+@@ -99,6 +119,8 @@ private:
+ 			bool				fEnabled;
+ 			uint32				fProtocol;
+ 			uint32				fAddress;
++			BString				fTarget;
++			bool				fStartTarget;
+ 			BObjectList<Button, true> fButtons;
+ };
+ 
+diff --git a/src/add-ons/input_server/devices/remote_control/ScriptCommand.cpp b/src/add-ons/input_server/devices/remote_control/ScriptCommand.cpp
+new file mode 100644
+index 0000000000..2c8555ec0a
+--- /dev/null
++++ b/src/add-ons/input_server/devices/remote_control/ScriptCommand.cpp
+@@ -0,0 +1,336 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "ScriptCommand.h"
++
++#include <ctype.h>
++#include <errno.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <AppDefs.h>
++#include <Message.h>
++#include <ObjectList.h>
++
++
++namespace RemoteControl {
++
++
++namespace {
++
++
++struct Verb {
++	const char*	name;
++	uint32		what;
++};
++
++const Verb kVerbs[] = {
++	{ "do", B_EXECUTE_PROPERTY },
++	{ "get", B_GET_PROPERTY },
++	{ "set", B_SET_PROPERTY },
++	{ "count", B_COUNT_PROPERTIES },
++	{ "create", B_CREATE_PROPERTY },
++	{ "delete", B_DELETE_PROPERTY }
++};
++
++
++/*!	The words of a command: runs of characters between white space, where
++	a "quoted part" may hold spaces. The quotes stay; Unquote() removes
++	them.
++*/
++status_t
++Split(const char* text, BObjectList<BString, true>& words, BString* error)
++{
++	const char* c = text;
++	while (true) {
++		while (isspace((uint8)*c))
++			c++;
++		if (*c == '\0')
++			return B_OK;
++		BString* word = new BString;
++		words.AddItem(word);
++		while (*c != '\0' && !isspace((uint8)*c)) {
++			if (*c != '"') {
++				*word << *c++;
++				continue;
++			}
++			*word << *c++;
++			while (*c != '\0' && *c != '"') {
++				if (*c == '\\' && c[1] != '\0')
++					*word << *c++;
++				*word << *c++;
++			}
++			if (*c != '"') {
++				if (error != NULL)
++					*error = "a quote is not closed";
++				return B_BAD_VALUE;
++			}
++			*word << *c++;
++		}
++	}
++}
++
++
++bool
++IsQuoted(const BString& word)
++{
++	return word.Length() >= 2 && word[0] == '"'
++		&& word[word.Length() - 1] == '"';
++}
++
++
++BString
++Unquote(const BString& word)
++{
++	if (!IsQuoted(word))
++		return word;
++	BString text;
++	for (int32 i = 1; i < word.Length() - 1; i++) {
++		if (word[i] == '\\' && i + 1 < word.Length() - 1)
++			i++;
++		text << word[i];
++	}
++	return text;
++}
++
++
++bool
++IsKeyword(const BString& word)
++{
++	return word.ICompare("of") == 0 || word.ICompare("to") == 0
++		|| word.ICompare("with") == 0 || word.ICompare("and") == 0;
++}
++
++
++bool
++ParseInteger(const BString& text, int64& value)
++{
++	if (text.IsEmpty())
++		return false;
++	char* end;
++	errno = 0;
++	value = strtoll(text.String(), &end, 0);
++	return *end == '\0' && errno == 0;
++}
++
++
++bool
++ParseReal(const BString& text, double& value)
++{
++	if (text.IsEmpty())
++		return false;
++	char* end;
++	errno = 0;
++	value = strtod(text.String(), &end);
++	return *end == '\0' && errno == 0;
++}
++
++
++/*!	Adds a value written in the command to the message as field. */
++status_t
++AddValue(BMessage& message, const char* field, const BString& word,
++	BString* error)
++{
++	if (IsQuoted(word))
++		return message.AddString(field, Unquote(word));
++
++	// typed: int32(5)
++	int32 open = word.FindFirst('(');
++	if (open > 0 && word[word.Length() - 1] == ')') {
++		BString type;
++		word.CopyInto(type, 0, open);
++		BString text;
++		word.CopyInto(text, open + 1, word.Length() - open - 2);
++		text = Unquote(text);
++		int64 integer;
++		double real;
++		if (type == "string")
++			return message.AddString(field, text);
++		if (type == "bool") {
++			if (text == "true" || text == "1")
++				return message.AddBool(field, true);
++			if (text == "false" || text == "0")
++				return message.AddBool(field, false);
++		} else if (type == "int8" && ParseInteger(text, integer)
++			&& integer >= INT8_MIN && integer <= INT8_MAX) {
++			return message.AddInt8(field, (int8)integer);
++		} else if (type == "int16" && ParseInteger(text, integer)
++			&& integer >= INT16_MIN && integer <= INT16_MAX) {
++			return message.AddInt16(field, (int16)integer);
++		} else if (type == "int32" && ParseInteger(text, integer)
++			&& integer >= INT32_MIN && integer <= INT32_MAX) {
++			return message.AddInt32(field, (int32)integer);
++		} else if (type == "int64" && ParseInteger(text, integer)) {
++			return message.AddInt64(field, integer);
++		} else if (type == "float" && ParseReal(text, real)) {
++			return message.AddFloat(field, (float)real);
++		} else if (type == "double" && ParseReal(text, real)) {
++			return message.AddDouble(field, real);
++		}
++		if (error != NULL) {
++			*error = "not a value: ";
++			*error << word;
++		}
++		return B_BAD_VALUE;
++	}
++
++	if (word == "true" || word == "false")
++		return message.AddBool(field, word == "true");
++	int64 integer;
++	if (ParseInteger(word, integer)) {
++		if (integer >= INT32_MIN && integer <= INT32_MAX)
++			return message.AddInt32(field, (int32)integer);
++		return message.AddInt64(field, integer);
++	}
++	double real;
++	if (ParseReal(word, real))
++		return message.AddFloat(field, (float)real);
++	return message.AddString(field, word);
++}
++
++
++}	// namespace
++
++
++status_t
++ParseScript(const char* text, BMessage& message, BString* error)
++{
++	message.MakeEmpty();
++	BObjectList<BString, true> words(8);
++	status_t status = Split(text, words, error);
++	if (status != B_OK)
++		return status;
++	if (words.IsEmpty()) {
++		if (error != NULL)
++			*error = "the command is empty";
++		return B_BAD_VALUE;
++	}
++
++	int32 index = 0;
++	const BString& first = *words.ItemAt(index++);
++	bool isVerb = false;
++	for (size_t i = 0; i < sizeof(kVerbs) / sizeof(kVerbs[0]); i++) {
++		if (first.ICompare(kVerbs[i].name) == 0) {
++			message.what = kVerbs[i].what;
++			isVerb = true;
++		}
++	}
++	if (!isVerb) {
++		// a message code: Bply, or 'Bply'
++		BString code(first);
++		if (code.Length() == 6 && code[0] == '\'' && code[5] == '\'')
++			code.Remove(5, 1).Remove(0, 1);
++		if (code.Length() != 4) {
++			if (error != NULL) {
++				*error = "\"";
++				*error << first << "\" is neither a verb (do, get, set, count, "
++					"create, delete) nor a code of four characters";
++			}
++			return B_BAD_VALUE;
++		}
++		message.what = (uint32)(uint8)code[0] << 24
++			| (uint32)(uint8)code[1] << 16 | (uint32)(uint8)code[2] << 8
++			| (uint8)code[3];
++	}
++
++	// the specifiers: after a verb its property comes first; after a code,
++	// they start with "of". The last one written is resolved first.
++	bool wantSpecifier = isVerb;
++	while (index < words.CountItems()) {
++		const BString& word = *words.ItemAt(index);
++		if (!wantSpecifier) {
++			if (word.ICompare("of") != 0)
++				break;
++			wantSpecifier = true;
++			index++;
++			continue;
++		}
++		if (IsKeyword(word) || IsQuoted(word)) {
++			if (error != NULL) {
++				*error = "a property is missing before \"";
++				*error << word << "\"";
++			}
++			return B_BAD_VALUE;
++		}
++		BString property(word);
++		index++;
++		int64 number;
++		if (index < words.CountItems()
++			&& ParseInteger(*words.ItemAt(index), number)
++			&& number >= 0 && number <= INT32_MAX) {
++			message.AddSpecifier(property, (int32)number);
++			index++;
++		} else if (index < words.CountItems()
++			&& IsQuoted(*words.ItemAt(index))) {
++			message.AddSpecifier(property, Unquote(*words.ItemAt(index)));
++			index++;
++		} else
++			message.AddSpecifier(property);
++		wantSpecifier = false;
++	}
++	if (wantSpecifier) {
++		if (error != NULL)
++			*error = "a property is missing at the end";
++		return B_BAD_VALUE;
++	}
++
++	if (index < words.CountItems()
++		&& words.ItemAt(index)->ICompare("to") == 0) {
++		if (++index >= words.CountItems()) {
++			if (error != NULL)
++				*error = "the value after \"to\" is missing";
++			return B_BAD_VALUE;
++		}
++		status = AddValue(message, "data", *words.ItemAt(index++), error);
++		if (status != B_OK)
++			return status;
++	}
++
++	if (index < words.CountItems()
++		&& words.ItemAt(index)->ICompare("with") == 0) {
++		index++;
++		while (true) {
++			if (index >= words.CountItems()) {
++				if (error != NULL)
++					*error = "a field is missing after \"with\" or \"and\"";
++				return B_BAD_VALUE;
++			}
++			const BString& field = *words.ItemAt(index++);
++			int32 equals = field.FindFirst('=');
++			if (equals <= 0) {
++				if (error != NULL) {
++					*error = "\"";
++					*error << field << "\" is not name=value";
++				}
++				return B_BAD_VALUE;
++			}
++			BString name;
++			field.CopyInto(name, 0, equals);
++			BString value;
++			field.CopyInto(value, equals + 1, field.Length() - equals - 1);
++			status = AddValue(message, name, value, error);
++			if (status != B_OK)
++				return status;
++			if (index >= words.CountItems()
++				|| words.ItemAt(index)->ICompare("and") != 0)
++				break;
++			index++;
++		}
++	}
++
++	if (index < words.CountItems()) {
++		if (error != NULL) {
++			*error = "\"";
++			*error << *words.ItemAt(index) << "\" is not understood here";
++		}
++		return B_BAD_VALUE;
++	}
++	return B_OK;
++}
++
++
++}	// namespace RemoteControl
+diff --git a/src/add-ons/input_server/devices/remote_control/ScriptCommand.h b/src/add-ons/input_server/devices/remote_control/ScriptCommand.h
+new file mode 100644
+index 0000000000..88dbe6e11f
+--- /dev/null
++++ b/src/add-ons/input_server/devices/remote_control/ScriptCommand.h
+@@ -0,0 +1,40 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef SCRIPT_COMMAND_H
++#define SCRIPT_COMMAND_H
++
++
++#include <String.h>
++
++
++class BMessage;
++
++
++namespace RemoteControl {
++
++
++/*!	A scripting command written as for hey, made into the message to send
++	to an application:
++		Bply of Window 0
++		do TogglePlaying of Window 0
++		set Volume of Window 0 to 0.5
++		set Seek of Window 0 to int64(5000000)
++		Bscn of Window 0 with direction=int32(1)
++	A verb (do, get, set, count, create, delete) and the property, or a
++	message code of four characters; then "of" and more specifiers (a
++	property, with an index or a "name"); then "to" and the value; then
++	"with" and fields, joined by "and". Values are numbers (int32, float
++	with a point), true and false, "strings", or typed: int8() int16()
++	int32() int64() float() double() bool() string(). On failure, error
++	says what is wrong.
++*/
++status_t ParseScript(const char* text, BMessage& message,
++	BString* error = NULL);
++
++
++}	// namespace RemoteControl
++
++
++#endif	// SCRIPT_COMMAND_H
+diff --git a/src/preferences/remotecontrol/Jamfile b/src/preferences/remotecontrol/Jamfile
+index c3c4b134cc..55a4d1e2a9 100644
+--- a/src/preferences/remotecontrol/Jamfile
++++ b/src/preferences/remotecontrol/Jamfile
+@@ -13,6 +13,7 @@ Application RemoteControl :
+ 	KeyNames.cpp
+ 	Templates.cpp
+ 	RemoteProfile.cpp
++	ScriptCommand.cpp
+ 	: be tracker shared libcolumnlistview.a [ TargetLibstdc++ ]
+ 	: RemoteControl.rdef
+ 	;
+diff --git a/src/preferences/remotecontrol/RemoteWindow.cpp b/src/preferences/remotecontrol/RemoteWindow.cpp
+index 812700d34e..98ffc2367c 100644
+--- a/src/preferences/remotecontrol/RemoteWindow.cpp
++++ b/src/preferences/remotecontrol/RemoteWindow.cpp
+@@ -18,6 +18,9 @@
+ #include <ctype.h>
+ #include <stdio.h>
+ 
++#include <algorithm>
++#include <vector>
++
+ #include <Alert.h>
+ #include <Application.h>
+ #include <Button.h>
+@@ -36,6 +39,7 @@
+ #include <MessageFilter.h>
+ #include <Path.h>
+ #include <PopUpMenu.h>
++#include <Roster.h>
+ #include <ScrollView.h>
+ #include <SeparatorView.h>
+ #include <StringItem.h>
+@@ -45,6 +49,7 @@
+ #include <ir_remote.h>
+ 
+ #include "KeyNames.h"
++#include "ScriptCommand.h"
+ #include "Templates.h"
+ 
+ 
+@@ -74,17 +79,43 @@ enum {
+ 	kMsgNamedKey			= 'bKey',
+ 	kMsgModifier			= 'bMod',
+ 	kMsgLearn				= 'lrn ',
+-	kMsgTemplate			= 'tmpl'
++	kMsgTemplate			= 'tmpl',
++	kMsgTarget				= 'pTgt',
++	kMsgStartTarget			= 'pStT',
++	kMsgScriptChanged		= 'bScr',
++	kMsgTest				= 'bTst'
+ };
+ 
+ enum {
+ 	kLabelColumn,
+ 	kCodeColumn,
+ 	kKeystrokeColumn,
+-	kRepeatColumn
++	kRepeatColumn,
++	kCommandColumn
+ };
+ 
+ 
++// the applications the "Send to" menu offers when they are installed, if
++// they aren't running
++static const char* const kKnownTargets[] = {
++	"application/x-vnd.BeTunes",
++	"application/x-vnd.Haiku-MediaPlayer"
++};
++
++
++/*!	An application's name for the "Send to" menu: its file's, else the
++	signature.
++*/
++static BString
++application_name(const char* signature)
++{
++	entry_ref ref;
++	if (be_roster->FindApp(signature, &ref) == B_OK)
++		return ref.name;
++	return signature;
++}
++
++
+ static status_t
+ control_add_on(uint32 code, BMessage* message)
+ {
+@@ -271,6 +302,14 @@ RemoteWindow::RemoteWindow()
+ 	fRemoteView = new BStringView("remote", "");
+ 	fForgetRemoteButton = new BButton("Forget remote",
+ 		new BMessage(kMsgForgetRemote));
++	fTargetField = new BMenuField("target", "Send to:",
++		new BPopUpMenu("target"));
++	fTargetField->SetToolTip("The active application gets keystrokes and "
++		"commands as from a keyboard. A chosen application gets them whether "
++		"it is active or not: commands go to it, keystrokes straight to its "
++		"first window.");
++	fStartTargetBox = new BCheckBox("Start it if it isn't running",
++		new BMessage(kMsgStartTarget));
+ 
+ 	fButtonList = new BColumnListView("buttons", B_NAVIGABLE,
+ 		B_FANCY_BORDER, true);
+@@ -289,6 +328,9 @@ RemoteWindow::RemoteWindow()
+ 	fButtonList->AddColumn(new BStringColumn("When held",
+ 		be_plain_font->StringWidth("When held") + margin, 30, 200,
+ 		B_TRUNCATE_END), kRepeatColumn);
++	fButtonList->AddColumn(new BStringColumn("Command",
++		be_plain_font->StringWidth("do TogglePlaying of Window 0") + margin,
++		40, 600, B_TRUNCATE_END), kCommandColumn);
+ 
+ 	fLabelControl = new BTextControl("Button:", "",
+ 		new BMessage(kMsgLabelChanged));
+@@ -335,6 +377,15 @@ RemoteWindow::RemoteWindow()
+ 	fWinBox = new BCheckBox("Win", new BMessage(kMsgModifier));
+ 	fWinBox->SetToolTip("The Option key: the Windows key on PC keyboards");
+ 	fRepeatBox = new BCheckBox("Repeats when held", new BMessage(kMsgRepeat));
++	fScriptControl = new BTextControl("Command:", "",
++		new BMessage(kMsgScriptChanged));
++	fScriptControl->SetToolTip("A scripting command for the application, "
++		"instead of the keystroke, written as for hey: \"Bply of Window 0\", "
++		"\"do TogglePlaying of Window 0\", \"set Volume of Window 0 to "
++		"0.5\". Empty: the keystroke.");
++	fTestButton = new BButton("Test", new BMessage(kMsgTest));
++	fTestButton->SetToolTip("Does what the button does, as if pressed on "
++		"the remote: for profiles that send to a chosen application.");
+ 	fRemoveButton = new BButton("Remove", new BMessage(kMsgRemoveButton));
+ 	fUpButton = new BButton("Up", new BMessage(kMsgMoveUp));
+ 	fDownButton = new BButton("Down", new BMessage(kMsgMoveDown));
+@@ -380,6 +431,11 @@ RemoteWindow::RemoteWindow()
+ 					.AddGlue()
+ 					.Add(fForgetRemoteButton)
+ 				.End()
++				.AddGroup(B_HORIZONTAL)
++					.Add(fTargetField)
++					.Add(fStartTargetBox)
++					.AddGlue()
++				.End()
+ 				.Add(fButtonList)
+ 				.AddGrid(B_USE_SMALL_SPACING, B_USE_SMALL_SPACING)
+ 					.AddTextControl(fLabelControl, 0, 0)
+@@ -396,11 +452,13 @@ RemoteWindow::RemoteWindow()
+ 						.AddGlue()
+ 						.Add(fRepeatBox)
+ 					.End()
++					.AddTextControl(fScriptControl, 0, 3)
+ 				.End()
+ 				.AddGroup(B_HORIZONTAL)
+ 					.Add(fLearnButton)
+ 					.Add(fTemplateField)
+ 					.AddGlue()
++					.Add(fTestButton)
+ 					.Add(fUpButton)
+ 					.Add(fDownButton)
+ 					.Add(fRemoveButton)
+@@ -626,6 +684,78 @@ RemoteWindow::MessageReceived(BMessage* message)
+ 			_SetLearning(fLearnButton->Value() == B_CONTROL_ON);
+ 			break;
+ 
++		case kMsgTarget:
++		{
++			Profile* profile = _CurrentProfile();
++			if (profile == NULL)
++				break;
++			profile->SetTarget(message->GetString("signature", ""));
++			_Changed(profile);
++			_UpdateTarget();
++			break;
++		}
++
++		case kMsgStartTarget:
++		{
++			Profile* profile = _CurrentProfile();
++			if (profile == NULL)
++				break;
++			profile->SetStartsTarget(
++				fStartTargetBox->Value() == B_CONTROL_ON);
++			_Changed(profile);
++			break;
++		}
++
++		case kMsgTest:
++		{
++			Profile* profile = _CurrentProfile();
++			Button* button = _CurrentButton();
++			if (profile == NULL || button == NULL || !profile->HasTarget()
++				|| !profile->HasRemote() || button->command == kUnlearned)
++				break;
++			BMessage press;
++			press.AddInt32("protocol", profile->Protocol());
++			press.AddInt32("address", profile->Address());
++			press.AddInt32("command", button->command);
++			status_t status = control_add_on(RemoteControl::kMsgTestButton,
++				&press);
++			BString text;
++			if (status == B_OK) {
++				text << "Pressed \"" << button->label << "\" for "
++					<< application_name(profile->Target()) << ".";
++			} else
++				text << "Couldn't press it: " << strerror(status);
++			_SetStatus(text);
++			break;
++		}
++
++		case kMsgScriptChanged:
++		{
++			Button* button = _CurrentButton();
++			if (button == NULL)
++				break;
++			BString script(fScriptControl->Text());
++			script.Trim();
++			if (script == button->script)
++				break;
++			BMessage parsed;
++			BString error;
++			if (!script.IsEmpty() && RemoteControl::ParseScript(script,
++					parsed, &error) != B_OK) {
++				// kept in the field to be fixed, but not saved
++				BString text;
++				text << "The command isn't understood: " << error << ".";
++				_SetStatus(text);
++				break;
++			}
++			button->script = script;
++			_Changed(_CurrentProfile());
++			_UpdateButtons(_CurrentButtonIndex());
++			_SetStatus(script.IsEmpty() ? "The button sends its keystroke."
++				: "The button sends its command.");
++			break;
++		}
++
+ 		case kMsgTemplate:
+ 			_AddTemplate(message->GetInt32("index", 0));
+ 			break;
+@@ -710,6 +840,7 @@ RemoteWindow::_UpdateProfile()
+ 	fExportButton->SetEnabled(enabled);
+ 	fTemplateField->SetEnabled(enabled);
+ 	fForgetRemoteButton->SetEnabled(enabled && profile->HasRemote());
++	_UpdateTarget();
+ 
+ 	BString remote;
+ 	if (profile == NULL)
+@@ -728,6 +859,76 @@ RemoteWindow::_UpdateProfile()
+ }
+ 
+ 
++/*!	The "Send to" menu: the active application, the applications running
++	(but background ones), the known ones installed, and the profile's.
++*/
++void
++RemoteWindow::_UpdateTarget()
++{
++	Profile* profile = _CurrentProfile();
++	BString current = profile != NULL ? profile->Target() : BString();
++
++	std::vector<BString> signatures;
++	BList teams;
++	be_roster->GetAppList(&teams);
++	for (int32 i = 0; i < teams.CountItems(); i++) {
++		app_info info;
++		if (be_roster->GetRunningAppInfo((team_id)(addr_t)teams.ItemAt(i),
++				&info) != B_OK
++			|| (info.flags & B_BACKGROUND_APP) != 0
++			|| info.signature[0] == '\0' || info.team == be_app->Team())
++			continue;
++		signatures.push_back(info.signature);
++	}
++	for (size_t i = 0; i < B_COUNT_OF(kKnownTargets); i++) {
++		entry_ref ref;
++		if (be_roster->FindApp(kKnownTargets[i], &ref) == B_OK)
++			signatures.push_back(kKnownTargets[i]);
++	}
++	if (!current.IsEmpty())
++		signatures.push_back(current);
++
++	// by name, each once
++	std::vector<std::pair<BString, BString> > targets;
++	for (size_t i = 0; i < signatures.size(); i++) {
++		bool known = false;
++		for (size_t j = 0; j < targets.size() && !known; j++)
++			known = targets[j].second.ICompare(signatures[i]) == 0;
++		if (!known) {
++			targets.push_back(std::make_pair(
++				application_name(signatures[i]), signatures[i]));
++		}
++	}
++	std::sort(targets.begin(), targets.end(),
++		[](const std::pair<BString, BString>& a,
++			const std::pair<BString, BString>& b) {
++			return a.first.ICompare(b.first) < 0;
++		});
++
++	BMenu* menu = fTargetField->Menu();
++	while (BMenuItem* item = menu->RemoveItem((int32)0))
++		delete item;
++	BMessage* message = new BMessage(kMsgTarget);
++	message->AddString("signature", "");
++	BMenuItem* item = new BMenuItem("The active application", message);
++	item->SetMarked(current.IsEmpty());
++	menu->AddItem(item);
++	menu->AddSeparatorItem();
++	for (size_t i = 0; i < targets.size(); i++) {
++		message = new BMessage(kMsgTarget);
++		message->AddString("signature", targets[i].second);
++		item = new BMenuItem(targets[i].first, message);
++		item->SetMarked(targets[i].second.ICompare(current) == 0);
++		menu->AddItem(item);
++	}
++	menu->SetTargetForItems(this);
++	fTargetField->SetEnabled(profile != NULL);
++	fStartTargetBox->SetValue(profile != NULL && profile->StartsTarget());
++	fStartTargetBox->SetEnabled(profile != NULL && profile->HasTarget());
++	_UpdateEditor();
++}
++
++
+ void
+ RemoteWindow::_UpdateButtons(int32 select)
+ {
+@@ -746,6 +947,7 @@ RemoteWindow::_UpdateButtons(int32 select)
+ 			button->modifiers)), kKeystrokeColumn);
+ 		row->SetField(new BStringField(button->repeat ? "Repeats" : "Once"),
+ 			kRepeatColumn);
++		row->SetField(new BStringField(button->script), kCommandColumn);
+ 		fButtonList->AddRow(row);
+ 	}
+ 	if (select >= 0 && select < fButtonList->CountRows()) {
+@@ -771,6 +973,8 @@ RemoteWindow::_UpdateEditor()
+ 	fKeyMenuField->SetEnabled(enabled);
+ 	fRepeatBox->SetValue(enabled && button->repeat);
+ 	fRepeatBox->SetEnabled(enabled);
++	fScriptControl->SetText(enabled ? button->script.String() : "");
++	fScriptControl->SetEnabled(enabled);
+ 	uint32 modifiers = enabled ? button->modifiers : 0;
+ 	fAltBox->SetValue((modifiers & B_COMMAND_KEY) != 0);
+ 	fCtrlBox->SetValue((modifiers & B_CONTROL_KEY) != 0);
+@@ -783,6 +987,10 @@ RemoteWindow::_UpdateEditor()
+ 	fRemoveButton->SetEnabled(enabled);
+ 	int32 index = _CurrentButtonIndex();
+ 	Profile* profile = _CurrentProfile();
++	// pressing a button of a profile following the active application
++	// would press it in this window
++	fTestButton->SetEnabled(enabled && profile->HasTarget()
++		&& profile->HasRemote() && button->command != kUnlearned);
+ 	fUpButton->SetEnabled(enabled && index > 0);
+ 	fDownButton->SetEnabled(enabled && profile != NULL
+ 		&& index < profile->CountButtons() - 1);
+@@ -1014,14 +1222,33 @@ RemoteWindow::_AddTemplate(int32 index)
+ 		button.key = added.buttons[i].key;
+ 		button.modifiers = added.buttons[i].modifiers;
+ 		button.repeat = added.buttons[i].repeat;
++		if (added.buttons[i].script != NULL)
++			button.script = added.buttons[i].script;
+ 		if (profile->AddButton(button) != NULL && first < 0)
+ 			first = profile->CountButtons() - 1;
+ 	}
++	// commands are for one application: the profile sends to it, unless
++	// it sends to another one already
++	if (added.target != NULL && !profile->HasTarget())
++		profile->SetTarget(added.target);
+ 	_Changed(profile);
++	_UpdateTarget();
+ 	_UpdateButtons(first);
+-	if (!fLearning)
+-		_SetStatus("Now press Learn, then each button the list asks for.");
+-	else
++	if (added.target != NULL
++		&& profile->Target().ICompare(added.target) != 0) {
++		BString text;
++		text << "These buttons are for " << application_name(added.target)
++			<< ": choose it under \"Send to\".";
++		_SetStatus(text);
++	} else if (!fLearning) {
++		BString text;
++		if (added.target != NULL) {
++			text << "The buttons go to " << application_name(added.target)
++				<< ", active or not. ";
++		}
++		text << "Now press Learn, then each button the list asks for.";
++		_SetStatus(text);
++	} else
+ 		_Prompt();
+ }
+ 
+diff --git a/src/preferences/remotecontrol/RemoteWindow.h b/src/preferences/remotecontrol/RemoteWindow.h
+index 6dfbe1df51..486884d78b 100644
+--- a/src/preferences/remotecontrol/RemoteWindow.h
++++ b/src/preferences/remotecontrol/RemoteWindow.h
+@@ -42,6 +42,7 @@ private:
+ 
+ 			void				_UpdateProfileList(int32 select);
+ 			void				_UpdateProfile();
++			void				_UpdateTarget();
+ 			void				_UpdateButtons(int32 select);
+ 			void				_UpdateEditor();
+ 			uint32				_CheckedModifiers() const;
+@@ -73,6 +74,8 @@ private:
+ 			BCheckBox*			fEnabledBox;
+ 			BStringView*		fRemoteView;
+ 			BButton*			fForgetRemoteButton;
++			BMenuField*			fTargetField;
++			BCheckBox*			fStartTargetBox;
+ 			BColumnListView*	fButtonList;
+ 
+ 			BTextControl*		fLabelControl;
+@@ -83,6 +86,8 @@ private:
+ 			BCheckBox*			fShiftBox;
+ 			BCheckBox*			fWinBox;
+ 			BCheckBox*			fRepeatBox;
++			BTextControl*		fScriptControl;
++			BButton*			fTestButton;
+ 			BButton*			fRemoveButton;
+ 			BButton*			fUpButton;
+ 			BButton*			fDownButton;
+diff --git a/src/preferences/remotecontrol/Templates.cpp b/src/preferences/remotecontrol/Templates.cpp
+index 530c71052d..565b8a25bc 100644
+--- a/src/preferences/remotecontrol/Templates.cpp
++++ b/src/preferences/remotecontrol/Templates.cpp
+@@ -49,6 +49,41 @@ static const TemplateButton kBeTunes[] = {
+ 	{ "Mute", kKeyM, kCommand, false },
+ };
+ 
++// MediaPlayer's scripting suite (MainWin.cpp): it works whether
++// MediaPlayer is active or not. The suite only sets the volume, so the
++// volume buttons send the keys, to MediaPlayer's window.
++static const TemplateButton kMediaPlayerCommands[] = {
++	{ "Play/pause", 0, 0, false, "do TogglePlaying of Window 0" },
++	{ "Stop", 0, 0, false, "do Stop of Window 0" },
++	{ "Next", 0, 0, false, "do Next of Window 0" },
++	{ "Previous", 0, 0, false, "do Prev of Window 0" },
++	{ "Forward 5 s", 0, 0, true, "set Seek of Window 0 to int64(5000000)" },
++	{ "Back 5 s", 0, 0, true, "set Seek of Window 0 to int64(-5000000)" },
++	{ "Forward 30 s", 0, 0, true,
++		"set Seek of Window 0 to int64(30000000)" },
++	{ "Back 30 s", 0, 0, true, "set Seek of Window 0 to int64(-30000000)" },
++	{ "Volume up", kKeyUp, 0, true, NULL },
++	{ "Volume down", kKeyDown, 0, true, NULL },
++	{ "Mute", 0, 0, false, "do Mute of Window 0" },
++	{ "Full screen", 0, 0, false, "do ToggleFullscreen of Window 0" },
++};
++
++// the commands of BeTunes' window (its README, "Scripting")
++static const TemplateButton kBeTunesCommands[] = {
++	{ "Play/pause", 0, 0, false, "Bply of Window 0" },
++	{ "Stop", 0, 0, false, "Bstp of Window 0" },
++	{ "Next song", 0, 0, false, "Bnxt of Window 0" },
++	{ "Previous song", 0, 0, false, "Bprv of Window 0" },
++	// 2 s a step: held, 10 steps a second
++	{ "Fast forward", 0, 0, true,
++		"Bscn of Window 0 with direction=int32(1)" },
++	{ "Rewind", 0, 0, true, "Bscn of Window 0 with direction=int32(-1)" },
++	{ "Volume up", 0, 0, true, "Bvup of Window 0" },
++	{ "Volume down", 0, 0, true, "Bvdn of Window 0" },
++	{ "Mute", 0, 0, false, "Bmut of Window 0" },
++	{ "Shuffle", 0, 0, false, "Bshf of Window 0" },
++};
++
+ static const TemplateButton kDesktop[] = {
+ 	{ "Up", kKeyUp, 0, true },
+ 	{ "Down", kKeyDown, 0, true },
+@@ -73,5 +108,10 @@ const Template kTemplates[] = {
+ 	{ "BeTunes", kBeTunes, B_COUNT_OF(kBeTunes) },
+ 	{ "Desktop navigation", kDesktop, B_COUNT_OF(kDesktop) },
+ 	{ "System volume", kVolume, B_COUNT_OF(kVolume) },
++	{ "MediaPlayer, active or not", kMediaPlayerCommands,
++		B_COUNT_OF(kMediaPlayerCommands),
++		"application/x-vnd.Haiku-MediaPlayer" },
++	{ "BeTunes, active or not", kBeTunesCommands,
++		B_COUNT_OF(kBeTunesCommands), "application/x-vnd.BeTunes" },
+ };
+ const int32 kTemplateCount = B_COUNT_OF(kTemplates);
+diff --git a/src/preferences/remotecontrol/Templates.h b/src/preferences/remotecontrol/Templates.h
+index 85aedf1f1f..f3b92b63c6 100644
+--- a/src/preferences/remotecontrol/Templates.h
++++ b/src/preferences/remotecontrol/Templates.h
+@@ -14,12 +14,16 @@ struct TemplateButton {
+ 	uint32		key;
+ 	uint32		modifiers;
+ 	bool		repeat;
++	const char*	script;		// a scripting command instead of the key
+ };
+ 
+ struct Template {
+ 	const char*				name;
+ 	const TemplateButton*	buttons;
+ 	int32					count;
++	const char*				target;
++		// the application the profile is to send to (by signature), for
++		// templates with commands; NULL: the active one
+ };
+ 
+ // buttons named for what they do in an application, with its keystrokes

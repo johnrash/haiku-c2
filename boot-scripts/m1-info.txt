@@ -1,0 +1,18 @@
+# M1: record what U-Boot sees and stay at the prompt.
+echo c2: M1 INFO BEGIN
+version
+mmc list
+mmc dev 1
+mmc info
+bdinfo
+fdt addr ${fdtcontroladdr}
+fdt print /chosen
+fdt print /aliases
+fdt print /psci
+fdt print /cpus
+fdt print /timer
+fdt print /reserved-memory
+fdt print /soc/bus@c8100000/serial@4c0
+efidebug memmap
+printenv
+echo c2: M1 INFO END

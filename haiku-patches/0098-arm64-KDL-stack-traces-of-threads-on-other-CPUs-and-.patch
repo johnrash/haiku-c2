@@ -1,0 +1,209 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 30 Oct 2026 13:44:13 -0400
+Subject: [PATCH 098/342] arm64 KDL: stack traces of threads on other CPUs, and
+ "iframe"
+
+A CPU that enters or is halted in the kernel debugger saves the frame
+pointer it is at (arch_debug_save_registers(), as on x86 and riscv64),
+so "bt <thread>" now traces a thread running on another CPU instead of
+refusing. And a new "iframe [-f] [<thread>]" command prints a thread's
+exception frames: x0 to x30, sp, elr, spsr (decoded), esr (exception
+class named), far and tpidr; with -f the FP/SIMD registers v0 to v31,
+fpsr and fpcr, which every exception entry saves.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../private/kernel/arch/arm64/arch_debug.h    |   4 +-
+ src/system/kernel/arch/arm64/arch_debug.cpp   | 144 +++++++++++++++++-
+ 2 files changed, 140 insertions(+), 8 deletions(-)
+
+diff --git a/headers/private/kernel/arch/arm64/arch_debug.h b/headers/private/kernel/arch/arm64/arch_debug.h
+index db81a7d7a9..b3cc153585 100644
+--- a/headers/private/kernel/arch/arm64/arch_debug.h
++++ b/headers/private/kernel/arch/arm64/arch_debug.h
+@@ -10,7 +10,9 @@
+ 
+ 
+ struct arch_debug_registers {
+-
++	addr_t	fp;
++		// the frame pointer where the CPU entered or was halted in the
++		// kernel debugger
+ };
+ 
+ 
+diff --git a/src/system/kernel/arch/arm64/arch_debug.cpp b/src/system/kernel/arch/arm64/arch_debug.cpp
+index 4ac108ad42..3063f0e38c 100644
+--- a/src/system/kernel/arch/arm64/arch_debug.cpp
++++ b/src/system/kernel/arch/arm64/arch_debug.cpp
+@@ -245,15 +245,21 @@ stack_trace(int argc, char **argv)
+ 		}
+ 		if (target != thread) {
+ 			if (target->state == B_THREAD_RUNNING) {
+-				// TODO
+-				kprintf("Thread %" B_PRId32 " is running on another CPU. "
+-						"Tracing running threads isn't supported on arm64 yet\n",
+-					id);
+-				return 0;
++				// running on another CPU: from where that CPU was halted for
++				// the kernel debugger (arch_debug_save_registers())
++				arch_debug_registers* registers = target->cpu != NULL
++					? debug_get_debug_registers(target->cpu->cpu_num) : NULL;
++				if (registers == NULL || registers->fp == 0) {
++					kprintf("Thread %" B_PRId32 " is running on another CPU, "
++						"which didn't save its registers\n", id);
++					return 0;
++				}
++				fp = registers->fp;
++			} else {
++				// x29 (frame pointer) is stored at regs[10]
++				fp = target->arch_info.regs[10];
+ 			}
+ 			thread = target;
+-			// x29 (frame pointer) is stored at regs[10]
+-			fp = thread->arch_info.regs[10];
+ 
+ 			// If switched to user-space, save current TTBR0 and switch to the thread's one
+ 			if (thread->team != NULL && thread->team->address_space != NULL) {
+@@ -350,9 +356,131 @@ stack_trace(int argc, char **argv)
+ // #pragma mark -
+ 
+ 
++/*!	Saves the caller's frame pointer, for stack traces of the thread this CPU
++	runs while another one is in the kernel debugger.
++*/
+ void
+ arch_debug_save_registers(struct arch_debug_registers* registers)
+ {
++	// this function's frame record holds the caller's frame pointer
++	addr_t* frame = (addr_t*)__builtin_frame_address(0);
++	registers->fp = frame[0];
++}
++
++
++static const char*
++exception_class_name(uint32 exceptionClass)
++{
++	switch (exceptionClass) {
++		case 0x00: return "unknown";
++		case 0x01: return "WFI/WFE";
++		case 0x07: return "FP/SIMD access";
++		case 0x0e: return "illegal execution state";
++		case 0x15: return "SVC";
++		case 0x18: return "MSR/MRS";
++		case 0x20: return "instruction abort, EL0";
++		case 0x21: return "instruction abort, EL1";
++		case 0x22: return "PC alignment";
++		case 0x24: return "data abort, EL0";
++		case 0x25: return "data abort, EL1";
++		case 0x26: return "SP alignment";
++		case 0x2c: return "FP exception";
++		case 0x2f: return "SError";
++		case 0x30: return "breakpoint, EL0";
++		case 0x31: return "breakpoint, EL1";
++		case 0x32: return "step, EL0";
++		case 0x33: return "step, EL1";
++		case 0x34: return "watchpoint, EL0";
++		case 0x35: return "watchpoint, EL1";
++		case 0x3c: return "BRK";
++		default: return "?";
++	}
++}
++
++
++static void
++print_iframe(struct iframe* frame, bool fpu)
++{
++	kprintf("iframe at %p\n", frame);
++	for (int i = 0; i < 28; i += 4) {
++		kprintf(" x%-2d %016" B_PRIx64 "  x%-2d %016" B_PRIx64 "  x%-2d %016"
++			B_PRIx64 "  x%-2d %016" B_PRIx64 "\n", i, frame->x[i], i + 1,
++			frame->x[i + 1], i + 2, frame->x[i + 2], i + 3, frame->x[i + 3]);
++	}
++	kprintf(" x28 %016" B_PRIx64 "  fp  %016" B_PRIx64 "  lr  %016" B_PRIx64
++		"  sp  %016" B_PRIx64 "\n", frame->x[28], frame->fp, frame->lr,
++		frame->sp);
++
++	uint64 spsr = frame->spsr;
++	kprintf(" elr %016" B_PRIx64 "  spsr %08" B_PRIx64 " (EL%" B_PRIu64
++		"%s, %c%c%c%c, DAIF %" B_PRIx64 ")  tpidr %016" B_PRIx64 "\n",
++		frame->elr, spsr, (spsr >> 2) & 3, (spsr & 1) != 0 ? "h" : "t",
++		(spsr & (1UL << 31)) != 0 ? 'N' : 'n',
++		(spsr & (1UL << 30)) != 0 ? 'Z' : 'z',
++		(spsr & (1UL << 29)) != 0 ? 'C' : 'c',
++		(spsr & (1UL << 28)) != 0 ? 'V' : 'v', (spsr >> 6) & 0xf,
++		frame->tpidr);
++	uint32 exceptionClass = (frame->esr >> 26) & 0x3f;
++	kprintf(" esr %016" B_PRIx64 " (EC %#" B_PRIx32 " %s, ISS %#" B_PRIx64
++		")  far %016" B_PRIx64 "\n", frame->esr, exceptionClass,
++		exception_class_name(exceptionClass), frame->esr & 0x1ffffff,
++		frame->far);
++		// an interrupt's frame has the last exception's ESR and FAR
++
++	if (!fpu)
++		return;
++	for (int i = 0; i < 32; i += 2) {
++		kprintf(" v%-2d %016" B_PRIx64 "%016" B_PRIx64 "  v%-2d %016" B_PRIx64
++			"%016" B_PRIx64 "\n", i, frame->fpu.regs[i * 2 + 1],
++			frame->fpu.regs[i * 2], i + 1, frame->fpu.regs[i * 2 + 3],
++			frame->fpu.regs[i * 2 + 2]);
++	}
++	kprintf(" fpsr %08" B_PRIx64 "  fpcr %08" B_PRIx64 "\n", frame->fpu.fpsr,
++		frame->fpu.fpcr);
++}
++
++
++static int
++dump_iframes(int argc, char** argv)
++{
++	static const char* usage = "usage: %s [-f] [ <thread id> ]\n"
++		"Prints the iframes (exception frames: the registers at an exception\n"
++		"or interrupt) of the current, respectively the specified thread.\n"
++		"  -f           -  Also the FP/SIMD registers.\n"
++		"  <thread id>  -  The ID of the thread.\n";
++	bool fpu = false;
++	int32 threadIndex = 1;
++	if (argc > 1 && strcmp(argv[1], "-f") == 0) {
++		fpu = true;
++		threadIndex++;
++	}
++	if (argc > threadIndex + 1
++		|| (argc == 2 && strcmp(argv[1], "--help") == 0)) {
++		kprintf(usage, argv[0]);
++		return 0;
++	}
++
++	Thread* thread = thread_get_current_thread();
++	if (argc > threadIndex) {
++		thread_id id = strtoul(argv[threadIndex], NULL, 0);
++		thread = Thread::GetDebug(id);
++		if (thread == NULL) {
++			kprintf("could not find thread %" B_PRId32 "\n", id);
++			return 0;
++		}
++	}
++
++	struct iframe_stack* frameStack = thread != NULL
++		? &thread->arch_info.iframes : &gBootFrameStack;
++	if (thread != NULL) {
++		kprintf("iframes of thread %" B_PRId32 " \"%s\", the latest last\n",
++			thread->id, thread->name);
++	}
++	if (frameStack->index == 0)
++		kprintf("none\n");
++	for (int32 i = 0; i < frameStack->index; i++)
++		print_iframe(frameStack->frames[i], fpu);
++	return 0;
+ }
+ 
+ 
+@@ -532,6 +660,8 @@ arch_debug_init(kernel_args *args)
+ 	add_debugger_command("where", &stack_trace, "Same as \"sc\"");
+ 	add_debugger_command("bt", &stack_trace, "Same as \"sc\" (as in gdb)");
+ 	add_debugger_command("sc", &stack_trace, "Stack crawl for current thread");
++	add_debugger_command("iframe", &dump_iframes,
++		"Dump the iframes (registers) of the current or a given thread");
+ 
+ 	return B_NO_ERROR;
+ }

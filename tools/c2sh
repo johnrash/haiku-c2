@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""Run a shell command on Haiku on the C2 over telnet and print its output.
+
+c2sh "<command>" [timeout-seconds]      (exit status = the command's)
+Needs the guest diagnostics script's telnetd (tools/guest/UserBootscript).
+Haiku's single user is "baron". A fresh image has no password, which ftpd
+cannot handle, so the first login sets the dev password below (test
+credential for this test image only; c2put/c2get use it).
+"""
+import re
+import socket
+import sys
+import time
+
+HOST = "10.42.0.2"
+PASSWORD = "haiku"
+IAC, DONT, DO, WONT, WILL, SB, SE = 255, 254, 253, 252, 251, 250, 240
+
+
+class Session:
+	def __init__(self):
+		# telnetd -debug serves one connection, then is restarted by the
+		# guest script after a second: retry for a while
+		for attempt in range(20):
+			try:
+				self.sock = socket.create_connection((HOST, 23), timeout=10)
+				break
+			except ConnectionRefusedError:
+				if attempt == 19:
+					raise
+				time.sleep(0.5)
+		self.buffer = b""
+
+	def _strip(self, data):
+		# refuse every telnet option: plain line mode, no server echo
+		out = bytearray()
+		i = 0
+		while i < len(data):
+			b = data[i]
+			if b == IAC and i + 1 < len(data):
+				cmd = data[i + 1]
+				if cmd in (DO, DONT, WILL, WONT) and i + 2 < len(data):
+					if cmd == DO:
+						self.sock.sendall(bytes([IAC, WONT, data[i + 2]]))
+					elif cmd == WILL:
+						self.sock.sendall(bytes([IAC, DONT, data[i + 2]]))
+					i += 3
+					continue
+				if cmd == SB:
+					j = data.find(bytes([IAC, SE]), i)
+					i = j + 2 if j >= 0 else len(data)
+					continue
+				i += 2
+				continue
+			out.append(b)
+			i += 1
+		return bytes(out)
+
+	def expect(self, pattern, timeout):
+		regex = re.compile(pattern)
+		end = time.time() + timeout
+		self.sock.settimeout(0.2)
+		while time.time() < end:
+			text = self.buffer.replace(b"\r", b"").replace(b"\0", b"")
+			match = regex.search(text)
+			if match:
+				self.buffer = text[match.end():]
+				return text[:match.start()], match
+			try:
+				data = self.sock.recv(65536)
+				if not data:
+					break
+				self.buffer += self._strip(data)
+			except socket.timeout:
+				pass
+		raise TimeoutError("waiting for %r, got %r" % (pattern, self.buffer[-300:]))
+
+	def send(self, line):
+		self.sock.sendall(line.encode() + b"\r\n")
+
+
+def login():
+	for password in (PASSWORD, ""):
+		s = Session()
+		s.expect(rb"login: ", 20)
+		s.send("baron")
+		s.expect(rb"password: ", 10)
+		s.send(password)
+		_, match = s.expect(rb"(> |Login failed)", 20)
+		if match.group(1) == b"> ":
+			break
+		s.sock.close()
+	else:
+		raise SystemExit("c2sh: cannot log in")
+	if password != PASSWORD:
+		# set the dev password so that ftpd accepts the account
+		s.send("passwd")
+		while True:
+			_, match = s.expect(rb"(old password: |repeat new password: "
+				rb"|new password: |> )", 20)
+			prompt = match.group(1)
+			if prompt == b"> ":
+				break
+			s.send("" if prompt == b"old password: " else PASSWORD)
+	return s
+
+
+def main():
+	if len(sys.argv) < 2:
+		sys.exit(__doc__)
+	command = sys.argv[1]
+	timeout = float(sys.argv[2]) if len(sys.argv) > 2 else 60
+	s = login()
+	s.send("echo __C2SH_BEGIN__; " + command + "; echo __C2SH_END__ $?")
+	s.expect(rb"__C2SH_BEGIN__\n", 20)
+	output, match = s.expect(rb"__C2SH_END__ (\d+)\n", timeout)
+	sys.stdout.write(re.sub(rb"\x1b\[[0-9;]*m", b"", output).decode("utf-8", "replace"))
+	s.send("exit")
+	sys.exit(int(match.group(1)))
+
+
+if __name__ == "__main__":
+	main()

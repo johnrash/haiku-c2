@@ -1,0 +1,5 @@
+# Boot the Haiku EFI loader already on the eMMC, without reflashing.
+mmc dev 1
+load mmc 1:1 ${kernel_addr_r} EFI/BOOT/BOOTAA64.EFI
+echo c2: BOOTEFI
+bootefi ${kernel_addr_r} ${fdtcontroladdr}

@@ -1,0 +1,114 @@
+--- a/src/gallium/frontends/hgl/hgl.c
++++ b/src/gallium/frontends/hgl/hgl.c
+@@ -71,8 +71,8 @@
+ 	if (!ptex)
+ 		return true;
+ 
+-	// TODO: pipe_context here??? Might be needed for hw renderers
+-	buffer->screen->flush_frontbuffer(buffer->screen, NULL, ptex, 0, 0,
++	// hardware renderers read the frame back through the context
++	buffer->screen->flush_frontbuffer(buffer->screen, stctxi->pipe, ptex, 0, 0,
+ 		buffer->winsysContext, NULL);
+ 
+ 	return true;
+--- a/src/gallium/targets/haiku-softpipe/GalliumContext.h
++++ b/src/gallium/targets/haiku-softpipe/GalliumContext.h
+@@ -21,11 +21,18 @@
+ 
+ class BBitmap;
+ 
++// The renderer add-on's screen, made once per team; each add-on that
++// shares this class has its own.
++extern "C" struct pipe_screen* hgl_target_create_screen(void);
++
+ class GalliumContext {
+ public:
+ 							GalliumContext(ulong options);
+ 							~GalliumContext();
+ 
++		status_t			InitCheck() const
++								{ return fDisplay != NULL ? B_OK : B_NO_INIT; }
++
+ 		void				Lock();
+ 		void				Unlock();
+ 
+--- a/src/gallium/targets/haiku-softpipe/GalliumContext.cpp
++++ b/src/gallium/targets/haiku-softpipe/GalliumContext.cpp
+@@ -29,7 +29,6 @@
+ #include "util/u_memory.h"
+ #include "util/u_framebuffer.h"
+ 
+-#include "target-helpers/inline_sw_helper.h"
+ #include "target-helpers/inline_debug_helper.h"
+ 
+ 
+@@ -86,19 +85,10 @@
+ 	if (atomic_add(&fDisplayRefCount, 1) > 0)
+ 		return B_OK;
+ 
+-	// Allocate winsys and attach callback hooks
+-	struct sw_winsys* winsys = hgl_create_sw_winsys();
+-
+-	if (!winsys) {
+-		ERROR("%s: Couldn't allocate sw_winsys!\n", __func__);
+-		return B_ERROR;
+-	}
+-
+-	struct pipe_screen* screen = sw_screen_create(winsys);
++	struct pipe_screen* screen = hgl_target_create_screen();
+ 
+ 	if (screen == NULL) {
+ 		ERROR("%s: Couldn't create screen!\n", __FUNCTION__);
+-		winsys->destroy(winsys);
+ 		return B_ERROR;
+ 	}
+ 
+@@ -344,7 +334,8 @@
+ 
+ 	// flush back buffer and swap buffers if double buffering is used
+ 	if (buffer->textures[ST_ATTACHMENT_BACK_LEFT] != NULL) {
+-		buffer->screen->flush_frontbuffer(buffer->screen, NULL, buffer->textures[ST_ATTACHMENT_BACK_LEFT],
++		buffer->screen->flush_frontbuffer(buffer->screen, context->st->pipe,
++			buffer->textures[ST_ATTACHMENT_BACK_LEFT],
+ 			0, 0, buffer->winsysContext, NULL);
+ 		std::swap(buffer->textures[ST_ATTACHMENT_FRONT_LEFT], buffer->textures[ST_ATTACHMENT_BACK_LEFT]);
+ 		p_atomic_inc(&buffer->stfbi->stamp);
+--- a/src/gallium/targets/haiku-softpipe/SoftwareRenderer.cpp
++++ b/src/gallium/targets/haiku-softpipe/SoftwareRenderer.cpp
+@@ -21,6 +21,8 @@
+ #include <sys/time.h>
+ #include <new>
+ 
++#include "target-helpers/inline_sw_helper.h"
++
+ 
+ #ifdef DEBUG
+ #	define TRACE(x...) printf("SoftwareRenderer: " x)
+@@ -41,6 +43,27 @@
+ 	return new SoftwareRenderer(view, opts);
+ }
+ 
++
++extern "C" struct pipe_screen*
++hgl_target_create_screen(void)
++{
++	// Allocate winsys and attach callback hooks
++	struct sw_winsys* winsys = hgl_create_sw_winsys();
++
++	if (!winsys) {
++		ERROR("%s: Couldn't allocate sw_winsys!\n", __func__);
++		return NULL;
++	}
++
++	struct pipe_screen* screen = sw_screen_create(winsys);
++
++	if (screen == NULL) {
++		ERROR("%s: Couldn't create screen!\n", __FUNCTION__);
++		winsys->destroy(winsys);
++	}
++	return screen;
++}
++
+ struct RasBuffer
+ {
+ 	int32 width, height, stride;
