@@ -7,7 +7,7 @@
  * The video track's keyframes in the first <seconds> (default 300), as the
  * Media Kit finds them (BMediaTrack::FindKeyFrameForTime, backward, every
  * 0.25 s), and the gaps between them: MediaPlayer snaps its seeks to them
- * (milestone M71 (docs/milestones.md)).
+ * (milestone M71).
  *
  * Build: $CXX -O2 -o keyframes keyframes.cpp -lmedia -lbe
  */

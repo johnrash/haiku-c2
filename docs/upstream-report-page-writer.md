@@ -1,6 +1,8 @@
 # Draft: a bug report for Haiku (not sent)
 
-A draft for Haiku's bug tracker (https://dev.haiku-os.org), about the data loss found in milestone M46 (docs/milestones.md). Nothing has been sent. Haiku doesn't take AI-written code, so the report describes the fix in words and has no patch. It was drafted with an AI assistant, which you may want to say, or put it in your own words.
+> **Status:** Not filed. The fix in the fork (patch 0207) was written with AI assistance: don't attach it or derive a patch from it for Haiku.
+
+A draft for Haiku's bug tracker (https://dev.haiku-os.org), about the data loss found in M46. Nothing has been sent. Haiku doesn't take AI-written code, so the report describes the fix in words and has no patch. It was drafted with an AI assistant, which you may want to say, or put it in your own words.
 
 ---
 
@@ -40,5 +42,5 @@ The loop condition `fWriterThread >= 0` still ends the thread at teardown, and t
 ---
 
 **Notes, not part of the report:**
-- The fork's fix is 83961def36 (milestone M46 (docs/milestones.md)). The test script is `tools/stress/powercut.py`, and the logs are `logs/powercut-215.log` and `logs/powercut-216.log`.
+- The fork's fix is `haiku-patches/0207` (M46); it was written with AI assistance, so don't attach it or derive a patch from it. The test script is `tools/stress/powercut.py`.
 - Before filing, it's worth checking upstream's current master: the code may have changed since hrev60299.

@@ -2,7 +2,7 @@
 // Distributed under the terms of the MIT License.
 //
 // rust-smoke: the aarch64-unknown-haiku Rust standard library on the C2
-// (milestone M78 (docs/milestones.md)): threads, channels, files, time, environment, a caught panic,
+// (milestone M78): threads, channels, files, time, environment, a caught panic,
 // 128-bit and floating point arithmetic.
 // Build: . deps/firefox/rust-out/env.sh; rustc -O --target aarch64-unknown-haiku
 //     -C linker=$CARGO_TARGET_AARCH64_UNKNOWN_HAIKU_LINKER main.rs -o rust-smoke

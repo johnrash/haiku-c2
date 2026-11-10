@@ -5,7 +5,9 @@ Distributed under the terms of the MIT License.
 
 # M43: Mali-450 on the S905 (GXBB), SoC integration facts
 
-> Facts read from Linux mainline (GPL; master at cbbddb6b08cc, fetched 2026-10-31/11-01 UTC), Hardkernel's vendor kernel `odroidc2-3.14.y` at c3e4c730feb1 (GPL), mainline U-Boot v2026.10 in this repo (GPL), the S905 public datasheet V1.1.4, and the board's own device tree blob. No code, macros or comments were copied.
+> **Status:** Facts gathered before M43's driver. `meson_mali` runs the GPU at 666.67 MHz from fclk_div3; the firmware leaves HHI_MALI_CLK_CNTL at 0. Board values are in M43 stage 2.
+
+> Facts read from Linux mainline (GPL; master at cbbddb6b08cc, fetched 2026-10-31/11-01 UTC), Hardkernel's vendor kernel `odroidc2-3.14.y` at c3e4c730feb1 (GPL), mainline U-Boot v2026.10 (the port's `u-boot/` tree; GPL), the S905 public datasheet V1.1.4, and the board's own device tree blob. No code, macros or comments were copied.
 
 This is the input for a clean-room, MIT-licensed Haiku kernel driver for the ODROID-C2's Mali-450 MP3. It covers everything **outside** the GPU that the driver must do on GXBB: where the register window and the interrupts are, the clock, the resets, the power, and what Linux's lima driver does at probe. The GPU's own registers (PMU, L2 caches, GP, PP, MMUs, DLBU, broadcast unit) are in the companion document, `docs/m43-mali-facts.md`, called "the GPU document" below; this one points at them only where the two meet.
 
@@ -411,7 +413,7 @@ The DDR set-up firmware owns all of these, and neither Linux nor the vendor GPU 
 
 ## 8. Open questions (UNVERIFIED items, collected)
 
-Most of these can be settled with read-only KDL commands on the board (`dw -p <address> 1`, as used for 0xC883C178 in `logs/m1-2026-10-27.log`), once someone chooses to run them. Nothing here was run on a board.
+Most of these can be settled with read-only KDL commands on the board (`dw -p <address> 1`), once someone chooses to run them. M43 stage 2 did; its results are summarized at the top.
 
 1. **Boot state:** what the firmware leaves in HHI_MALI_CLK_CNTL (0xC883C1B0), HHI_GP0_PLL_CNTL (0xC883C040) and HHI_MPLL_CNTL6 (0xC883C294). Mainline U-Boot writes none of them.
 2. **Fixed PLL rate** on this board (HHI_MPLL_CNTL, 0xC883C280). Nominal 2 GHz gives the fclk rates in §2.3.
@@ -446,12 +448,11 @@ Most of these can be settled with read-only KDL commands on the board (`dw -p <a
 - drivers/amlogic/clk/clk-gxbb.c, drivers/amlogic/clk/gp0_pll.c
 - the file list from https://api.github.com/repos/hardkernel/linux/git/trees/c3e4c730feb1750940971cae9ca1da3ca50f1d56?recursive=1
 
-**In this repo:**
+**In the source trees `tools/haiku-setup.sh` sets up, and this repository:**
 - `u-boot/` (mainline U-Boot v2026.10): `u-boot.dtb` (the DTB Haiku boots with), `drivers/reset/reset-meson.c`, `drivers/clk/meson/gxbb.c`, `arch/arm/include/asm/arch-meson/clock-gx.h`
 - `boot-scripts/boot-emmc.txt`
 - `haiku/src/add-ons/kernel/bus_managers/fdt/fdt_module.cpp`, `haiku/src/system/kernel/arch/arm/arch_int_gicv2.cpp`, `haiku/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp`, `haiku/src/add-ons/kernel/drivers/video/meson_vdec/`
 - `docs/m26-vdec-facts.md`, `docs/m26-vdec-hevc-facts.md`, `docs/m27-irq-uart-i2c-facts.md`
-- `logs/m1-2026-10-27.log`: it holds no Mali, GPU or clock-tree dumps. The only relevant line is meson_i2c's clk81 = 166,666,666 Hz, which is computed, not measured.
 
 **S905 public datasheet V1.1.4** (text extracted earlier for M27, from https://web.archive.org/web/20240712025337id_/https://dn.odroid.com/S905/DataSheet/S905_Public_Datasheet_V1.1.4.pdf). Used:
 - §18 (power domains, Mali power modes, AO power registers)

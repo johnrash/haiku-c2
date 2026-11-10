@@ -2,6 +2,8 @@ Facts read from Amlogic's GPL vendor driver (`drivers/amlogic/amports/vmjpeg.c` 
 
 # M51: S905 (GXBB) VDEC_1 MJPEG decoding, hardware facts
 
+> **Status:** Research before M51; the board's answers are in M51 (patches 0230 and 0231): `gxl_mjpeg.bin` runs with the vendor protocol, output is always three planes, 4:2:2 comes out as 4:2:0, a frame decodes only once more data follows (hence 4 KiB of zero padding), and a 720p frame takes 10.8 ms, a 1080p one 21.4 ms.
+
 This document is the input for MJPEG support in `meson_vdec`, the clean-room, MIT-licensed Haiku driver for the S905's video decoder. The target stream is the Logitech C920's: 1920×1080 and 1280×720 baseline JPEG frames, 4:2:2, each frame with its own Huffman tables. The microcode is to be linux-firmware's `gxl_mjpeg.bin`. The document describes how Amlogic's own kernel drove MJPEG on VDEC_1 (`amvdec_mjpeg`), and where that differs from what the Haiku driver already does for MPEG-1/2.
 
 **Related documents:**
@@ -16,7 +18,7 @@ This document is the input for MJPEG support in `meson_vdec`, the clean-room, MI
 - **UNVERIFIED** marks a meaning the vendor source does not state, or one that is inferred.
 - "The vendor" means this driver as built for GXBB (`get_cpu_type()` = MESON_CPU_MAJOR_ID_GXBB). vmjpeg.c itself has no chip branches: its only conditionals are "Meson6 or later" blocks hard-wired on, and a compiled-out NV21 output mode (§5.5).
 
-Nothing in this document has been run on the board yet.
+The board's answers are summarized at the top.
 
 ---
 
@@ -586,7 +588,7 @@ Everything about the JPEG syntax the microcode accepts is **UNVERIFIED**. Baseli
 
 ### 8.2 The C920's frames (observation, not a vendor fact)
 
-A 1920 × 1080 MJPEG frame kept in this project's scratch space (322,528 bytes; by its structure a C920 frame, but its source was not recorded) has, in this order:
+A 1920 × 1080 MJPEG frame (not kept in this repository) (322,528 bytes; by its structure a C920 frame, but its source was not recorded) has, in this order:
 - **DQT:** three quantisation tables.
 - **SOF0 (baseline), 8-bit, 1920 × 1080:**
   - Y sampling 2×1, quantisation table 0;
@@ -737,9 +739,9 @@ All from https://github.com/hardkernel/linux at commit **c3e4c730feb1750940971ca
 - `drivers/amlogic/amports/vh264.c`, saved by the HEVC study at the same commit: grepped only for the NV21 label and bit 17 (§5.5).
 
 **Local files:**
-- linux-firmware's `/lib/firmware/meson/vdec/gxl_mjpeg.bin.zst` and `gxl_mpeg4_5.bin.zst`, decompressed into the session's scratch space for the comparison (§1.3).
-- A C920-like 1080p frame from the scratch space (§8.2).
-- This repository's `docs/m26-vdec-facts.md`, `docs/m26-vdec-hevc-vendor-facts.md`, `docs/m48-venc-facts.md`, `meson_vdec.cpp`, `meson_vdec_private.h` and `headers/private/drivers/meson_vdec.h`.
+- linux-firmware's `/lib/firmware/meson/vdec/gxl_mjpeg.bin.zst` and `gxl_mpeg4_5.bin.zst`, decompressed for the comparison (§1.3).
+- A C920-like 1080p frame (§8.2), not kept in this repository.
+- This repository's `docs/m26-vdec-facts.md`, and the port's `docs/m26-vdec-hevc-vendor-facts.md`, `docs/m48-venc-facts.md`, `meson_vdec.cpp`, `meson_vdec_private.h` and `headers/private/drivers/meson_vdec.h`.
 
 **Not read:**
 - The vendor's still-picture JPEG decoder `drivers/amlogic/amports/jpegdec.c` (`amjpegdec`, its own microcode under `arch/ucode/jpeg`) is in the same tree. It is not used by the MJPEG path and was left out of scope. It may say how the JPEG hardware treats sampling factors and quantisation tables (§5.4, §8.2).

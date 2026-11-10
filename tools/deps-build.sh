@@ -1,5 +1,5 @@
 #!/bin/bash
-# Cross-compile the static libraries OpenSSH links (milestone M7 (docs/milestones.md)) into
+# Cross-compile the static libraries OpenSSH links (milestone M7) into
 # deps/prefix, from the source archives in deps/src (downloaded once,
 # checksums verified):
 #   OpenSSL 3.5.9 (own haiku-aarch64 target, tools/deps/haiku-aarch64.conf),

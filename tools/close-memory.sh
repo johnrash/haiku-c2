@@ -5,7 +5,7 @@
 # close-memory.sh <seconds> <log>: the test board's tcpchurn server closes each
 # connection the ordinary way (fin) while the laptop's client keeps sending;
 # used memory every 30 s over one shared ssh connection, then 150 s after the
-# load for the time wait. Stops early above 1500 MB used (milestone M82 (docs/milestones.md)).
+# load for the time wait. Stops early above 1500 MB used (milestone M82).
 cd "$(dirname "$0")/.."
 T=$1; R=$2; B=10.42.0.2; P=$((5700 + RANDOM % 200))
 CM="-o ControlMaster=auto -o ControlPath=/tmp/cm-close-%r@%h -o ControlPersist=900"

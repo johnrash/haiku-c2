@@ -6,7 +6,7 @@
 # it (wpa_supplicant-2.11.haiku.1: Haiku's fork at $REV, with the recipe's
 # two patches, all in deps/src, and ours from patches/wpa_supplicant) and
 # package it as deps/wpa_supplicant/wpa_supplicant-2.11.haiku.1-2-arm64.hpkg. net_server
-# starts it by its signature to join WPA networks (milestone M64 (docs/milestones.md)).
+# starts it by its signature to join WPA networks (milestone M64).
 # OpenSSL is linked statically from deps/prefix (deps-build.sh), as OpenSSH
 # is. No catalogs: linkcatkeys isn't among the build's host tools, so its
 # dialog is in English only.

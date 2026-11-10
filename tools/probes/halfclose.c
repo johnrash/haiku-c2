@@ -4,7 +4,7 @@
  *
  * halfclose <port>: accepts one connection, shuts its own sending side
  * down (shutdown(SHUT_WR)), then reads until the peer closes and prints the
- * byte count: data sent after a half-close must still arrive (milestone M82 (docs/milestones.md)).
+ * byte count: data sent after a half-close must still arrive (milestone M82).
  */
 #include <arpa/inet.h>
 #include <netinet/in.h>

@@ -2,11 +2,13 @@ Facts read from Amlogic's GPL vendor driver (`drivers/amlogic/amports/`) in Hard
 
 # M26: S905 (GXBB) HEVC decoding in Amlogic's vendor driver, hardware facts
 
+> **Status:** Research from Amlogic's vendor kernel, written 2026-10-30 for comparison. The driver built in M26 stage 3 uses linux-firmware's `gxl_hevc.bin` and the protocol in `m26-vdec-hevc-facts.md`. The vendor microcode was tried once on the board, then deleted with the driver's vendor mode; it is not in this repository.
+
 This document describes how Amlogic's own kernel drove the S905's HEVC decoder (VDEC_HEVC). That kernel played HEVC in hardware on the ODROID-C2.
 
 **Related documents:**
 - `m26-vdec-facts.md` is the **base document**, cited as "base §N". It covers the mainline VDEC_1 path, the ESPARSER, the canvas LUT and the shared interrupt. None of that is repeated here.
-- The mainline-family HEVC driver (the out-of-tree codec_hevc.c) is covered in its own document. §7 only lists the differences.
+- The mainline-family HEVC driver (the out-of-tree codec_hevc.c) is covered in `m26-vdec-hevc-facts.md`. §7 only lists the differences.
 
 **Conventions (as in the base document):**
 - DOS offsets are **byte offsets from the DOS base 0xC8820000**. Amlogic's headers number DOS registers by 32-bit word index; byte offset = word index × 4. §9 gives both.
@@ -22,8 +24,7 @@ This document describes how Amlogic's own kernel drove the S905's HEVC decoder (
   - the C2 device tree `meson64_odroidc2.dts`.
 - The same `vh265.c` blob is on `odroidc2-v3.16.y`.
 - Hardkernel's Android M branch has a later `vh265.c` (h265_version 201512091) and a later microcode. Where the two drivers differ, the text says so (§5.12).
-- The microcode was extracted to `firmware/meson/vdec/vendor/` for a test (it worked: §11 of `docs/m26-vdec-hevc-facts.md`) and deleted on 2026-10-30. It was research material only and must not ship.
-- Nothing in this document has been run on the board yet.
+- The vendor microcode was extracted for a one-off test (it worked: §11 of `docs/m26-vdec-hevc-facts.md`) and deleted the same day. It was research material only, must not ship, and is not in this repository.
 
 ---
 
@@ -154,7 +155,7 @@ At removal, `hevc_source_changed(0, 0, 0)` leaves the clock as it is. The one ex
 | HEVCD_IPP_DBG_SEL | 0x20 |
 | HEVCD_IPP_DBG_DATA | read; pass when (value & 3) == 1 |
 
-**This board:** it reports "GXBB (S905) Revision 1f:c" in mainline Linux (logs/m9-sep-1.log), so its minor revision is 0xC and the self-test would not run. That mainline's "c" is the same field as the vendor's minor revision is inferred (**UNVERIFIED**).
+**This board:** it reports "GXBB (S905) Revision 1f:c" in mainline Linux (a boot log on this board), so its minor revision is 0xC and the self-test would not run. That mainline's "c" is the same field as the vendor's minor revision is inferred (**UNVERIFIED**).
 
 ### 1.5 Power-down order (`vdec_poweroff(VDEC_HEVC)`)
 
@@ -196,7 +197,7 @@ The Android M driver additionally waits up to 200 ms for the status register to 
   - The image is registered for M8, M8M2 and GXBB (`firmware_def.h`). On a GXBB kernel only the GXBB copy is kept.
 - **Where it comes from:** built into the kernel. Loading from the filesystem (`video/<cpu>/decoder/<format>/<name>`) is compiled out (`ENABLE_LOAD_FIRMWARE_FROM_FS` is commented out).
   - Two other names appear in vh265.c and are absent from the tree: `vh265_mc_debug` (debug flag 0x200000) and `vh265_mc_dw` (in an `#if 0` block, for double-write-only mode).
-- **Byte layout:** the C array is u32 words, stored little-endian in memory on AArch64. The DMA reads memory bytes in order. The extracted files are 16,384 bytes: the words little-endian, then zeros.
+- **Byte layout:** the C array is u32 words, stored little-endian in memory on AArch64. The DMA reads memory bytes in order. Extracted, the files were 16,384 bytes: the words little-endian, then zeros.
 - **The loader:**
   1. Copy min(16 KiB, array size) into a 16 KiB buffer and zero the rest.
   2. HEVC_MPSR (DOS + 0xCC04) = 0, HEVC_CPSR (DOS + 0xCC84) = 0, then two dummy reads of HEVC_MPSR.
@@ -917,4 +918,4 @@ All from https://github.com/hardkernel/linux, branch `odroidc2-3.14.y` at c3e4c7
 
 **For §7 only:** the out-of-tree `codec_hevc.c`, `codec_hevc_common.c` and `vdec_hevc.c` (Maxime Jourdan lineage, as carried by LibreELEC), the copy used for the companion mainline-family document.
 
-**From this repository:** logs/m9-sep-1.log, for the board's SoC revision line.
+**From this board:** a mainline Linux boot log, for the SoC revision line.

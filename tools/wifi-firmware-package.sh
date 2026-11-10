@@ -2,7 +2,7 @@
 # Copyright 2026, haiku-odroid-c2 port authors.
 # Distributed under the terms of the MIT License.
 #
-# The RTL8822B Wi-Fi chip's firmware (milestone M64 (docs/milestones.md)) as a package of its own,
+# The RTL8822B Wi-Fi chip's firmware (milestone M64) as a package of its own,
 # outside the fork: firmware/realtek_rtw88_firmware-<version>-any.hpkg, with
 # firmware/realtek/rtw88/rtw8822b_fw.bin in data/firmware/realtekwifi/
 # (where the realtekwifi driver's RTL8822B support reads it) and Realtek's

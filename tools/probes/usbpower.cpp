@@ -5,7 +5,7 @@
  * usbpower: each USB device's power, as its descriptors and status say:
  * the current its active configuration asks for (bMaxPower), whether it
  * says it is self-powered (the configuration's attributes, and the
- * device's GET_STATUS), for working out a hub's budget (milestone M72 (docs/milestones.md)).
+ * device's GET_STATUS), for working out a hub's budget (milestone M72).
  *
  * Build: $CXX -O2 -o usbpower usbpower.cpp -ldevice -lbe
  */

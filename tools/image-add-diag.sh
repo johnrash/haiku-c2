@@ -155,7 +155,7 @@ cp :$root/configs/locale-settings \"/myfs/home/config/settings/Locale settings\"
 fi
 diagCommand=""
 [ $diag = 1 ] && diagCommand="cp :$root/tools/guest/UserBootscript /myfs/home/config/settings/boot/UserBootscript"
-# The hardware clock (the RTC shield, milestone M23 (docs/milestones.md)) keeps GMT, as Linux expects
+# The hardware clock (the RTC shield, milestone M23) keeps GMT, as Linux expects
 # (configs/RTC_time_settings; Haiku's default is local time).
 printf '%s\n' "mkdir -p /myfs/home/config/settings/boot" \
 	"cp :$root/configs/RTC_time_settings /myfs/home/config/settings/RTC_time_settings" \

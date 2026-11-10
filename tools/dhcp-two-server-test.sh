@@ -3,7 +3,7 @@
 # Distributed under the terms of the MIT License.
 #
 # dhcp-two-server-test.sh <outdir> <scenario>...: runs each scenario of
-# tools/dhcp-two-server-sim.py against the test board (milestone M82 (docs/milestones.md)). Stops the
+# tools/dhcp-two-server-sim.py against the test board (milestone M82). Stops the
 # crossover's dnsmasq, restarts the board's DHCP client for each scenario
 # and saves the simulator's log with the board's DHCP syslog lines; then
 # starts dnsmasq again and has the board take its usual lease from it.

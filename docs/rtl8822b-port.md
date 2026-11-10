@@ -1,11 +1,13 @@
 # RTL8822BU (RTL8812BU "AC1300") in realtekwifi: port notes
 
-Written 2026-11-02. Phase 1 adds the chip to the fork's `realtekwifi` driver (Haiku's port of FreeBSD rtwn) so that it comes up, loads its firmware and can **scan** on 2.4 and 5 GHz. **Status: compile-tested only.** Nothing has run on hardware yet. Committed in the fork as f9873097d8 (+265).
+> **Status:** Written 2026-11-02 before the hardware arrived; it first ran in M80 (+275) and has worked since +297. The later changes are in patches 0273 to 0295: STBC and LDPC in the transmit descriptor (0288, the stall), A-MPDU density (0290), USB transmit aggregation (0292), RSSI units (0294), the receive watchdog (0278, 0291, 0293) and replug recovery (0295). The "uncertainties" lists below are historical.
 
-Phase 2 (same day, not committed yet) adds what station mode needs to associate and run WPA2: media status, firmware rate adaptation, IQK, the rtw88 hardware-crypto setup and the association registers. It is also compile-tested only; see "Phase 2: association and WPA2" at the end. Sections before it describe phase 1 and say where phase 2 changed things.
+Written 2026-11-02. Phase 1 adds the chip to the fork's `realtekwifi` driver (Haiku's port of FreeBSD rtwn) so that it comes up, loads its firmware and can **scan** on 2.4 and 5 GHz. Committed in the fork at +265 (patch 0256).
+
+Phase 2 (the same day, patch 0257) adds what station mode needs to associate and run WPA2: media status, firmware rate adaptation, IQK, the rtw88 hardware-crypto setup and the association registers. It is also compile-tested only; see "Phase 2: association and WPA2" at the end. Sections before it describe phase 1 and say where phase 2 changed things.
 
 - Driver directory: `haiku/src/add-ons/kernel/drivers/network/wlan/realtekwifi/` (below, paths are relative to it).
-- Reference: Linux rtw88 v7.0 in `deps/src/rtw88-v7.0/`, used **only under its BSD-3-Clause option**. Realtek's out-of-tree 88x2bu driver (GPL only) was not used or looked at.
+- Reference: Linux rtw88 v7.0 (not kept in this repository), used **only under its BSD-3-Clause option**. Realtek's out-of-tree 88x2bu driver (GPL only) was not used or looked at.
 - Firmware: linux-firmware `rtw88/rtw8822b_fw.bin` (161,240 bytes; version 30.20.0, H2C format 14). Install it as `/boot/system/data/firmware/realtekwifi/rtw8822b_fw.bin`. The driver asks for `rtwn-rtl8822bufw`, and `glue.c` maps that name to the file.
 - Build: `cd generated.arm64 && jam -q realtekwifi` exits 0 with no warnings in the new or changed code (see "Build" below).
 
@@ -463,7 +465,7 @@ Phase 2 changed the data path (firmware rate adaptation) and treats (QoS) Null f
 ## Build
 
 ```
-cd /build/haiku-odroid-c2/generated.arm64 && jam -q realtekwifi
+cd generated.arm64 && jam -q realtekwifi
 ...updated 8 target(s)...   (exit 0)
 ```
 
@@ -488,9 +490,9 @@ cd /build/haiku-odroid-c2/generated.arm64 && jam -q realtekwifi
 
 ## Phase 2: association and WPA2 (station mode)
 
-Phase 2 adds what station mode needs to associate and use WPA2 with hardware crypto. It builds on f9873097d8 in the same files plus one new file. **Compile-tested only.** It is not committed.
+Phase 2 adds what station mode needs to associate and use WPA2 with hardware crypto. It builds on phase 1 (patch 0256) in the same files plus one new file, and is patch 0257.
 
-Out of scope, as agreed: AP/IBSS, more beamforming, power save (stays off), Tx/Rx aggregation tuning (Rx aggregation as in phase 1, USB Tx aggregation off) and LED.
+Out of scope: AP/IBSS, more beamforming, power save (stays off), Tx/Rx aggregation tuning (Rx aggregation as in phase 1, USB Tx aggregation off) and LED.
 
 ### Files (phase 2)
 
@@ -584,8 +586,8 @@ The RSSI is rtwn's per-node `avg_pwdb` (signal dBm + 100, 0..100), the same scal
 - **Unicast data with firmware RA** (station known to the firmware, rate not forced):
   - `USE_RATE` and `DISDATAFB` clear, so the firmware picks the rate and SGI.
   - `DATARATE` = the initial rate.
-  - The station's rate id, bandwidth and STBC.
-  - The LDPC bit only for HT LDPC; rtw88's `le32_encode_bits()` drops the VHT value (2) in the 1-bit field.
+  - The station's rate id and bandwidth.
+  - STBC and LDPC as 0 or 1, as rtw88's bool fields give them. (At first this wrote the raw values, STBC 2 and LDPC 0 for a VHT peer, which hung transmission on 5 GHz; fixed in +297, patch 0288.)
   - The short-preamble bit is not set.
   - In the window between RUN and the media status command, data still goes out with rtwn's fixed rate and `USE_RATE`.
 - **Forced rate** (`USE_RATE` + `DISDATAFB`):
@@ -691,7 +693,7 @@ Nothing else in the core changed. Media status, RSSI, C2H, IQK and the crypto mo
 - No configured per-station rate mask (`rtw_rate_mask_cfg`).
 - RA info is resent every 8 s from the current node state, as rtw88 does. There is no immediate update when the peer's capabilities change (rtw88's `rtw_sta_rc_work`), so such a change waits up to 8 s.
 - Not needed on the 8822B: rtw88's `rtw_set_ampdu_factor` (the 8822B's chip op is NULL) and the beacon filter configuration (needs `FW_FEATURE_BCN_FILTER`; the feature word of rtw8822b_fw.bin 30.20.0 is 0).
-- Reserved pages, LPS, beamforming at association (`rtw_bf_assoc`) and coexistence notifications are left out, as agreed.
+- Reserved pages, LPS, beamforming at association (`rtw_bf_assoc`) and coexistence notifications are left out.
 - Thermal Tx power tracking: TODO (item 6).
 - Multicast data uses the TID queue, not QSEL_HIGH; this only matters for AP/IBSS.
 
@@ -717,7 +719,7 @@ Nothing else in the core changed. Media status, RSSI, C2H, IQK and the crypto mo
 ### Build (phase 2)
 
 ```
-cd /build/haiku-odroid-c2/generated.arm64 && jam -q realtekwifi
+cd generated.arm64 && jam -q realtekwifi
 ...updated 107 target(s)...   (exit 0; the if_rtwnvar.h change rebuilds the whole driver)
 ```
 

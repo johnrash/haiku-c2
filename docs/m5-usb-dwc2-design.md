@@ -1,6 +1,8 @@
 # M5 design notes: DWC2 USB host (keyboard and mouse)
 
-Research for M5, written 2026-10-28 during the unattended M4.5 run. **Nothing here is implemented.** Whether USB (M5) or Ethernet (M6) comes first was still open then; see `m6-ethernet-design.md`.
+> **Status:** Research written 2026-10-28, before any USB code. Ethernet went first, and dwc2 was then built in M5 with split transactions as planned here. The channel handling changed later: two lanes (M6), separate bulk lanes (M80), and isochronous transfers (M12, M20, M45).
+
+Research for M5, written 2026-10-28 during the unattended M4.5 run. See `m6-ethernet-design.md`.
 
 ## Sources and licences
 **Usable:**

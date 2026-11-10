@@ -3,7 +3,7 @@
 # Distributed under the terms of the MIT License.
 #
 # make-icon.py [--preview <png> [<size>...]] [--rdef <file>]
-# Weather Board's application icon (milestone M66 (docs/milestones.md)): a cloud with five rain
+# Weather Board's application icon (milestone M66): a cloud with five rain
 # drops, drawn in thickness as in a reference picture, as a
 # Haiku vector icon (HVIF, the "flat icon" format of
 # haiku/src/libs/icon/flat_icon, which this writes as its importer reads it).

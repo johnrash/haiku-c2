@@ -3,8 +3,9 @@
 Binary firmware that the port's drivers load. It's packaged separately from
 Haiku by `tools/firmware-package.sh` and `tools/wifi-firmware-package.sh`.
 Both sets are the files from
-[linux-firmware](https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git),
-redistributed under their own licences, which are kept next to them.
+[linux-firmware](https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git)
+20260319 (217ca6e4), redistributed under their own licences, which are
+kept next to them.
 
 | File | For | Licence | SHA-256 |
 |---|---|---|---|
@@ -15,5 +16,7 @@ redistributed under their own licences, which are kept next to them.
 | `realtek/rtw88/rtw8822b_fw.bin` | RTL8812BU/RTL8822B USB Wi-Fi | `LICENCE.rtlwifi_firmware.txt` | `a72da690597bfa99d8eb6fc2ab090d18d8ad92ac2befd35db1c9e3662d8d8418` |
 
 The H.264 hardware **encoder**'s microcode (milestone M48) is not here. It
-comes from Amlogic's vendor kernel under other terms. `tools/venc-firmware.sh`
-builds a package from a copy you obtain yourself.
+comes from Amlogic's vendor kernel (Amlogic labels it GPL-2.0-or-later but
+gives no source). `tools/venc-firmware.sh` fetches it from Hardkernel's
+vendor kernel, checks its pinned checksums and packages it for your own
+boards.

@@ -7,7 +7,7 @@
  * For each USB HID interface: its report descriptor, and what GET_REPORT says
  * the input report is now for report IDs 0 to 7, repeated three times. Tells a
  * button a device really reports as held from a release that got lost
- * (milestone M79 (docs/milestones.md)).
+ * (milestone M79).
  *
  * Build: $CXX -O2 $HAIKU_CXX_INCLUDES -o hidreport hidreport.cpp -ldevice -lbe
  */

@@ -4,7 +4,7 @@
  *
  * wifimerge: checks WirelessNetworkMenuItem::MergeNetworks() (the Deskbar
  * network menu's and the Network preferences' list of wireless networks,
- * milestone M77 (docs/milestones.md)) on made-up scan results: one entry per network name, the
+ * milestone M77) on made-up scan results: one entry per network name, the
  * associated access point or else the strongest, hidden networks left out.
  * Linked with the build's WirelessNetworkMenuItem.o and RadioView.o:
  *

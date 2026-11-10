@@ -4,7 +4,7 @@
  *
  * gltest <directory>: fixed OpenGL scenes in a 256x256 BGLView, each read
  * back with glReadPixels and written as <directory>/<scene>.ppm, to compare
- * renderers pixel by pixel (milestone M43 (docs/milestones.md)): run it on Lima Pipe and with
+ * renderers pixel by pixel (milestone M43): run it on Lima Pipe and with
  * LIBGL_ALWAYS_SOFTWARE=1. Scenes:
  *   lit       a sphere of quad strips, two lights with specular highlights,
  *             a local viewer (as GLTeapot lights its teapot)

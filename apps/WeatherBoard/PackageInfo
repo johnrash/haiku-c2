@@ -2,7 +2,7 @@ name			weatherboard
 version			1.2-1
 architecture	arm64
 summary			"Live readings of Hardkernel's Weather Board 2"
-description		"Weather Board shows the readings of Hardkernel's Weather Board 2 on the ODROID-C2's header (I2C B, pins 27 and 28): temperature, humidity and pressure from its BME280, light and UV index from its Si1132, a new reading every second, with the last two minutes of temperature and of light as curves. Drag the panel's handle onto the Desktop (Deskbar: Show replicants) to keep it there. Private build for the ODROID-C2 port; see apps/WeatherBoard in the project."
+description		"Weather Board shows the readings of Hardkernel's Weather Board 2 on the ODROID-C2's header (I2C B, pins 27 and 28): temperature, humidity and pressure from its BME280, light and UV index from its Si1132, a new reading every second, with the last two minutes of temperature and of light as curves. Drag the panel's handle onto the Desktop (Deskbar: Show replicants) to keep it there. Needs the ODROID-C2 port's Haiku (I2C B on the header). From https://github.com/johnrash/haiku-c2 (apps/WeatherBoard)."
 packager		"haiku-odroid-c2 port"
 vendor			"haiku-odroid-c2 port"
 copyrights		{

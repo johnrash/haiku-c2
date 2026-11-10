@@ -3,7 +3,7 @@
  * Distributed under the terms of the MIT License.
  *
  * LCD Shield: a demo of Hardkernel's 16x2 LCD + IO Shield on the
- * ODROID-C2 (milestone M68 (docs/milestones.md)), through meson_gpio's /dev/misc/shield devices.
+ * ODROID-C2 (milestone M68), through meson_gpio's /dev/misc/shield devices.
  * The display shows pages (the clock, the CPU, Blinken: a bar for each
  * core, memory, the network, a Weather Board on I2C B, a message), SW1
  * turns them, SW2 changes what the LEDs show (CPU load, a scanner, set by

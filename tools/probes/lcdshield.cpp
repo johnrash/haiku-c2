@@ -3,7 +3,7 @@
  * Distributed under the terms of the MIT License.
  *
  * Tries Hardkernel's 16x2 LCD + IO Shield through /dev/misc/gpio from a
- * program, before its driver (milestone M68 (docs/milestones.md)): the pins as the shield's
+ * program, before its driver (milestone M68): the pins as the shield's
  * schematic has them.
  *
  *   lcdshield lcd <line1> [<line2>]   the HD44780 started in 4-bit mode,

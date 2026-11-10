@@ -2,6 +2,8 @@ Facts read from Linux's GPL drivers/staging/media/meson/vdec (mainline master at
 
 # M26 stage 3: S905 (GXBB) HEVC decoder block, hardware facts for a feasibility test
 
+> **Status:** Written 2026-10-30 for an HEVC feasibility test. The test passed, and full HEVC (Main and Main 10, output as 8-bit NV12) was built in M26 stage 3 (sections 11 and 11.1; patches 0137 and 0138). Mid-stream size changes came in M41.
+
 This is the HEVC counterpart of `m26-vdec-facts.md` (the **base document**, cited as "base §N") and `m26-vdec-h264-facts.md` (cited as "H.264 §N"). Everything those documents say about the DOS block, the ESPARSER, the canvas LUT and the session order still applies and is not repeated. This document covers the separate **HEVC core** in the DOS block, with its own AMRISC processor, its own register bank and its own stream fetcher.
 
 Conventions are those of base §0:
@@ -890,7 +892,7 @@ On GX, HEVC_SAO_CTRL1 bits 0 and 1 do the equivalent job, as disables.
 - **No status register** other than HEVC_DEC_STATUS_REG is read.
 - **Software re-trigger (V only).** V writes 1 to a register it calls HEVC_ASSIST_MBOX1_IRQ_REG to make its own handler run again, for example after freeing a buffer. That register is not in mainline's headers; by the pattern of base §9.1 it would be at 0xC1D0 (**UNVERIFIED**).
 - **Host to firmware.** HEVC_MCPU_INTR_REQ (0xCC14) ← 0x4 (§5.5).
-- **On this board.** Base §10 found the vdec interrupt arriving as short pulses, often seen as spurious, and polled instead. HEVC_DEC_STATUS_REG is easy to poll: after the host writes 0x05 or 0xFF, a report shows up as a change to 0x08, 0x0A, 0x0B, 0x20 or 0x22. The register keeps 0x08 until the host answers. Note that 0x20 and 0x22 can be transient (§5.4).
+- **On this board.** Base §11 found the vdec interrupt arriving as short pulses, often seen as spurious, and polled at first (fixed in M26 stage 2; §11.1 uses the interrupt). HEVC_DEC_STATUS_REG is easy to poll: after the host writes 0x05 or 0xFF, a report shows up as a change to 0x08, 0x0A, 0x0B, 0x20 or 0x22. The register keeps 0x08 until the host answers. Note that 0x20 and 0x22 can be transient (§5.4).
 
 ---
 
@@ -1098,28 +1100,28 @@ hevc_regs.h defines further HEVC registers (parser status and info, SAO interfac
 
 ## 11. Found on the board (ODROID-C2, 2026-10-30)
 
-Observations from Haiku's experimental `meson_vdec` HEVC mode (haiku 37e84ef42e), not facts from Linux. They answer the first questions of §10.1.
+Observations from Haiku's experimental `meson_vdec` HEVC mode (patch 0137), not facts from Linux. They answer the first questions of §10.1.
 
 | §10.1 item | Found |
 |---|---|
 | 1 (liveness) | After the §1.3 power-up: HEVC_PARSER_VERSION 0x00010001, HEVC_SHIFT_STARTCODE 0x100, HEVC_SHIFT_EMULATECODE 0x300 |
-| 2 (firmware load) | The IMEM DMA finishes at once, for `gxl_hevc.bin` and the vendor microcode alike |
-| 3 (first report) | Status 0x08 arrives about 9 ms after the first write. The RPM matches the **8-tile layout** for `gxl_hevc.bin`: slice type 2, NAL type 20, address 0, the stream's width and height, CTB 64, first_slice 1, bit depth 0, chroma 1. The vendor microcode's RPM matches the same fields 8 places lower from misc_flag0 on |
-| 4 (byte count) | HEVC_SHIFT_BYTE_COUNT reads 0 after the start and counts from there |
-| 5 (interrupt) | Not tried: the mailbox stays masked (HEVC_ASSIST_MBOX1_MASK = 0) and the host polls HEVC_DEC_STATUS_REG. It reads 0xFF right after the start, then 0x08 at each slice header |
-| 6 (alignment) | 64 KiB aligned planes, a 1 MiB aligned workspace (buffers aligned to their size, at most 1 MiB, as for H.264) |
-| 7 (status after the data, no end position) | After the last picture's data and an end-of-sequence NAL (00 00 01 48 01), the firmware reports status **0x09** with HEVC_DECODE_MODE (scratch J) = 0x24, NAL type 36. HEVC_PARSER_LCU_START bits 23:0 = CTB count − 1 by then: the picture is complete. Between pictures, the next picture's 0x08 report marks the previous one complete |
-| 8 (padding) | The ESPARSER scheme of base §3.4 (4 KiB minimum, `00 00 01 FF` after the pack) works; the end-of-sequence NAL is written the same way |
-| 9 (output) | NV12, Cb first, row pitch ALIGN(W, 32), with HEVC_SAO_CTRL1 = 0xFF0 \| 1: **bit for bit** equal to FFmpeg for 320×240 (1 and 10 intra pictures) and 1920×1080 (30 intra pictures), with `gxl_hevc.bin`; the vendor microcode too (one picture). Read through the CPU after a cache invalidate; display not tried |
-| 10 (unused table slots) | Programming all 48 slots (unused ones pointing at frame 0, C's way) works |
-| 12 (first session) | No first-session defect: the first HEVC session after each of two boots was bit exact |
-| 13 (VDEC_1 after HEVC) | H.264 decodes bit exact after HEVC sessions in the same boot |
+| 3 (firmware load) | The IMEM DMA finishes at once, for `gxl_hevc.bin` and the vendor microcode alike (the vendor microcode was deleted afterwards; it is not in this repository) |
+| 4 (first report) | Status 0x08 arrives about 9 ms after the first write. The RPM matches the **8-tile layout** for `gxl_hevc.bin`: slice type 2, NAL type 20, address 0, the stream's width and height, CTB 64, first_slice 1, bit depth 0, chroma 1. The vendor microcode's RPM matches the same fields 8 places lower from misc_flag0 on |
+| 5 (byte count) | HEVC_SHIFT_BYTE_COUNT reads 0 after the start and counts from there |
+| 6 (interrupt) | Not tried: the mailbox stays masked (HEVC_ASSIST_MBOX1_MASK = 0) and the host polls HEVC_DEC_STATUS_REG. It reads 0xFF right after the start, then 0x08 at each slice header |
+| 7 (alignment) | 64 KiB aligned planes, a 1 MiB aligned workspace (buffers aligned to their size, at most 1 MiB, as for H.264) |
+| 8 (status after the data, no end position) | After the last picture's data and an end-of-sequence NAL (00 00 01 48 01), the firmware reports status **0x09** with HEVC_DECODE_MODE (scratch J) = 0x24, NAL type 36. HEVC_PARSER_LCU_START bits 23:0 = CTB count − 1 by then: the picture is complete. Between pictures, the next picture's 0x08 report marks the previous one complete |
+| 9 (padding) | The ESPARSER scheme of base §3.4 (4 KiB minimum, `00 00 01 FF` after the pack) works; the end-of-sequence NAL is written the same way |
+| 10 (output) | NV12, Cb first, row pitch ALIGN(W, 32), with HEVC_SAO_CTRL1 = 0xFF0 \| 1: **bit for bit** equal to FFmpeg for 320×240 (1 and 10 intra pictures) and 1920×1080 (30 intra pictures), with `gxl_hevc.bin`; the vendor microcode too (one picture). Read through the CPU after a cache invalidate; display not tried |
+| 11 (unused table slots) | Programming all 48 slots (unused ones pointing at frame 0, C's way) works |
+| 13 (first session) | No first-session defect: the first HEVC session after each of two boots was bit exact |
+| 14 (VDEC_1 after HEVC) | H.264 decodes bit exact after HEVC sessions in the same boot |
 
 **A trap: the powered-down block's registers.** In an HEVC session, VDEC_1 stays powered down and isolated. Any CPU read of a VDEC_1 register (VLD_MEM_VIFIFO_LEVEL, for one) then hangs the whole system, KDL included; only a power cycle helped. A driver that has both blocks must touch only the registers of the block that is powered.
 
 **Speed:** 1920×1080 intra pictures at 20 Mbit/s decode at about 60–64 frames/s (no output written), with HEVC at 666.7 MHz.
 
-### 11.1 Full decoding (haiku c918a3cfdd, 2026-10-30)
+### 11.1 Full decoding (patch 0138, 2026-10-30)
 
 Observations from the finished HEVC mode: P and B pictures, 10 bits, the interrupt. Not facts from Linux.
 

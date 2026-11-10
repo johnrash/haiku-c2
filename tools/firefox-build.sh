@@ -7,7 +7,7 @@
 # haiku-rpi at 5db456c, MIT): HaikuPorts' native Haiku port (www-client/
 # firefox at c17ec5a8, toolkit cairo-haiku) and haiku-pi's arm64 patches, with
 # ours (patches/firefox/157.0.1/). C and C++: the Haiku cross gcc 13.3; Rust:
-# deps/firefox/rust-out (Rust 1.90.0 with aarch64-unknown-haiku, milestone M78 (docs/milestones.md)).
+# deps/firefox/rust-out (Rust 1.90.0 with aarch64-unknown-haiku, milestone M78).
 # Everything for the C2 carries the Cortex-A53 errata workarounds.
 #
 #   tools/firefox-build.sh STEP...
@@ -29,7 +29,7 @@
 #              configuration, HaikuPorts' launcher, the resources
 #   check      the runtime_loader checks and the A53 errata scanners
 #   package    deps/firefox/firefox-157.0.1-<revision>-arm64.hpkg
-# The sources are prepared beforehand (milestone M78 (docs/milestones.md)): deps/firefox/src/
+# The sources are prepared beforehand (milestone M78): deps/firefox/src/
 # firefox-157.0.1 with HaikuPorts' patchsets, patches/firefox/157.0.1/ and
 # patches/rust-libc/.
 set -e
@@ -201,7 +201,7 @@ step_build() {
 
 # The build as a user service of its own, which is what to run: at 10 jobs it
 # ran the whole laptop out of memory and the kernel killed the desktop app
-# (milestone M78 (docs/milestones.md)). Over the limit only the build dies, and it goes on if the
+# (milestone M78). Over the limit only the build dies, and it goes on if the
 # app that started it goes away. To stop it: systemctl --user stop firefox-build
 # Resumable: the objdir stays.
 step_start() {

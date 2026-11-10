@@ -5,7 +5,7 @@
 # mapchurn-test.sh <seconds> <threads> <log>: runs tools/probes/mapchurn on
 # The test board and reads the wired pages (KDL page_stats through c2console)
 # before, while mapchurn holds its address space after the load, and after
-# it exits (milestone M82 (docs/milestones.md): page tables freed on unmap).
+# it exits (milestone M82: page tables freed on unmap).
 cd "$(dirname "$0")/.."
 T=$1; N=$2; R=$3; B=10.42.0.2; HOLD=60
 SER=$(ls -t logs/m1-*.log | head -1)

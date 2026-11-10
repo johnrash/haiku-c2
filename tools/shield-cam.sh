@@ -3,7 +3,7 @@
 # Distributed under the terms of the MIT License.
 #
 # shield-cam.sh <name> [exposure]: a picture of the test C2's 16x2 LCD + IO
-# Shield (milestone M68 (docs/milestones.md)) through the C920 webcam on this laptop, which the
+# Shield (milestone M68) through the C920 webcam on this laptop, which the
 # user pointed at it: logs/shield/<name>.jpg, turned the right way up (the
 # camera sees the shield upside down) and with its contrast stretched.
 # Manual exposure (default 50; automatic washes the LCD out). The camera is

@@ -1,6 +1,8 @@
 # M25 item 6: hardware video decoding on the S905, a feasibility study
 
-Written 2026-10-30, before any code, as milestone M25 (docs/milestones.md) asks. Sources are listed at the end. Facts from GPL code (Linux, Amlogic's vendor kernel) are recorded as facts only: register names, offsets and what a step does. No code.
+> **Status:** Feasibility study written 2026-10-30. Option C was taken: M26 built MPEG-1/2, H.264 and HEVC with an NV12 overlay; M31 removed the last copy; M60 added MPEG-1/2 in MediaPlayer and interlaced H.264; M51 added MJPEG. Since M53 the display does 4K at up to 30 Hz; the decoders stay within the 1920x1088 macroblock budget.
+
+Written 2026-10-30, before any code, for M25 item 6. Sources are listed at the end. Facts from GPL code (Linux, Amlogic's vendor kernel) are recorded as facts only: register names, offsets and what a step does. No code.
 
 ## Verdict
 **Feasible.** It's a driver the size of M6's HDMI work or larger, and it pays off for a narrow set of formats.
@@ -23,7 +25,7 @@ Written 2026-10-30, before any code, as milestone M25 (docs/milestones.md) asks.
   2. Then H.264 end to end in MediaPlayer.
   3. Then decide on HEVC, the part with real value and the least public ground.
 
-## What the CPU does today (milestone M21 (docs/milestones.md), this board)
+## What the CPU did then (measured in M21 on the test board)
 | Format | Software (FFmpeg, 4 × A53 at 1.5 GHz) | S905 hardware |
 |---|---|---|
 | H.264 1080p30 | plays, 1.8 cores | yes |
@@ -34,7 +36,7 @@ Written 2026-10-30, before any code, as milestone M25 (docs/milestones.md) asks.
 | AV1 1080p30 | nearly (17 late, 3 dropped in 11 s) | **no hardware** |
 | MPEG-2, MPEG-4 ASP | cheap | yes |
 
-The display path tops out at 1920x1200 (M25 item 5), so the S905's 4K decoding would gain nothing here.
+The display path topped out at 1920x1200 then (M25 item 5; 4K at up to 30 Hz came in M53), so the S905's 4K decoding would have gained nothing.
 
 ## The hardware (S905 datasheet rev 1.1.4)
 - **What Amlogic quotes for the S905:**
@@ -95,13 +97,13 @@ The display path tops out at 1920x1200 (M25 item 5), so the S905's 4K decoding w
   - Linux reserves 256 MiB of CMA on GX (LibreELEC uses 384), and Haiku has no CMA.
   - 1080p H.264 needs roughly 50–60 MB of physically contiguous buffers.
   - These would have to be allocated early, as the frame buffer is, or the session can fail on fragmented memory.
-- **The 1080p cap:** mainline caps GXBB's H.264 at 1080p without saying why, though the datasheet says 4K30. It doesn't matter for our 1920x1200 display.
-- **Limits:** one decoding session at a time, and no hardware deinterlacing (interlaced streams would stay in software).
+- **The 1080p cap:** mainline caps GXBB's H.264 at 1080p without saying why, though the datasheet says 4K30. It didn't matter for the 1920x1200 display of the time.
+- **Limits:** one decoding session at a time, and no hardware deinterlacing (interlaced streams would stay in software; M60 later decoded interlaced H.264 in hardware, woven as FFmpeg does).
 - **No upstream to follow:** Linux's driver is still in staging after six years, and LibreELEC is replacing it.
 
 ## Options
 - **A. Stop here.** Software already plays H.264, VP9 and AV1 at 1080p30 and HEVC at 720p. The loss is HEVC 1080p and H.264 1080p60.
-- **B. Bring up MPEG-2 and H.264 (recommended to start).** Stop after MPEG-2 decodes bit-exact against FFmpeg in a test probe. If that works, H.264 through MediaPlayer with the zero-copy overlay.
+- **B. Bring up MPEG-2 and H.264 (recommended to start).** Stop after MPEG-2 decodes bit-exact against FFmpeg in a test probe (M26 found that MPEG-1/2 decoders may differ within the IDCT tolerance, so "within tolerance" was the real goal). If that works, H.264 through MediaPlayer with the zero-copy overlay.
 - **C. B, then HEVC**, the part that actually adds a format. It's the riskiest and depends on what B teaches.
 
 ## Sources

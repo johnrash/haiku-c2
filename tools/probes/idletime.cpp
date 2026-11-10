@@ -6,7 +6,7 @@
  *
  * Prints idle_time(), the time since app_server last saw input, each second,
  * and whether screen_blanker runs: is something keeping a board from its
- * screen saver with input events (milestone M79 (docs/milestones.md))?
+ * screen saver with input events (milestone M79)?
  *
  * Build: $CXX -O2 $HAIKU_CPPFLAGS -o idletime idletime.cpp -lbe
  */

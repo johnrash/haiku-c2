@@ -4,7 +4,7 @@
  *
  * usbqtime [seconds [rounds]]: prints, every interval, the counters a
  * temporary realtekwifi test build keeps in the kernel area
- * "usb_test_stats" (USB callback delays and the send queue; milestone M82 (docs/milestones.md)).
+ * "usb_test_stats" (USB callback delays and the send queue; milestone M82).
  * It resets the maxima after reading them.
  */
 #include <OS.h>

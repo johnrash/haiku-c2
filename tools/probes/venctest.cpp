@@ -3,7 +3,7 @@
  * Distributed under the terms of the MIT License.
  *
  * venctest <microcode> <width> <height> <frames> <out.h264> [options]:
- * the S905's H.264 encoder through meson_venc (milestone M48 (docs/milestones.md)). Encodes a test
+ * the S905's H.264 encoder through meson_venc (milestone M48). Encodes a test
  * picture that moves (a gradient, a bright square crossing it, and four
  * colored quadrants for telling the RGB formats' byte orders apart) and
  * writes the stream (Annex B, the SPS and PPS first) for decoding with

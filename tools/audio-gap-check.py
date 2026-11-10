@@ -4,7 +4,7 @@
 #
 # audio-gap-check.py <wav> [threshold]: finds the clicks in a recording of a
 # steady tone (audiotest's, played on a board and recorded on the laptop
-# through a cable, milestone M82 (docs/milestones.md)). Takes out the tone and its first harmonics
+# through a cable, milestone M82). Takes out the tone and its first harmonics
 # in the frequency domain, then looks at what is left in 0.5 ms steps: a
 # lost or late USB packet leaves about the tone's own level there, against
 # the noise floor elsewhere. Prints each click (time, length, level) and a

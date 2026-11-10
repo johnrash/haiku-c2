@@ -2,6 +2,8 @@ Facts read from Amlogic's GPL vendor driver (`drivers/amlogic/amports/encoder.c`
 
 # M48: S905 (GXBB) HCODEC H.264 encoding, hardware facts
 
+> **Status:** Research from the vendor driver, before M48's driver. On the board: a P picture ends with status **9** on GXBB, not 10, and each picture raises a status 5 interrupt after the slice header first; RGBA input exists (4-byte pixels in A, R, G, B order, B_RGB32 taken directly); 667 MHz works. The stream is Baseline, level 4.0, Annex B. See M48 and patches 0214 to 0219.
+
 This document is the input for `meson_venc`, a clean-room, MIT-licensed Haiku kernel driver for the S905's H.264 encoder (HCODEC). It describes how Amlogic's own kernel drove that block on GXBB. That kernel had the encoder built in for the ODROID-C2 (`CONFIG_AM_ENCODER=y` in `odroidc2_defconfig`).
 
 **Related documents:**
@@ -16,7 +18,7 @@ This document is the input for `meson_venc`, a clean-room, MIT-licensed Haiku ke
 - "The vendor" means this driver as built for GXBB: `get_cpu_type()` is MESON_CPU_MAJOR_ID_GXBB (0x1F). That is at least GXBB and below GXTVBB (0x20); this kernel knows no later chip. Where the driver branches on the chip, only the GXBB branch is described, and the others are mentioned in a word.
 - "Full mode" is the vendor's `UCODE_MODE_FULL` (0), the mode this document is about. §12.4 notes the other modes briefly.
 
-Nothing in this document has been run on the board yet.
+The board results are summarized at the top.
 
 ---
 
@@ -44,7 +46,7 @@ The vendor's register access is plain `readl`/`writel` (with barriers) through t
 | Power island | AO_RTI_GEN_PWR_SLEEP0 bits 1:0, AO_RTI_GEN_PWR_ISO0 bits 5:4, DOS_MEM_PD_HCODEC, DOS_SW_RESET1 (§2) |
 | Clock | upper half of HHI_VDEC_CLK_CNTL (bit 24 = gate). The vendor sets 500 MHz (fclk/4) on GXBB. DOS_GCLK_EN0 bits 26:12 are HCODEC's internal gates (§2) |
 | Interrupt | HCODEC mailbox 2, GIC SPI 45, edge rising. Acknowledged by writing 1 to HCODEC_ASSIST_MBOX2_CLR_REG (§3) |
-| Host protocol | command and status in HCODEC_HENC_SCRATCH_0: the CPU writes 1 (SPS), 2 (PPS), 3 (IDR) or 4 (P). The microcode answers 7, 8, 9 or 10 and raises the mailbox (§7) |
+| Host protocol | command and status in HCODEC_HENC_SCRATCH_0: the CPU writes 1 (SPS), 2 (PPS), 3 (IDR) or 4 (P). The microcode answers 7, 8, 9 or 10 and raises the mailbox (§7); on GXBB a P picture ends with 9, and status 5 comes first, after the slice header |
 | Result | the byte count in HCODEC_VLC_TOTAL_BYTES; the bytes are at the start of the bitstream buffer (§7.4) |
 | Input | MFDIN reads NV12, NV21, 3-plane 4:2:0, packed or planar 4:4:4, packed 4:2:2, RGB888 (packed or planar) or RGBA8888. RGB goes through a built-in RGB-to-YUV converter. Sizes are rounded up to 16 (§6) |
 | Frames | two reconstruction buffers (4:2:0 with interleaved chroma) that swap roles after every picture: one is written as the new reconstruction while the other is read as the reference (§5, §7.5) |
@@ -67,7 +69,7 @@ The vendor's register access is plain `readl`/`writel` (with barriers) through t
 1. Pulse the HCODEC sub-unit resets (the AMRISC keeps running).
 2. Reprogram the canvases, the bitstream pointers, the QDCT/ME/IE/VLC settings, the scratch registers and MFDIN.
 3. Write the command to HENC_SCRATCH_0.
-4. Wait for mailbox 2. Status 9 or 10 means done.
+4. Wait for mailbox 2. Status 9 or 10 means done (on GXBB a P picture ends with 9; an interrupt with status 5 comes first, after the slice header, and isn't completion).
 5. Read HCODEC_VLC_TOTAL_BYTES and invalidate the bitstream range in the cache.
 6. Advance frame_num and the POC; swap the two reconstruction buffers.
 
@@ -197,7 +199,7 @@ The lower half is VDEC_1's clock (base §1.2). The upper half has the same layou
 
 ### 2.8 Registers shared with Haiku's VDEC driver (coexistence)
 
-These are observations about this repository's `meson_vdec` (haiku/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp), not vendor facts. They matter only if VDEC_1 and HCODEC are used at the same time.
+These are observations about the port's `meson_vdec` (haiku/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp) at the time, not vendor facts; the whole-register write of DOS_GCLK_EN0 was fixed later (a shared lock and counted clock). They matter only if VDEC_1 and HCODEC are used at the same time.
 
 | Register | What meson_vdec does | Effect on a running HCODEC |
 |---|---|---|
@@ -1084,7 +1086,7 @@ The steps are the same as §11.3, with these differences:
 | 8 | the canvas words are the swapped ones: the previous picture's reconstruction is now ANC0 |
 | 10 | **SCRATCH_D ← 0xFFFF00FF** |
 | 12 | **SCRATCH_0 ← 4** |
-| 13 | done at **10** |
+| 13 | done at **10** (on GXBB: 9) |
 | 15 | frame_number += 1 (wrapping above 65,535 to 0); POC LSB += 2; swap the canvas words |
 
 ### 11.5 Session stop (last instance closed)
@@ -1271,7 +1273,7 @@ The mailbox mask is left at 1 and the canvases are not released.
 
 All from https://github.com/hardkernel/linux, branch `odroidc2-3.14.y`, whose head on 2026-11-01 was **c3e4c730feb1750940971cae9ca1da3ca50f1d56** (committed 2018-03-03). That is the same commit as `m26-vdec-hevc-vendor-facts.md` and `m43-gxbb-mali-integration-facts.md`. Raw files came from https://raw.githubusercontent.com/hardkernel/linux/c3e4c730feb1750940971cae9ca1da3ca50f1d56/ + path, and listings from https://api.github.com/repos/hardkernel/linux/.
 
-Everything was kept in the session's scratch directory and never run. The microcode was neither extracted nor written to disk; its fingerprints (§4.2) were computed in memory.
+Nothing downloaded was run, or is kept in this repository. The microcode was neither extracted nor written to disk; its fingerprints (§4.2) were computed in memory.
 
 **Already in the scratch directory at the start of this study** (fetched for `m48-venc-feasibility.md`, branch head):
 
@@ -1325,7 +1327,7 @@ Everything was kept in the session's scratch directory and never run. The microc
 | arch/arm64/boot/dts/meson64_odroidc2.dts | 23,563 | amvenc_avc node (SPI 45, edge), codec_io bases, CMA pools |
 | arch/arm64/configs/odroidc2_defconfig | 111,699 | CONFIG_AM_ENCODER=y, CONFIG_CMA=y |
 
-**From this repository:** `docs/m26-vdec-facts.md` (board results, §10), `docs/m26-vdec-hevc-vendor-facts.md`, and `haiku/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp` (for §2.8 only).
+**From this repository:** `docs/m26-vdec-facts.md` (board results, §11), `docs/m26-vdec-hevc-vendor-facts.md`, and `haiku/src/add-ons/kernel/drivers/video/meson_vdec/meson_vdec.cpp` (for §2.8 only).
 
 ### 14.2 Open questions for the first board test
 

@@ -4,7 +4,7 @@
 #
 # gfortran-cross-build.sh: a second arm64 cross GCC 13.3, from the same
 # buildtools sources as Haiku's own cross tools, with Fortran
-# (OpenBLAS's LAPACK and SciPy need it; milestone M83 (docs/milestones.md)). Haiku's cross tools are
+# (OpenBLAS's LAPACK and SciPy need it; milestone M83). Haiku's cross tools are
 # built with --disable-shared and C/C++ only. This one also builds the target
 # libraries shared, for libgfortran.so.5 (packaged by tools/ports-build.sh as
 # gcc_fortran_syslibs); its libstdc++ and libgcc_s are not used, the boards

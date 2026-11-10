@@ -13,6 +13,9 @@
 #                patches/binutils/ld-2.46.1-aarch64-843419-rescan.patch.
 #   u-boot/      U-Boot v2026.10 with patches/u-boot/.
 #   amlogic-boot-fip/  LibreELEC's boot blobs for the C2, at b6600f2857.
+# GitHub's mirror of Haiku has no hrev tags, so they're fetched from Haiku's
+# own server (review.haiku-os.org). git am needs your user.name and
+# user.email set.
 # Then, for the cross tools (see docs/BUILDING.md):
 #   mkdir generated.arm64 && cd generated.arm64 &&
 #   ../haiku/configure --cross-tools-source ../buildtools \
@@ -29,10 +32,18 @@ UBOOT_TAG=v2026.10
 FIP_URL=${FIP_URL:-https://github.com/LibreELEC/amlogic-boot-fip.git}
 FIP_BASE=b6600f2857fdf81d11f18ea7a2e44aa989e7bcc4
 
+HAIKU_TAGS_URL=${HAIKU_TAGS_URL:-https://review.haiku-os.org/haiku}
+
 cd "$ROOT"
+git config user.email > /dev/null || {
+	echo "haiku-setup: set git's user.name and user.email first (git am needs them)"
+	exit 1
+}
 
 if [ ! -d haiku ]; then
 	git clone "$HAIKU_URL" haiku
+	# the build's version comes from the hrev tags, which GitHub's mirror lacks
+	git -C haiku fetch --tags "$HAIKU_TAGS_URL"
 	git -C haiku checkout -b odroid-c2 "$HAIKU_BASE"
 	# the patches keep their authors and dates; the committer is whoever
 	# runs this

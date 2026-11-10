@@ -7,7 +7,7 @@
  * Which input device keeps a board busy with events? Lists the devices and any
  * keys held down, then stops each device for a few seconds and watches
  * idle_time(), the time since app_server last saw input. Every device is
- * started again after its turn (milestone M79 (docs/milestones.md)).
+ * started again after its turn (milestone M79).
  *
  * Build: $CXX -O2 $HAIKU_CXX_INCLUDES -o inputwho inputwho.cpp -lbe
  */

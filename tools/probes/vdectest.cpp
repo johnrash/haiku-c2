@@ -4,7 +4,7 @@
  *
  * Decodes an MPEG-1/2, H.264 (Annex B, a name ending in .h264) or HEVC (a
  * name ending in .hevc) elementary stream with the S905's video decoder
- * (meson_vdec, milestone M26 (docs/milestones.md)) and writes every frame's picture as NV12 (the Y
+ * (meson_vdec, milestone M26) and writes every frame's picture as NV12 (the Y
  * rows, then the CbCr rows, without the decoder's padding) to a file, for
  * tools/vdec-compare.py (tools/vdec-compare10.py for 10-bit HEVC) to check
  * against FFmpeg's decoding.

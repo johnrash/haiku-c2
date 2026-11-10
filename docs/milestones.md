@@ -6,16 +6,17 @@ November 2026. The tools, the docs and the Haiku patches refer to them as
 was the working log the milestones come from, and it is not published.
 
 Numbers like +257 are the fork's versions: the count of commits after
-upstream's hrev60299 (`git describe` gives `hrev60299-257-g...`). The
+upstream's hrev60299 (`git describe --tags` gives `hrev60299-257-g...`). The
 patches in `haiku-patches/` are numbered differently. Patch 0001 is the
 first commit after the upstream base a12d4cd1a5 (hrev60299+6), and the
 private fork's internal artwork (+67, +80, +81) isn't in the series. So up
 to +66, +N is patch N-6; from +68 to +79 it's patch N-7; and from +82 on
-it's patch N-9.
+it's patch N-9. A tree built from the patches therefore calls itself
+hrev60299+348 where the private fork says +351.
 
 "The test board" is the C2 on the bench's crossover cable (10.42.0.2), with
 a serial console and a power relay. "The LAN boards" are other C2s on an
-ordinary home network, updated from the port's package repository.
+ordinary home network, updated from the port's own package repository.
 
 Some milestones were work on apps that aren't tied to the C2 and aren't
 published here; they're listed as such.
@@ -42,7 +43,7 @@ published here; they're listed as such.
 - **M17:** kernel panic at shutdown in TCP
 - **M18:** Tracker names wrap in icon view
 - **M19:** work on an app that isn't part of this repository
-- **M20:** a list of fixes: first-boot resize, Mini icon view, the USB audio adapter's buttons, 44.1 kHz, power-off and EFI runtime calls
+- **M20:** a list of fixes: first-boot resize, Mini icon view, the USB audio adapter's buttons, 44.1 kHz, heavy video stutter; power-off checked
 - **M21:** items 2-6 of the list after M20, simplest first
 - **M22:** work on an app that isn't part of this repository
 - **M23:** the RTC shield keeps the time
@@ -52,9 +53,9 @@ published here; they're listed as such.
 - **M27:** the BeBox Device Kit classes on the 40-pin header
 - **M28:** work on an app that isn't part of this repository
 - **M29:** a display connected after boot gets its own mode
-- **M30:** the CPU clock follows the load by default (the second of the four)
-- **M31:** video shown from the decoder's own frames (the third of the four)
-- **M32:** encrypted shares on all cores (the fourth of the four)
+- **M30:** the CPU clock follows the load by default
+- **M31:** video shown from the decoder's own frames
+- **M32:** work on an app that isn't part of this repository
 - **M33:** work on an app that isn't part of this repository
 - **M34:** work on an app that isn't part of this repository
 - **M35:** Korean (and Japanese and Chinese) text shows

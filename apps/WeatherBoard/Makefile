@@ -1,4 +1,4 @@
-# Builds Weather Board for arm64 Haiku and its package (milestone M66 (docs/milestones.md)).
+# Builds Weather Board for arm64 Haiku and its package (milestone M66).
 #   make            the application, WeatherBoard
 #   make package    weatherboard-<version>-arm64.hpkg
 # Uses the project's cross tools and sysroot (tools/haiku-arm64-env.sh) and

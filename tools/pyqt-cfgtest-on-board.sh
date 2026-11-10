@@ -5,7 +5,7 @@
 # pyqt-cfgtest-on-board.sh <test program> <output file>: PyQt-builder's
 # PYQTBUILD_TEST_RUNNER for recording: runs one of PyQt6's configuration
 # tests (built for the boards) on the test board and fetches what it wrote; the
-# answers are kept in patches/python/pyqt6-6.12.0-cfgtests (milestone M85 (docs/milestones.md)).
+# answers are kept in patches/python/pyqt6-6.12.0-cfgtests (milestone M85).
 set -e
 board=baron@10.42.0.2
 opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=QUIET -o PubkeyAuthentication=no"

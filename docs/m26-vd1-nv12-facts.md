@@ -1,6 +1,8 @@
 # VD1 with NV12 buffers: facts for an NV12 overlay
 
-Facts only, from Linux mainline's Amlogic display driver (GPL), for `meson_hdmi`'s video layer (milestone M26 (docs/milestones.md), after stage 3). No code was copied. `meson_hdmi` already shows packed 4:2:2 (B_YCbCr422) on VD1 (M9); this note has what differs for NV12.
+> **Status:** Built in M26 stage 4; since M31 the video layer shows the decoder's own frames.
+
+Facts only, from Linux mainline's Amlogic display driver (GPL), for `meson_hdmi`'s video layer (M26 stage 4). No code was copied. `meson_hdmi` already shows packed 4:2:2 (B_YCbCr422) on VD1 (M9); this note has what differs for NV12.
 
 **Source:** torvalds/linux master, `drivers/gpu/drm/meson/meson_overlay.c` (last change 7075ff51eb51, 2026-08-14) and `meson_crtc.c`, fetched raw on 2026-10-30.
 

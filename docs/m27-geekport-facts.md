@@ -1,5 +1,7 @@
 # GeekPort: facts for the SAR ADC and the PWMs on the 40-pin header
 
+> **Status:** Research written before M27's header work. As built (`docs/m27-header-api.md`): pin 33 has no PWM, because it shares its PWM block with the CPU regulator's PWM_B; the ADC uses a five-point correction instead of Linux's two-point one.
+
 Facts only, for an MIT driver on the ODROID-C2 (S905, GXBB). They come from Linux mainline's SAR ADC, PWM, clock and pinctrl drivers (GPL), mainline U-Boot (GPL), the Amlogic S905 public datasheet, Hardkernel's wiki, the C2 schematic and Hardkernel's wiringPi. No code was copied. Anything not confirmed by a source, or where sources disagree without a clear answer, is marked **UNVERIFIED**. Addresses are physical. "HHI" means the HIU block at 0xc883c000, and its offsets are byte offsets.
 
 ## 0. What a minimal driver must do
@@ -34,7 +36,7 @@ U-Boot's `meson-gxbb-odroidc2.dtb` matches Linux master's dts/dtsi apart from wh
 | PWM EF | 0xc11086c0 | 0x10 | 0x21b0 | same | disabled |
 | PWM AO AB | 0xc8100550 | 0x10 | AO 0x54 | same | disabled |
 
-Correction to the brief: the PWM nodes carry the **"-v2"** compatibles and a `clocks` list. The obsolete `amlogic,meson-gxbb-pwm` string is not in this DT.
+Note: the PWM nodes carry the **"-v2"** compatibles and a `clocks` list. The obsolete `amlogic,meson-gxbb-pwm` string is not in this DT.
 
 - **SAR ADC interrupt:** GIC SPI 73 (0x49, so INTID 105), rising edge.
 - **SAR ADC clocks:** `clkin` = xtal (24 MHz fixed clock), `core` = clkc **CLKID_SAR_ADC (23)**, `adc_clk` = clkc **CLKID_SAR_ADC_CLK (97)**, `adc_sel` = clkc **CLKID_SAR_ADC_SEL (98)**. CLKID_SAR_ADC_DIV (99) exists but is not referenced.
@@ -295,7 +297,7 @@ The wiki also says that every header signal is 3.3 V except the analog inputs. J
 
 ## Sources
 
-Downloaded into a scratch directory (`m27-sources/`) on 2026-10-30. Sizes are in bytes.
+Downloaded on 2026-10-30 for this research; not kept in this repository. Sizes are in bytes.
 
 Linux master files (fetched raw):
 

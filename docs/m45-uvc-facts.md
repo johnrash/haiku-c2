@@ -5,9 +5,11 @@ Distributed under the terms of the MIT License.
 
 # M45: Logitech C920 (UVC) on the C2's DWC2 host, facts
 
+> **Status:** Research before M45's implementation; the results are in M45 and patches 0193 to 0204. The C920 sends 12-byte headers with EOF, a DHT in every frame, and payloads of 800, 2688 or 3072 bytes. Its microphone was done in M50, and MJPEG went to the S905's decoder in M51.
+
 > Facts read on 2026-11-01 from these sources:
 > - the fork (`haiku/`, branch odroid-c2): the DWC2 driver, the USB stack, usb_raw, the USB Kit and the usb_webcam add-on;
-> - the C920's descriptors as `listusb -v` printed them on the board (saved as `c920-desc.txt`);
+> - the C920's descriptors as `listusb -v` printed them on the board (not kept in this repository);
 > - Linux master at cbbddb6b08cc: `drivers/usb/dwc2` (SPDX `(GPL-2.0+ OR BSD-3-Clause)`) and `drivers/media/usb/uvc` (`GPL-2.0-or-later`; the headers `GPL-2.0`, `video.h` `GPL-2.0 WITH Linux-syscall-note`);
 > - FreeBSD main at 63302e904a52: `sys/dev/usb/controller/dwc_otg.c` (BSD-2-Clause);
 > - the USB Video Class 1.1 specification set from usb.org.
@@ -448,14 +450,14 @@ Largest MJPEG frame each alt carries at 30 fps: alt 4 167 KB, alt 6 249 KB, alt 
 - **DWC2 behaviour:** HCTSIZ and HCINT after a high-bandwidth IN microframe ends with a full-size DATA0 or DATA1; the latest point in a microframe at which an enabled periodic channel still runs in it; FRMOVRUN against a halt with no reason bit when armed late. The databook was not available.
 - **Rx FIFO:** whether 512 words carry 3 × 1024 bytes per microframe without errors.
 - **GHWCFG2 queue depths:** 4 or 8 entries? And what GHWCFG4 bit 31 means.
-- **Load:** interrupt latency and CPU cost at 8,000 halts/s with the desktop, VNC and USB audio running. Whether option A1 is enough, or A2/A3 is needed.
+- **Load:** interrupt latency and CPU cost at 8,000 halts/s with the desktop, a remote-desktop session and USB audio running. Whether option A1 is enough, or A2/A3 is needed.
 - **usb_raw:** whether usb_raw and usb_audio may use the same device at once (the camera's video and microphone).
 
 ---
 
 ## E. Downloads and sources
 
-**Downloads** (each in its own directory under a scratch directory, `uvc-research/`; none was run):
+**Downloads** (for this research, not kept in this repository; none was run):
 
 | Directory | File | Source URL | Bytes |
 |---|---|---|---|
@@ -467,7 +469,7 @@ Largest MJPEG frame each alt carries at 30 fps: alt 4 167 KB, alt 6 249 KB, alt 
 
 Commit IDs were taken from the GitHub API, `repos/<repo>/commits/<branch>`; the last change to `drivers/usb/dwc2` is dated 2026-10-05.
 
-**In this repo:**
+**In the source trees `tools/haiku-setup.sh` sets up, and this repository:**
 - `haiku/src/add-ons/kernel/busses/usb/dwc2.cpp`, `dwc2.h`, `dwc2_hardware.h`, `dwc2_isochronous.cpp`, `ehci.cpp`, `xhci.cpp`, `uhci.cpp`, `ohci.cpp`
 - `haiku/src/add-ons/kernel/bus_managers/usb/` (`Pipe.cpp`, `Device.cpp`, `Transfer.cpp`, `usb.cpp`, `usb_private.h`, `usbspec_private.h`)
 - `haiku/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp`, `usb_raw.h`
@@ -477,5 +479,4 @@ Commit IDs were taken from the GitHub API, `repos/<repo>/commits/<branch>`; the 
 - `haiku/src/apps/codycam/`, `haiku/build/jam/images/definitions/regular`, `haiku/build/jam/packages/Haiku`
 - `configs/haiku-UserBuildConfig`
 - the built `generated.arm64/.../packaging/packages/haiku.hpkg`, listed with the host `package` tool
-- `docs/m5-usb-dwc2-design.md`, `docs/milestones.md` (M12 and the high-speed isochronous assessment)
-- `logs/m1-2026-10-27.log`
+- `docs/m5-usb-dwc2-design.md`

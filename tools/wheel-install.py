@@ -3,7 +3,7 @@
 # Distributed under the terms of the MIT License.
 #
 # wheel-install.py <wheel> <site dir> <bin dir> <interpreter>: installs a
-# wheel into a package's tree (milestone M83 (docs/milestones.md)), as pip would but for any
+# wheel into a package's tree (milestone M83), as pip would but for any
 # platform: pip refuses a wheel built for Haiku arm64 on this laptop. The
 # wheel's files go to <site dir> (its .data/purelib and platlib too), its
 # .data/scripts and the console scripts of entry_points.txt to <bin dir>,

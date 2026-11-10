@@ -1,5 +1,7 @@
 # The 40-pin header as a Be-style API (M27)
 
+> **Status:** Current as of M27. Since then I2C B was tested with Hardkernel's Weather Board 2 (M65), and with `lcd_io_shield true` the `meson_gpio` driver claims the LCD + IO shield's pins (M68). UART A has not been tried with a real device.
+
 A set of classes in libdevice, in the style of the BeBox's Device Kit and its GeekPort: `Open`, `Close`, `IsOpen`, `Read`, `Write`, plus `CountDevices` and `GetDeviceName` to list what there is (as `BSerialPort` and `BJoystick` have). The BeBox classes `BDigitalPort`, `BA2D` and `BD2A` keep their Be Book behaviour. The rest of the header is covered by `BDigitalPin`, `BPWM`, `BI2CDevice` and `BGeekPort`, plus Haiku's own `BSerialPort`. Everything below is built and tested on the board (`tools/probes/geekporttest.cpp`, nothing wired to the header).
 
 ## Rules for every class
@@ -66,7 +68,7 @@ status_t    GetDeviceName(int32 index, char* name, size_t size);
   - 20 writes 2.6 µs apart gave all 20 edges, in order;
   - 100 rising edges 100 µs apart gave 100 messages;
   - starting to record on a pin that's already at the level the edge leads to records no edge.
-- **Pin 7** on the test board is held high from outside (probably the RTC shield's interrupt line), so its pull-down has no effect there.
+- **Pin 7** on the test board was held high from outside (probably the RTC shield's interrupt line, when it carried that shield), so its pull-down had no effect there.
 
 ## BPWM: a PWM output with your period (PWM.h)
 
@@ -87,7 +89,7 @@ status_t    Stop();                     // the pin low
 - The period can be from about 84 ns to **0.35 s** (3 Hz): 24 MHz divided by 1 to 128, and at most 65536 counts.
 - Servo example: `SetPeriod(20000000)`, `SetPulseWidth(1500000)`, `Start()`. At 50 Hz the pulse width moves in steps of **0.33 µs** (the crystal divided by 8).
 - Closing stops the output, unlike `BD2A`: a motor or servo shouldn't keep running when its program ends. The two channels have independent clock dividers.
-- The controller takes new counts only from a write that changes them, and loses writes that come too close together. The driver spaces them 25 µs apart (docs/m27-geekport-facts.md, milestone M27 (docs/milestones.md)).
+- The controller takes new counts only from a write that changes them, and loses writes that come too close together. The driver spaces them 25 µs apart (found on the board in M27).
 
 ## BSerialPort "header": UART A on pins 8 and 10
 

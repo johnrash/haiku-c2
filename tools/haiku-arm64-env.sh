@@ -63,7 +63,7 @@ export HAIKU_CPPFLAGS
 
 # Cortex-A53 errata 835769 and 843419: the C2's A53 r0p4 cores have both,
 # and the cross compiler leaves the workarounds off unless asked (843419 made
-# ICU's hash tables pick up garbage; see milestone M7 (docs/milestones.md)). Passed to every
+# ICU's hash tables pick up garbage; see milestone M7). Passed to every
 # compile and link through CC and CXX.
 export HAIKU_ERRATA_FLAGS="-mfix-cortex-a53-835769 -mfix-cortex-a53-843419"
 export CC="$HAIKU_TOOLS/aarch64-unknown-haiku-gcc --sysroot=$HAIKU_SYSROOT $HAIKU_ERRATA_FLAGS"

@@ -3,7 +3,7 @@
  * Distributed under the terms of the MIT License.
  *
  * Weather Board: the readings of Hardkernel's Weather Board 2 on the
- * ODROID-C2's header (milestone M66 (docs/milestones.md)), live, in a window or, through the
+ * ODROID-C2's header (milestone M66), live, in a window or, through the
  * panel's dragger, as a replicant on the Desktop.
  */
 

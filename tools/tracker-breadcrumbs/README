@@ -1,5 +1,5 @@
-The GUI test of /build/TrackerBreadcrumbs/tracker-breadcrumbs, adapted for
-the fork, where the breadcrumbs are in the system's Tracker (milestone M16 (docs/milestones.md)).
+The GUI test of the tracker-breadcrumbs change (by jrash), adapted for
+the fork, where the breadcrumbs are in the system's Tracker (milestone M16).
 
   . tools/haiku-arm64-env.sh
   $CXX -O2 $HAIKU_CPPFLAGS -I haiku/headers/private/app -o run/crumbinput \

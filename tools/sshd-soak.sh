@@ -3,7 +3,7 @@
 # Distributed under the terms of the MIT License.
 #
 # sshd-soak.sh <hours> <log>: the conditions of the sshd failures on the test board
-# (milestone M82 (docs/milestones.md)): a password login every 5 s, and every 10 minutes
+# (milestone M82): a password login every 5 s, and every 10 minutes
 # MediaPlayer plays a track to its end through the USB adapter. Each login
 # that fails is logged with its time and sshpass's status (5: password
 # refused, 255: ssh error); the board's syslog and a core file on its

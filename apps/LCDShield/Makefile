@@ -1,4 +1,4 @@
-# Builds LCD Shield for arm64 Haiku and its package (PLAN.md M68).
+# Builds LCD Shield for arm64 Haiku and its package (milestone M68).
 #   make            the application, LCDShield
 #   make package    lcdshield-<version>-arm64.hpkg
 # Uses the project's cross tools and sysroot (tools/haiku-arm64-env.sh),

@@ -54,8 +54,11 @@ def local_packages(optional=False):
 		paths += sorted(glob.glob(os.path.join(ROOT, "apps/*/*.hpkg"))
 			+ glob.glob(os.path.join(ROOT, "deps/firefox/firefox-*-arm64.hpkg")),
 			key=os.path.getmtime)
-	with open(os.path.join(ROOT, "run/allpkgs.txt")) as f:
-		paths += [os.path.join(ROOT, p) for p in f.read().split()]
+	# more packages for the boards, one path a line (optional)
+	extra = os.path.join(ROOT, "run/allpkgs.txt")
+	if os.path.exists(extra):
+		with open(extra) as f:
+			paths += [os.path.join(ROOT, p) for p in f.read().split()]
 	packages = {}
 	for path in paths:
 		name, version, _ = package_info(path)

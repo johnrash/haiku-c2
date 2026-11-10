@@ -1,6 +1,6 @@
 #!/bin/bash
 # The arm64 HaikuPorts bootstrap packages (generated.arm64/download) were
-# built without the Cortex-A53 erratum workarounds (milestone M7 (docs/milestones.md)/M8). This makes
+# built without the Cortex-A53 erratum workarounds (milestone M7/M8). This makes
 # fixed copies under the same names and versions, which image-add-diag.sh
 # puts in place of the originals:
 # - erratum 843419: every sequence is patched (tools/a53-843419.py --fix);

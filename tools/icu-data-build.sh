@@ -12,7 +12,7 @@
 # (tools/a53-843419.py): the bootstrap build was linked without the
 # workaround, and the sequence in uhash_openSize (libicuuc 0x11bff8) made
 # hash tables pick up garbage resize ratios on the C2, so about 1 in 40
-# programs crashed in setlocale() (milestone M7 (docs/milestones.md)).
+# programs crashed in setlocale() (milestone M7).
 # Usage: icu-data-build.sh       -> deps/icu/icu74-74.1_bootstrap-1-arm64.hpkg
 set -e
 . "$(dirname "$0")/haiku-arm64-env.sh"

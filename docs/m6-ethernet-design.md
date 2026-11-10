@@ -1,6 +1,8 @@
 # M6 design notes: DesignWare Ethernet (GMAC 3.70a + RTL8211F)
 
-Research for M6, written 2026-10-28 during the unattended M4.5 run. **Nothing here is implemented.** Compare with `m5-usb-dwc2-design.md`.
+> **Status:** Written 2026-10-28, when Ethernet was planned for M6. It was built first, in M5, as `meson_dwmac`; the values marked unverified held (PRG_ETH0 0x1621, MDC divider 4). Later fixes: a transmit race in `Write()` and no EEE at gigabit (M81).
+
+Research for M6, written 2026-10-28 during M4.5. Compare with `m5-usb-dwc2-design.md`.
 
 ## Sources and licences
 **Usable:**
@@ -78,11 +80,11 @@ Research for M6, written 2026-10-28 during the unattended M4.5 run. **Nothing he
   - `ETHER_SETPROMISC`, `ETHER_ADDMULTI`/`REMMULTI`, `ETHER_NONBLOCK`.
 
   Reference: `drivers/network/virtio/virtio_net.cpp`.
-- **RX checksum:** the hardware result can feed Haiku's `NET_BUFFER_L3/L4_CHECKSUM_VALID` later.
+- **RX checksum:** the hardware checks it, but the driver's `read()` interface can't pass that on to the stack, so it isn't used (M25).
 - **Why not the FreeBSD compat layer and FreeBSD's `if_dwc`:** the compat layer has no device-tree root bus (only PCI and USB), no `ofw_bus`/clk/gpio/reset shims, and no cache maintenance in `bus_dma`, which assumes coherent memory. Making it work would mean changing code shared by every compat driver. That isn't worth it for one NIC.
 
 ## Plan
-About **1.2–1.8k lines**, roughly 1–2 weeks with board iterations. Each step has a check you can see from the laptop, over the crossover cable to the host's USB NIC:
+About **1.2–1.8k lines**, roughly 1–2 weeks with board iterations. Each step has a check visible from the development host, over the crossover cable to the host's USB NIC:
 
 | # | Step | Pass when |
 |---|---|---|
@@ -100,9 +102,9 @@ About **1.2–1.8k lines**, roughly 1–2 weeks with board iterations. Each step
 - PRG_ETH0 and the power domain, if U-Boot networking is ever skipped.
 
 ## USB or Ethernet first?
-My recommendation: **Ethernet first.**
+The recommendation, which was followed: **Ethernet first.**
 - **It's less code with less risk:** about half the size of the USB driver, with no split-transaction timing, and U-Boot already sets the hardware up.
-- **It's fully testable from this laptop:** tcpdump, ping and file transfers. The USB work, by contrast, needs a keyboard and mouse plugged into the C2.
+- **It's fully testable from the development host:** tcpdump, ping and file transfers. The USB work, by contrast, needs a keyboard and mouse plugged into the C2.
 - **It makes every later milestone faster:** once Haiku has a network, `telnetd` and `ftpd` (both in the minimum image) give a remote shell and file transfer. That replaces the boot-script diagnostics, and makes the USB bring-up much easier to debug.
 
 USB is still what makes the desktop usable on its own, so it comes straight after.

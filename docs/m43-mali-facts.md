@@ -5,6 +5,8 @@ Distributed under the terms of the MIT License.
 
 # M43: Mali-450 MP3 (S905 / GXBB) for a lima-compatible kernel driver, hardware facts
 
+> **Status:** Facts gathered before M43's driver. On the board: Mali-450 r0p0 (GP 0x0d070000, PP 0xcf070000), L2 caches of 8 KiB (GP) and 64 KiB (PPs), PMU STATUS 0x7 after U-Boot, and no bit 10 (SYNC_ERROR) on this GPU. `meson_mali` runs GP and PP jobs one at a time.
+
 > Facts read from Linux's lima DRM driver (drivers/gpu/drm/lima and include/uapi/drm/lima_drm.h, torvalds/linux master at cbbddb6b08cc, fetched 2026-10-31; the last change to the lima directory is ae72b9c39d28, 2026-09-30), the GX device tree, the GXBB clock driver, a few DRM core helpers, the board's own U-Boot DTB, and Mesa 22.0.5's lima Gallium driver (MIT, the copy in `deps/build/mesa-22.0.5`). No code, macros or comments were copied.
 
 This is the input for a clean-room, MIT-licensed Haiku kernel driver that Mesa's lima userland can run on. It lists register offsets, bit meanings, sequences, values, timeouts and the uAPI's structures and semantics, in tables and short prose. Where a source gives no meaning for a value, or where a meaning is inferred from names or behaviour, the text says **UNVERIFIED**.

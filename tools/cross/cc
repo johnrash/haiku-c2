@@ -1,6 +1,6 @@
 #!/bin/bash
-# Compiler for Haiku makefile-engine builds on this host (tools/app-build.sh
-# puts this directory first in PATH, CC=cc CXX=c++): the arm64 cross gcc with
+# Compiler for Haiku makefile-engine builds on this host (put this directory
+# first in PATH, with CC=cc CXX=c++): the arm64 cross gcc with
 # the sysroot, the Cortex-A53 errata flags and Haiku's headers. Paths under
 # /boot/system/develop (an app's SYSTEM_INCLUDE_PATHS) are mapped to the
 # build tree. Links get deps/prefix/lib (static OpenSSL & co.) and libgcc_s,

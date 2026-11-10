@@ -2,7 +2,7 @@
 # Copyright 2026, haiku-odroid-c2 port authors.
 # Distributed under the terms of the MIT License.
 #
-# qt6-build.sh <stage>...: Qt 6.12.0 for the C2 (milestone M83 (docs/milestones.md)), for PySide6.
+# qt6-build.sh <stage>...: Qt 6.12.0 for the C2 (milestone M83), for PySide6.
 #   host    Qt for this laptop in deps/host/qt6.12: the build tools a cross
 #           build runs (moc, rcc, uic, qsb, qmlcachegen, ...), and the QtCore
 #           PySide6's binding generator links; no X11, OpenGL or Vulkan.

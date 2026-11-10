@@ -1,5 +1,7 @@
 # Infrared receiver: facts for an MIT driver (S905 / GXBB, ODROID-C2)
 
+> **Status:** Facts gathered 2026-10-31, before `meson_ir` (M24). The driver follows section 0. The JVC RM-RK52 decodes as JVC, address 0x8f. The ODROID remote's codes (section 6) were never tried on hardware.
+
 Facts only, for a clean-room, MIT-licensed Haiku driver for the ODROID-C2's infrared receiver. GPL sources (Linux mainline, Hardkernel's vendor kernel and U-Boot, IRMP) were read only for facts: register addresses, bit positions, units, write sequences and timing values. No code, macros, identifier lists or comments were copied. Everything below is in my own words. Anything not confirmed by a source, or where sources disagree without a clear answer, is marked **UNVERIFIED**, with what each source says.
 
 ## Sources
@@ -26,7 +28,7 @@ In order of how much this document relies on them. Every downloaded file is list
    - arch/arm64/boot/dts/meson64_odroidc2.dts, for its IR node;
    - Amlogic's vendor remote driver: drivers/amlogic/input/remote/remote_main.c, remote_main.h and remote_func.c.
 4. **Hardkernel's vendor U-Boot, branch odroidc2-v2015.01**: arch/arm/include/asm/arch-gxb/secure_apb.h, Amlogic's list of GXBB register addresses.
-5. **Mainline U-Boot v2026.10** (local tree /build/haiku-odroid-c2/u-boot):
+5. **Mainline U-Boot v2026.10** (the port's `u-boot/` tree):
    - drivers/pinctrl/meson/pinctrl-meson-gxbb.c, the AO bank layout;
    - u-boot.dtb, identical to dts/upstream/src/arm64/amlogic/meson-gxbb-odroidc2.dtb, decompiled with `dtc`. This is the DT the board passes to Haiku.
 6. **ODROID-C2 schematic rev 0.2** (odroid-c2_rev0.2_20160226.pdf): sheet 4 "C2-MAIN" and sheet 22 "Remote Control Receiver" (PDF pages 3 and 24, rendered with pdftoppm and read).
@@ -36,7 +38,7 @@ In order of how much this document relies on them. Every downloaded file is list
 10. **Arduino-IRremote** (MIT): src/ir_JVC.hpp (master) and src/ir_JVC.cpp (tag 2.8.0). **IRMP** (GPL): src/irmpprotocols.h (master). Both used for the JVC disagreements and repeat timings.
 11. The port's own MIT material: docs/m27-irq-uart-i2c-facts.md (GPIO interrupt block, GIC conventions), headers/private/drivers/ir_remote.h and src/add-ons/kernel/drivers/misc/meson_gpio/meson_gpio.cpp.
 
-Used only as a cross-check: the text of the S905X datasheet rev 0.2, saved in a scratch directory from earlier work (`s905txt/s905x.txt`) and not downloaded for this document. It gives the same AO_MF_IR_DEC register addresses as the S905 datasheet.
+Used only as a cross-check: the text of the S905X datasheet rev 0.2, from earlier research (not kept in this repository). It gives the same AO_MF_IR_DEC register addresses as the S905 datasheet.
 
 Conventions:
 - Addresses are physical. The AO (always-on) bus starts at 0xc8100000. One 4 KB page there holds the AO pin mux, the AO GPIO registers, AO_RTI_GEN_CNTL_REG0, the console UART (0xc81004c0) and the IR block.
@@ -587,7 +589,7 @@ Linux's windows: header mark 8138–8662; header space 3938–4462; bit mark 263
 | Volume down | 0x81 | 0x7E | 0xB281 | 0x817E | 0x7E814DB2 |
 | Volume up | 0x80 | 0x7F | 0xB280 | 0x01FE | 0x7F804DB2 |
 
-The last column is what FRAME would hold in hardware NEC mode (1.9). It is also what a software decoder gets if it shifts each received bit in at the top of a 32-bit word. Both sources list the same 12 buttons. Whether the remote has any others is not stated (**UNVERIFIED**; the remote is on order).
+The last column is what FRAME would hold in hardware NEC mode (1.9). It is also what a software decoder gets if it shifts each received bit in at the top of a 32-bit word. Both sources list the same 12 buttons. Whether the remote has any others is not stated (**UNVERIFIED**; the ODROID remote wasn't available for testing).
 
 ## 7. Traps
 
@@ -631,9 +633,9 @@ The last column is what FRAME would hold in hardware NEC mode (1.9). It is also 
 
 ## Appendix A: downloads
 
-All files were saved in a scratch directory (`ir-research/`) on 2026-10-31. Sizes are in bytes.
+Downloaded on 2026-10-31 for this research; not kept in this repository. Sizes are in bytes.
 
-The two PDFs are byte-identical (same MD5) to the copies downloaded for M27 in `m27b-sources/`. The datasheet text used here is the pdftotext output of that identical file.
+The two PDFs are byte-identical (same MD5) to the copies downloaded for M27. The datasheet text used here is the pdftotext output of that identical file.
 
 | File | URL | Size |
 |---|---|---|
@@ -689,7 +691,6 @@ Requests that failed. Their error bodies were deleted and nothing from them is u
 - https://lirc-remotes.sourceforge.net/remotes-table.html, searched for JVC car-stereo remotes: 403.
 
 Local sources, not downloaded:
-- `/build/haiku-odroid-c2/u-boot` (v2026.10): `drivers/pinctrl/meson/pinctrl-meson-gxbb.c`, `u-boot.dtb` (decompiled with `dtc`), `dts/upstream/src/arm64/amlogic/meson-gx.dtsi`.
-- `/build/haiku-odroid-c2/haiku` (MIT): `headers/private/drivers/ir_remote.h`, `src/add-ons/kernel/drivers/misc/meson_gpio/meson_gpio.cpp`, `headers/private/kernel/arch/int.h` (`arch_int_configure_io_interrupt`), and the drivers that call it (`meson_uart`, `meson_vdec`).
-- `/build/haiku-odroid-c2/docs/m27-irq-uart-i2c-facts.md`.
-- `/build/haiku-odroid-c2/logs/m1-2026-10-27.log`: U-Boot's device list showing the `remote_input_ao` pin configuration node.
+- `u-boot/` (v2026.10): `drivers/pinctrl/meson/pinctrl-meson-gxbb.c`, `u-boot.dtb` (decompiled with `dtc`), `dts/upstream/src/arm64/amlogic/meson-gx.dtsi`.
+- `haiku/` (MIT): `headers/private/drivers/ir_remote.h`, `src/add-ons/kernel/drivers/misc/meson_gpio/meson_gpio.cpp`, `headers/private/kernel/arch/int.h` (`arch_int_configure_io_interrupt`), and the drivers that call it (`meson_uart`, `meson_vdec`).
+- `docs/m27-irq-uart-i2c-facts.md`.

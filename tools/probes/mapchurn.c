@@ -8,7 +8,7 @@
  * thread forks now and then, the child doing the same briefly. Pages of
  * other threads' regions fault in while tables around them are freed. At
  * the end it prints the counts and holds its address space for <hold>
- * seconds, for a look at the wired pages it costs (milestone M82 (docs/milestones.md): page
+ * seconds, for a look at the wired pages it costs (milestone M82: page
  * tables freed on unmap). Exits 1 on any wrong byte.
  */
 #include <pthread.h>

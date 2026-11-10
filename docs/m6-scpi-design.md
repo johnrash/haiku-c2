@@ -1,6 +1,8 @@
 # M6 design notes: CPU clock and temperature through SCPI (BL30)
 
-Research for M6 item 3, written 2026-10-28. **Nothing here is implemented**, and the board was not used. The facts come from the device tree, our serial logs, the firmware blobs in `amlogic-boot-fip/odroid-c2/`, and the sources below. Compare with `m6-ethernet-design.md`.
+> **Status:** Design written 2026-10-28, before `meson_scpi`; built as designed in M6. Since M30 the governor is on by default (`dvfs off` in the driver settings turns it off), samples every 50 ms, and goes down to 250 MHz in power-saving mode. `sysinfo` shows the clock through the PMU cycle counter (M7). GET_DVFS_INFO returns a 6-entry table, 100 to 1536 MHz, and the boot index reads 0.
+
+Research for M6 item 3, written 2026-10-28, without the board. The facts come from the device tree, our serial logs, the firmware blobs in `amlogic-boot-fip/odroid-c2/`, and the sources below. Compare with `m6-ethernet-design.md`.
 
 ## Sources and licences
 **Usable:**
@@ -19,7 +21,7 @@ Research for M6 item 3, written 2026-10-28. **Nothing here is implemented**, and
   - **`sensors`** (`amlogic,meson-gxbb-scpi-sensors`, `arm,scpi-sensors`, `#thermal-sensor-cells = 1`) stays enabled.
 - **`mailbox@404`** (`amlogic,meson-gxbb-mhu`), in `hiubus` (bus@c883c000): registers **0xc883c404**, length 0x4c. Interrupts GIC SPI 208, 209 and 210, rising edge, so Haiku INTIDs **240–242**. `#mbox-cells = 1`; no `status`, so enabled.
 - **`sram@c8000000`** (`mmio-sram`, 0x14000, `ranges = <0 0x0 0xc8000000 0x14000>`): `cpu_scp_lpri` (`amlogic,meson-gxbb-scp-shmem`) at reg `<0x13000 0x400>`, so **0xc8013000**; `cpu_scp_hpri` at `<0x13400 0x400>`, so **0xc8013400**. The node names say `@0` and `@200`; only `reg` counts.
-- **CPUs:** each `cpu@N` has `clocks = <&scpi_dvfs 0>` and `#cooling-cells = <2>`. **There is no `operating-points` table: the operating points come only from the firmware.** `logs/m1-2026-10-27.log` shows `clocks = <0x5 0x0>` on all four CPUs, so the SCPI nodes are in the passed DT (`/scpi` itself wasn't printed).
+- **CPUs:** each `cpu@N` has `clocks = <&scpi_dvfs 0>` and `#cooling-cells = <2>`. **There is no `operating-points` table: the operating points come only from the firmware.** The first serial log (M1) shows `clocks = <0x5 0x0>` on all four CPUs, so the SCPI nodes are in the passed DT (`/scpi` itself wasn't printed).
 - **`thermal-zones/cpu-thermal`:** sensor `<&scpi_sensors 0>`, polled every 1000 ms (250 ms while passive). Trips: passive **80 °C**, hot **90 °C**, critical **110 °C**, each with 2 °C hysteresis. Both cooling maps throttle all four CPUs.
 - **Haiku FDT details:** `get_reg()` returns `reg` untranslated, so use `translate_fdt_address()` from `meson_gx_mmc.cpp`. `/scpi` has no `reg`; reach the mailbox and SRAM through their phandles with `fdt_bus_module_info::node_by_phandle`, which nothing in the tree calls yet. *Unverified.*
 
@@ -87,7 +89,7 @@ Research for M6 item 3, written 2026-10-28. **Nothing here is implemented**, and
   - **Userland:** `cat` and `echo` are enough, so no new tool is needed.
 - **Safety rules:**
   - **Hard cap 1536 MHz**, the boot frequency. Higher indexes are never sent, so DVFS can only lower the clock from what runs today.
-  - Because the DT disables `scpi_clocks`, DVFS stays off unless `~/config/settings/kernel/drivers/meson_scpi` says `dvfs on`. Temperature always works.
+  - Because the DT disables `scpi_clocks`, DVFS was planned to stay off unless `~/config/settings/kernel/drivers/meson_scpi` says `dvfs on` (since M30 it's on unless the file says `dvfs off`). Temperature always works.
 - **`auto` governor** (a kernel thread):
   - **Load:** every 100 ms, compute the busiest CPU's load from `cpu_get_active_time()` deltas. Above 80 %, go to 1536 MHz; below 30 %, step down one OPP. Floor at 1000 MHz at first.
   - **Thermal:** at 80 °C or above, step down every 250 ms; at 90 °C or above, go to the floor; recover below the trip minus 2 °C. Ignore readings outside 0–125 °C, and act only on two readings in a row.
@@ -95,7 +97,7 @@ Research for M6 item 3, written 2026-10-28. **Nothing here is implemented**, and
 - **Why not a cpufreq module first:** its hooks run with interrupts off, where a mailbox round trip can't run; all four CPUs share one domain; and it is looked up by path, so it can't share the driver's transport without that extra interface.
 
 ## Plan
-About **600–900 lines**. Every step runs on the board, after the current hardware session ends.
+About **600–900 lines**. Every step runs on the board.
 
 | # | Step | Pass when |
 |---|---|---|

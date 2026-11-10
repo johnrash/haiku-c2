@@ -2,7 +2,7 @@
 # Copyright 2026, haiku-odroid-c2 port authors.
 # Distributed under the terms of the MIT License.
 #
-# The S905 H.264 encoder's microcode (milestone M48 (docs/milestones.md)) as a package of its own,
+# The S905 H.264 encoder's microcode (milestone M48) as a package of its own,
 # for one's own boards only: firmware/meson_venc_firmware-<version>-any.hpkg, with
 # h264_enc_mc_gx.bin in data/firmware/meson/venc/ (where the meson_encoder
 # media plugin and tools/probes/venctest read it) and Amlogic's notice.

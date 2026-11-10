@@ -2,7 +2,7 @@
 # HaikuPorts ports the arm64 HaikuPorts repository has no builds of (it only
 # has bootstrap packages), cross-compiled from the sources in deps/src
 # (checksums of the HaikuPorts recipes, which are there too) with those
-# recipes' patches and options and the Cortex-A53 errata flags (milestone M8 (docs/milestones.md)):
+# recipes' patches and options and the Cortex-A53 errata flags (milestone M8):
 # - libraries behind jam build features (configs/haiku-UserBuildConfig):
 #   libedit (Debugger), glu (GLInfo, libglut, Haiku3d), tiff, libwebp, dav1d
 #   and libavif1.0 (the TIFF, WebP and AVIF translators), ffmpeg6 (the media
@@ -12,13 +12,13 @@
 # - libpcre;
 # - freetype 2.14.3, for the bootstrap 2.6.3: the app_server and every
 #   application draw text with it, and 2.6.3 can't read CFF2 (variable)
-#   fonts such as upstream's Noto Sans CJK (milestone M38 (docs/milestones.md)); with libpng
-#   (static) for colour emoji (milestone M56 (docs/milestones.md));
+#   fonts such as upstream's Noto Sans CJK (milestone M38); with libpng
+#   (static) for colour emoji (milestone M56);
 # - zstd: the library, and its sources for the kernel's and the boot
 #   loader's decompressor (jam's zstd build feature: packages compressed
-#   with zstd, as HaikuPorts' are now; milestone M39 (docs/milestones.md));
+#   with zstd, as HaikuPorts' are now; milestone M39);
 # - command line tools: xz_utils, bzip2, gzip, tar, unzip, zip, zstd_bin;
-# - libpcap and tcpdump (packet capture on the boards, milestone M82 (docs/milestones.md));
+# - libpcap and tcpdump (packet capture on the boards, milestone M82);
 # - capstone (the Debugger's disassembler) and fluidlite, static libraries
 #   (only deps/ports/<port>/, no package).
 # Each port is installed to deps/ports/<port>/ (its /boot/system tree, with
@@ -330,7 +330,7 @@ nativeEnv()
 		ac_cv_c_bigendian=no "$@"
 }
 
-# Python modules (milestone M83 (docs/milestones.md)): built as wheels with the host Python 3.15 in
+# Python modules (milestone M83): built as wheels with the host Python 3.15 in
 # deps/host/venv-py315 and installed to lib/python3.15/vendor-packages, with
 # their bytecode; packages named as HaikuPorts' (<module>_python315).
 PYVENV=$HAIKU_PROJECT/deps/host/venv-py315
@@ -407,7 +407,7 @@ pyWheel()
 # pyqtTools: sip and PyQt-builder in the venv (they run on this laptop),
 # from deps/src: their versions said outright (they take them from git with
 # setuptools_scm otherwise), and PyQt-builder's configuration tests handed
-# to $PYQTBUILD_TEST_RUNNER (patches/python, milestone M85 (docs/milestones.md))
+# to $PYQTBUILD_TEST_RUNNER (patches/python, milestone M85)
 pyqtTools()
 {
 	grep -q PYQTBUILD_TEST_RUNNER \
@@ -435,7 +435,7 @@ PY
 		"$t/sip-6.17.2" "$t/pyqt_builder-1.21.0" >> "$log" 2>&1
 }
 
-# Qt 6.12 (milestone M83 (docs/milestones.md)): cross-built with the host Qt's tools
+# Qt 6.12 (milestone M83): cross-built with the host Qt's tools
 # (tools/qt6-build.sh host), HaikuPorts' layout and options.
 HOSTQT=$HAIKU_PROJECT/deps/host/qt6.12
 QT_DIRS="-DCMAKE_INSTALL_PREFIX=/boot/system -DINSTALL_LIBDIR=lib
@@ -491,7 +491,7 @@ qtModule()
 	# them the host Qt's three modules took 21 GB and filled the disk)
 }
 
-# The Python stack's libraries (milestone M83 (docs/milestones.md)), built when named: openssl3,
+# The Python stack's libraries (milestone M83), built when named: openssl3,
 # libffi, sqlite, ffmpeg8 (libraries only, beside ffmpeg6), openblas.
 
 for port in ${@:-$ALL}; do
@@ -1269,7 +1269,7 @@ PC
 		# lz4, xxHash and OpenSSL from the ports; what configure can't run
 		# here as the test board's gcc found it (socketpair, C99 vsnprintf, secure
 		# mkstemp...). The tarball's signature checked with its release
-		# key (milestone M86 (docs/milestones.md)).
+		# key (milestone M86).
 		unpack rsync-3.5.2.tar.gz rsync-3.5.2 \
 			../../patches/rsync/rsync-3.5.2-haiku.patch
 		(cd "$WORK/$dir" && autoconf -o configure.sh \

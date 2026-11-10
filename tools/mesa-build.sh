@@ -13,8 +13,8 @@
 # presenter thread).
 # Packages as HaikuPorts does: mesa (libraries), mesa_swpipe (the renderer)
 # and mesa_devel (headers, OpenGL kit); and mesa_lima (the Lima Pipe add-on).
-# Usage: mesa-build.sh  -> deps/mesa/mesa{,_swpipe,_lima,_devel}-22.0.5-4-arm64.hpkg
-#   (revision 1 without LLVM)
+# Usage: mesa-build.sh  -> deps/mesa/mesa{,_swpipe,_lima,_devel}-22.0.5-<revision>-arm64.hpkg
+#   (revision 1 without LLVM, 6 with deps/llvm's)
 set -e
 . "$(dirname "$0")/haiku-arm64-env.sh"
 VERSION=22.0.5

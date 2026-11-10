@@ -3,7 +3,7 @@
 # Distributed under the terms of the MIT License.
 # hdmi-record.sh <seconds> <out.mkv>: pauses tools/hdmi-live.sh, records the
 # capture stick at 1080p60 (MJPEG as is), then restarts the live loop.
-root=/build/haiku-odroid-c2
+root=$(cd "$(dirname "$0")/../.." && pwd)
 loop=$(cat $root/run/hdmi-live.pid 2>/dev/null)
 [ -n "$loop" ] && kill "$loop" 2>/dev/null
 for p in $(pgrep -x ffmpeg); do sudo kill "$p"; done

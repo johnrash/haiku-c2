@@ -3,7 +3,7 @@
  * Distributed under the terms of the MIT License.
  *
  * Reads Hardkernel's Weather Board 2 on the header's I2C B (pins 27 and 28,
- * BI2CDevice's "header" bus; milestone M65 (docs/milestones.md)): a Bosch BME280 (temperature,
+ * BI2CDevice's "header" bus; milestone M65): a Bosch BME280 (temperature,
  * humidity, pressure) and a Silicon Labs Si1132 (UV index, visible and
  * infrared light).
  *

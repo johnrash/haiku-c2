@@ -1,6 +1,8 @@
 # What rtw88 does on an RTL8822BU, and where r22b differs
 
-Written 2026-11-04 from reading the Linux 7.0 in-tree driver (`deps/src/rtw88-v7.0/`, its BSD-3-Clause option) and the fork's working tree. Realtek's out-of-tree 88x2bu driver was not used. No board was touched and nothing was built.
+> **Status:** Written 2026-11-04, in the middle of the investigation. Suspect 1 turned out to be the cause (fixed in +297, patch 0288); suspect 2 was adopted (+299, patch 0290); upload speed came with transmit aggregation (+301, patch 0292). Line numbers refer to an unpublished working tree that still had temporary code.
+
+Written 2026-11-04 from reading the Linux 7.0 in-tree driver (rtw88, © Realtek, GPL-2.0 OR BSD-3-Clause, read under its BSD-3-Clause option; facts only) and the fork's working tree. Realtek's out-of-tree 88x2bu driver was not used. No board was touched and nothing was built.
 
 ## How to read this
 
@@ -319,7 +321,7 @@ The periodic capture is 42 s, so 21 runs. The counts below are from it.
 
 **Not periodic, though it looks so in the capture:**
 
-- **EDCA:** rtw88 has no EDCA code in the watchdog. R and W of 0x500-0x50c, 20 each, are 5 `conf_tx` calls (each makes 4 read-modify-writes per AC). What called them 5 times in 42 s is in mac80211. docs/milestones.md's line lists these with the 2 s work; they don't belong there.
+- **EDCA:** rtw88 has no EDCA code in the watchdog. R and W of 0x500-0x50c, 20 each, are 5 `conf_tx` calls (each makes 4 read-modify-writes per AC). What called them 5 times in 42 s is in mac80211. An earlier reading of the capture counted them with the 2 s work; they don't belong there.
 - **LED:** R and W of 0x4c, 810 each (19 per second), are mac80211's throughput LED trigger through `rtw8822b_led_set` (0x4c bits 18:16 = 0, bit 22 clear, bit 19 = off). This is what most of the control traffic is.
 - **0x4e0:** 1622 writes = exactly the accesses to 0x00-0xff (810 + 810 + 1 + 1). See item 7.
 
@@ -820,7 +822,7 @@ Read all of these on both systems if a register-level comparison becomes possibl
 
 1. **Scoreboard during startup.** The capture has `W 0x00aa 0382` (0x8203, TDMA bit set) just after the coex table. `rtw_coex_tdma` sets that bit only if `RTW_FLAG_BUSY_TRAFFIC` is set, and at bring-up the flag should be clear. It would fit a flag left from an earlier joined run, as `rtw_core_stop` doesn't clear it. Not proven. It doesn't matter on a chip with no BT.
 2. **Open Rx URBs.** Line 4 of `wifi-rtw88-c2-usb-summary.txt` says "most open at once 1, typically 0", 224 per second, 1.6 MB, for "25 s, half up, half down". The download section says 4 URBs, typically 3 open, 28 MB/s. The code says four, always. Line 4 can't cover the 12 s download (it would be over 300 MB), so it looks like the upload part only, with the open count not reliable there. I used the download section.
-3. **milestone M80 (docs/milestones.md)** lists "the EDCA parameters (0x500-0x50c, 20 times)" among the 2 s work. The counts are right and the attribution isn't (item 4).
+3. **An earlier reading (M80)** listed "the EDCA parameters (0x500-0x50c, 20 times)" among the 2 s work. The counts are right and the attribution isn't (item 4).
 
 **Not covered by any capture, so from the code only:** channel setup (item 2) and everything at association (item 3). The startup capture reaches IPS before any channel set, and the periodic capture starts after the join.
 
@@ -846,7 +848,7 @@ Read all of these on both systems if a register-level comparison becomes possibl
 
 # Notes for whoever changes the driver
 
-- **The STBC soak was still running when this was written.** By 11:18 `logs/wifi-soak-295-stbc.log` had 25 rounds and no "no link" line, with rounds 11-13 much slower than the rest. Its witness log has 5 lost pings from 11:01:08 to 11:01:16. That is about the length of the TEMP 8 s silence limit, so it may be a stall and a restart, which would count against suspect 1. The board's syslog would tell, and I was told not to touch the boards. Read the finished logs before ordering the rest of this list.
+- **The STBC soak was still running when this was written.** By 11:18 `logs/wifi-soak-295-stbc.log` had 25 rounds and no "no link" line, with rounds 11-13 much slower than the rest. Its witness log has 5 lost pings from 11:01:08 to 11:01:16. That is about the length of the TEMP 8 s silence limit, so it may be a stall and a restart, which would count against suspect 1. The board's syslog would tell, and this study was read-only. Read the finished logs before ordering the rest of this list.
 - If it holds, suspect 2 is still worth doing for speed alone.
 - Change one suspect per soak. A single 15-minute soak is a weak test here: the stall has come 1 per 1 to 5 GB, and M80's earlier conclusions were overturned more than once.
 - Remove the TEMP code first or keep it deliberately: `temp_watch` reads RF 0 and writes 0x522, 0x02, 0x100 when it sees silence, so it can change what happens after a stall.

@@ -3,7 +3,7 @@
  * Distributed under the terms of the MIT License.
  *
  * emojitime: how long the app_server takes to draw strings with and without
- * emoji (milestone M56 (docs/milestones.md)), into a B_RGBA32 bitmap: DrawString() and Sync(),
+ * emoji (milestone M56), into a B_RGBA32 bitmap: DrawString() and Sync(),
  * four times each; the first draw makes the glyphs (and the fallback
  * fonts' cache entries), the others take them from the glyph cache.
  * Prints the four times, in milliseconds, for each string.

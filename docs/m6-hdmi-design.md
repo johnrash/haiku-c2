@@ -1,6 +1,8 @@
 # M6 design notes: native HDMI display (VPU, ENCP, HDMI PLL, DesignWare HDMI TX)
 
-Research for M6 item 4, written 2026-10-28. **Nothing here is implemented.** Compare with `m6-ethernet-design.md`. The goal is for Haiku to set HDMI modes itself, 1920x1080@60 first and the other EDID modes after, instead of keeping the 1280x720 mode U-Boot picked.
+> **Status:** Design written 2026-10-28. Stages 0 to 3 were built in M6. Stage 4 came later and partly differently: a PLL solver and more modes (M25), 4K at up to 30 Hz with a 4096x2160 frame buffer (M53), DPMS (M21), and hot-plug by polling HPD rather than the INTID 89 interrupt (M25, M29). The retrace semaphore and the AVI infoframe were never done. Limits quoted below (165 MHz, a 9 MB frame buffer) are the first version's.
+
+Research for M6 item 4, written 2026-10-28. Compare with `m6-ethernet-design.md`. The goal is for Haiku to set HDMI modes itself, 1920x1080@60 first and the other EDID modes after, instead of keeping the 1280x720 mode U-Boot picked.
 
 ## Sources and licences
 **Usable:**
@@ -38,7 +40,7 @@ All addresses are from `meson-gx.dtsi`/`meson-gxbb.dtsi` plus U-Boot's `meson-gx
 ### What U-Boot leaves running
 - **Everything, and it survives ExitBootServices.** `efi_exit_boot_services()` only calls `dm_remove_devices_active()`, which removes devices flagged `DM_FLAG_OS_PREPARE`/`ACTIVE_DMA`. `meson_vpu` has `DM_FLAG_PRE_RELOC | DM_FLAG_LEAVE_PD_ON`, `meson_dw_hdmi` has no remove hook. Confirmed in practice: Haiku's desktop runs on this pipeline today.
 - So the power domain, resets, gates, pinmux, VPU clock, HDMI system clock, HDMI TX init (CSC, video packetizer, sampler, interrupts muted) and PHY setup are all done. **A driver only has to change mode-dependent registers.** It must never reset or power-cycle these blocks.
-- **U-Boot's mode** (`logs/*`: `HDMI: 1280x720, 74250000 Hz pixel clock`): 1280x720@60, x8r8g8b8 (B_RGB32; `screenmode` prints "24 bits" for B_RGB32, `ScreenMode.cpp:134`), stride 5120, canvas **0x4e**.
+- **U-Boot's mode** (U-Boot's console: `HDMI: 1280x720, 74250000 Hz pixel clock`): 1280x720@60, x8r8g8b8 (B_RGB32; `screenmode` prints "24 bits" for B_RGB32, `ScreenMode.cpp:134`), stride 5120, canvas **0x4e**.
   - **Frame buffer:** 0x7fc6c000, 0x394000 bytes (1280·720·4 + 64 KiB), at the end of RAM and `EfiReservedMemoryType` in the memory map. Too small for 1080p.
   - **GOP size bug:** the GOP reports FrameBufferSize = 3840·2160·4 (U-Boot's maximum), which runs 30 MiB past the end of RAM. The kernel log line `mark_page_range_in_use(0x7ec6c, 0x1fa4): range would extend past free list` is that range. The driver must use width·height·4, not the GOP size. *Inferred from logs.*
   - **Clock path** (U-Boot always uses its "DMT" path): HDMI PLL VCO 5940 MHz, post-dividers OD1 = 4, OD2 = 2, OD3 = 1, VID_PLL /5, VCLK /2; ENCP and HDMI TX pixel clock from vclk_div1.

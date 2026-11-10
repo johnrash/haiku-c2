@@ -34,7 +34,7 @@ while [ $(date +%s) -lt $end ]; do
   kill $LP 2>/dev/null; wait $LP 2>/dev/null
   sleep 3
   timeout 8 $S 'sh /boot/home/killblast.sh 10.42.0.1' > /dev/null
-  png=$(timeout 15 $S 'ping -c 20 -i 0.1 ${GATEWAY:-192.168.1.1} 2>&1 | tail -2 | tr "\n" " " | sed "s/ packets transmitted, / tx /; s/ packets received, / rx /; s/---[^-]*--- //; s/round-trip min.avg.max.stddev = //"')
+  png=$(timeout 15 $S 'ping -c 20 -i 0.1 '"${GATEWAY:-192.168.1.1}"' 2>&1 | tail -2 | tr "\n" " " | sed "s/ packets transmitted, / tx /; s/ packets received, / rx /; s/---[^-]*--- //; s/round-trip min.avg.max.stddev = //"')
   echo "round $n [$ap]: up $u, down $d, ping $png$note"
   case "$png" in *" 0 rx "*) echo "    (no link at the end of round $n, $(date +%T))";; esac
 done

@@ -3,7 +3,7 @@
 # Distributed under the terms of the MIT License.
 #
 # Software reboots of the test board (10.42.0.2), checking its USB devices
-# after each (milestone M21 (docs/milestones.md)'s keyboard dropout came after software reboots,
+# after each (milestone M21's keyboard dropout came after software reboots,
 # never after relay power cycles). After each boot reaches the desktop and
 # 30 s more:
 #   - which of the given devices (<vid:pid>) listusb shows;

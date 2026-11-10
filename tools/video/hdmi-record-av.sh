@@ -3,7 +3,7 @@
 # Distributed under the terms of the MIT License.
 # hdmi-record-av.sh <seconds> <out.mkv>: like hdmi-record.sh, with the
 # capture stick's HDMI audio (ALSA card 1) as 16-bit PCM
-root=/build/haiku-odroid-c2
+root=$(cd "$(dirname "$0")/../.." && pwd)
 loop=$(cat $root/run/hdmi-live.pid 2>/dev/null)
 [ -n "$loop" ] && kill "$loop" 2>/dev/null
 for p in $(pgrep -x ffmpeg); do sudo kill "$p"; done

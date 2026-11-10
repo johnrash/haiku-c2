@@ -1,5 +1,7 @@
 # Header I/O: facts for GPIO interrupts, UART A and I2C B
 
+> **Status:** Research written before M27's header work. As built (`docs/m27-header-api.md`, patches 0149 to 0157): I2C B is attached as `/dev/bus/i2c/header` and used through `BI2CDevice`; both edges work with two channels on one pad. The datasheet's "invert RX" bit (CONTROL bit 25) does nothing on the S905.
+
 Facts only, for MIT drivers on the ODROID-C2 (S905, GXBB). The sources are Linux mainline (GPIO interrupt multiplexer, GXBB pinctrl, Meson UART, Meson I2C, GXBB clocks, DT), mainline U-Boot (GPL), the Amlogic S905 public datasheet V1.1.4, the C2 schematic rev 0.2, and the port's own MIT code. No code, macros or comments were copied. Anything not confirmed by a source, or where sources disagree without a clear answer, is marked **UNVERIFIED**.
 
 Conventions:
@@ -49,7 +51,7 @@ Conventions:
 
 ### (c) A program-level I2C transfer on bus B (pins 27 = SDA = GPIODV_26, 28 = SCL = GPIODV_27)
 
-1. **The port's `meson_i2c` does not attach to I2C B today.** Its `supports_device()` rejects FDT nodes whose status is not "okay", and the C2's I2C B node is "disabled". Every boot log so far shows only the controller at 0xc1108500 (I2C A, 85 boots). Everything else is ready:
+1. **The port's `meson_i2c` did not attach to I2C B then** (M27 attached it). Its `supports_device()` rejects FDT nodes whose status is not "okay", and the C2's I2C B node is "disabled". Every boot log so far shows only the controller at 0xc1108500 (I2C A, 85 boots). Everything else is ready:
    - the pin-mux table has an I2C B entry (set PERIPHS_PIN_MUX_7 bits 25 and 24, clear PERIPHS_PIN_MUX_2 bits 27 and 26);
    - the clock gate (HHI_GCLK_MPEG0 bit 9) is shared with I2C A and already on;
    - the divider code is generic.
@@ -530,7 +532,7 @@ A write message followed by a read message therefore puts a repeated START betwe
 
 ## Sources
 
-Downloaded into a scratch directory (`m27b-sources/`) on 2026-10-31. Sizes are in bytes. Linux files are master, fetched raw:
+Downloaded on 2026-10-31 for this research; not kept in this repository. Sizes are in bytes. Linux files are master, fetched raw:
 
 | URL | Size |
 |---|---|
@@ -554,8 +556,8 @@ Downloaded into a scratch directory (`m27b-sources/`) on 2026-10-31. Sizes are i
 `drivers/clk/meson/gxbb.h` returned 404: it has been merged into gxbb.c.
 
 Local sources:
-- `/build/haiku-odroid-c2/u-boot`: `drivers/serial/serial_meson.c` (REG5 bits 23/24/26/27, ÷3 baud), `drivers/i2c/meson_i2c.c` (ACK_IGNORE never set, divider), `dts/upstream/include/dt-bindings/reset/amlogic,meson-gxbb-reset.h` (reset IDs 143, 196, 201), and `dts/upstream/src/arm64/amlogic/meson-gxbb-odroidc2.dtb` decompiled with `dtc -I dtb -O dts` (node status, interrupts, clocks, labels, pinctrl regs, gpio-line-names).
-- `/build/haiku-odroid-c2/haiku` (MIT):
+- `u-boot/`: `drivers/serial/serial_meson.c` (REG5 bits 23/24/26/27, ÷3 baud), `drivers/i2c/meson_i2c.c` (ACK_IGNORE never set, divider), `dts/upstream/include/dt-bindings/reset/amlogic,meson-gxbb-reset.h` (reset IDs 143, 196, 201), and `dts/upstream/src/arm64/amlogic/meson-gxbb-odroidc2.dtb` decompiled with `dtc -I dtb -O dts` (node status, interrupts, clocks, labels, pinctrl regs, gpio-line-names).
+- `haiku/` (MIT):
   - `src/add-ons/kernel/busses/i2c/meson/meson_i2c.cpp`
   - `src/add-ons/kernel/bus_managers/i2c/{bus_raw.cpp,I2CBus.cpp,I2CModule.cpp,I2CPrivate.h}`
   - `headers/private/i2c/i2c.h`
@@ -565,4 +567,4 @@ Local sources:
   - `src/system/kernel/arch/arm64/arch_uart_meson.cpp`
   - `src/add-ons/kernel/bus_managers/fdt/fdt_module.cpp` (SPI + 32)
   - `build/jam/images/definitions/regular` and `build/jam/packages/Haiku` (i2c tool, bus manager, meson_i2c in the arm64 image)
-- `/build/haiku-odroid-c2/logs/*.log`: `meson_i2c` lines with clk81 = 166666666 Hz, only I2C A attached.
+- the port's serial logs: `meson_i2c` lines with clk81 = 166666666 Hz, only I2C A attached (before M27).

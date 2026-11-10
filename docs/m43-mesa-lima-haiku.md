@@ -5,6 +5,8 @@ Distributed under the terms of the MIT License.
 
 # M43: Mesa's lima driver on Haiku (Mali-450 MP3), userland design study
 
+> **Status:** Design study before M43's userland. As built: the device is `/dev/misc/mali/0`, the driver is "Lima Pipe" (package `mesa_lima`), buffers are cached and cleaned around jobs, quads draw correctly without P7, and a presenter thread overlaps the readback (M55). Overlapping GP and PP jobs was tried in M61 and not adopted (`patches/haiku/meson_mali-gp-pp-overlap.patch`).
+
 > Facts read from Mesa 22.0.5 as we build it: `deps/build/mesa-22.0.5` (the release tarball, HaikuPorts' `mesa-22.0.5.patchset` and `tools/patches/mesa-22.0.5-bitmap-stride.patch`), on 2026-10-31. Every `file:line` is in that tree unless it names `haiku/` or `docs/milestones.md`. The Linux lima kernel source is not on this machine. What the kernel must do is inferred from the uapi header and from how Mesa uses it, and marked **UNVERIFIED** where it matters. Nothing was downloaded. The Mesa tree was not changed; a trial build ran in a scratch directory (§1.6).
 
 This is the input for the userland half of hardware OpenGL on the C2: Mesa's lima Gallium driver, a small libdrm replacement, and a second BGLRenderer add-on. The kernel driver is a separate piece of work. §1.8 is the contract it has to meet.
@@ -159,13 +161,13 @@ A trial ran in a scratch directory: `meson setup` with our cross file, `-Dgalliu
 | `LIMA_GEM_SUBMIT` (GP, PP for Mali-450, both with and without DLBU) | yes | pass-through |
 | `LIMA_GEM_WAIT` | yes | pass-through |
 | `LIMA_CTX_CREATE`, `LIMA_CTX_FREE` | return an id, nothing else | pass-through |
-| `VERSION` | 1.1 ("lima"): growable heaps (1.0 until fork b4257aee02) | `drmGetVersion` in two calls, as libdrm does |
+| `VERSION` | 1.1 ("lima"): growable heaps (1.0 until patch 0188) | `drmGetVersion` in two calls, as libdrm does |
 | `SYNCOBJ_CREATE`, `DESTROY`, `WAIT` | yes | pass-through |
 | Sync file export and import | no | emulated (§1.4) |
 | `drmGetDevice2` | no | returns an error |
 | Prime, `GEM_FLINK`, `GEM_OPEN` | EINVAL | Prime functions return an error |
 | `MODE_*_DUMB`, `drmOpenWithType` | no | declared; `drmOpenWithType` returns -1 |
-| Growable heap (`LIMA_BO_FLAG_HEAP`, version 1.1) | yes (fork b4257aee02): 64 KiB at first, doubled on PLBU_OUT_OF_MEM | — |
+| Growable heap (`LIMA_BO_FLAG_HEAP`, version 1.1) | yes (patch 0188): 64 KiB at first, doubled on PLBU_OUT_OF_MEM | — |
 
 **Upstream libdrm** is not needed. It is not on this machine, not in our repository and not in the bootstrap packages. Whether HaikuPorts has a recipe can't be checked offline. Either way, libdrm's core finds devices through Linux and BSD device numbers and sysfs, so a port would still need glue to reach our driver. A 300-line shim is simpler.
 
@@ -328,7 +330,7 @@ What it costs:
 
 - Each frame waits for the GPU (no overlap), then makes one CPU read of the buffer, plus the copy `DrawBitmap` or direct mode makes, as today.
 - For a GLTeapot-sized window this is small.
-- At 1920x1080, M19 measured 45 ms for softpipe's clear and present (`docs/milestones.md`, M19). The GPU takes the clear, but the present copies remain, and the first one reads write-combining memory.
+- At 1920x1080, an earlier measurement put softpipe's clear and present at 45 ms a frame. The GPU takes the clear, but the present copies remain, and the first one reads write-combining memory.
 - Later steps, in order of payoff (stage 5):
   - read back frame N-1 while the GPU draws frame N (one frame of latency);
   - copy from the buffer straight into the frame buffer in direct mode;
@@ -431,7 +433,7 @@ Each stage ends with something that runs on the board.
 3. Device node path: `/dev/misc/lima/0`, or another name outside `/dev/graphics`?
 4. Renderer choice: a priority symbol in the add-ons (P5), name order, or a setting? Should Lima Pipe be the default once it works, with `LIBGL_ALWAYS_SOFTWARE` as the way back?
 5. Is a single GPU address space for all teams acceptable for v1?
-6. Is the fixed 1 MiB tile heap (version 1.0) enough for GLTeapot and Haiku3d, or does the kernel need heap growth (1.1) early? **Answered (milestone M43 (docs/milestones.md) stage 4):** not enough with several GL applications and full-screen frames (GP error 0x4, then failed PP jobs); the kernel grows heaps since fork b4257aee02.
+6. Is the fixed 1 MiB tile heap (version 1.0) enough for GLTeapot and Haiku3d, or does the kernel need heap growth (1.1) early? **Answered (milestone M43 stage 4):** not enough with several GL applications and full-screen frames (GP error 0x4, then failed PP jobs); the kernel grows heaps since fork b4257aee02.
 7. Stay on Mesa 22.0.5 (one build, HaikuPorts' patches, ours), or move lima to a newer Mesa for its fixes? Newer lima versions were not examined.
 8. Add-on and package names: "Lima Pipe" and `mesa_lima`?
 9. Flat shading, `glPolygonMode` lines and occlusion query results are missing in lima 22.0.5. Do any of the applications we care about depend on them?

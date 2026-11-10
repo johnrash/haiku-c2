@@ -1,5 +1,5 @@
 #!/bin/sh
-# Test streams for the S905 video decoder (milestone M26 (docs/milestones.md)) and FFmpeg's
+# Test streams for the S905 video decoder (milestone M26) and FFmpeg's
 # decoding of them, frame by frame, as the decoder writes them (NV12), in
 # run/vdec/: <stream> and <stream>.framemd5. tools/probes/vdectest.cpp
 # compares its frames with these.
@@ -44,7 +44,7 @@ make264 t1080.h264 1920x1080 30 60 -profile:v high -bf 3 -x264-params b-pyramid=
 	-refs 4 -g 30 -b:v 8M
 make264 t720s.h264 1280x720 30 60 -profile:v high -bf 2 -slices 4 -g 30 -b:v 4M
 
-# HEVC (Annex B), from libx265 (milestone M26 (docs/milestones.md) stage 3):
+# HEVC (Annex B), from libx265 (milestone M26 stage 3):
 #   h240one.hevc  320x240, one IDR picture
 #   h240i.hevc    320x240, 10 intra pictures
 #   h1080i.hevc   1920x1080, 30 intra pictures, 20 Mbit/s
@@ -73,7 +73,7 @@ make265 h1080.hevc 1920x1080 30 60 -x265-params log-level=error -b:v 8M
 make265 h480s.hevc 720x480 30 60 \
 	-x265-params log-level=error:keyint=30:slices=4 -b:v 2M
 
-# Portrait (milestone M41 (docs/milestones.md)): 1080x1920, as phones film upright
+# Portrait (milestone M41): 1080x1920, as phones film upright
 make264 p1080.h264 1080x1920 30 60 -profile:v high -bf 3 \
 	-x264-params b-pyramid=normal -refs 4 -g 30 -b:v 8M
 make265 p1080.hevc 1080x1920 30 60 -x265-params log-level=error -b:v 8M

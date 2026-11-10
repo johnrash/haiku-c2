@@ -6,7 +6,7 @@
  *
  * Prints the input events app_server delivers, through a small off-screen
  * window that asks for all pointer and keyboard events. With a device name,
- * that device is stopped first and started again at the end (milestone M79 (docs/milestones.md)).
+ * that device is stopped first and started again at the end (milestone M79).
  *
  * Build: $CXX -O2 $HAIKU_CXX_INCLUDES -o inputwatch inputwatch.cpp -lbe
  */

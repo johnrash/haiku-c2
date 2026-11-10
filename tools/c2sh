@@ -2,7 +2,7 @@
 """Run a shell command on Haiku on the C2 over telnet and print its output.
 
 c2sh "<command>" [timeout-seconds]      (exit status = the command's)
-Needs the guest diagnostics script's telnetd (tools/guest/UserBootscript).
+Needs the telnetd loop that tools/guest/c2-system.sh starts in images made with --remote-shell.
 Haiku's single user is "baron". A fresh image has no password, which ftpd
 cannot handle, so the first login sets the dev password below (test
 credential for this test image only; c2put/c2get use it).

@@ -4,7 +4,7 @@
  *
  * memhog <MB> <seconds>: allocates that much memory in 4 MB pieces, writes
  * every page, keeps rewriting a page of each piece for that long, then
- * checks and frees it all: memory pressure for other tests (milestone M82 (docs/milestones.md)).
+ * checks and frees it all: memory pressure for other tests (milestone M82).
  * Exits 1 if a page lost its pattern.
  */
 #include <stdint.h>

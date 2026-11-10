@@ -1,5 +1,7 @@
 # M26: S905 (GXBB) VDEC_1 MPEG-1/2 decoding, hardware facts
 
+> **Status:** Facts written 2026-10-30, before `meson_vdec`; the board results are in section 11. In M26 stage 2 the interrupts became edge-triggered and polling was dropped. In M60, MPEG-1/2 in MediaPlayer showed neither the first-session fault nor the lost last picture.
+
 > Facts read from Linux's GPL drivers/staging/media/meson/vdec (mainline master at commit abf8c33470f7, 2026-10-30; the last change to that directory is b3a805dd5a83, committed 2026-10-04) and the GX device tree and clock/reset drivers; no code copied.
 
 This is the input for a clean-room, MIT-licensed VDEC driver for Haiku. It lists register names, offsets, values, ordering, timing and data layouts, in tables and short prose. Where Linux gives no meaning for a value, or where a meaning is inferred from names or behaviour, the text says **UNVERIFIED**.
@@ -670,7 +672,7 @@ All files are from torvalds/linux master as of 2026-10-30 (HEAD abf8c33470f7), f
 
 ---
 
-## 10. Found on the board (ODROID-C2, Haiku meson_vdec, 2026-10-30)
+## 11. Found on the board (ODROID-C2, Haiku meson_vdec, 2026-10-30)
 
 These come from running the sequences above on this board; they are observations, not Linux facts.
 
@@ -689,5 +691,5 @@ These come from running the sequences above on this board; they are observations
   - Sent once the firmware is quiet with frames to decode into, every frame came out, except with a consumer slow to hand frames back at 1080p: then the flush returned one picture where it usually returns two, and one was still lost.
   - The flush reports carry PIC_INFO 0x9000 and the stream offset of the last normal report.
 - **First session after boot:** the first picture's first macroblock had its top two 8×8 blocks wrong, saturated values, and the error carried through that GOP. Later sessions didn't show it. Neither a power cycle at init nor writing the canvases before the reset helped. It looks like inverse-quantizer or IDCT state that only a completed decode initialises.
-- **Interrupts:** both are short pulses; with the GIC set to level, many arrive as spurious (INTID 1023). Polling covers them.
+- **Interrupts:** both are short pulses; with the GIC set to level, many arrive as spurious (INTID 1023). Polling covered them at first; since M26 stage 2 they're configured edge-triggered and used.
 - **Quality and speed:** against FFmpeg, differences are within MPEG's IDCT tolerance: at most a few pixels by more than 2, with the usual drift along long P chains. Decoding at 1080p runs at well over 80 frames a second.

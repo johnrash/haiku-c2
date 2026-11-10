@@ -3,7 +3,7 @@
 # Distributed under the terms of the MIT License.
 #
 # dhcp-moved-test.sh <log>: a stuck lease (seen on a C2 on Wi-Fi), on the test board's cable
-# (milestone M82 (docs/milestones.md)). dnsmasq stops; tools/dhcp-bridge-sim.py leases the board
+# (milestone M82). dnsmasq stops; tools/dhcp-bridge-sim.py leases the board
 # its 10.42.0.2 for 60 s; then tools/dhcp-two-server-sim.py "moved" takes
 # over as a router that NAKs .2 and offers 10.42.0.3, sent to that address
 # unless the board asks for broadcasts. A board that keeps .2 configured

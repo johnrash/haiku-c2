@@ -5,7 +5,7 @@
  * Decodes a file's video track through the Media Kit, as MediaPlayer does,
  * and reports which decoder the Media Kit chose (meson_decoder, the S905's
  * video decoder, or FFmpeg's), the frame rate and whether the frames' times
- * rise steadily (milestone M26 (docs/milestones.md)).
+ * rise steadily (milestone M26).
  *
  *   mediadecode <file> [rgb|422|nv12] [<output>]
  *   mediadecode <file> seek

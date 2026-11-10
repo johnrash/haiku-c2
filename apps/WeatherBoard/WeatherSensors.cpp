@@ -2,7 +2,7 @@
  * Copyright 2026, haiku-odroid-c2 port authors.
  * Distributed under the terms of the MIT License.
  *
- * The chips as tools/probes/weatherboard.cpp reads them (milestone M65 (docs/milestones.md)): the
+ * The chips as tools/probes/weatherboard.cpp reads them (milestone M65): the
  * BME280 in forced mode with the datasheet's compensation formulas, the
  * Si1132 reset, given the datasheet's default UV coefficients and forced.
  */

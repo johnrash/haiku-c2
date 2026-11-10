@@ -2,6 +2,8 @@ Facts read from Linux's GPL drivers/staging/media/meson/vdec (mainline abf8c3347
 
 # M26: S905 (GXBB) VDEC_1 H.264 decoding, hardware facts
 
+> **Status:** Facts written 2026-10-30, before the H.264 path existed; board results are in section 16. Later: edge-triggered interrupts (M26 stage 2), mid-stream size changes and portrait video up to the 1920x1088 macroblock budget (M41), and field-coded and MBAFF streams in hardware, woven as FFmpeg does (M60).
+
 This is the H.264 counterpart of `m26-vdec-facts.md`, called the **base document** here and cited as "base §N". The base document already covers everything H.264 shares with MPEG-1/2, and none of it is repeated here:
 
 - conventions (base §0);
@@ -22,7 +24,7 @@ This document covers only what H.264 adds or changes. It uses the same conventio
 **Provenance:**
 - codec_h264.c arrived in d7647e7c90f5 (2020-03-03). The commit message names no tested SoC.
 - Later commits touching it are a typo fix (2a1a564adab1) and allocator-API conversions (69050f8d6d07, bf4afc53b77a). The firmware protocol in Linux is therefore unchanged since 2020.
-- Nothing in this document has been run on this board yet. Base §10 "Found on the board" applies to MPEG-1/2 only.
+- Base §11 "Found on the board" applies to MPEG-1/2 only; this document's board results are in §16.
 
 ---
 
@@ -51,7 +53,7 @@ This document covers only what H.264 adds or changes. It uses the same conventio
 
 - **Name:** `meson/vdec/gxbb_h264.bin`, from linux-firmware.
 - **This host's copy:** linux-firmware 20260319.git217ca6e4, `/usr/lib/firmware/meson/vdec/gxbb_h264.bin.zst`. Decompressed, it is **36,864 bytes**, md5 `eee6da399af38101b6c001f3cbb0a21d`.
-- **This repo's copy:** `firmware/meson/vdec/gxbb_h264.bin` is the same file (same size and md5; not yet committed when this was written). The same `LICENSE.amlogic_vdec` covers it.
+- **This repo's copy:** `firmware/meson/vdec/gxbb_h264.bin` is the same file (same size and md5). The same `LICENSE.amlogic_vdec` covers it.
 - **Layout:**
 
 | File range | Size | Part |
@@ -244,7 +246,7 @@ What codes 3–5 and 9 mean is **UNVERIFIED**. Linux never writes a command into
 - **Read the report before acknowledging.** After step 4 the firmware may post its next report. That report can overwrite AV_SCRATCH_1–6 and A–D, so read all of them before the AV_SCRATCH_0 write (inferred from the shared registers).
 - **SEI flag.** Whether the firmware stalls when AV_SCRATCH_J bit 15 is left set is **UNVERIFIED**. Clear it as Linux does.
 - **After a fatal command.** Linux makes no register write after commands 6, 7 and 8. The AMRISC keeps running until the session is stopped (base §1.4).
-- **Polling.** Base §10 found the vdec IRQ unreliable at the GIC and polled instead. For H.264 the equivalent is to poll AV_SCRATCH_0 bits 7:0 for a non-zero value. Command 1 stays in the low byte until the host replies, so a poller must remember that it is already handling it (inferred).
+- **Polling.** Base §11 found the vdec IRQ unreliable at the GIC and polled at first (edge-triggered interrupts fixed that in M26 stage 2). For H.264 the equivalent is to poll AV_SCRATCH_0 bits 7:0 for a non-zero value. Command 1 stays in the low byte until the host replies, so a poller must remember that it is already handling it (inferred).
 
 ---
 
@@ -430,7 +432,7 @@ Frames are delivered in report order.
 
 **Pictures with the error flag:** Linux delivers them normally and only logs the flag.
 
-**Interlaced pictures:** both fields arrive in one buffer, woven, as with MPEG-2 (inferred, **UNVERIFIED** for H.264 field pairs).
+**Interlaced pictures:** both fields arrive in one buffer, woven, as with MPEG-2 (confirmed in M60 for field-coded and MBAFF streams: both fields woven, as FFmpeg does).
 
 ---
 
@@ -455,7 +457,7 @@ Frames are delivered in report order.
 - Linux does no reordering for H.264. It delivers frames in report order and matches timestamps by stream offset.
 - The V4L2 stateful-decoder interface requires capture buffers in display order.
 - Together, these mean the firmware does reference marking, reordering and bumping itself.
-- On GXBB this is **UNVERIFIED**. For MPEG-2, base §10 found display order.
+- On GXBB this is **UNVERIFIED**. For MPEG-2, base §11 found display order.
 
 **Supporting facts:**
 - The host never tells the firmware which pictures are references.
@@ -734,7 +736,7 @@ The ESPARSER registers and the registers outside DOS are exactly those of base �
     - which parts of the dummy (SEI, CABAC, profile, size, the IDR flag) are needed.
 17. **Mid-stream start:** firmware behaviour with slices before the first SPS.
 18. **Size limit:** whether 1920×1080 is a GXBB hardware or firmware limit or Linux policy, and what triggers commands 7 and 8 on GXBB.
-19. **Untested combination:** whether Linux's H.264 path was ever run on GXBB. The commit names no tested SoC, and nothing here has been run on this board.
+19. **Untested combination:** whether Linux's H.264 path was ever run on GXBB. The commit names no tested SoC. (The port's own H.264 path runs on GXBB: §16.)
 
 ---
 
@@ -754,7 +756,7 @@ These are observations from Haiku's `meson_vdec` on this board, not facts from L
 | 16 (end of stream) | The 16×16 IDR picture makes the firmware put out every frame it holds. After that, it sends **no** command 1 for the picture and stops taking frames back. So the driver ends the stream when the firmware has read everything before the picture and reported nothing for 100 ms. Hand-backs wait in a queue for free slots. |
 | 18 (limits) | 1920×1080 works (coded 1088, cropped). Larger sizes weren't tried. |
 
-**The first session after boot** (also MPEG-2's open item, base §10):
+**The first session after boot** (also MPEG-2's open item, base §11):
 - The first macroblock's luma of the first picture comes out wrong: brighter, with the top-left corner garbled.
 - Intra prediction spreads the error over the whole picture, and P and B pictures carry it to the next IDR picture. Chroma is right.
 - Later sessions of the same boot are right, even though each session powers VDEC_1 down and up.

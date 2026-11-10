@@ -2,7 +2,7 @@
  * Copyright 2026, haiku-odroid-c2 port authors.
  * Distributed under the terms of the MIT License.
  *
- * Checks libdevice's GeekPort classes on the ODROID-C2 (milestone M27 (docs/milestones.md))
+ * Checks libdevice's GeekPort classes on the ODROID-C2 (milestone M27)
  * without anything wired to the header:
  *
  *   geekporttest digital    BDigitalPort: the Be Book's rules (opens as

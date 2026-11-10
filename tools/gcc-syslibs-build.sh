@@ -2,7 +2,7 @@
 # Rebuild gcc_syslibs (libstdc++, libsupc++, libgcc_s, libgomp, libatomic,
 # libssp) for Haiku arm64 from the buildtools gcc (the cross compiler's
 # source) with the Cortex-A53 erratum workarounds, which the bootstrap
-# package was built without (milestone M8 (docs/milestones.md)). A gcc configured like
+# package was built without (milestone M8). A gcc configured like
 # build/scripts/build_cross_tools_gcc4, but with shared target libraries,
 # libgomp and libatomic. The libraries go to deps/bootstrap/rebuilt/gcc_syslibs
 # for tools/bootstrap-fix.sh, after a check that they export every symbol the

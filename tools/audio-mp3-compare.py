@@ -5,7 +5,7 @@
 # audio-mp3-compare.py <recording.wav> <file.mp3>: compares a 48 kHz mono
 # recording of a played MP3 (the adapter cabled to the laptop's Y-247A,
 # `sudo arecord -D hw:2,0 -f S16_LE -r 48000 -c 1`) with the decoded file
-# (milestone M82 (docs/milestones.md)). Follows the recording's lag behind the file every 2 s: a
+# (milestone M82). Follows the recording's lag behind the file every 2 s: a
 # step up is sound played twice (usb_audio repeated buffers: 80 ms at
 # 44.1 kHz, 84 at 48), a step down sound skipped. Then compares band energies
 # per 20 ms with what the file predicts and lists dropouts (much quieter than

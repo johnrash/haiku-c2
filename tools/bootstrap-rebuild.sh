@@ -1,6 +1,6 @@
 #!/bin/bash
 # Rebuild the binaries of arm64 bootstrap packages that have Cortex-A53
-# erratum 835769 sequences (milestone M8 (docs/milestones.md)), from their sources in deps/src
+# erratum 835769 sequences (milestone M8), from their sources in deps/src
 # (checksums of the haikuports.cross recipes; FreeType's GPG signature), with
 # those recipes' patches and configure options and the errata flags. Built
 # files that the bootstrap package has at the same path go to

@@ -1,5 +1,5 @@
 #!/bin/sh
-# The video decoder's firmware (milestone M26 (docs/milestones.md)) as a package of its own, outside
+# The video decoder's firmware (milestone M26) as a package of its own, outside
 # the fork: firmware/meson_vdec_firmware-<version>-any.hpkg, with the files of
 # firmware/meson/vdec/ in data/firmware/meson/vdec/ (where the meson_decoder
 # media plugin reads them) and Amlogic's license. tools/c2-repo.py puts it in

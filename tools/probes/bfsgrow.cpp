@@ -8,7 +8,7 @@
  * to the size of its device, while <readers> threads (default 4) read the
  * attributes of files on it, as Tracker does at boot, and one thread writes
  * (creates, appends to and deletes files). Resizing must not free the block
- * cache or the allocation groups under them (milestone M74 (docs/milestones.md)). The volume needs
+ * cache or the allocation groups under them (milestone M74). The volume needs
  * a grow limit (bfs_shell --initialize ... "grow_limit <size>"), so that it
  * grows in place, as c2-grow does on a boot volume.
  *

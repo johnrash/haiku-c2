@@ -2,7 +2,7 @@
  * Copyright 2026, haiku-odroid-c2 port authors.
  * Distributed under the terms of the MIT License.
  *
- * emojitext [seconds]: colour emoji through the app_server (milestone M56 (docs/milestones.md)).
+ * emojitext [seconds]: colour emoji through the app_server (milestone M56).
  * Checks, drawing into a B_RGBA32 bitmap (white, black high colour) with
  * the plain font, which takes emoji from the "Noto Color Emoji" fallback:
  *   - the family is installed;
@@ -19,7 +19,7 @@
  *     U+2764 HEAVY BLACK HEART (text by default) in black, but in colour
  *     with U+FE0F after it; U+263A WHITE SMILING FACE, which the plain font
  *     has, in colour with U+FE0F;
- *   - sequences drawn as one emoji (milestone M62 (docs/milestones.md)): a flag, a ZWJ family, a
+ *   - sequences drawn as one emoji (milestone M62): a flag, a ZWJ family, a
  *     skin tone, a keycap, ZWJ sequences with U+FE0F in them, a tag flag
  *     (England): each as wide as one emoji, and in colour (but the
  *     family, which Noto Color Emoji draws in greys).
