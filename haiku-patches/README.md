@@ -1,6 +1,6 @@
 # The Haiku fork, as patches
 
-These 342 patches are the port's changes to Haiku. They are the commits of
+These 343 patches are the port's changes to Haiku. They are the commits of
 the fork's `odroid-c2` branch on top of upstream Haiku a12d4cd1a5
 (hrev60299+6, committed 2026-10-26), in order, made with `git format-patch`.
 Each file keeps its author and date. For publication, 34 commit messages
@@ -9,9 +9,9 @@ two code comments in 0327 and 0333 were too.
 
 - **To get the tree:** `tools/haiku-setup.sh` clones upstream Haiku, checks
   out the base on a new branch `odroid-c2` and applies them all with
-  `git am`. The final tree is `b4a0900b07ee2c75dfe2b362c231b5a14b8a7c4e`
-  and its version is hrev60299+348 (the hrev tags come from Haiku's own
-  server: GitHub's mirror has none). The private fork is at +351: it also
+  `git am`. The final tree is `ec03ed53d7fe66eb70dd88e16dcf9585257edd37`
+  and its version is hrev60299+349 (the hrev tags come from Haiku's own
+  server: GitHub's mirror has none). The private fork is at +352: it also
   has three commits of internal artwork, which aren't published, so images
   built from these patches have Haiku's stock unofficial-build artwork
   instead.

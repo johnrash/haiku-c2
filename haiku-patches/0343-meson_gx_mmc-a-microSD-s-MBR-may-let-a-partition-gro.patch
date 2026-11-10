@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Tue, 10 Nov 2026 07:40:38 -0500
+Subject: [PATCH] meson_gx_mmc: a microSD's MBR may let a partition grow
+
+A writable microSD ("sd_writable true") kept its whole first 4 MiB
+unwritable, the MBR included, so an image running from the card couldn't
+grow to fill it at its first boot: c2-grow's rewrite of the boot
+partition's MBR entry was refused, while the same image on an eMMC
+module (no protected start) grew.
+
+A write of the MBR alone now goes through if it only grows a partition:
+the card's MBR is read again and compared, and U-Boot's boot code, the
+disk signature and the boot signature must stay as they are; a changed
+partition entry keeps its status, CHS fields, type and start (beyond the
+protected area), and its size only gets larger. The rest of the first
+4 MiB stays unwritable, and eMMC is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/busses/mmc/meson_gx_mmc.cpp        | 89 ++++++++++++++++++-
+ 1 file changed, 86 insertions(+), 3 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp b/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
+index 7b66a2acee..fb7416aa33 100644
+--- a/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
++++ b/src/add-ons/kernel/busses/mmc/meson_gx_mmc.cpp
+@@ -28,7 +28,9 @@
+  *   ODROID-C2) are read-only: data writes and every command that can
+  *   change the card are refused. With "sd_writable true" in the driver
+  *   settings (an image that runs from the card) they are writable beyond
+- *   their first 4 MiB, which hold the MBR and U-Boot.
++ *   their first 4 MiB, which hold the MBR and U-Boot. The MBR may then
++ *   still let a partition grow, nothing else (an image growing to fill
++ *   the card at its first boot, tools/guest/c2-grow.cpp).
+  * - eMMC data can run at double data rate (DDR52, set_ddr()), SD cards
+  *   at 50 MHz (high speed); either is kept only if multi-block test reads
+  *   pass, and a transfer that fails in such a mode is retried at a safe
+@@ -233,6 +235,7 @@ private:
+ 									const generic_io_vec* vecsEnd,
+ 									generic_size_t& vecOffset,
+ 									generic_size_t length);
++			status_t			_CheckMbrWrite(IOOperation* operation);
+ 			status_t			_ApplyClock();
+ 			bool				_SlowDown();
+ 			bool				_TestRead();
+@@ -936,9 +939,13 @@ MesonMmc::DoIO(uint8 command, IOOperation* operation, bool offsetAsSectors)
+ {
+ 	bool write = operation->IsWrite();
+ 	off_t offset = operation->Offset();
++	bool mbr = false;
+ 	if (write && (fReadOnly
+ 			|| offset < (off_t)fProtectedBlocks * kBlockSize)) {
+-		return B_READ_ONLY_DEVICE;
++		// in the protected start, only the MBR alone, checked below
++		if (fReadOnly || offset != 0 || operation->Length() != kBlockSize)
++			return B_READ_ONLY_DEVICE;
++		mbr = true;
+ 	}
+ 
+ 	generic_size_t length = operation->Length();
+@@ -947,6 +954,12 @@ MesonMmc::DoIO(uint8 command, IOOperation* operation, bool offsetAsSectors)
+ 
+ 	MutexLocker locker(fLock);
+ 
++	if (mbr) {
++		status_t status = _CheckMbrWrite(operation);
++		if (status != B_OK)
++			return status;
++	}
++
+ 	TRACE("DoIO %s offset %" B_PRIdOFF " length %" B_PRIuGENADDR ", %" B_PRIu32
+ 		" vecs\n", write ? "write" : "read", offset, length,
+ 		operation->VecCount());
+@@ -1017,6 +1030,75 @@ MesonMmc::DoIO(uint8 command, IOOperation* operation, bool offsetAsSectors)
+ }
+ 
+ 
++static uint32
++mbr_read_le32(const uint8* bytes)
++{
++	uint32 value;
++	memcpy(&value, bytes, sizeof(value));
++	return B_LENDIAN_TO_HOST_INT32(value);
++}
++
++
++/*!	Whether \a operation, a write of the MBR (block 0) of a card whose start
++	is protected, may go ahead: only if it grows a partition, as
++	tools/guest/c2-grow.cpp extends the boot partition at an image's first
++	boot. U-Boot's boot code, the disk signature and the boot signature stay
++	as they are, and each partition entry either stays as it is or keeps
++	everything but its size, which only gets larger; its start must be
++	beyond the protected area. The card's MBR is read again to compare.
++	Called with fLock held.
++*/
++status_t
++MesonMmc::_CheckMbrWrite(IOOperation* operation)
++{
++	static const uint32 kTableOffset = 446;
++	static const uint32 kEntrySize = 16;
++
++	if (fBounceArea < 0)
++		return B_READ_ONLY_DEVICE;
++
++	// the new MBR, from the operation's vectors
++	uint8 newMbr[kBlockSize];
++	const generic_io_vec* vecs = operation->Vecs();
++	generic_size_t vecOffset = 0;
++	_CopyVecs(vecs, operation->Vecs() + operation->VecCount(), vecOffset,
++		kBlockSize, true);
++	memcpy(newMbr, fBounceBuffer, kBlockSize);
++
++	// the card's
++	uint32 response;
++	status_t status = _Execute(SD_READ_SINGLE_BLOCK, 0, &response,
++		fBouncePhysical, 1, false);
++	if (status != B_OK)
++		return status;
++	const uint8* oldMbr = (const uint8*)fBounceBuffer;
++
++	bool allowed = memcmp(oldMbr, newMbr, kTableOffset) == 0
++		&& oldMbr[510] == 0x55 && oldMbr[511] == 0xaa
++		&& newMbr[510] == 0x55 && newMbr[511] == 0xaa;
++	bool grows = false;
++	for (uint32 i = 0; allowed && i < 4; i++) {
++		const uint8* oldEntry = oldMbr + kTableOffset + kEntrySize * i;
++		const uint8* newEntry = newMbr + kTableOffset + kEntrySize * i;
++		if (memcmp(oldEntry, newEntry, kEntrySize) == 0)
++			continue;
++		// bytes 0-11: status, CHS, type and start; 12-15: the size
++		allowed = memcmp(oldEntry, newEntry, 12) == 0 && newEntry[4] != 0
++			&& mbr_read_le32(newEntry + 8) >= fProtectedBlocks
++			&& mbr_read_le32(newEntry + 12) > mbr_read_le32(oldEntry + 12);
++		grows = true;
++	}
++	if (!allowed) {
++		ERROR("MBR write refused: on a card's protected start, only a "
++			"partition may grow\n");
++		return B_READ_ONLY_DEVICE;
++	}
++	if (grows)
++		INFO("MBR written: a partition grows\n");
++	return B_OK;
++}
++
++
+ /*!	Copies \a length bytes between the I/O vectors, starting at \a vecs
+ 	and \a vecOffset, and the bounce buffer: into it with \a toBounce,
+ 	else out of it. The vectors are physical; all RAM is mapped at
+@@ -1269,7 +1351,8 @@ driver_setting_enabled(const char* name)
+ 	settings (~/config/settings/kernel/drivers/meson_gx_mmc, passed on by the
+ 	boot loader) say "sd_writable true", as an image that runs from the
+ 	microSD needs. Their first 4 MiB, where the MBR and U-Boot are, stay
+-	unwritable either way.
++	unwritable either way, except for a partition growing in the MBR on a
++	writable card (MesonMmc::_CheckMbrWrite()).
+ */
+ static bool
+ sd_writable()

@@ -1,6 +1,6 @@
 # Milestones
 
-The port was built in numbered milestones, M0 to M89, from October to
+The port was built in numbered milestones, M0 to M90, from October to
 November 2026. The tools, the docs and the Haiku patches refer to them as
 "Mxx". Some code comments in the patches still say "PLAN.md Mxx": PLAN.md
 was the working log the milestones come from, and it is not published.
@@ -12,7 +12,7 @@ first commit after the upstream base a12d4cd1a5 (hrev60299+6), and the
 private fork's internal artwork (+67, +80, +81) isn't in the series. So up
 to +66, +N is patch N-6; from +68 to +79 it's patch N-7; and from +82 on
 it's patch N-9. A tree built from the patches therefore calls itself
-hrev60299+348 where the private fork says +351.
+hrev60299+349 where the private fork says +352.
 
 "The test board" is the C2 on the bench's crossover cable (10.42.0.2), with
 a serial console and a power relay. "The LAN boards" are other C2s on an
@@ -113,3 +113,4 @@ published here; they're listed as such.
 - **M87:** LCD Shield 1.5: D5 and D7, Fahrenheit, all of it as a Desktop replicant, an icon, AM/PM, a dot-matrix display
 - **M88:** Terminal without antialiasing, app_server's monochrome text
 - **M89:** work on an app that isn't part of this repository
+- **M90:** a microSD grows at its first boot like an eMMC module

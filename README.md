@@ -8,7 +8,7 @@ Gigabit Ethernet, USB, hardware video decoding, the Mali GPU, and the
 
 This repository has everything in one place:
 
-- **The port's changes to Haiku**, as 342 patches
+- **The port's changes to Haiku**, as 343 patches
   ([`haiku-patches/`](haiku-patches), indexed by area in
   [`docs/haiku-fixes.md`](docs/haiku-fixes.md)). Many are bug fixes in
   Haiku's common code (network stack, file system cache, USB, media,
@@ -47,9 +47,10 @@ This repository has everything in one place:
   audio. (M6, M13, M29, M53)
 - **Storage:** eMMC (8-bit DDR52) and microSD. An image made for keeping
   grows its system volume to fill the disk during its first two boots
-  (tested on eMMC modules). The bench's test images, which are reflashed
-  for every test, keep the rest of the eMMC as a separate `/Data` volume
-  instead. (M4, M4.5, M6, M7, M10, M11, M20, M40, M46, M74)
+  (tested on an eMMC module and a 32 GB microSD). The bench's test images,
+  which are reflashed for every test, keep the rest of the eMMC as a
+  separate `/Data` volume instead. (M4, M4.5, M6, M7, M10, M11, M20, M40,
+  M46, M74, M90)
 - **Network:** Gigabit Ethernet with DHCP. Wi-Fi with RTL8812BU (RTL8822B)
   USB adapters. NTP at boot, since the C2 has no battery-backed clock.
   (M5, M6, M64, M80, M81)

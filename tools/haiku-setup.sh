@@ -7,7 +7,7 @@
 #                with haiku-patches/ applied on the branch odroid-c2 (git am:
 #                the port's commits, their authors and messages kept). Full
 #                history and tags: the build's version comes from them
-#                ("hrev60299+348" at patch 0342).
+#                ("hrev60299+349" at patch 0343).
 #   buildtools/  Haiku's cross-toolchain sources at 33d46bf5c3 (binutils
 #                2.46.1, gcc 13.3.0), with
 #                patches/binutils/ld-2.46.1-aarch64-843419-rescan.patch.

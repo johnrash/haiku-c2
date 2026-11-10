@@ -115,7 +115,7 @@ if [ -e $settings/c2-grow ] && [ -x $grow ]; then
 			done
 			sleep 30
 			/bin/notify --title "System volume" --timeout 15 \
-				"Restarting to let the system volume use the whole disk" \
+				"System will restart shortly to resize boot volume to utilize entire disk space." \
 				> /dev/null 2>&1
 			sleep 15
 			log "restarting to grow the file system"

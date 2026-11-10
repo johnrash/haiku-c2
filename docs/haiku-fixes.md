@@ -1,6 +1,6 @@
 # The Haiku patches by area
 
-The 342 patches in [`haiku-patches/`](../haiku-patches) are the port's
+The 343 patches in [`haiku-patches/`](../haiku-patches) are the port's
 commits on top of upstream Haiku a12d4cd1a5 (hrev60299+6), in order;
 `tools/haiku-setup.sh` applies them. Each one is a `git format-patch`
 file with its full commit message: what was wrong, how it was found,
@@ -66,7 +66,7 @@ platform can hit. This list is made by `tools/haiku-patches-index.py`.
 - [0338](../haiku-patches/0338-kernel-arm64-flush-the-TLB-when-ClearFlags-clears-on.patch) kernel/arm64: flush the TLB when ClearFlags() clears only the access flag
 - [0339](../haiku-patches/0339-kernel-elf-reserve-a-user-image-s-whole-span-before-.patch) kernel/elf: reserve a user image's whole span before mapping its segments
 
-## Storage and packages (21)
+## Storage and packages (22)
 
 - [0006](../haiku-patches/0006-mmc_disk-attach-to-MMC-eMMC-cards.patch) mmc_disk: attach to MMC/eMMC cards
 - [0007](../haiku-patches/0007-mmc-add-Amlogic-Meson-GX-SD-eMMC-host-controller-dri.patch) mmc: add Amlogic Meson GX SD/eMMC host controller driver
@@ -89,6 +89,7 @@ platform can hit. This list is made by `tools/haiku-patches-index.py`.
 - [0185](../haiku-patches/0185-mmc-SD-cards-put-in-or-taken-out-while-running.patch) mmc: SD cards put in or taken out while running
 - [0220](../haiku-patches/0220-mmc_disk-a-card-taken-out-leaves-dev-and-its-number-.patch) mmc_disk: a card taken out leaves /dev, and its number is free again
 - [0261](../haiku-patches/0261-bfs-resize-the-block-cache-of-a-mounted-volume-in-pl.patch) bfs: resize the block cache of a mounted volume in place
+- [0343](../haiku-patches/0343-meson_gx_mmc-a-microSD-s-MBR-may-let-a-partition-gro.patch) meson_gx_mmc: a microSD's MBR may let a partition grow
 
 ## USB (36)
 
