@@ -43,8 +43,11 @@ This repository has everything in one place:
 - **Display:** a native HDMI driver, 1920x1080 at 60 Hz, and modes up to
   4K at 30 Hz; a display plugged in after boot gets its own mode. HDMI
   audio. (M6, M13, M29, M53)
-- **Storage:** eMMC (8-bit, 52 MHz) and microSD. The rest of the eMMC is a
-  `/Data` volume that survives reflashing. (M4, M10, M11, M40, M46)
+- **Storage:** eMMC (8-bit, 52 MHz) and microSD. An image made for
+  keeping grows its system volume to fill the card or eMMC module during
+  its first two boots. The bench's test images, which are reflashed for
+  every test, keep the rest of the eMMC as a separate `/Data` volume
+  instead. (M4, M10, M11, M20, M40, M46, M74)
 - **Network:** Gigabit Ethernet with DHCP. Wi-Fi with RTL8812BU (RTL8822B)
   USB adapters. NTP at boot, since the C2 has no battery-backed clock.
   (M5, M64, M81)

@@ -49,8 +49,18 @@ jam -q -j$(nproc) @c2-mmc
   843419 rescan patch. `tools/a53-843419.py` and `tools/a53-835769.py`
   check a binary.
 - `tools/c2-sd-image.sh <name>` makes a self-contained microSD image, with
-  U-Boot and Haiku running from the card, in `images/`. `PACKAGES` and
-  `DIAG_OPTS` (`--ssh`) work as for `c2-test-image.sh`.
+  U-Boot and Haiku running from the card, in `images/`; `TARGET=emmc`
+  makes one for an eMMC module. Write it with `dd` or Etcher.
+  - With `DIAG_OPTS=--grow-on-boot` (plus `--no-data-partition` for an
+    eMMC module), the system volume grows to fill the card or module
+    during the first two boots. The first boot extends the partition and
+    restarts the board once the desktop is up. The second grows the file
+    system.
+  - Without it, an eMMC image keeps the space after 1 GiB as a `/Data`
+    volume.
+  - `PACKAGES` and `DIAG_OPTS` (`--ssh`) work as for `c2-test-image.sh`.
+  - `tools/c2-grow.sh` grows an existing card or module from the PC, in a
+    USB card reader.
 - `tools/uboot-build.sh <name>` builds and signs U-Boot, with the config
   fragment and the patches, into `tftp/<name>.bin` and `.sd.bin`.
 
@@ -167,8 +177,8 @@ With `--kdl` it then enters the kernel debugger.
 launch_daemon at boot, before and independent of the desktop. In every
 image it:
 
-- formats the data partition as BFS "Data" if a good read finds no file
-  system on it, and mounts it at `/Data`;
+- formats the data partition, if the image has one, as BFS "Data" when a
+  good read finds no file system on it, and mounts it at `/Data`;
 - sets the clock over NTP on the first boot;
 - prints `c2-system: desktop up` once Tracker runs, or, if there's no
   Tracker after 120 s, `ps` to the serial log.
@@ -179,8 +189,9 @@ enters KDL so that the hang can be inspected.
 
 ## Known issues
 
-- Clock control (`dvfs on`) and other settings live on the system
-  partition, so reflashing the image resets them. `/Data` keeps its files.
+- On the bench, clock control (`dvfs on`) and other settings live on the
+  system partition, so reflashing the test image resets them. `/Data`
+  keeps its files.
 
 ## Things that cost time
 
